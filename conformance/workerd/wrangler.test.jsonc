@@ -1,0 +1,17 @@
+{
+  // The oracle lane. `main` is the dependency-free probe, so nothing here
+  // resolves vendored source and CI's filtered vendor install is irrelevant.
+  "name": "do-runtime-conformance",
+  "main": "../fixtures/probe.ts",
+  "compatibility_date": "2026-07-01",
+  "compatibility_flags": ["nodejs_compat", "experimental"],
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Probe"] }],
+  "durable_objects": {
+    "bindings": [{ "name": "PROBE", "class_name": "Probe" }]
+  },
+  // Facet classes come from a Worker Loader — the same shape decision 15 gives
+  // the codemode executor. There is no wrangler config key for a
+  // `durableObjectClass` binding at this version; `getDurableObjectClass` off a
+  // loaded worker is how a facet class is reached.
+  "worker_loaders": [{ "binding": "LOADER" }]
+}

@@ -1,0 +1,5 @@
+node_modules/
+.tsbuild/
+.wrangler/
+__screenshots__/
+.DS_Store

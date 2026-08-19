@@ -1,0 +1,28 @@
+{
+  // The unit lane's tests, in their own project for the same reason
+  // conformance/tsconfig.json is in its own: they pull in vitest and node types
+  // that the runtime must never see. Keeping them here is also what lets a test
+  // depend on both `src/util` and `backends` — the cycle a shared project would
+  // create is between sources and tests, not between sources.
+  //
+  // Tests reach `backends` through its emitted declarations, so they need no
+  // knowledge of the substrate; `node` is here only because the on-disk backend
+  // test makes a temporary directory.
+  "extends": "./tsconfig.base.json",
+  "include": [
+    "src/**/*.test.ts",
+    "backends/**/*.test.ts"
+  ],
+  "references": [
+    { "path": "./src/util" },
+    { "path": "./src/io" },
+    { "path": "./src/api" },
+    { "path": "./src/server" },
+    { "path": "./src/transport" },
+    { "path": "./backends" }
+  ],
+  "compilerOptions": {
+    "types": ["@cloudflare/workers-types", "node"],
+    "outDir": "./.tsbuild/tests"
+  }
+}

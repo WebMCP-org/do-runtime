@@ -1,0 +1,23 @@
+{
+  // The storage-backend adaptation, and the only project in the package that
+  // may see a substrate: `node:sqlite` for the Node lane, the injected
+  // sqlite-wasm surface for the browser one. It depends on `src/util` for the
+  // interface it implements and on nothing else, so the arrow points the same
+  // way upstream's does — `sqlite.c++` implements what `sqlite.h` declares.
+  "extends": "../tsconfig.base.json",
+  "include": [
+    "."
+  ],
+  "exclude": [
+    "**/*.test.ts"
+  ],
+  "references": [
+    {
+      "path": "../src/util"
+    }
+  ],
+  "compilerOptions": {
+    "types": ["@cloudflare/workers-types", "node"],
+    "outDir": "../.tsbuild/backends"
+  }
+}

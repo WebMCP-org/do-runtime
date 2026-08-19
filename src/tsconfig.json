@@ -1,0 +1,12 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": { "outDir": "../.tsbuild/index" },
+  "files": ["index.ts"],
+  "references": [
+    { "path": "./util" },
+    { "path": "./io" },
+    { "path": "./api" },
+    { "path": "./server" },
+    { "path": "./transport" }
+  ]
+}

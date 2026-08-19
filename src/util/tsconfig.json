@@ -1,0 +1,17 @@
+{
+  // Sources only. Tests live in ../../tsconfig.tests.json, so that this project
+  // can keep tsconfig.base.json's `types` exactly as it is: `backends/` needs
+  // node types and `sqlite-kv.test.ts` needs `backends/`, and letting either
+  // reach in here would put `process` within reach of the runtime.
+  "extends": "../../tsconfig.base.json",
+  "include": [
+    "."
+  ],
+  "exclude": [
+    "**/*.test.ts"
+  ],
+  "references": [],
+  "compilerOptions": {
+    "outDir": "../../.tsbuild/util"
+  }
+}

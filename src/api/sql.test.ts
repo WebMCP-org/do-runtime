@@ -1,0 +1,380 @@
+/**
+ * ← workerd `src/workerd/api/sql.{h,c++}`.
+ *
+ * There is no `sql-test.c++` upstream; `sql.h`'s coverage is the `sql-test.js`
+ * behavioural suite, which runs inside a real Durable Object and so belongs to
+ * the conformance lane rather than here. What this file asserts is the part of
+ * `sql.c++` that is pure translation — cursor semantics, the two `one()`
+ * messages, `databaseSize`'s arithmetic, the regulator's refusal of transaction
+ * control — plus the three claims that are ours rather than upstream's: the
+ * materialised-cursor divergence, the direct-construction refusal that
+ * `typeof SqlStorageCursor` forces, and the empty-input-lock-stack throw.
+ */
+
+import { expect, test } from "vitest";
+import { createNodeSqlProvider } from "../../backends/node-sqlite";
+import { SqliteDatabase } from "../util/sqlite";
+import { InputGate, OutputGate } from "../io/io-gate";
+import { type Actor, IoContext, requireInputLock, type Timer } from "../io/io-context";
+import {
+  CURSOR_NOT_CONSTRUCTIBLE_MESSAGE,
+  SQL_INGEST_UNIMPLEMENTED_MESSAGE,
+  SQL_RESERVED_PREFIX_MESSAGE,
+  SQL_TRANSACTION_REFUSED_MESSAGE,
+  SqlStorage,
+  SqlStorageRegulator,
+} from "./sql";
+
+class TestActor implements Actor {
+  readonly inputGate = new InputGate();
+  readonly outputGate = new OutputGate();
+  getInputGate(): InputGate {
+    return this.inputGate;
+  }
+  getOutputGate(): OutputGate {
+    return this.outputGate;
+  }
+  shutdownActorCache(): void {}
+  assertCanSetAlarm(): void {}
+}
+
+const idleTimer: Timer = {
+  now: () => 0,
+  afterDelay: () => new Promise<void>(() => {}),
+};
+
+type Fixture = { ctx: IoContext; db: SqliteDatabase; sql: SqlStorage };
+
+async function newFixture(): Promise<Fixture> {
+  const db = new SqliteDatabase(await createNodeSqlProvider().open("sql-test"));
+  const actor = new TestActor();
+  const ctx = new IoContext(actor, idleTimer);
+  return { ctx, db, sql: new SqlStorage(ctx, { getSqliteDb: () => db }) };
+}
+
+/** Every `sql.*` entry point is gated, so every case runs inside one slice. */
+function sqlTest(name: string, body: (fixture: Fixture) => void | Promise<void>): void {
+  test(name, async () => {
+    const fixture = await newFixture();
+    await fixture.ctx.run(() => body(fixture));
+  });
+}
+
+// =======================================================================================
+// Cursor
+
+sqlTest("exec returns a cursor over the rows, with column names", ({ sql }) => {
+  sql.exec("CREATE TABLE things (id INTEGER, label TEXT)");
+  sql.exec("INSERT INTO things VALUES (1, 'one'), (2, 'two')");
+
+  const cursor = sql.exec("SELECT id, label FROM things ORDER BY id");
+  expect(cursor.columnNames).toEqual(["id", "label"]);
+  expect(cursor.toArray()).toEqual([
+    { id: 1, label: "one" },
+    { id: 2, label: "two" },
+  ]);
+});
+
+sqlTest("a cursor is iterable, and iterating consumes it", ({ sql }) => {
+  sql.exec("CREATE TABLE things (id INTEGER)");
+  sql.exec("INSERT INTO things VALUES (1), (2), (3)");
+
+  const cursor = sql.exec("SELECT id FROM things ORDER BY id");
+  expect([...cursor]).toEqual([{ id: 1 }, { id: 2 }, { id: 3 }]);
+  // Upstream's cursor is a live statement: once drained it yields nothing more.
+  expect([...cursor]).toEqual([]);
+});
+
+sqlTest("next() reports done exactly as the iterator protocol does", ({ sql }) => {
+  sql.exec("CREATE TABLE things (id INTEGER)");
+  sql.exec("INSERT INTO things VALUES (7)");
+
+  const cursor = sql.exec("SELECT id FROM things");
+  expect(cursor.next()).toEqual({ done: false, value: { id: 7 } });
+  expect(cursor.next()).toEqual({ done: true });
+});
+
+sqlTest("raw() yields arrays in column order and shares the cursor's position", ({ sql }) => {
+  sql.exec("CREATE TABLE things (id INTEGER, label TEXT)");
+  sql.exec("INSERT INTO things VALUES (1, 'one'), (2, 'two')");
+
+  const cursor = sql.exec("SELECT id, label FROM things ORDER BY id");
+  expect(cursor.next()).toEqual({ done: false, value: { id: 1, label: "one" } });
+  expect([...cursor.raw()]).toEqual([[2, "two"]]);
+});
+
+sqlTest("one() returns the single row", ({ sql }) => {
+  sql.exec("CREATE TABLE things (id INTEGER)");
+  sql.exec("INSERT INTO things VALUES (42)");
+  expect(sql.exec("SELECT id FROM things").one()).toEqual({ id: 42 });
+});
+
+sqlTest("one() refuses an empty result, with upstream's message", ({ sql }) => {
+  sql.exec("CREATE TABLE things (id INTEGER)");
+  expect(() => sql.exec("SELECT id FROM things").one()).toThrow(
+    "Expected exactly one result from SQL query, but got no results.",
+  );
+});
+
+sqlTest("one() refuses multiple results, with upstream's message", ({ sql }) => {
+  sql.exec("CREATE TABLE things (id INTEGER)");
+  sql.exec("INSERT INTO things VALUES (1), (2)");
+  expect(() => sql.exec("SELECT id FROM things").one()).toThrow(
+    "Expected exactly one result from SQL query, but got multiple results.",
+  );
+});
+
+sqlTest("bindings are passed through as parameters", ({ sql }) => {
+  sql.exec("CREATE TABLE things (id INTEGER, label TEXT)");
+  sql.exec("INSERT INTO things VALUES (?, ?)", 5, "five");
+  expect(sql.exec("SELECT label FROM things WHERE id = ?", 5).one()).toEqual({ label: "five" });
+});
+
+sqlTest("public bindings receive workerd's JSG value conversion", ({ sql }) => {
+  const backing = new Uint8Array([9, 1, 2, 3, 8]);
+  const bytes = new Uint8Array(backing.buffer, 1, 3);
+  const view = new DataView(backing.buffer, 1, 3);
+  const buffer = new Uint8Array([4, 5, 6]).buffer;
+
+  expect(
+    sql
+      .exec(
+        `SELECT typeof(?) AS trueType, ? AS trueValue,
+                typeof(?) AS falseType, ? AS falseValue,
+                typeof(?) AS undefinedType, ? AS undefinedValue,
+                hex(?) AS bytesHex, hex(?) AS viewHex, hex(?) AS bufferHex`,
+        true,
+        true,
+        false,
+        false,
+        undefined,
+        undefined,
+        bytes,
+        view,
+        buffer,
+      )
+      .one(),
+  ).toEqual({
+    trueType: "text",
+    trueValue: "true",
+    falseType: "text",
+    falseValue: "false",
+    undefinedType: "null",
+    undefinedValue: null,
+    bytesHex: "010203",
+    viewHex: "010203",
+    bufferHex: "040506",
+  });
+});
+
+sqlTest("a statement batch returns the last statement and binds only that statement", ({ sql }) => {
+  expect(
+    sql
+      .exec(
+        "CREATE TABLE things (id INTEGER, label TEXT); " +
+          "INSERT INTO things VALUES (1, 'one'); " +
+          "SELECT label FROM things WHERE id = ?;",
+        1,
+      )
+      .one(),
+  ).toEqual({ label: "one" });
+});
+
+sqlTest("rowsWritten is the statement's change count", ({ sql }) => {
+  sql.exec("CREATE TABLE things (id INTEGER)");
+  expect(sql.exec("INSERT INTO things VALUES (1), (2), (3)").rowsWritten).toBe(3);
+});
+
+sqlTest("rowsWritten includes DML that returns rows", ({ sql }) => {
+  sql.exec("CREATE TABLE things (id INTEGER)");
+  const cursor = sql.exec("INSERT INTO things VALUES (1), (2), (3) RETURNING id");
+  expect(cursor.toArray()).toEqual([{ id: 1 }, { id: 2 }, { id: 3 }]);
+  expect(cursor.rowsWritten).toBe(3);
+});
+
+sqlTest("rowsRead counts the rows this cursor has yielded", ({ sql }) => {
+  sql.exec("CREATE TABLE things (id INTEGER)");
+  sql.exec("INSERT INTO things VALUES (1), (2), (3)");
+
+  const cursor = sql.exec("SELECT id FROM things");
+  expect(cursor.rowsRead).toBe(0);
+  cursor.next();
+  expect(cursor.rowsRead).toBe(1);
+  cursor.toArray();
+  expect(cursor.rowsRead).toBe(3);
+});
+
+sqlTest("the cursor class is exposed for instanceof but refuses construction", ({ sql }) => {
+  sql.exec("CREATE TABLE things (id INTEGER)");
+  const cursor = sql.exec("SELECT id FROM things");
+  expect(cursor).toBeInstanceOf(sql.Cursor);
+  expect(() => new sql.Cursor()).toThrow(CURSOR_NOT_CONSTRUCTIBLE_MESSAGE);
+});
+
+// =======================================================================================
+// databaseSize
+
+sqlTest("databaseSize is the used page count times the page size", ({ sql, db }) => {
+  const expected = (): number => {
+    const size = db.run("SELECT * FROM pragma_page_size").rawRows[0]?.[0];
+    const pages = db.run(
+      "SELECT (SELECT * FROM pragma_page_count) - (SELECT * FROM pragma_freelist_count)",
+    ).rawRows[0]?.[0];
+    return Number(size) * Number(pages);
+  };
+
+  expect(sql.databaseSize).toBe(0);
+  sql.exec("CREATE TABLE things (id INTEGER, payload BLOB)");
+  sql.exec("INSERT INTO things VALUES (1, ?)", new Uint8Array(4096).fill(7));
+  expect(sql.databaseSize).toBe(expected());
+  expect(sql.databaseSize).toBeGreaterThan(0);
+});
+
+sqlTest("databaseSize excludes pages on the freelist", ({ sql }) => {
+  sql.exec("CREATE TABLE things (id INTEGER, payload BLOB)");
+  for (let row = 0; row < 40; row++) {
+    sql.exec("INSERT INTO things VALUES (?, ?)", row, new Uint8Array(4096).fill(7));
+  }
+  const full = sql.databaseSize;
+  sql.exec("DELETE FROM things");
+  // Without the freelist subtraction the file has not shrunk, so this reads unchanged.
+  expect(sql.databaseSize).toBeLessThan(full);
+});
+
+// =======================================================================================
+// SqlStorageRegulator
+
+sqlTest("transaction control from SQL is refused, with upstream's message", ({ sql }) => {
+  for (const statement of [
+    "BEGIN TRANSACTION",
+    "COMMIT",
+    "ROLLBACK",
+    "SAVEPOINT foo",
+    "RELEASE foo",
+  ]) {
+    expect(() => sql.exec(statement), statement).toThrow(SQL_TRANSACTION_REFUSED_MESSAGE);
+  }
+});
+
+sqlTest("a refused transaction statement never reaches the database", ({ sql, db }) => {
+  sql.exec("CREATE TABLE things (id INTEGER)");
+  expect(() => sql.exec("BEGIN")).toThrow(SQL_TRANSACTION_REFUSED_MESSAGE);
+  // If BEGIN had run, the savepoint stack below would refuse to open.
+  expect(() => db.run("SAVEPOINT probe")).not.toThrow();
+  db.run("RELEASE probe");
+});
+
+sqlTest("transaction control is refused anywhere in a statement batch", ({ sql }) => {
+  expect(() => sql.exec("CREATE TABLE things (id INTEGER); BEGIN; SELECT 1"))
+    .toThrow(SQL_TRANSACTION_REFUSED_MESSAGE);
+  expect(() => sql.exec("SELECT 1; SAVEPOINT hidden; SELECT 2"))
+    .toThrow(SQL_TRANSACTION_REFUSED_MESSAGE);
+});
+
+sqlTest("a statement naming the reserved _cf_ prefix is refused", ({ sql }) => {
+  for (const statement of [
+    "SELECT * FROM _cf_KV",
+    "CREATE TABLE _cf_KV (k TEXT)",
+    "DROP TABLE _cf_METADATA",
+    "INSERT INTO _cf_KV VALUES ('k', 'v')",
+    // Case-insensitive, which is the direction upstream's autogate is moving.
+    "SELECT * FROM _CF_kv",
+  ]) {
+    expect(() => sql.exec(statement), statement).toThrow(SQL_RESERVED_PREFIX_MESSAGE);
+  }
+});
+
+sqlTest("a quoted identifier is still an identifier", ({ sql }) => {
+  // The delimiters are stripped, not the word: `"_cf_KV"` names the same table `_cf_KV` does.
+  expect(() => sql.exec('CREATE TABLE "_cf_KV" (k TEXT)')).toThrow(SQL_RESERVED_PREFIX_MESSAGE);
+  expect(() => sql.exec("CREATE TABLE `_cf_KV` (k TEXT)")).toThrow(SQL_RESERVED_PREFIX_MESSAGE);
+});
+
+sqlTest("the token as data is allowed, because upstream allows it", ({ sql }) => {
+  // The authorizer sees resolved identifiers, so a literal is not one — measured on real
+  // workerd, `conformance/suite/sql.spec.ts`. The vendored `agents` package ships exactly
+  // this statement in its schema migration, and refusing it broke every agent's constructor.
+  sql.exec("CREATE TABLE notes (callback TEXT)");
+  sql.exec("INSERT INTO notes VALUES ('_cf_keepAliveHeartbeat')");
+  expect(sql.exec("DELETE FROM notes WHERE callback = '_cf_keepAliveHeartbeat'").rowsWritten).toBe(
+    1,
+  );
+  expect(sql.exec("SELECT '_cf_ is data' AS note").one()).toEqual({ note: "_cf_ is data" });
+  // A doubled quote inside the literal does not end it, so the identifier scan must not
+  // resume in the middle of one.
+  expect(sql.exec("SELECT 'it''s _cf_ data' AS note").one()).toEqual({ note: "it's _cf_ data" });
+});
+
+sqlTest("a comment is not code either", ({ sql }) => {
+  expect(sql.exec("SELECT 1 AS n -- _cf_KV lives here").one()).toEqual({ n: 1 });
+  expect(sql.exec("SELECT /* _cf_KV */ 1 AS n").one()).toEqual({ n: 1 });
+});
+
+sqlTest("a name that merely contains the token is allowed", ({ sql }) => {
+  // `isAllowedName` tests a prefix, so only a leading `_cf_` is reserved.
+  sql.exec("CREATE TABLE my_cf_things (id INTEGER)");
+  expect(sql.exec("SELECT count(*) AS n FROM my_cf_things").one()).toEqual({ n: 0 });
+});
+
+sqlTest("the reserved prefix does not block the trusted path", ({ sql, db }) => {
+  // `SqliteKv` and `SqliteMetadata` write through `SqliteDatabase.run`, not through `exec`.
+  sql.exec("CREATE TABLE things (id INTEGER)");
+  db.run("CREATE TABLE _cf_probe (id INTEGER)");
+  expect(db.run("SELECT count(*) AS n FROM _cf_probe").rawRows[0]?.[0]).toBe(0);
+  expect(() => sql.exec("SELECT * FROM _cf_probe")).toThrow(SQL_RESERVED_PREFIX_MESSAGE);
+});
+
+test("the regulator's three callbacks are all ported", () => {
+  expect(SqlStorageRegulator.isAllowedName("_cf_KV")).toBe(false);
+  expect(SqlStorageRegulator.isAllowedName("_CF_KV")).toBe(false);
+  expect(SqlStorageRegulator.isAllowedName("_cf_")).toBe(false);
+  expect(SqlStorageRegulator.isAllowedName("_cf")).toBe(true);
+  expect(SqlStorageRegulator.isAllowedName("things")).toBe(true);
+  expect(SqlStorageRegulator.isAllowedName("my_cf_thing")).toBe(true);
+  // Upstream's body is `return true`; it is a no-op there, not a blocked port.
+  expect(SqlStorageRegulator.isAllowedTrigger("anything")).toBe(true);
+  expect(() => SqlStorageRegulator.allowTransactions()).toThrow(SQL_TRANSACTION_REFUSED_MESSAGE);
+});
+
+// =======================================================================================
+// Substrate boundary
+
+sqlTest("ingest throws the named substrate-boundary message", ({ sql }) => {
+  expect(() => sql.ingest("SELECT 1")).toThrow(SQL_INGEST_UNIMPLEMENTED_MESSAGE);
+});
+
+// =======================================================================================
+// The enforcement point
+
+test("exec with no input lock on the stack throws rather than running", async () => {
+  const { sql, db } = await newFixture();
+  expect(() => sql.exec("CREATE TABLE things (id INTEGER)")).toThrow(
+    "no input lock available in this context",
+  );
+  expect(db.run("SELECT name FROM sqlite_master WHERE name='things'").rawRows).toEqual([]);
+});
+
+test("databaseSize with no input lock on the stack throws", async () => {
+  const { sql } = await newFixture();
+  expect(() => sql.databaseSize).toThrow("no input lock available in this context");
+});
+
+test("the throw names the operation, and comes from the one shared check", async () => {
+  const { ctx } = await newFixture();
+  expect(() => requireInputLock(ctx, "exec()")).toThrow(
+    "exec(): no input lock available in this context",
+  );
+});
+
+// =======================================================================================
+// prepare()
+
+sqlTest("a prepared statement is callable and runs the query", ({ sql }) => {
+  sql.exec("CREATE TABLE things (id INTEGER)");
+  sql.exec("INSERT INTO things VALUES (1), (2)");
+
+  const statement = sql.prepare("SELECT id FROM things WHERE id = ?");
+  expect(statement).toBeInstanceOf(sql.Statement);
+  expect(statement(2).toArray()).toEqual([{ id: 2 }]);
+  expect(statement(1).toArray()).toEqual([{ id: 1 }]);
+});

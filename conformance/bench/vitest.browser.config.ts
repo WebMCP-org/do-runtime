@@ -1,0 +1,44 @@
+/**
+ * The benchmark's own config, so no lane picks it up.
+ *
+ * `include` names the two bench files and nothing else, and the file names end
+ * in `.bench.ts` rather than `.spec.ts` so the browser lane's
+ * `conformance/browser/*.smoke.spec.ts` and `conformance/suite/**` globs cannot
+ * reach them either. The baseline stays exactly what it was: unit 755,
+ * workerd 38/38, node 38/38, browser 41/41.
+ *
+ * Everything below the `include` is copied from `conformance/browser/vitest.config.ts`
+ * because the benchmark needs the same platform the lane needs — cross-origin
+ * isolation for the SAH pool, and named `optimizeDeps` so the first worker to
+ * import the driver does not trigger a mid-run re-optimisation.
+ */
+
+import { fileURLToPath } from "node:url";
+import { defineConfig } from "vitest/config";
+import { playwright } from "@vitest/browser-playwright";
+
+const packageRoot = fileURLToPath(new URL("../../", import.meta.url));
+
+export default defineConfig({
+  optimizeDeps: { include: ["@sqlite.org/sqlite-wasm"] },
+  server: {
+    headers: {
+      // The SAH pool needs cross-origin isolation. It is also what gives
+      // `performance.now()` 5 µs resolution instead of 100 µs, which the report
+      // prints as its clock floor.
+      "Cross-Origin-Opener-Policy": "same-origin",
+      "Cross-Origin-Embedder-Policy": "require-corp",
+    },
+  },
+  test: {
+    name: "bench-browser",
+    root: packageRoot,
+    include: ["conformance/bench/sql-latency.browser.bench.ts"],
+    browser: {
+      enabled: true,
+      provider: playwright(),
+      headless: true,
+      instances: [{ browser: "chromium" }],
+    },
+  },
+});

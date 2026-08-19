@@ -1,0 +1,19 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "include": [
+    "."
+  ],
+  // Tests moved to ../../tsconfig.tests.json when `backends/` became a project
+  // of its own; a file may only belong to one project.
+  "exclude": [
+    "**/*.test.ts"
+  ],
+  "references": [
+    {
+      "path": "../util"
+    }
+  ],
+  "compilerOptions": {
+    "outDir": "../../.tsbuild/io"
+  }
+}

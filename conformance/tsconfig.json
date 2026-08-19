@@ -1,0 +1,28 @@
+{
+  // Checked separately from the src/ project graph: the lanes pull in vitest
+  // and workers-types in combinations the runtime itself must never see.
+  //
+  // The STABLE workers-types entrypoint, not `/experimental`, since Section 6b
+  // wired the node lane and this program started importing `src/`. Those files
+  // are specified against the stable entrypoint (`tsconfig.base.json`), and
+  // checking one file against two declaration sets makes one of the two results
+  // a lie about the package. The switch made a real gap visible on the way past —
+  // `api/sql.ts`'s `Cursor` does not declare `reusedCachedQueryForTest`, which
+  // experimental's `SqlStorageCursor` requires (`experimental/index.d.ts:3888`)
+  // and stable's does not — reported rather than papered over here.
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ESNext", "WebWorker"],
+    "types": [
+      "@cloudflare/workers-types",
+      "@cloudflare/vitest-pool-workers/types"
+    ],
+    "strict": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
+    "noEmit": true
+  },
+  "include": ["."]
+}

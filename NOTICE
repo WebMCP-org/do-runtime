@@ -1,0 +1,7 @@
+do-runtime
+Copyright 2026 Kukumis, Inc.
+
+This product contains a TypeScript port derived from portions of workerd
+(https://github.com/cloudflare/workerd), licensed under the Apache License,
+Version 2.0. See LICENSE.workerd. The derived files were modified for this port
+and identify their upstream workerd counterparts in their source comments.

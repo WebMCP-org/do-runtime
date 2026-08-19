@@ -1,0 +1,50 @@
+{
+  "name": "@mcp-b/do-runtime",
+  "version": "0.1.0",
+  "description": "Cloudflare's Durable Object runtime (workerd), ported to TypeScript: actors with input/output gates, SQLite storage, facets and alarms, running in the browser and in Node.",
+  "license": "FSL-1.1-MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/WebMCP-org/do-runtime.git"
+  },
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./server/alarm-scheduler": "./src/server/alarm-scheduler.ts",
+    "./backends/sqlite-wasm": "./backends/sqlite-wasm.ts",
+    "./backends/node-sqlite": "./backends/node-sqlite.ts",
+    "./cloudflare-workers": "./src/api/cloudflare-workers.ts",
+    "./conformance": "./conformance/host.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc -b tsconfig.json && tsc -p conformance/tsconfig.json",
+    "test": "pnpm test:unit && pnpm test:conformance",
+    "test:unit": "vitest run --config vitest.unit.config.ts",
+    "test:conformance": "pnpm test:conformance-workerd && pnpm test:conformance-node && pnpm test:conformance-browser",
+    "test:conformance-workerd": "vitest run --config conformance/workerd/vitest.config.ts",
+    "test:conformance-node": "vitest run --config conformance/node/vitest.config.ts",
+    "test:conformance-browser": "vitest run --config conformance/browser/vitest.config.ts",
+    "bench:node": "vitest run --config conformance/bench/vitest.node.config.ts",
+    "bench:browser": "vitest run --config conformance/bench/vitest.browser.config.ts"
+  },
+  "dependencies": {
+    "capnweb": "0.10.0"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.18.8",
+    "@cloudflare/workers-types": "4.20260702.1",
+    "@sqlite.org/sqlite-wasm": "3.53.0-build1",
+    "@types/node": "^26.1.2",
+    "@vitest/browser-playwright": "4.1.10",
+    "playwright": "1.61.1",
+    "typescript": "^5.9.3",
+    "vite": "^8.1.5",
+    "vitest": "4.1.10",
+    "wrangler": "^4.114.0"
+  },
+  "engines": {
+    "node": ">=24.11.0"
+  },
+  "packageManager": "pnpm@11.9.0"
+}

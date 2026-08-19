@@ -1,0 +1,23 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "include": [
+    "."
+  ],
+  // Tests live in ../../tsconfig.tests.json, as io/'s do and for the same
+  // reason: they reach `backends` for a real SQLite substrate, and a file may
+  // only belong to one project.
+  "exclude": [
+    "**/*.test.ts"
+  ],
+  "references": [
+    {
+      "path": "../io"
+    },
+    {
+      "path": "../util"
+    }
+  ],
+  "compilerOptions": {
+    "outDir": "../../.tsbuild/api"
+  }
+}

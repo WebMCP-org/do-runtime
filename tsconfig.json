@@ -1,0 +1,17 @@
+{
+  // Project references render workerd's own Bazel target walls between
+  // util/ io/ api/ server/. They are not an invented layer: if a legitimate
+  // upstream include ever crosses a wall, widen the reference to match
+  // upstream rather than reshuffling files.
+  "files": [],
+  "references": [
+    { "path": "./src/util" },
+    { "path": "./src/io" },
+    { "path": "./src/api" },
+    { "path": "./src/server" },
+    { "path": "./src/transport" },
+    { "path": "./src" },
+    { "path": "./backends" },
+    { "path": "./tsconfig.tests.json" }
+  ]
+}

@@ -1,0 +1,4 @@
+# Not a workspace; pnpm reads its settings from here.
+allowBuilds:
+  workerd: true
+  esbuild: true

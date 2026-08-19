@@ -1,0 +1,26 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "include": [
+    "."
+  ],
+  // Tests live in ../../tsconfig.tests.json, as api/'s and io/'s do and for the
+  // same reason: a file may only belong to one project.
+  "exclude": [
+    "**/*.test.ts"
+  ],
+  // `api/` is here for one reason and it is decision 18's: `rpc-session.ts`
+  // reconciles the `RpcTarget` capnweb tests against with the one
+  // `api/cloudflare-workers.ts` declares, and reconciling two identities means
+  // holding both. The arrow points this way — transport depends on the module
+  // that owns the class — because inverting it would make the module defining
+  // the base class depend on the library that aliases it, which is not a
+  // layering upstream has.
+  "references": [
+    {
+      "path": "../api"
+    }
+  ],
+  "compilerOptions": {
+    "outDir": "../../.tsbuild/transport"
+  }
+}

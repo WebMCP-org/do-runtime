@@ -1,0 +1,23 @@
+{
+  // Shared by every src/ project. Two deliberate absences enforce the reverse
+  // boundary structurally rather than by review:
+  //   - no "DOM" in lib, so nothing here can reach document/navigator;
+  //   - no chrome-types in types, so chrome.* does not typecheck.
+  // The runtime has no host-side dependencies in package.json for the same
+  // reason: an import of one does not resolve at all.
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ESNext", "WebWorker"],
+    "types": ["@cloudflare/workers-types"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
+    "composite": true,
+    "declaration": true,
+    "emitDeclarationOnly": true
+  }
+}
