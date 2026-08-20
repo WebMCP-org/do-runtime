@@ -98,6 +98,7 @@ export type {
 export {
   createActorContainer,
   FACET_ALARM_UNIMPLEMENTED_MESSAGE,
+  noFacets,
 } from "./server/actor-container";
 export { ACTOR_CLASS_SERIALIZATION_UNIMPLEMENTED_MESSAGE } from "./api/actor";
 /**
@@ -153,6 +154,12 @@ export {
   RETRY_JITTER_FACTOR,
   alarmRetryDelayMs,
 } from "./server/alarm-scheduler";
+/**
+ * The refusing outlet (`ActorSqlite::Hooks::DEFAULT` upstream) — the
+ * `ports.alarms` for a host that schedules nothing, as `noFacets` is its
+ * `ports.facets`. A real root actor gets `AlarmScheduler.hooks(id)` instead.
+ */
+export { DEFAULT_ALARM_OUTLET } from "./io/actor-sqlite";
 /** The object an `alarm()` handler is called with (`api/global-scope.h:386-412`). */
 export { AlarmInvocationInfo } from "./api/global-scope";
 /**

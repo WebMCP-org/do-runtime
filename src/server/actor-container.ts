@@ -210,6 +210,26 @@ export interface FacetHost {
 }
 
 /**
+ * The `FacetHost` for a host that places no facets — the shape of every first
+ * integration, provided so hosts stop re-typing it. `start` refuses by name.
+ * `abort` returns, per its contract above: a host with nothing to kill returns.
+ * The storage operations refuse, because a call to either proves a facet once
+ * existed — which this host could not have placed.
+ */
+export const noFacets: FacetHost = {
+  start(): FacetHandle {
+    throw new Error("this host places no facets");
+  },
+  abort(): void {},
+  deleteStorage(): Promise<void> {
+    return Promise.reject(new Error("this host places no facets"));
+  },
+  copyStorage(): Promise<void> {
+    return Promise.reject(new Error("this host places no facets"));
+  },
+};
+
+/**
  * The four ports. Each one is a seam workerd itself takes as a constructor
  * input; a port that would exist only because our code is currently shaped
  * badly is an invented seam and was rejected. Rejected, for the record:
