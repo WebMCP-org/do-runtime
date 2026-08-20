@@ -101,7 +101,7 @@ Boot order inside an actor worker is load-bearing; each inversion below is a mea
 
 ## Quickstart
 
-Not on npm yet — exports are TypeScript source, so consume from git (`pnpm add github:WebMCP-org/do-runtime`) or copy the tree. Requires Node ≥ 24.11 (for `node:sqlite`).
+Install with `pnpm add @mcp-b/do-runtime`. The package ships ESM JavaScript and declarations and requires Node ≥ 24.11 when using the `node:sqlite` backend.
 
 ```ts
 import { DurableObject } from "@mcp-b/do-runtime/cloudflare-workers";
