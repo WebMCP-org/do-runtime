@@ -27,6 +27,7 @@
     "test:conformance-workerd": "vitest run --config conformance/workerd/vitest.config.ts",
     "test:conformance-node": "vitest run --config conformance/node/vitest.config.ts",
     "test:conformance-browser": "vitest run --config conformance/browser/vitest.config.ts",
+    "check:oracle": "node scripts/check-workerd-oracle.mjs",
     "bench:node": "vitest run --config conformance/bench/vitest.node.config.ts",
     "bench:browser": "vitest run --config conformance/bench/vitest.browser.config.ts"
   },
