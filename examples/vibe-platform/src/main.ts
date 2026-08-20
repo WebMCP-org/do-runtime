@@ -16,12 +16,16 @@ import { rolldown } from "@rolldown/browser";
 import { newRpcSession } from "@mcp-b/do-runtime";
 import { RpcTarget } from "@mcp-b/do-runtime/cloudflare-workers";
 import {
+  AGENT_ORIGIN,
   WORKSPACE_ORIGIN,
+  type AgentBoot,
+  type AgentRpc,
   type PageRpc,
   type WireRequest,
   type WorkspaceBoot,
   type WorkspaceRpc,
 } from "./wire";
+import { storeZip, type ZipEntry } from "./zip";
 
 // ---------------------------------------------------------------------------
 // DOM
@@ -40,6 +44,7 @@ const banner = $<HTMLElement>("#banner");
 const status = $<HTMLElement>("#status");
 const saveButton = $<HTMLButtonElement>("#save");
 const buildButton = $<HTMLButtonElement>("#build");
+const exportButton = $<HTMLButtonElement>("#export");
 
 function log(line: string, isError = false): void {
   const row = document.createElement("div");
@@ -59,15 +64,17 @@ function fail(message: string): void {
 // ---------------------------------------------------------------------------
 // The worker, and the session to the actor inside it
 
-const worker = new Worker(new URL("./worker/host.worker.ts", import.meta.url), { type: "module" });
+const workspaceWorker = new Worker(new URL("./worker/host.worker.ts", import.meta.url), {
+  type: "module",
+});
 
 // An uncaught exception in a dedicated worker goes nowhere anyone can see it:
 // what it eventually causes is a call that never answers, several layers away.
 // These two listeners are the whole of the fail-loudly wiring on this side.
-worker.addEventListener("error", (event: ErrorEvent) => {
+workspaceWorker.addEventListener("error", (event: ErrorEvent) => {
   fail(`the workspace worker failed: ${event.message}`);
 });
-worker.addEventListener("messageerror", () => {
+workspaceWorker.addEventListener("messageerror", () => {
   fail("the workspace worker could not deserialise a message");
 });
 
@@ -81,7 +88,7 @@ class PageTarget extends RpcTarget implements PageRpc {
 // One raw `postMessage` carries the port, because a `MessagePort` is not a value
 // capnweb can serialise. Everything after this is capnweb.
 const channel = new MessageChannel();
-worker.postMessage({ port: channel.port2 } satisfies WorkspaceBoot, [channel.port2]);
+workspaceWorker.postMessage({ port: channel.port2 } satisfies WorkspaceBoot, [channel.port2]);
 const workspace = newRpcSession<WorkspaceRpc>(channel.port1, new PageTarget());
 
 // ---------------------------------------------------------------------------
@@ -157,15 +164,18 @@ function resolveRelative(base: string, relative: string): string {
  * import map turns them into esm.sh URLs at runtime. That is what keeps the
  * bundle to the code you actually wrote.
  */
-async function build(): Promise<string> {
+async function bundleWorkspace(
+  entry: string,
+  external: (id: string) => boolean,
+): Promise<string> {
   // One listing per build, so `resolveId` is a set lookup rather than a round
   // trip per candidate extension.
   const paths = new Set(await listFiles());
 
   const bundle = await rolldown({
-    input: ENTRY,
+    input: entry,
     cwd: "/",
-    external: (id: string) => !id.startsWith(".") && !id.startsWith("/"),
+    external,
     plugins: [
       {
         name: "durable-object-fs",
@@ -187,6 +197,57 @@ async function build(): Promise<string> {
   const first = output[0];
   if (first === undefined) throw new Error("rolldown produced no output chunk");
   return first.code;
+}
+
+const build = (): Promise<string> =>
+  bundleWorkspace(ENTRY, (id) => !id.startsWith(".") && !id.startsWith("/"));
+
+// ---------------------------------------------------------------------------
+// The authored Durable Object, in its own worker and persistent pool
+
+const AGENT_ENTRY = "/server/agent.ts";
+let agentWorker: Worker | undefined;
+let agent: ReturnType<typeof newRpcSession<AgentRpc>> | undefined;
+let agentClassName: string | undefined;
+
+function stopAgent(): void {
+  agentWorker?.terminate();
+  agentWorker = undefined;
+  agent = undefined;
+  agentClassName = undefined;
+}
+
+async function restartAgent(initial = false): Promise<void> {
+  // OPFS sync handles are exclusive: terminate first, then give their async
+  // release time to overlap the Rolldown build before the new worker retries.
+  stopAgent();
+  const source = await bundleWorkspace(AGENT_ENTRY, (id) => id === "cloudflare:workers");
+  const nextWorker = new Worker(new URL("./worker/agent.worker.ts", import.meta.url), {
+    type: "module",
+  });
+  nextWorker.addEventListener("error", (event: ErrorEvent) => {
+    log(`agent worker failed: ${event.message}`, true);
+  });
+  nextWorker.addEventListener("messageerror", () => {
+    log("agent worker could not deserialise a message", true);
+  });
+
+  const nextChannel = new MessageChannel();
+  nextWorker.postMessage(
+    { port: nextChannel.port2, source } satisfies AgentBoot,
+    [nextChannel.port2],
+  );
+  const nextAgent = newRpcSession<AgentRpc>(nextChannel.port1, new PageTarget());
+  try {
+    const className = await nextAgent.ready();
+    agentWorker = nextWorker;
+    agent = nextAgent;
+    agentClassName = className;
+    log(initial ? `user agent placed: ${className}` : "agent restarted; storage intact");
+  } catch (error) {
+    nextWorker.terminate();
+    throw error;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -226,6 +287,53 @@ function renderPreview(code: string): void {
   // opaque origin can still postMessage to its parent.
   addEventListener("error", (e) => parent.postMessage({ preview: String(e.message) }, "*"));
   addEventListener("unhandledrejection", (e) => parent.postMessage({ preview: String(e.reason) }, "*"));
+
+  // The opaque preview gets one capability: /api/* requests. A transferred
+  // MessagePort is the reply channel for exactly one request.
+  const nativeFetch = globalThis.fetch.bind(globalThis);
+  globalThis.fetch = async (input, init) => {
+    const raw = input instanceof Request ? input.url : String(input);
+    const path = raw.startsWith("/api/")
+      ? raw
+      : (() => {
+          try {
+            const url = new URL(raw);
+            return url.hostname === "preview.invalid" && url.pathname.startsWith("/api/")
+              ? url.pathname + url.search
+              : null;
+          } catch { return null; }
+        })();
+    if (path === null) return nativeFetch(input, init);
+
+    const request = input instanceof Request
+      ? new Request(input, init)
+      : new Request("http://preview.invalid" + path, init);
+    const body = request.method === "GET" || request.method === "HEAD"
+      ? undefined
+      : new Uint8Array(await request.arrayBuffer());
+    const channel = new MessageChannel();
+    const reply = new Promise((resolve, reject) => {
+      channel.port1.onmessage = (event) => resolve(event.data);
+      channel.port1.onmessageerror = () => reject(new Error("the /api bridge reply was unreadable"));
+    });
+    const message = {
+      previewApi: {
+        method: request.method,
+        path,
+        headers: [...request.headers.entries()],
+        ...(body === undefined ? {} : { body }),
+      },
+    };
+    parent.postMessage(message, "*", body === undefined
+      ? [channel.port2]
+      : [channel.port2, body.buffer]);
+    const response = await reply;
+    channel.port1.close();
+    const responseBody = request.method === "HEAD" || [204, 205, 304].includes(response.status)
+      ? null
+      : response.body;
+    return new Response(responseBody, { status: response.status, headers: response.headers });
+  };
 </script>
 </head><body><div id="root"></div>
 <script type="module">${escaped}</script>
@@ -233,13 +341,73 @@ function renderPreview(code: string): void {
 }
 
 addEventListener("message", (event: MessageEvent) => {
-  // The preview is an opaque origin, so `event.origin` is the string "null" and
-  // proves nothing. The shape is the check.
+  // The origin is necessarily opaque; source identity plus strict payload
+  // validation is the authority check for the one sandboxed frame.
+  if (event.source !== preview.contentWindow || event.origin !== "null") return;
   const data: unknown = event.data;
   if (typeof data === "object" && data !== null && "preview" in data) {
     log(`preview: ${String((data as { preview: unknown }).preview)}`, true);
+    return;
+  }
+  if (
+    typeof data === "object" &&
+    data !== null &&
+    "previewApi" in data &&
+    event.ports[0] !== undefined
+  ) {
+    void forwardPreviewApi((data as { previewApi: unknown }).previewApi, event.ports[0]);
   }
 });
+
+type PreviewApiRequest = {
+  method: string;
+  path: string;
+  headers: [string, string][];
+  body?: Uint8Array;
+};
+
+function isPreviewApiRequest(value: unknown): value is PreviewApiRequest {
+  if (typeof value !== "object" || value === null) return false;
+  const request = value as Partial<PreviewApiRequest>;
+  return (
+    typeof request.method === "string" &&
+    typeof request.path === "string" &&
+    request.path.startsWith("/api/") &&
+    Array.isArray(request.headers) &&
+    request.headers.every(
+      (header) =>
+        Array.isArray(header) &&
+        header.length === 2 &&
+        typeof header[0] === "string" &&
+        typeof header[1] === "string",
+    ) &&
+    (request.body === undefined || request.body instanceof Uint8Array)
+  );
+}
+
+async function forwardPreviewApi(value: unknown, port: MessagePort): Promise<void> {
+  try {
+    if (!isPreviewApiRequest(value)) throw new Error("invalid /api bridge request");
+    if (agent === undefined) throw new Error("the user agent is not running");
+    const response = await agent.request({
+      method: value.method,
+      url: `${AGENT_ORIGIN}${value.path}`,
+      headers: value.headers,
+      ...(value.body === undefined ? {} : { body: value.body }),
+    });
+    port.postMessage(response);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    log(`/api bridge failed: ${message}`, true);
+    port.postMessage({
+      status: 502,
+      headers: [["content-type", "text/plain; charset=utf-8"]],
+      body: encoder.encode(message),
+    });
+  } finally {
+    port.close();
+  }
+}
 
 // ---------------------------------------------------------------------------
 // UI
@@ -280,6 +448,89 @@ async function rebuild(): Promise<void> {
   log(`built ${code.length} bytes in ${elapsed}ms`);
 }
 
+function exportedWorker(className: string): string {
+  return `export { ${className} } from "./server/agent";
+
+export default {
+  fetch(request, env) {
+    const url = new URL(request.url);
+    if (url.pathname.startsWith("/api/")) {
+      return env.AGENT.getByName("default").fetch(request);
+    }
+    return env.ASSETS.fetch(request);
+  },
+};
+`;
+}
+
+async function exportProject(): Promise<void> {
+  if (agentClassName === undefined) throw new Error("the user agent is not running");
+  const paths = await listFiles();
+  const sources = await Promise.all(
+    paths.map(async (path): Promise<ZipEntry> => [path.slice(1), await readFile(path)]),
+  );
+  const app = await build();
+  const wrangler = `${JSON.stringify(
+    {
+      $schema: "node_modules/wrangler/config-schema.json",
+      name: "vibe-platform-export",
+      main: "worker.ts",
+      compatibility_date: "2026-08-20",
+      durable_objects: {
+        bindings: [{ name: "AGENT", class_name: agentClassName }],
+      },
+      migrations: [{ tag: "v1", new_sqlite_classes: [agentClassName] }],
+      assets: { directory: "./public", binding: "ASSETS", run_worker_first: true },
+    },
+    null,
+    2,
+  )}\n`;
+  const publicHtml = `<!doctype html>
+<html lang="en"><head><meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>My Durable Object app</title>
+<script type="importmap">${JSON.stringify(IMPORT_MAP)}</script>
+</head><body><div id="root"></div><script type="module" src="/app.js"></script></body></html>\n`;
+  const readme = `# Exported vibe-platform project
+
+The files under \`server/\` and \`src/\` are the exact workspace sources. \`worker.ts\` routes
+\`/api/*\` to the \`${agentClassName}\` Durable Object and everything else to the built assets.
+
+\`pnpm install\`, then \`pnpm exec wrangler deploy --dry-run\`, validates the Worker bundle and asset manifest locally.
+It does not create Cloudflare resources, upload anything, or prove production credentials.
+
+Run \`pnpm exec wrangler deploy\` when you are ready to deploy.
+`;
+  const packageJson = `${JSON.stringify(
+    {
+      name: "vibe-platform-export",
+      private: true,
+      type: "module",
+      scripts: { deploy: "wrangler deploy", "deploy:dry": "wrangler deploy --dry-run" },
+      devDependencies: { wrangler: "^4.114.0" },
+    },
+    null,
+    2,
+  )}\n`;
+  const bytes = storeZip([
+    ...sources,
+    ["worker.ts", exportedWorker(agentClassName)],
+    ["public/index.html", publicHtml],
+    ["public/app.js", app],
+    ["wrangler.jsonc", wrangler],
+    ["package.json", packageJson],
+    ["README.md", readme],
+  ]);
+  const url = URL.createObjectURL(new Blob([bytes], { type: "application/zip" }));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = "vibe-platform.zip";
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+  status.textContent = "exported vibe-platform.zip";
+  log(`exported ${bytes.length} bytes; server sources unchanged`);
+}
+
 let busy = false;
 
 /** One action at a time, and a failed one says so in the status line and the log. */
@@ -288,6 +539,7 @@ async function withBusy(what: string, run: () => Promise<void>): Promise<void> {
   busy = true;
   saveButton.disabled = true;
   buildButton.disabled = true;
+  exportButton.disabled = true;
   status.textContent = `${what}…`;
   try {
     await run();
@@ -298,6 +550,7 @@ async function withBusy(what: string, run: () => Promise<void>): Promise<void> {
     busy = false;
     saveButton.disabled = false;
     buildButton.disabled = false;
+    exportButton.disabled = false;
   }
 }
 
@@ -308,12 +561,17 @@ saveButton.addEventListener("click", () => {
     // until the write it could reveal had committed.
     log(`saved ${selectedPath}`);
     await refreshFiles();
+    if (selectedPath.startsWith("/server/")) await restartAgent();
     await rebuild();
   });
 });
 
 buildButton.addEventListener("click", () => {
   void withBusy("building", rebuild);
+});
+
+exportButton.addEventListener("click", () => {
+  void withBusy("exporting", exportProject);
 });
 
 // ---------------------------------------------------------------------------
@@ -326,6 +584,7 @@ async function boot(): Promise<void> {
   log(`actor placed; crossOriginIsolated=${String(crossOriginIsolated)}`);
   await refreshFiles();
   await openFile(ENTRY);
+  await restartAgent(true);
   await withBusy("building", rebuild);
 }
 

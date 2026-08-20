@@ -141,12 +141,49 @@ function refuse(status: number, message: string): Response {
 // =======================================================================================
 // The starter app, seeded on first boot
 //
-// Three files, so that the in-page bundler has a real module graph to resolve:
+// Three front-end files plus the authored actor, so both in-page builds have a real module graph:
 // an entry, a component, and a module the component imports by a relative path.
 // Bare specifiers (`react`, `react-dom/client`) stay external and are satisfied
 // by the preview's import map — see `main.ts`.
 
 const STARTER: Record<string, string> = {
+  "/server/agent.ts": `import { DurableObject } from "cloudflare:workers";
+
+export class MyAgent extends DurableObject {
+  constructor(ctx, env) {
+    super(ctx, env);
+    this.ctx.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS visits (id INTEGER PRIMARY KEY, at INTEGER NOT NULL, note TEXT NOT NULL)"
+    );
+  }
+
+  async fetch(request) {
+    const url = new URL(request.url);
+    if (url.pathname !== "/api/visits") {
+      return new Response("not found", { status: 404 });
+    }
+
+    if (request.method === "POST") {
+      const body = await request.json();
+      const note = typeof body === "object" && body !== null && typeof body.note === "string"
+        ? body.note.slice(0, 80)
+        : "a quiet hello";
+      this.ctx.storage.sql.exec(
+        "INSERT INTO visits (at, note) VALUES (?, ?)", Date.now(), note
+      );
+    } else if (request.method !== "GET") {
+      return new Response("GET or POST only", { status: 405 });
+    }
+
+    const [count] = this.ctx.storage.sql.exec("SELECT count(*) AS value FROM visits").toArray();
+    const recent = this.ctx.storage.sql
+      .exec("SELECT at, note FROM visits ORDER BY id DESC LIMIT 5")
+      .toArray();
+    return Response.json({ visits: count.value, recent });
+  }
+}
+`,
+
   "/src/main.tsx": `import { createRoot } from "react-dom/client";
 import { App } from "./App";
 
@@ -175,14 +212,27 @@ export function stageFor(drops: number): Stage {
 }
 `,
 
-  "/src/App.tsx": `import { useState } from "react";
+  "/src/App.tsx": `import { useEffect, useState } from "react";
 import { stageFor } from "./plant";
 
 const TITLE = "The fern that lives in a Durable Object";
 
 export function App() {
   const [drops, setDrops] = useState(0);
+  const [visits, setVisits] = useState(null);
   const stage = stageFor(drops);
+
+  async function loadVisits(method = "GET") {
+    const response = await fetch("/api/visits", {
+      method,
+      headers: { "content-type": "application/json" },
+      ...(method === "POST" ? { body: JSON.stringify({ note: "hello from the fern" }) } : {}),
+    });
+    if (!response.ok) throw new Error(await response.text());
+    setVisits(await response.json());
+  }
+
+  useEffect(() => { void loadVisits(); }, []);
 
   return (
     <main style={styles.main}>
@@ -200,8 +250,16 @@ export function App() {
           : \`\${stage.name} — \${stage.note} (watered \${drops}\\u00D7)\`}
       </p>
 
+      <p data-testid="visits" style={styles.stage}>
+        {visits === null ? "asking the Durable Object…" : \`visits held in SQLite: \${visits.visits}\`}
+      </p>
+
       <button style={styles.button} onClick={() => setDrops((d) => d + 1)}>
         water it
+      </button>
+      {" "}
+      <button style={styles.button} onClick={() => void loadVisits("POST")}>
+        sign the guestbook
       </button>
     </main>
   );

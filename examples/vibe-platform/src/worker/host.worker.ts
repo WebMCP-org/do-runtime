@@ -57,6 +57,7 @@ import {
   type WorkspaceBoot,
   type WorkspaceRpc,
 } from "../wire";
+import { gateRequestBody } from "./gate-request-body";
 import { Workspace, type WorkspaceEnv } from "./workspace";
 
 // ---------------------------------------------------------------------------
@@ -312,68 +313,6 @@ async function placed(): Promise<Live> {
     placing = undefined;
   });
   return await placing;
-}
-
-// ---------------------------------------------------------------------------
-// The one thing the runtime cannot do for a host: gate an inbound body
-
-/** The `Body` mixin's consuming methods; every one of them is an await. */
-const BODY_CONSUMERS = ["arrayBuffer", "blob", "bytes", "formData", "json", "text"] as const;
-
-/**
- * Wrap an inbound `Request` so that reading its body resumes inside a gated
- * slice.
- *
- * This is the inbound mirror of the runtime's own `gateResponseBody`
- * (`src/api/http.ts:64`), which does the same job for the `Response` an outbound
- * `fetch` returns. That one is not exported and takes an `IoContext` this host
- * cannot hold, so the wrapping is done here with the primitive that IS public:
- * `container.awaitIo`, which is documented as "the form a host-provided async
- * primitive must take".
- *
- * **What it buys, measured rather than asserted.** The runtime drops the actor's
- * invocation stack at the end of the microtask checkpoint, which in JavaScript
- * means the next macrotask, scheduled through a `MessageChannel`
- * (`src/io/io-context.ts`, `atCheckpointEnd`). So the question for any foreign
- * promise is only ever "does it settle before that message arrives".
- *
- * For a `Request` whose body is already in memory — which is every request this
- * example makes — the answer in Chromium is yes, at every size tried from 0 to
- * 8 MB. Take the wrapper away and `await request.text()` still keeps its input
- * lock and the workspace still saves. **For a `Request` whose body is a stream,
- * the answer is no**: the same measurement with a `ReadableStream` body that
- * enqueues from a `setTimeout` loses the race, and the `sql.exec` after the
- * `await` would throw `no input lock available in this context`.
- *
- * So the wrapper is what makes the actor's `await request.text()` correct rather
- * than lucky, and it is the same thing upstream does by construction: ten
- * `awaitIo` calls in `api/http.c++` and zero `awaitIoWithInputLock`, so a body
- * read releases the input gate while it waits and re-takes one afterwards.
- *
- * A `Proxy` rather than a subclass for the reason the runtime's version gives:
- * `Request`'s internals are exotic, so anything reconstructed by hand loses
- * members the platform will add next.
- */
-function gateRequestBody(container: ActorContainer, request: Request): Request {
-  return new Proxy(request, {
-    get(subject, property): unknown {
-      if ((BODY_CONSUMERS as readonly (string | symbol)[]).includes(property)) {
-        return (...args: unknown[]): Promise<unknown> =>
-          container.awaitIo(
-            (subject[property as (typeof BODY_CONSUMERS)[number]] as (
-              ...a: unknown[]
-            ) => Promise<unknown>).apply(subject, args),
-          );
-      }
-      // Accessors like `headers` and `method` read internal slots, so they need
-      // the real object as the receiver; a method reached this way is bound for
-      // the same reason.
-      const value: unknown = Reflect.get(subject, property, subject);
-      return typeof value === "function"
-        ? (value as (...a: unknown[]) => unknown).bind(subject)
-        : value;
-    },
-  });
 }
 
 // ---------------------------------------------------------------------------

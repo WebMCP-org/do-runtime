@@ -60,6 +60,14 @@ export interface WorkspaceRpc {
   request(wire: WireRequest): Promise<WireResponse>;
 }
 
+/** What the dedicated user-actor worker exposes to the page. */
+export interface AgentRpc {
+  /** Compile/import/place the authored class and return its exported name. */
+  ready(): Promise<string>;
+  /** One `fetch()` event on the authored Durable Object. */
+  request(wire: WireRequest): Promise<WireResponse>;
+}
+
 /** What the page exposes to the worker: somewhere to put a line the user should see. */
 export interface PageRpc {
   log(line: string, isError: boolean): void;
@@ -71,6 +79,12 @@ export type WorkspaceBoot = {
   port: MessagePort;
 };
 
+/** The evaluated source is a Rolldown output; the workspace keeps the originals untouched. */
+export type AgentBoot = {
+  port: MessagePort;
+  source: string;
+};
+
 /**
  * The origin the actor answers on. It is never resolved and never reaches the
  * network — `fetch()` here is a method call on an object in a Web Worker — but
@@ -79,6 +93,9 @@ export type WorkspaceBoot = {
  * real host.
  */
 export const WORKSPACE_ORIGIN = "http://workspace.invalid";
+
+/** The equally fictional origin used when the preview calls the authored actor. */
+export const AGENT_ORIGIN = "http://agent.invalid";
 
 /**
  * The one failure this example expects a user to hit, so it is worded for a user.
