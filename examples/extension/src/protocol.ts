@@ -57,6 +57,7 @@ export type HostStatus = {
  */
 export interface HostRpc {
   increment(): Promise<number>;
+  enqueueIncrement(amount: number): Promise<string>;
   snapshot(): Promise<CounterSnapshot>;
   armWake(delayMs: number): Promise<number>;
   status(): Promise<HostStatus>;

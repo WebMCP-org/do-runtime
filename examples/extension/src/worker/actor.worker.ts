@@ -365,6 +365,10 @@ class HostTarget extends RpcTarget implements HostRpc {
     return await (await placed()).entry.increment();
   }
 
+  async enqueueIncrement(amount: number): Promise<string> {
+    return await (await placed()).entry.enqueueIncrement(amount);
+  }
+
   async snapshot(): Promise<CounterSnapshot> {
     return await (await placed()).entry.snapshot();
   }

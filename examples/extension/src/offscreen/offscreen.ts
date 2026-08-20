@@ -88,6 +88,8 @@ const host = newMessagePortRpcSession<HostRpc>(channel.port1);
  */
 const ops = {
   increment: (): Promise<number> => host.increment() as unknown as Promise<number>,
+  enqueueIncrement: (amount: number): Promise<string> =>
+    host.enqueueIncrement(amount) as unknown as Promise<string>,
   snapshot: (): Promise<CounterSnapshot> => host.snapshot() as unknown as Promise<CounterSnapshot>,
   armWake: (delayMs: number): Promise<number> =>
     host.armWake(delayMs) as unknown as Promise<number>,
@@ -98,6 +100,8 @@ async function runOp(op: HostOp, args: readonly unknown[]): Promise<unknown> {
   switch (op) {
     case "increment":
       return await ops.increment();
+    case "enqueueIncrement":
+      return await ops.enqueueIncrement(Number(args[0]));
     case "snapshot":
       return await ops.snapshot();
     case "armWake":

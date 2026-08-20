@@ -49,11 +49,14 @@ popup.html ──sendMessage──▶ service worker ──chrome.offscreen.crea
   and drives the popup instead, so the actor is re-placed inside a real offscreen
   document — a different renderer — and continues the same count.
 - **A real `AlarmScheduler`, with its persisted retry ladder.** The alarm is armed
-  in the actor's own storage, recorded in the scheduler's `_cf_ALARM` table, and
-  delivered back into the actor as a gated event. The ladder — retry counts,
+  through `Agent.schedule()`, recorded in both Agent storage and the scheduler's
+  `_cf_ALARM` table, and delivered back as a gated event. The ladder — retry counts,
   exponential backoff, abandonment — is rows rather than process memory, which is
   the divergence from workerd that exists precisely because MV3 evicts its
   contexts.
+- **The Agents SDK queue.** The e2e enqueues an increment and observes its state
+  write through `snapshot()`, exercising the SDK's SQLite-backed queue rather
+  than a host callback.
 - **Offscreen corpse recovery.** A crashed offscreen document disappears from
   `chrome.runtime.getContexts` while still holding the one offscreen slot.
   `src/background.ts` catches the resulting "single offscreen document" error —

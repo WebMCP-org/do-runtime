@@ -4,8 +4,8 @@
  * runtime needs, which is the part this example exists to show.
  *
  * It is deliberately ordinary Agents SDK code: it imports `Agent` from
- * `agents`, persists state with `setState()`, and arms
- * `this.ctx.storage.setAlarm()`. Nothing in it knows it is running in a Chrome
+ * `agents`, persists state with `setState()`, and uses the SDK's queue and
+ * scheduler. Nothing in it knows it is running in a Chrome
  * extension, in a Web Worker, or over an OPFS file, and that is the property the
  * runtime sells. `vite.config.ts` aliases `cloudflare:workers` to the package's
  * own module; on Cloudflare the specifier resolves natively and this file does
@@ -29,7 +29,7 @@ export type CounterSnapshot = {
 export type CounterEvent = {
   /** `Date.now()` when the row was written. */
   readonly at: number;
-  /** `"increment"` for a call, `"alarm"` for a wake the runtime delivered. */
+  /** The public operation that produced this row. */
   readonly kind: string;
 };
 
@@ -79,6 +79,17 @@ export class Counter extends Agent<CounterEnv, CounterState> {
     return value;
   }
 
+  async enqueueIncrement(amount: number): Promise<string> {
+    if (!Number.isSafeInteger(amount)) throw new TypeError("amount must be a safe integer");
+    return await this.queue("queuedIncrement", { amount });
+  }
+
+  async queuedIncrement({ amount }: { amount: number }): Promise<void> {
+    this.#schema();
+    this.setState({ value: this.state.value + amount });
+    this.#record("sdk-queue");
+  }
+
   async snapshot(): Promise<CounterSnapshot> {
     this.#schema();
     const events = this.ctx.storage.sql
@@ -91,17 +102,15 @@ export class Counter extends Agent<CounterEnv, CounterState> {
    * Arm a wake `delayMs` from now, and answer the absolute time it was armed
    * for.
    *
-   * `setAlarm` is the actor's whole involvement with alarms: it writes the time
-   * into its own storage, and the storage engine tells the host's alarm outlet
-   * (`ports.alarms`) before the local commit lands, so an alarm cannot be
-   * durable in the actor and unknown to the scheduler. The retry ladder, the
-   * backoff and the abandonment are the `AlarmScheduler`'s, not this class's —
-   * see `actor.worker.ts`.
+   * `Agent.schedule()` records the callback in Agent SQLite and sets the one
+   * physical Durable Object alarm. The storage engine then tells the host's
+   * alarm outlet (`ports.alarms`) before the local commit lands. The retry
+   * ladder, backoff and abandonment are the host `AlarmScheduler`'s.
    */
   async armWake(delayMs: number): Promise<number> {
     this.#schema();
     const at = Date.now() + Math.max(0, delayMs);
-    await this.ctx.storage.setAlarm(at);
+    await this.schedule(new Date(at), "scheduledIncrement");
     return at;
   }
 
@@ -114,9 +123,9 @@ export class Counter extends Agent<CounterEnv, CounterState> {
    * across a service-worker eviction, because the ladder is rows rather than
    * process memory.
    */
-  async alarm(): Promise<void> {
+  async scheduledIncrement(): Promise<void> {
     this.#schema();
-    this.#record("alarm");
+    this.#record("sdk-schedule");
     this.setState({ value: this.state.value + 1 });
   }
 }
