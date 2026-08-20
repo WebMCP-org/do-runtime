@@ -51,28 +51,14 @@
  * entry proxy. The unused remote-facet, stream-pump, and MessagePort WebSocket
  * copies are gone.
  *
- * **Deferred, and the reason is the oracle rather than the effort.** An earlier
- * draft of this header promised `worker.terminate()` mid-transaction as an OPFS
- * journal-recovery row, and said the §1.7.1 table would therefore be asserted
- * twice here. No such row exists in `conformance/suite/`, and one does not belong
- * there: what termination measures is whether SQLite's rollback journal survives
- * a process disappearing mid-write on OPFS, and workerd cannot answer that,
- * because workerd has no OPFS. A `substrate(host, "real-crash", …)` row would
- * therefore need an `absent` arm, and the only durability property that arm could
- * assert through a clean `respawn` is the one `transactions.spec.ts` already
- * asserts three times. That is a fig leaf, not an assertion, and putting it in the
- * suite would put a non-oracle OPFS recovery row in the oracle. The shared
- * §1.6 crash row asks a narrower platform-neutral question instead: does a
- * host-declared crash drop volatile instance state while preserving storage
- * that the output gate already committed?
- *
- * Where it does belong is beside `sqlite-wasm.smoke.spec.ts`, which is already
- * this lane's storage-floor spec and is deliberately outside the suite. It is not
- * free there either: a terminated worker releases its pool's exclusive sync access
- * handles whenever the browser gets round to it — there is no signal and
- * `pauseVfs()` requires a live worker with its databases already closed — so the
- * replacement has to retry-until-acquired, and a row that passes on the timing of
- * that is a flake with no reproduction.
+ * **A real OPFS crash stays outside the shared oracle.** Worker termination asks
+ * whether SQLite's rollback journal survives a process disappearing mid-write on
+ * OPFS, which workerd cannot answer because it has no OPFS. The browser-only
+ * `sqlite-wasm-crash.smoke.spec.ts` therefore owns that proof: it commits one row,
+ * terminates the worker with a second row in an open transaction, retries bounded
+ * replacement workers until the browser releases the pool handles, and observes
+ * only the committed row. The shared §1.6 crash row keeps the narrower portable
+ * contract: volatile instance state disappears while output-gated storage stays.
  *
  * `crash()` below is the same thing the node lane means by it: drop the container
  * without letting it flush, so the files are all that survives. Every lane that
