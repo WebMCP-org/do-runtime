@@ -15,6 +15,22 @@ import { host } from "conformance:host";
 // lives beside the interface it reads.
 import { substrate } from "../host";
 
+it("§2.4 synchronous KV shares values and ordering with async storage", async () => {
+  const probe = await host.spawn("sync-kv");
+  expect(await probe.call("syncKvInterop")).toEqual({
+    asyncRead: { from: "sync" },
+    syncRead: { from: "async" },
+    listed: ["ordered:a", "ordered:b"],
+    deleted: true,
+    missing: "undefined",
+  });
+});
+
+it("§2.4 deleteAll removes ordinary values and the stored alarm", async () => {
+  const probe = await host.spawn("delete-all");
+  expect(await probe.call("deleteAllState")).toEqual({ value: null, alarm: null });
+});
+
 it("§2.4 workerd round-trips rich values; this runtime refuses them (decision 16)", async () => {
   await substrate(host, "v8-value-codec", {
     native: async () => {

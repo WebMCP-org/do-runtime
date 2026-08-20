@@ -529,6 +529,24 @@ export class Probe extends DurableObject<Record<string, unknown>> {
     return { columns: cursor.columnNames, row: cursor.one() };
   }
 
+  /** Experimental compatibility wrapper: callable, reusable, and wearing `sql.Statement`. */
+  sqlPrepare(): Record<string, unknown> {
+    const sql = this.ctx.storage.sql as SqlStorage & {
+      prepare(query: string): (
+        ...bindings: unknown[]
+      ) => SqlStorageCursor<Record<string, SqlStorageValue>>;
+    };
+    sql.exec("CREATE TABLE IF NOT EXISTS prepare_probe(id INTEGER)");
+    sql.exec("DELETE FROM prepare_probe");
+    sql.exec("INSERT INTO prepare_probe VALUES (1), (2)");
+    const statement = sql.prepare("SELECT id FROM prepare_probe WHERE id = ?");
+    return {
+      instance: statement instanceof sql.Statement,
+      first: statement(1).toArray(),
+      second: statement(2).toArray(),
+    };
+  }
+
   /** A write that returns rows still reports that statement's writes. */
   async sqlReturningRowsWritten(): Promise<Record<string, unknown>> {
     const sql = this.ctx.storage.sql;
@@ -656,6 +674,31 @@ export class Probe extends DurableObject<Record<string, unknown>> {
         )
         .toArray(),
       check: sql.exec("SELECT rtreecheck('rtree_probe') AS result").one().result,
+    };
+  }
+
+  /** The synchronous and asynchronous KV surfaces share one ordered store and codec. */
+  async syncKvInterop(): Promise<Record<string, unknown>> {
+    const kv = this.ctx.storage.kv;
+    kv.put("shared:sync", { from: "sync" });
+    const asyncRead = await this.ctx.storage.get("shared:sync");
+    await this.ctx.storage.put("shared:async", { from: "async" });
+    const syncRead = kv.get("shared:async");
+    kv.put("ordered:b", 2);
+    kv.put("ordered:a", 1);
+    const listed = [...kv.list({ prefix: "ordered:" })].map(([key]) => key);
+    const deleted = kv.delete("shared:sync");
+    return { asyncRead, syncRead, listed, deleted, missing: typeof kv.get("shared:sync") };
+  }
+
+  /** `deleteAll()` resets the actor database, including alarm metadata. */
+  async deleteAllState(): Promise<Record<string, unknown>> {
+    await this.ctx.storage.put("delete-me", "present");
+    await this.ctx.storage.setAlarm(Date.now() + 600_000);
+    await this.ctx.storage.deleteAll();
+    return {
+      value: (await this.ctx.storage.get("delete-me")) ?? null,
+      alarm: await this.ctx.storage.getAlarm(),
     };
   }
 

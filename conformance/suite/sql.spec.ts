@@ -30,6 +30,15 @@ it("§1.4 a SQL batch executes in order and returns the bound final statement", 
   });
 });
 
+it("§1.4 a prepared SQL statement is callable and reusable", async () => {
+  const probe = await host.spawn("sql-prepare");
+  expect(await probe.call("sqlPrepare")).toEqual({
+    instance: true,
+    first: [{ id: 1 }],
+    second: [{ id: 2 }],
+  });
+});
+
 it("§1.4 DML with RETURNING reports the rows it wrote", async () => {
   const probe = await host.spawn("sql-returning-rows-written");
   expect(await probe.call("sqlReturningRowsWritten")).toEqual({
