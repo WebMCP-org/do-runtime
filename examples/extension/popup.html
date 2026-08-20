@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Counter</title>
+    <style>
+      body {
+        margin: 0;
+        padding: 12px;
+        width: 320px;
+        font: 13px/1.4 system-ui, sans-serif;
+      }
+      h1 {
+        margin: 0 0 8px;
+        font-size: 13px;
+        font-weight: 600;
+      }
+      .row {
+        display: flex;
+        gap: 6px;
+        flex-wrap: wrap;
+        margin-bottom: 8px;
+      }
+      button {
+        flex: 1 1 auto;
+        padding: 6px 8px;
+        font: inherit;
+        cursor: pointer;
+      }
+      pre {
+        margin: 0;
+        padding: 8px;
+        height: 260px;
+        overflow: auto;
+        background: #f4f4f5;
+        border-radius: 4px;
+        font: 11px/1.4 ui-monospace, monospace;
+        white-space: pre-wrap;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Durable Object counter</h1>
+    <div class="row">
+      <button id="increment">Increment</button>
+      <button id="read">Read</button>
+    </div>
+    <div class="row">
+      <button id="arm">Arm alarm (5s)</button>
+      <button id="status">Status</button>
+    </div>
+    <pre id="output"></pre>
+    <script type="module" src="./src/popup/popup.ts"></script>
+  </body>
+</html>

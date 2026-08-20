@@ -1,0 +1,5 @@
+dist/
+# scripts/e2e.mjs starts its own dev server and browser; anything it leaves behind
+# (traces, videos, screenshots) belongs to a run rather than to the example.
+test-results/
+playwright-report/

@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "do-runtime example — Durable Object counter",
+  "version": "0.1.0",
+  "description": "One Durable Object actor running under MV3: offscreen document, module Worker, sqlite-wasm on OPFS, real alarms.",
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Durable Object counter"
+  },
+  "permissions": ["offscreen", "storage", "unlimitedStorage"],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; worker-src 'self';"
+  }
+}

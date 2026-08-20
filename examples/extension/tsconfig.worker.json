@@ -1,0 +1,29 @@
+{
+  // The worker half: the actor class and the worker entry that hosts it.
+  //
+  // Two projects rather than one because the two lib sets cannot coexist. This
+  // one is the runtime's own shape — `WebWorker` plus `@cloudflare/workers-types`
+  // — because everything it compiles imports `@mcp-b/do-runtime`, whose package
+  // exports are TypeScript SOURCE specified against exactly those globals.
+  // Adding "DOM" here re-declares half of workers-types and produces hundreds of
+  // duplicate-identifier errors inside the package, not in this example.
+  "compilerOptions": {
+    "target": "ES2023",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ESNext", "WebWorker"],
+    "types": ["@cloudflare/workers-types"],
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    // `cloudflare:workers` is a platform specifier no resolver knows. `vite.config.ts`
+    // aliases it for the build; this is the same statement for the checker.
+    "paths": {
+      "cloudflare:workers": ["../../src/api/cloudflare-workers.ts"]
+    }
+  },
+  "include": ["src/worker/**/*.ts", "src/protocol.ts"]
+}

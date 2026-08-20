@@ -1,4 +1,6 @@
-# Not a workspace; pnpm reads its settings from here.
+# The runtime lives at the root; runnable examples are workspace packages.
+packages:
+  - "examples/*"
 allowBuilds:
   workerd: true
   esbuild: true

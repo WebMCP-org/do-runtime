@@ -1,0 +1,20 @@
+{
+  "name": "do-runtime-example-vibe-platform",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "e2e": "node scripts/e2e.mjs"
+  },
+  "dependencies": {
+    "@mcp-b/do-runtime": "workspace:*",
+    "@rolldown/browser": "^1.1.5",
+    "@sqlite.org/sqlite-wasm": "3.53.0-build1",
+    "capnweb": "0.10.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "4.20260702.1",
+    "vite": "^8.2.1"
+  }
+}

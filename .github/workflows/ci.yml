@@ -23,3 +23,5 @@ jobs:
       - run: pnpm test:conformance-workerd
       - run: pnpm test:conformance-node
       - run: pnpm test:conformance-browser
+      - run: pnpm examples:build
+      - run: pnpm test:examples

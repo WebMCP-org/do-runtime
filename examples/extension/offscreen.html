@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>do-runtime host</title>
+  </head>
+  <body>
+    <!--
+      Normally invisible: Chrome renders an offscreen document with no window.
+      Open chrome-extension://<id>/offscreen.html in a tab and this markup is
+      what you get, with the same worker booted behind it and the same
+      operations on window.__host.
+    -->
+    <p>do-runtime example host. Operations are on <code>window.__host</code>.</p>
+    <script type="module" src="./src/offscreen/offscreen.ts"></script>
+  </body>
+</html>

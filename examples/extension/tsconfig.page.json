@@ -1,0 +1,36 @@
+{
+  // The page half: the service worker, the offscreen document, and the popup.
+  //
+  // `DOM` because these files touch `window`, `document` and `Worker`;
+  // `chrome-types` because they touch `chrome.*`. The `lib` is what actually
+  // separates this project from `tsconfig.worker.json`: "DOM" and "WebWorker"
+  // declare incompatible versions of the same globals, so no single project can
+  // check both halves.
+  //
+  // **`@cloudflare/workers-types` is here too, and that is forced rather than
+  // chosen.** `offscreen.ts` imports `newRpcSession` from `@mcp-b/do-runtime`,
+  // whose package exports are TypeScript SOURCE — so checking this project
+  // checks the whole runtime, and the runtime is specified against workers-types
+  // globals. Without it, ~200 `Cannot find name 'DurableObjectPutOptions'`-class
+  // errors come out of `src/api/` rather than out of this example.
+  //
+  // Loading it beside "DOM" duplicates a long list of global declarations
+  // (`Response`, `Request`, `WebSocket`, `crypto`, …). `skipLibCheck` is what
+  // makes that survivable: the duplicates are all in `.d.ts` files, so they are
+  // suppressed, and nothing in this example touches a global the two disagree
+  // about. See the "Rough edges" section of this example's README.
+  "compilerOptions": {
+    "target": "ES2023",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ESNext", "DOM", "DOM.Iterable"],
+    "types": ["chrome-types", "@cloudflare/workers-types"],
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
+    "noEmit": true
+  },
+  "include": ["src/background.ts", "src/offscreen/**/*.ts", "src/popup/**/*.ts", "src/protocol.ts"]
+}

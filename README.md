@@ -89,6 +89,14 @@ Why it is shaped this way:
 - **Alarms get their own worker** because the scheduler needs a database and a database needs a worker. Setting an alarm is one durable row there; delivery comes back through the supervisor, which places the target actor if it is not running.
 - **Every hop is `MessagePort` + [Cap'n Web](https://github.com/cloudflare/capnweb).** Each worker is booted with one raw `postMessage` carrying its port; everything after is a capability-based RPC session opened by `newRpcSession()`. A container's `entry(instance)` proxy is what sits behind the session, so every call from outside is one gated event.
 
+Boot order inside an actor worker is load-bearing; each inversion below is a measured failure, not a style choice:
+
+1. Capture raw platform timers at module scope and build the `Timer` port on them — a `Timer` that reads the installed globals recurses once the scope is in.
+2. Set `globalThis.sqlite3ApiConfig = { disable: { vfs: { opfs: true, "opfs-wl": true } } }` before touching sqlite — only the SAH pool is wanted, and the other two VFSes spawn workers and arm watchdogs of their own.
+3. `sqlite3InitModule()` and `installOpfsSAHPoolVfs(...)` **before** `installActorScope` — the installer arms watchdogs through the global `setTimeout`, which must not yet be the actor's gate.
+4. `installActorScope(globalThis, resolve)` with a `resolve` that throws when the container is gone, so a torn-down worker refuses instead of falling through to raw timers.
+5. Application pool settings, not the conformance lane's test-only ones: a stable pool name (it becomes an OPFS directory name), `clearOnInit: false`, capacity sized to two databases per root plus journals. The pool takes exclusive sync access handles — one holder per pool; a second context fails to install.
+
 `conformance/browser/` is that picture, runnable: [`host.ts`](conformance/browser/host.ts) is the page, [`actor.worker.ts`](conformance/browser/actor.worker.ts) is a worker hosting one actor tree over OPFS, [`alarms.worker.ts`](conformance/browser/alarms.worker.ts) is the scheduler, and [`protocol.ts`](conformance/browser/protocol.ts) is the three RPC surfaces between them.
 
 ## Quickstart
@@ -97,7 +105,7 @@ Not on npm yet — exports are TypeScript source, so consume from git (`pnpm add
 
 ```ts
 import { DurableObject } from "@mcp-b/do-runtime/cloudflare-workers";
-import { createActorContainer, type FacetHost, type Timer } from "@mcp-b/do-runtime";
+import { createActorContainer, DEFAULT_ALARM_OUTLET, noFacets, type Timer } from "@mcp-b/do-runtime";
 import { createNodeSqlProvider } from "@mcp-b/do-runtime/backends/node-sqlite";
 
 class Counter extends DurableObject {
@@ -125,14 +133,6 @@ const timer: Timer = {
     }),
 };
 
-/** This host places no facets; a real one constructs a child container per request. */
-const noFacets: FacetHost = {
-  start: () => { throw new Error("this host places no facets"); },
-  abort: () => {},
-  deleteStorage: async () => {},
-  copyStorage: async () => {},
-};
-
 const container = await createActorContainer({
   id: "counter-1",
   uniqueKey: "my-app", // keep this stable forever: every DurableObjectId is derived from it
@@ -140,8 +140,8 @@ const container = await createActorContainer({
   env: {},
   ports: {
     sql: createNodeSqlProvider({ directory: "./data" }),
-    alarms: { scheduleRun: async () => {} }, // or AlarmScheduler.hooks("counter-1")
-    facets: noFacets,
+    alarms: DEFAULT_ALARM_OUTLET, // refuses — a real host passes AlarmScheduler.hooks("counter-1")
+    facets: noFacets, // refuses — a real host constructs a child container per request
     timer,
   },
 });
@@ -152,6 +152,13 @@ await counter.increment(); // 2
 ```
 
 Open a second container over the same directory and `increment()` answers `3`: the instance was volatile, the storage was not. In a browser the only line that changes is `sql`, which becomes `createSqliteWasmProvider(pool, { prefix: "/counter-1" })` from `@mcp-b/do-runtime/backends/sqlite-wasm`.
+
+## Examples
+
+Two runnable browser hosts live in [`examples/`](examples/), each with its own README and Playwright e2e (`pnpm test:examples`):
+
+- [`examples/extension/`](examples/extension/) — a Chrome MV3 extension: service worker → offscreen document (with corpse recovery) → worker hosting a `Counter` actor with a real `AlarmScheduler`. Proves the MV3 CSP story (`'wasm-unsafe-eval'`), OPFS persistence across reloads, and alarm delivery with the persisted retry ladder.
+- [`examples/vibe-platform/`](examples/vibe-platform/) — a self-contained vibe-coding page: a `Workspace` actor stores an app's source files in its SQLite storage and serves them through its real `fetch()` handler; `@rolldown/browser` bundles them in-page and a sandboxed iframe renders the result. Its COOP/COEP headers exist for the in-page bundler's shared memory — the runtime and the SAH pool need none.
 
 ## Hosting an actor
 
@@ -183,7 +190,7 @@ The lifecycle:
 
 `SqlDatabaseProvider.open(name)` is the only seam. The runtime owns database names, tables, transactions, reset behaviour, and facet metadata; the host chooses the physical provider and prefix. Stored KV values are JSON-compatible only — V8-only types are rejected at `put()` rather than stored lossily. `_cf_` names are reserved to the runtime.
 
-The browser provider takes an already-installed OPFS SAH pool (`installOpfsSAHPoolVfs`, cross-origin isolated). One pool per worker; the root and each local facet get separate prefixes inside it. The Node provider uses in-memory databases by default and a directory when asked.
+The browser provider takes an already-installed OPFS SAH pool (`installOpfsSAHPoolVfs`; sync access handles in a dedicated worker — no cross-origin isolation or `SharedArrayBuffer` needed). One pool per worker; the root and each local facet get separate prefixes inside it. The Node provider uses in-memory databases by default and a directory when asked.
 
 ### Alarms
 
@@ -231,6 +238,7 @@ This is `0.x`. The public surface is what [`src/index.ts`](src/index.ts) and the
 | `src/transport/` | The one `MessagePort` Cap'n Web session adapter |
 | `backends/` | `node:sqlite` and sqlite-wasm/OPFS `SqlDatabaseProvider`s |
 | `conformance/` | One suite, three hosts: workerd, Node, browser; plus the probe fixture and benchmarks |
+| `examples/` | Runnable browser hosts: an MV3 extension and an in-page vibe-coding platform |
 | `docs/decisions.md` | The numbered invariants and decisions that source comments cite (`§1.2`, `decision 8`) |
 
 The `util → io → api → server` direction follows workerd's own layering, enforced with TypeScript project references. Source comments cite the workerd file and line they port (`← io-gate.c++:142`), and every deliberate divergence is recorded beside its implementation and in a conformance row.

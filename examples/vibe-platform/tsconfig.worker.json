@@ -1,0 +1,27 @@
+{
+  // The worker half: no DOM, and the Workers types are the real ones here.
+  //
+  // `Request`, `Response` and `Headers` in `workspace.ts` are the shapes a
+  // Durable Object is written against, which is the point — the class does not
+  // know it is running in a browser tab. See `tsconfig.page.json` for the other
+  // half of this split and why it exists.
+  //
+  // `WebWorker.Iterable` is not decoration: `lib.webworker` alone declares a
+  // `Headers` with no `entries()`, and that copy wins over the workers-types
+  // one, so serialising a `Response`'s headers does not compile without it.
+  "compilerOptions": {
+    "target": "ES2023",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ESNext", "WebWorker", "WebWorker.Iterable"],
+    "types": ["@cloudflare/workers-types"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
+    "noEmit": true
+  },
+  "include": ["src/worker/**/*.ts", "src/wire.ts"]
+}

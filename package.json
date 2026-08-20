@@ -18,8 +18,10 @@
     "./conformance": "./conformance/host.ts"
   },
   "scripts": {
-    "typecheck": "tsc -b tsconfig.json && tsc -p conformance/tsconfig.json",
+    "typecheck": "tsc -b tsconfig.json && tsc -p conformance/tsconfig.json && tsc -p examples/extension/tsconfig.page.json && tsc -p examples/extension/tsconfig.worker.json && tsc -p examples/vibe-platform/tsconfig.page.json && tsc -p examples/vibe-platform/tsconfig.worker.json",
     "test": "pnpm test:unit && pnpm test:conformance",
+    "examples:build": "pnpm --filter \"do-runtime-example-*\" build",
+    "test:examples": "node examples/extension/scripts/e2e.mjs && node examples/vibe-platform/scripts/e2e.mjs",
     "test:unit": "vitest run --config vitest.unit.config.ts",
     "test:conformance": "pnpm test:conformance-workerd && pnpm test:conformance-node && pnpm test:conformance-browser",
     "test:conformance-workerd": "vitest run --config conformance/workerd/vitest.config.ts",
