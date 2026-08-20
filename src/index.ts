@@ -128,7 +128,6 @@ export {
   FACET_TREE_MAX_DEPTH,
   HIBERNATION_UNIMPLEMENTED_MESSAGE,
 } from "./api/actor-state";
-export { SQL_INGEST_UNIMPLEMENTED_MESSAGE } from "./api/sql";
 export { PITR_UNIMPLEMENTED_MESSAGE, REPLICATION_UNIMPLEMENTED_MESSAGE } from "./io/actor-cache";
 /**
  * The alarm scheduler is exported where the gate is not, and the difference is

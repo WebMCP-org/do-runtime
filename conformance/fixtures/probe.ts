@@ -547,6 +547,30 @@ export class Probe extends DurableObject<Record<string, unknown>> {
     };
   }
 
+  /** `sql.ingest()` consumes complete statements and returns the partial input tail. */
+  sqlIngest(): Record<string, unknown> {
+    const sql = this.ctx.storage.sql as SqlStorage & {
+      ingest(query: string): {
+        remainder: string;
+        rowsRead: number;
+        rowsWritten: number;
+        statementCount: number;
+      };
+    };
+    const result = sql.ingest(
+      "CREATE TABLE IF NOT EXISTS ingest_probe(id INTEGER); " +
+        "DELETE FROM ingest_probe; INSERT INTO ingest_probe VALUES (1), (2); " +
+        "SELECT id FROM ingest_probe ORDER BY id; SELECT",
+    );
+    return {
+      remainder: result.remainder,
+      statementCount: result.statementCount,
+      countersAreNumbers:
+        typeof result.rowsRead === "number" && typeof result.rowsWritten === "number",
+      rows: sql.exec("SELECT id FROM ingest_probe ORDER BY id").toArray(),
+    };
+  }
+
   /** A write that returns rows still reports that statement's writes. */
   async sqlReturningRowsWritten(): Promise<Record<string, unknown>> {
     const sql = this.ctx.storage.sql;

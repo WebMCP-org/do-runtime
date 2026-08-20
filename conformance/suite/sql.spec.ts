@@ -39,6 +39,16 @@ it("§1.4 a prepared SQL statement is callable and reusable", async () => {
   });
 });
 
+it("§1.4 SQL ingest consumes complete statements and returns the partial tail", async () => {
+  const probe = await host.spawn("sql-ingest");
+  expect(await probe.call("sqlIngest")).toEqual({
+    remainder: " SELECT",
+    statementCount: 4,
+    countersAreNumbers: true,
+    rows: [{ id: 1 }, { id: 2 }],
+  });
+});
+
 it("§1.4 DML with RETURNING reports the rows it wrote", async () => {
   const probe = await host.spawn("sql-returning-rows-written");
   expect(await probe.call("sqlReturningRowsWritten")).toEqual({

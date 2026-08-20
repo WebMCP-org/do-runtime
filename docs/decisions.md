@@ -144,7 +144,7 @@ and SQLite-owned companions; an unknown name fails startup.
 
 ### §2.5 Fail-closed substrate boundaries
 
-Hibernation, point-in-time recovery, replication, SQL ingest, actor-class stub
+Hibernation, point-in-time recovery, replication, actor-class stub
 serialization, and unsupported module-scope Workers features throw named
 errors. They do not return empty values or silently downgrade behavior.
 
@@ -217,5 +217,6 @@ owns only placement and physical storage operations.
 | A workerd facet alarm appears to schedule and then breaks asynchronously ([workerd#6810](https://github.com/cloudflare/workerd/issues/6810)) | This runtime refuses facet `setAlarm()` synchronously |
 | A host may lose a physical wake between durable and platform timer writes | The host timer journals an opaque one-shot token before arming; the scheduler remains authoritative |
 | No jsg exception provenance in browser errors | An unclassified alarm failure stays retryable rather than being prematurely abandoned |
-| Local SQLite has no PITR, replication, or ingest | Those APIs throw named errors; bookmarks remain development counters, not recovery points |
+| Local SQLite has no Cloudflare PITR or read-replica service | Those APIs throw named errors; bookmarks remain development counters, not recovery points |
+| Local SQLite has no libsql billing counters | SQL and ingest counters report returned rows and SQLite changes |
 | Cap'n Web and the declared Workers module can create distinct `RpcTarget` identities | `newRpcSession()` reconciles them at the transport boundary |

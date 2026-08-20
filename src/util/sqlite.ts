@@ -37,9 +37,8 @@
  * `api/sql.ts` owns that question); `SqliteObserver` row-count billing, whose
  * counters are libsql `STMTSTATUS` extensions neither backend exposes;
  * `sqlite-metering.{h,c++}`, which swaps SQLite's process-wide allocator to
- * meter per-database memory — a C-API facility with no JS analogue; `ingestSql`
- * and the point-in-time-recovery APIs, both named substrate boundaries in the
- * package README.
+ * meter per-database memory — a C-API facility with no JS analogue; and the
+ * point-in-time-recovery APIs, a named substrate boundary in the package README.
  *
  * Spec: §1.4, §2.4 in docs/decisions.md.
  */
@@ -52,6 +51,14 @@ export type SqlResult = {
   readonly rawRows: readonly (readonly unknown[])[];
   /** Rows changed by this statement, including DML with `RETURNING`. */
   readonly rowsWritten: number;
+};
+
+/** ← `SqliteDatabase::IngestResult`. */
+export type SqlIngestResult = {
+  readonly remainder: string;
+  readonly rowsRead: number;
+  readonly rowsWritten: number;
+  readonly statementCount: number;
 };
 
 /**
@@ -317,6 +324,40 @@ export class SqliteDatabase {
     const [sql, ...bindings] = rest;
     if (typeof sql !== "string") throw new Error("run(options, sql, ...) takes a SQL string.");
     return this.#exec(sql, bindings, first.allowUnconfirmed ?? false, first.regulate);
+  }
+
+  /** ← `SqliteDatabase::ingestSql`: execute complete statements, retain the partial tail. */
+  ingest(sql: string, regulate?: (sql: string) => void): SqlIngestResult {
+    this.assertUsable();
+    let remainder = sql;
+    let rowsRead = 0;
+    let rowsWritten = 0;
+    let statementCount = 0;
+
+    while (hasSqlStatement(remainder)) {
+      let statement: SqlDatabaseStatement;
+      try {
+        statement = this.#backend.prepare(remainder);
+      } catch (error) {
+        if (error instanceof Error && /incomplete input/i.test(error.message)) break;
+        throw error;
+      }
+      try {
+        // sqlite3_complete_length(), which upstream uses, requires the terminating semicolon.
+        if (!statement.sql.trimEnd().endsWith(";")) break;
+        regulate?.(statement.sql);
+        if (statement.parameterCount !== 0) throw new Error(SQL_WRONG_BINDINGS_MESSAGE);
+        const result = this.#execStatement(statement, [], false);
+        rowsRead += result.rawRows.length;
+        rowsWritten += result.rowsWritten;
+        statementCount += 1;
+        remainder = remainder.slice(statement.sql.length);
+      } finally {
+        statement.close();
+      }
+    }
+
+    return { remainder, rowsRead, rowsWritten, statementCount };
   }
 
   #exec(

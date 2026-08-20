@@ -188,7 +188,7 @@ The lifecycle:
 
 ### Storage
 
-`SqlDatabaseProvider.open(name)` is the only seam. The runtime owns database names, tables, transactions, reset behaviour, and facet metadata; the host chooses the physical provider and prefix. Stored KV values use structured-clone semantics across workerd, Node, and the browser; existing JSON rows remain readable. `_cf_` names are reserved to the runtime.
+`SqlDatabaseProvider.open(name)` is the only seam. The runtime owns database names, tables, transactions, reset behaviour, facet metadata, and streaming `sql.ingest()` statement boundaries; the host chooses the physical provider and prefix. Stored KV values use structured-clone semantics across workerd, Node, and the browser; existing JSON rows remain readable. `_cf_` names are reserved to the runtime.
 
 The browser provider takes an already-installed OPFS SAH pool (`installOpfsSAHPoolVfs`; sync access handles in a dedicated worker — no cross-origin isolation or `SharedArrayBuffer` needed). One pool per worker; the root and each local facet get separate prefixes inside it. The Node provider uses in-memory databases by default and a directory when asked.
 
@@ -213,11 +213,12 @@ The browser cannot reproduce every workerd facility. Where it cannot, the runtim
 | Area | Contract here |
 | --- | --- |
 | Hibernatable WebSockets | Unsupported; named methods throw. Use memory-only sockets and reconnect. |
-| Point-in-time recovery, replication, SQL ingest | Unsupported by local SQLite; named methods throw. Bookmarks are development counters, not recovery points. |
+| Cloudflare point-in-time recovery and read replication | Unsupported by local SQLite; named methods throw. Bookmarks are development counters, not recovery points. |
 | Actor-class stub serialization | Throws; needs workerd's serializer and channel tokens. |
 | Module-scope `waitUntil`, `cache`, `abortIsolate`, Workers RPC stub constructors | Named `cloudflare:workers` boundaries throw. |
 | `DurableObjectState.abort()` | Breaks later storage and re-entry; cannot synchronously terminate the calling JavaScript slice. |
 | Stored value wire bytes | Browser-safe versioned structured-clone encoding rather than V8's private format; public value types align and legacy JSON rows remain readable. |
+| SQL row counters | Local `rowsRead`/`rowsWritten`, including `sql.ingest()`, use returned rows and SQLite changes; workerd uses unavailable libsql billing counters. |
 | Reserved SQL names | `_cf_` detected from tokenized SQL text, which can reject more than workerd's authorizer. |
 | Node SQLite length limit | Bound and returned strings and blobs are capped at 4 MiB; `node:sqlite` cannot cap an unreturned SQL-computed value. The browser backend uses SQLite's native limit. |
 | Response BYOB readers | Refused; their continuation cannot be re-gated. Use a default reader or `arrayBuffer()`. |

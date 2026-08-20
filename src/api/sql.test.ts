@@ -18,7 +18,6 @@ import { InputGate, OutputGate } from "../io/io-gate";
 import { type Actor, IoContext, requireInputLock, type Timer } from "../io/io-context";
 import {
   CURSOR_NOT_CONSTRUCTIBLE_MESSAGE,
-  SQL_INGEST_UNIMPLEMENTED_MESSAGE,
   SQL_RESERVED_PREFIX_MESSAGE,
   SQL_TRANSACTION_REFUSED_MESSAGE,
   SqlStorage,
@@ -337,10 +336,37 @@ test("the regulator's three callbacks are all ported", () => {
 });
 
 // =======================================================================================
-// Substrate boundary
+// Streaming ingestion
 
-sqlTest("ingest throws the named substrate-boundary message", ({ sql }) => {
-  expect(() => sql.ingest("SELECT 1")).toThrow(SQL_INGEST_UNIMPLEMENTED_MESSAGE);
+sqlTest("ingest executes complete statements and returns the incomplete tail", ({ sql }) => {
+  const result = sql.ingest(
+    "CREATE TABLE things (id INTEGER); " +
+      "INSERT INTO things VALUES (1), (2); " +
+      "SELECT * FROM things; INSERT INTO things",
+  );
+  expect(result).toEqual({
+    remainder: " INSERT INTO things",
+    rowsRead: 2,
+    rowsWritten: 2,
+    statementCount: 3,
+  });
+  expect(sql.exec("SELECT id FROM things ORDER BY id").toArray()).toEqual([{ id: 1 }, { id: 2 }]);
+});
+
+sqlTest("ingest with no complete statement changes nothing", ({ sql }) => {
+  expect(sql.ingest("CREATE TABLE things (")).toEqual({
+    remainder: "CREATE TABLE things (",
+    rowsRead: 0,
+    rowsWritten: 0,
+    statementCount: 0,
+  });
+});
+
+sqlTest("ingest uses the same regulator as exec", ({ sql }) => {
+  expect(() => sql.ingest("CREATE TABLE _cf_private (id INTEGER);")).toThrow(
+    SQL_RESERVED_PREFIX_MESSAGE,
+  );
+  expect(() => sql.ingest("BEGIN;")).toThrow(SQL_TRANSACTION_REFUSED_MESSAGE);
 });
 
 // =======================================================================================

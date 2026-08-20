@@ -20,9 +20,7 @@ export type Capability =
   /** Substrate boundary: no Chrome equivalent lifecycle. */
   | "hibernation"
   /** Substrate boundary: sqlite-wasm lacks the storage capability. */
-  | "bookmarks"
-  /** Substrate boundary: same. */
-  | "sql-ingest";
+  | "bookmarks";
 
 export type LaneName = "workerd" | "node" | "browser";
 

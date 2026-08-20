@@ -34,16 +34,16 @@
  *     authorizer the statement text is the only source, so `exec` tokenizes it
  *     and runs `isAllowedName` over every identifier-shaped token. That is
  *     deliberately STRICTER than upstream — see `SQL_RESERVED_PREFIX_MESSAGE`.
- *  4. **`ingest` is a substrate boundary**, named in the package README beside
- *     the point-in-time-recovery APIs: it needs `SqliteDatabase::ingestSql`,
- *     which neither backend has.
+ *  4. **`ingest` stays at upstream's SQLite seam.** `SqliteDatabase.ingest()`
+ *     executes every complete statement and returns the partial tail, using the
+ *     same compiled boundaries and regulator as `exec`.
  *
  * Spec: §1.4, §2.4 in docs/decisions.md.
  */
 
 import { requireInputLock } from "../io/io-context";
 import type { IoContext } from "../io/io-context";
-import type { SqliteDatabase, SqlValue } from "../util/sqlite";
+import type { SqlIngestResult, SqliteDatabase, SqlValue } from "../util/sqlite";
 
 /**
  * ← `SqlStorage::BindingValue`. JSG converts these public JavaScript values
@@ -62,6 +62,9 @@ export type BindingValue =
 /** ← the `SqlStorageValue` `JSG_TS_DEFINE` on `Cursor`. */
 export type SqlRow = Record<string, SqlStorageValue>;
 
+/** ← `SqlStorage::IngestResult`. */
+export type SqlStorageIngestResult = SqlIngestResult;
+
 /**
  * ← `SqlStorageRegulator::allowTransactions()`, copied verbatim. Users match on
  * it and it is the one regulator callback our substrate can still answer.
@@ -72,14 +75,6 @@ export const SQL_TRANSACTION_REFUSED_MESSAGE =
   "statements. The JavaScript API is safer because it will automatically roll back on " +
   "exceptions, and because it interacts correctly with Durable Objects' automatic atomic " +
   "write coalescing.";
-
-/**
- * Substrate boundary, named rather than skipped: `ingest` is
- * `SqliteDatabase::ingestSql`, a multi-statement bulk loader neither
- * `node:sqlite` nor sqlite-wasm exposes.
- */
-export const SQL_INGEST_UNIMPLEMENTED_MESSAGE =
-  "This Durable Object's storage back-end does not implement sql.ingest().";
 
 /** See translation 2 in the header: the class is exposed for `instanceof` only. */
 export const CURSOR_NOT_CONSTRUCTIBLE_MESSAGE =
@@ -413,9 +408,11 @@ export class SqlStorage implements globalThis.SqlStorage {
     return run;
   }
 
-  /** Substrate boundary — see the header. */
-  ingest(_query: string): never {
-    throw new Error(SQL_INGEST_UNIMPLEMENTED_MESSAGE);
+  /** ← `SqlStorage::ingest`. */
+  ingest(query: string): SqlStorageIngestResult {
+    requireInputLock(this.#ctx, "sql.ingest()");
+    requireAllowedNames(query);
+    return this.#owner.getSqliteDb().ingest(query, refuseTransactionControl);
   }
 
   /** ← `SqlStorage::setMaxPageCountForTest`, which is what its name says. */

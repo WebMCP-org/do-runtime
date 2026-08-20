@@ -43,7 +43,6 @@ export const host: ConformanceHost = {
   capabilities: new Set<Capability>([
     "hibernation",
     "bookmarks",
-    "sql-ingest",
   ]),
   spawn: async (name = `probe-${probeCounter++}`) => actor(name),
   respawn: async (a) => actor(a.name),
