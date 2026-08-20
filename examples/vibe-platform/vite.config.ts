@@ -36,6 +36,11 @@ export default defineConfig({
       // the host's job here, the same way `wrangler.jsonc` supplies bindings
       // there.
       "cloudflare:workers": `${repoRoot}src/api/cloudflare-workers.ts`,
+      "cloudflare:email": `${repoRoot}examples/platform-shims/cloudflare-email.ts`,
+      "node:async_hooks": "unenv/node/async_hooks",
+      "node:diagnostics_channel": "unenv/node/diagnostics_channel",
+      "node:os": "unenv/node/os",
+      path: "unenv/node/path",
     },
   },
   optimizeDeps: {

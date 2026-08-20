@@ -146,17 +146,13 @@ function refuse(status: number, message: string): Response {
 // by the preview's import map — see `main.ts`.
 
 const STARTER: Record<string, string> = {
-  "/server/agent.ts": `import { DurableObject } from "cloudflare:workers";
+  "/server/agent.ts": `import { Agent } from "agents";
 
-export class MyAgent extends DurableObject {
-  constructor(ctx, env) {
-    super(ctx, env);
-    this.ctx.storage.sql.exec(
-      "CREATE TABLE IF NOT EXISTS visits (id INTEGER PRIMARY KEY, at INTEGER NOT NULL, note TEXT NOT NULL)"
-    );
-  }
+export class MyAgent extends Agent {
+  static options = { hibernate: false };
+  initialState = { visits: 0, recent: [] };
 
-  async fetch(request) {
+  async onRequest(request) {
     const url = new URL(request.url);
     if (url.pathname !== "/api/visits") {
       return new Response("not found", { status: 404 });
@@ -167,18 +163,15 @@ export class MyAgent extends DurableObject {
       const note = typeof body === "object" && body !== null && typeof body.note === "string"
         ? body.note.slice(0, 80)
         : "a quiet hello";
-      this.ctx.storage.sql.exec(
-        "INSERT INTO visits (at, note) VALUES (?, ?)", Date.now(), note
-      );
+      this.setState({
+        visits: this.state.visits + 1,
+        recent: [{ at: Date.now(), note }, ...this.state.recent].slice(0, 5),
+      });
     } else if (request.method !== "GET") {
       return new Response("GET or POST only", { status: 405 });
     }
 
-    const [count] = this.ctx.storage.sql.exec("SELECT count(*) AS value FROM visits").toArray();
-    const recent = this.ctx.storage.sql
-      .exec("SELECT at, note FROM visits ORDER BY id DESC LIMIT 5")
-      .toArray();
-    return Response.json({ visits: count.value, recent });
+    return Response.json(this.state);
   }
 }
 `,

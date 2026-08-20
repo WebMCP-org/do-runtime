@@ -16,6 +16,7 @@ import { rolldown } from "@rolldown/browser";
 import { newMessagePortRpcSession, RpcTarget, type RpcStub } from "capnweb";
 import {
   AGENT_ORIGIN,
+  AGENTS_GLOBAL,
   CLOUDFLARE_WORKERS_GLOBAL,
   WORKSPACE_ORIGIN,
   type AgentBoot,
@@ -199,7 +200,10 @@ async function bundleWorkspace(
       : {
           format: "iife",
           name: iifeName,
-          globals: { "cloudflare:workers": CLOUDFLARE_WORKERS_GLOBAL },
+          globals: {
+            "cloudflare:workers": CLOUDFLARE_WORKERS_GLOBAL,
+            agents: AGENTS_GLOBAL,
+          },
         },
   );
   await bundle.close();
@@ -252,7 +256,7 @@ async function restartAgent(initial = false): Promise<void> {
   await stopAgent();
   const source = await bundleWorkspace(
     AGENT_ENTRY,
-    (id) => id === "cloudflare:workers",
+    (id) => id === "cloudflare:workers" || id === "agents",
     AGENT_MODULE,
   );
   const nextWorker = new Worker(new URL("./worker/agent.worker.ts", import.meta.url), {
@@ -510,6 +514,7 @@ async function exportProject(): Promise<void> {
       name: "vibe-platform-export",
       main: "worker.ts",
       compatibility_date: "2026-08-20",
+      compatibility_flags: ["nodejs_compat"],
       durable_objects: {
         bindings: [{ name: "AGENT", class_name: agentClassName }],
       },
@@ -541,6 +546,7 @@ Run \`pnpm exec wrangler deploy\` when you are ready to deploy.
       private: true,
       type: "module",
       scripts: { deploy: "wrangler deploy", "deploy:dry": "wrangler deploy --dry-run" },
+      dependencies: { agents: "0.21.0" },
       devDependencies: { wrangler: "^4.114.0" },
     },
     null,

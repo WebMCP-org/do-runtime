@@ -176,7 +176,7 @@ async function main() {
     //    container, the same OPFS files.
     await page.reload({ timeout: BOOT_TIMEOUT_MS });
     snapshot = await op(page, "snapshot");
-    check("the counter survived the reload", snapshot.value, 4);
+    check("the Agent state survived the reload", snapshot.value, 4);
     check(
       "the alarm event survived the reload",
       snapshot.events.filter((event) => event.kind === "alarm").length,

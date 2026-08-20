@@ -15,7 +15,7 @@
 
 import { fileURLToPath } from "node:url";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -36,7 +36,11 @@ const skip = (line) => {
 };
 const fail = (line, error) => {
   failures += 1;
-  const detail = String(error?.message ?? error).split("\n")[0];
+  const detail = String(error?.stderr || error?.stdout || error?.message || error)
+    .trim()
+    .split("\n")
+    .slice(0, 8)
+    .join("\n      ");
   console.log(`FAIL  ${line}\n      ${detail}`);
 };
 
@@ -178,7 +182,7 @@ try {
     await builtOk();
   });
 
-  await step("the seeded front-end reaches the user Durable Object through /api/*", async () => {
+  await step("the seeded front-end reaches the user Agent through /api/*", async () => {
     await page.waitForFunction(
       () => document.querySelector("#log").textContent.includes("user agent placed: MyAgent"),
       undefined,
@@ -211,7 +215,7 @@ try {
     });
   }
 
-  await step("editing server/agent.ts respawns the actor and preserves its SQL state", async () => {
+  await step("editing server/agent.ts respawns the Agent and preserves SDK state", async () => {
     await file("/server/agent.ts").click();
     await page.waitForFunction(
       () => document.querySelector("#editor").value.includes("export class MyAgent"),
@@ -320,6 +324,13 @@ try {
 
     const repoRoot = path.resolve(root, "../..");
     const outdir = path.join(exportDirectory, "dry-run");
+    const exportedPackage = JSON.parse(
+      await readFile(path.join(exportDirectory, "package.json"), "utf8"),
+    );
+    if (exportedPackage.dependencies?.agents !== "0.21.0") {
+      throw new Error("exported package.json does not pin agents@0.21.0");
+    }
+    await symlink(path.join(root, "node_modules"), path.join(exportDirectory, "node_modules"));
     const result = await execFileAsync(
       "pnpm",
       ["exec", "wrangler", "deploy", "--dry-run", "--outdir", outdir],

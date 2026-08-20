@@ -3,8 +3,8 @@
  * that a product would actually write — everything else is the host wiring the
  * runtime needs, which is the part this example exists to show.
  *
- * It is deliberately ordinary Workers code: it imports `DurableObject` from
- * `cloudflare:workers`, it reads and writes `this.ctx.storage.sql`, and it arms
+ * It is deliberately ordinary Agents SDK code: it imports `Agent` from
+ * `agents`, persists state with `setState()`, and arms
  * `this.ctx.storage.setAlarm()`. Nothing in it knows it is running in a Chrome
  * extension, in a Web Worker, or over an OPFS file, and that is the property the
  * runtime sells. `vite.config.ts` aliases `cloudflare:workers` to the package's
@@ -18,7 +18,7 @@
  * the runtime type the same thing, instead of needing a cast at the call site.
  */
 
-import { DurableObject } from "cloudflare:workers";
+import { Agent } from "agents";
 
 /** What `snapshot()` hands back. JSON-compatible: it crosses two RPC hops. */
 export type CounterSnapshot = {
@@ -36,19 +36,13 @@ export type CounterEvent = {
 /** How many event rows `snapshot()` reports. The table keeps all of them. */
 const RECENT_EVENTS = 10;
 
-/**
- * `<unknown>` rather than the default, and it is not cosmetic.
- *
- * TypeScript resolves `cloudflare:workers` through the ambient
- * `declare module "cloudflare:workers"` in `@cloudflare/workers-types`, which
- * wins over this project's `paths` mapping — so the checker sees Cloudflare's
- * `DurableObject<Env = Cloudflare.Env, Props = {}>` while the bundler substitutes
- * the runtime's port. `Cloudflare.Env` is an empty interface, and `unknown` is
- * not assignable to it, so `new Counter(ctx, env)` with the container's
- * `env: unknown` fails to typecheck unless `Env` is named here. See this
- * example's README.
- */
-export class Counter extends DurableObject<unknown> {
+export type CounterEnv = Record<string, never>;
+type CounterState = { value: number };
+
+export class Counter extends Agent<CounterEnv, CounterState> {
+  static override options = { hibernate: false };
+  override initialState: CounterState = { value: 0 };
+
   /**
    * Schema on every call rather than once in the constructor.
    *
@@ -59,23 +53,13 @@ export class Counter extends DurableObject<unknown> {
    * the same reason.
    */
   #schema(): void {
-    this.ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS counter (value INTEGER NOT NULL)");
     this.ctx.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS events (at INTEGER NOT NULL, kind TEXT NOT NULL)",
-    );
-    // One row, seeded once. `INSERT … SELECT … WHERE NOT EXISTS` keeps it to a
-    // single statement, so there is no read-then-write window inside the event.
-    this.ctx.storage.sql.exec(
-      "INSERT INTO counter (value) SELECT 0 WHERE NOT EXISTS (SELECT 1 FROM counter)",
     );
   }
 
   #record(kind: string): void {
     this.ctx.storage.sql.exec("INSERT INTO events (at, kind) VALUES (?, ?)", Date.now(), kind);
-  }
-
-  #value(): number {
-    return this.ctx.storage.sql.exec("SELECT value FROM counter").one().value as number;
   }
 
   /**
@@ -89,9 +73,10 @@ export class Counter extends DurableObject<unknown> {
    */
   async increment(): Promise<number> {
     this.#schema();
-    this.ctx.storage.sql.exec("UPDATE counter SET value = value + 1");
+    const value = this.state.value + 1;
+    this.setState({ value });
     this.#record("increment");
-    return this.#value();
+    return value;
   }
 
   async snapshot(): Promise<CounterSnapshot> {
@@ -99,7 +84,7 @@ export class Counter extends DurableObject<unknown> {
     const events = this.ctx.storage.sql
       .exec("SELECT at, kind FROM events ORDER BY rowid DESC LIMIT ?", RECENT_EVENTS)
       .toArray() as unknown as CounterEvent[];
-    return { value: this.#value(), events };
+    return { value: this.state.value, events };
   }
 
   /**
@@ -132,6 +117,6 @@ export class Counter extends DurableObject<unknown> {
   async alarm(): Promise<void> {
     this.#schema();
     this.#record("alarm");
-    this.ctx.storage.sql.exec("UPDATE counter SET value = value + 1");
+    this.setState({ value: this.state.value + 1 });
   }
 }

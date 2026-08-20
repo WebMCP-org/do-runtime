@@ -71,6 +71,11 @@ export default defineConfig({
        * file in this example imports `cloudflare:workers`.
        */
       "cloudflare:workers": `${packageRoot}src/api/cloudflare-workers.ts`,
+      "cloudflare:email": `${packageRoot}examples/platform-shims/cloudflare-email.ts`,
+      "node:async_hooks": "unenv/node/async_hooks",
+      "node:diagnostics_channel": "unenv/node/diagnostics_channel",
+      "node:os": "unenv/node/os",
+      path: "unenv/node/path",
     },
   },
 });

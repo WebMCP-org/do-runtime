@@ -35,7 +35,7 @@ import { createSqliteWasmProvider, type SqliteWasmHost } from "@mcp-b/do-runtime
 import sqlite3InitModule from "@sqlite.org/sqlite-wasm";
 import { RpcTarget } from "cloudflare:workers";
 import type { CounterSnapshot, HostRpc, HostStatus, WorkerBoot } from "../protocol";
-import { Counter } from "./counter";
+import { Counter, type CounterEnv } from "./counter";
 
 // =======================================================================================
 // Raw platform timers, captured before anything else in this module can run
@@ -308,7 +308,7 @@ async function place(): Promise<Live> {
     if (live?.container === container) live = undefined;
   });
 
-  const instance = await container.start((ctx, env) => new Counter(ctx, env));
+  const instance = await container.start((ctx, env) => new Counter(ctx, env as CounterEnv));
   // A break during boot has already run the handler above, and `live` was not
   // this container yet — so nothing dropped it. Refuse to publish a container
   // that is already broken rather than handing callers one that answers nothing.

@@ -4,6 +4,7 @@ packages:
 allowBuilds:
   workerd: true
   esbuild: true
+  core-js-pure: false
 # The pinned Aug 20 oracle is newer than the repository's release-age gate.
 minimumReleaseAgeExclude:
   - "@cloudflare/workerd-darwin-64@1.20260820.1"

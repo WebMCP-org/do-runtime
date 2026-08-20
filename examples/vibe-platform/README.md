@@ -1,8 +1,8 @@
 # vibe-platform
 
-A vibe-coding platform with no server: the page edits a front-end and a **user-authored Durable
-Object**, runs each half in-tab, and exports the unchanged sources as a deployable Wrangler project.
-Reload the tab or edit the actor class and its SQLite state is still there.
+A vibe-coding platform with no server: the page edits a front-end and a **user-authored Agents SDK
+Agent**, runs each half in-tab, and exports the unchanged sources as a deployable Wrangler project.
+Reload the tab or edit the Agent class and its SQLite-backed state is still there.
 
 ```
 pnpm --filter do-runtime-example-vibe-platform dev     # http://localhost:5173
@@ -37,12 +37,12 @@ whose `resolveId`/`load` are HTTP requests to the actor. Bare imports (`react`, 
 stay external and are resolved at runtime by an import map pointing at esm.sh, so the bundle
 contains only the code you wrote.
 
-**The authored Durable Object runs here too.** `/server/agent.ts` imports `DurableObject` from
-`cloudflare:workers`, exactly as deployed code does. Rolldown strips its TypeScript without changing
-the stored file and maps that external to the runtime's module; `agent.worker.ts` blob-imports the
-result and hosts the exported class through `createActorContainer`. It has a separate worker, actor
-realm, and stable OPFS pool. Saving any `server/*` file drains requests, releases storage, and places
-a new instance over the same SQLite files, so code is volatile while state is durable.
+**The authored Agent runs here too.** `/server/agent.ts` imports `Agent` from `agents`, declares
+`initialState`, updates it with `setState()`, and handles HTTP through `onRequest()` exactly as the
+deployed source does. Rolldown strips its TypeScript without changing the stored file and maps the
+SDK external to the browser host; `agent.worker.ts` blob-imports the result and places the exported
+class through `createActorContainer`. Saving any `server/*` file drains requests, releases storage,
+and places a new instance over the same SQLite files, so code is volatile while state is durable.
 
 **The sandbox has one narrow capability.** The preview keeps `sandbox="allow-scripts"`. Its `fetch`
 wrapper sends only `/api/*` requests to the parent over a one-request `MessageChannel`; the page
@@ -56,7 +56,8 @@ The workspace starter is also seeded exactly once, under boot semantics.
 **Export is a real Wrangler project.** The Export button downloads a store-only ZIP made with no
 dependency. `server/*` and `src/*` are byte-for-byte the workspace rows; generated `worker.ts` routes
 `/api/*` to the Durable Object and other requests to the built front-end assets. `wrangler.jsonc`
-contains the Durable Object binding, `new_sqlite_classes` migration, and assets configuration.
+contains the Durable Object binding, `new_sqlite_classes` migration, assets configuration, and the
+Agents SDK's `nodejs_compat` flag; `package.json` pins the same Agents SDK version tested here.
 
 ## Shape
 
@@ -94,7 +95,7 @@ On a static host that cannot set headers, the usual workaround is
 that re-serves the page with them. This example does not ship it; `vite dev` and `vite preview` both
 set the headers directly.
 
-## Two things that will bite you
+## Three things that will bite you
 
 **One tab at a time.** Each OPFS SAH pool takes exclusive sync access handles — that exclusivity is
 what makes SQLite synchronous here — so a second tab cannot install the workspace or user-agent
@@ -106,6 +107,10 @@ other tab and reload; measured, it recovers.
 still builds and the workspace still saves and persists — the iframe just renders nothing. The e2e
 detects this and prints `SKIP` for the three steps that need a rendered React app rather than
 failing; `VIBE_E2E_OFFLINE=1 node scripts/e2e.mjs` takes that path on purpose.
+
+**This is the Agents SDK's HTTP state path, not its whole platform.** The SDK eagerly imports Node
+and email modules, so Vite maps the Node imports through `unenv` and a fail-closed email shim. The
+starter disables Agent WebSocket hibernation because this runtime refuses hibernatable sockets.
 
 ## Deploying an export
 
@@ -126,6 +131,9 @@ later real deployment will succeed.
 - **Alarms.** `ports.alarms` is a named refusal here. A real one is an `AlarmScheduler` over a
   database of its own, which in a browser means a second worker with a second pool and delivery
   routed back through the page.
+- **Agents SDK WebSockets, schedules, workflows, MCP, and email.** The real SDK is loaded, but this
+  demo intentionally proves the smallest useful slice: `initialState`, `state`, `setState()`, and
+  `onRequest()` through an actor restart, page reload, and deploy dry-run.
 - **Facets.** `ports.facets` refuses too. Facets are child actors with their own gates and their own
   database inside the parent's pool — the mechanism you would reach for to give each *project* in a
   platform its own storage under one root.

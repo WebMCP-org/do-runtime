@@ -90,6 +90,9 @@ export type AgentBoot = {
 /** The global Rolldown uses for the browser's `cloudflare:workers` external. */
 export const CLOUDFLARE_WORKERS_GLOBAL = "__vibeCloudflareWorkers";
 
+/** The global Rolldown uses for the browser-hosted `agents` package. */
+export const AGENTS_GLOBAL = "__vibeAgents";
+
 /**
  * The origin the actor answers on. It is never resolved and never reaches the
  * network — `fetch()` here is a method call on an object in a Web Worker — but

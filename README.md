@@ -157,8 +157,8 @@ Open a second container over the same directory and `increment()` answers `3`: t
 
 Two runnable browser hosts live in [`examples/`](examples/), each with its own README and Playwright e2e (`pnpm test:examples`):
 
-- [`examples/extension/`](examples/extension/) — a Chrome MV3 extension: service worker → offscreen document (with corpse recovery) → worker hosting a `Counter` actor with a real `AlarmScheduler`. Proves the MV3 CSP story (`'wasm-unsafe-eval'`), OPFS persistence across reloads, and alarm delivery with the persisted retry ladder.
-- [`examples/vibe-platform/`](examples/vibe-platform/) — a self-contained vibe-coding page that authors both a front-end and a Durable Object, runs them in-tab on the real runtime with durable SQLite state, and exports the unchanged sources as a Wrangler project that passes `wrangler deploy --dry-run`.
+- [`examples/extension/`](examples/extension/) — a Chrome MV3 extension: service worker → offscreen document (with corpse recovery) → worker hosting an Agents SDK `Counter` with a real `AlarmScheduler`. Proves `Agent.setState()` persistence, the MV3 CSP story (`'wasm-unsafe-eval'`), and alarm delivery with the persisted retry ladder.
+- [`examples/vibe-platform/`](examples/vibe-platform/) — a self-contained vibe-coding page that authors both a front-end and an Agents SDK `Agent`, runs them in-tab with durable SQLite-backed state, and exports the unchanged sources as a Wrangler project that passes `wrangler deploy --dry-run`.
 
 ## Hosting an actor
 

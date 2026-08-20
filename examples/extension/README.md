@@ -1,6 +1,6 @@
 # Chrome MV3 extension example
 
-One Durable Object actor, running for real inside a Manifest V3 extension: a
+One Agents SDK actor, running for real inside a Manifest V3 extension: a
 service worker that owns nothing, an offscreen document that supervises, a module
 Worker that holds the actor, and SQLite on OPFS underneath it.
 
@@ -44,7 +44,7 @@ popup.html ──sendMessage──▶ service worker ──chrome.offscreen.crea
   the extension and invisible to every page.
 - **Persistence that survives the page.** The e2e reloads the tab, which destroys
   the document, the Worker, the container and the instance, and finds the same
-  counter and the same event rows in the new one.
+  `Agent.setState()` counter and the same event rows in the new one.
 - **Persistence that survives the *context*.** The last e2e step closes the tab
   and drives the popup instead, so the actor is re-placed inside a real offscreen
   document — a different renderer — and continues the same count.
@@ -199,13 +199,11 @@ first (`chrome.offscreen.closeDocument()` from the service worker's console).
 
 Written down because this example exists partly to find them.
 
-- **`@cloudflare/workers-types` declares `cloudflare:workers` ambiently, and an
-  ambient module declaration beats a `paths` mapping.** So `import { DurableObject }
-  from "cloudflare:workers"` typechecks against Cloudflare's declarations while the
-  bundler substitutes the runtime's port. Mostly harmless, except that Cloudflare's
-  `DurableObject<Env = Cloudflare.Env>` defaults `Env` to an empty interface, and
-  the container's `env: unknown` is not assignable to it —
-  `src/worker/counter.ts` therefore writes `extends DurableObject<unknown>`.
+- **The Agents SDK root entry eagerly imports Workers-only Node and email modules.**
+  Vite maps the Node imports through `unenv`; `cloudflare:email` is a fail-closed
+  shim because these demos do not expose email delivery. This proves Agent state
+  and HTTP/RPC handlers, not every SDK feature. Both demos disable Agent WebSocket
+  hibernation because this runtime deliberately refuses hibernatable sockets.
 - **`FacetHost` has no "places no facets" implementation in the package.**
   `noFacets` appears only as a snippet in the root README, so every host retypes
   four members to say the same thing.

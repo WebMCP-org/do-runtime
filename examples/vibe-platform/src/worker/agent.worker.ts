@@ -13,9 +13,11 @@ import {
   type Timer,
 } from "@mcp-b/do-runtime";
 import type { SqliteWasmHost } from "@mcp-b/do-runtime/backends/sqlite-wasm";
-import * as cloudflareWorkers from "@mcp-b/do-runtime/cloudflare-workers";
-import { DurableObject, RpcTarget } from "@mcp-b/do-runtime/cloudflare-workers";
+import * as cloudflareWorkers from "cloudflare:workers";
+import { DurableObject, RpcTarget } from "cloudflare:workers";
+import * as agents from "agents";
 import {
+  AGENTS_GLOBAL,
   CLOUDFLARE_WORKERS_GLOBAL,
   type AgentBoot,
   type AgentRpc,
@@ -103,6 +105,7 @@ async function evaluateActor(): Promise<{
   exports: Record<string, unknown>;
 }> {
   (globalThis as Record<string, unknown>)[CLOUDFLARE_WORKERS_GLOBAL] = cloudflareWorkers;
+  (globalThis as Record<string, unknown>)[AGENTS_GLOBAL] = agents;
   const url = URL.createObjectURL(new Blob([authoredSource], { type: "text/javascript" }));
   let imported: Record<string, unknown>;
   try {
@@ -115,12 +118,17 @@ async function evaluateActor(): Promise<{
     throw new Error("The authored bundle did not export a module record.");
   }
 
+  // The SDK's aliased Workers module can have a different class identity from
+  // the host's copy, so either public base is an authored actor.
   const classes = Object.entries(module).filter(
     (entry): entry is [string, typeof DurableObject] =>
-      typeof entry[1] === "function" && entry[1].prototype instanceof DurableObject,
+      typeof entry[1] === "function" &&
+      (entry[1].prototype instanceof DurableObject || entry[1].prototype instanceof agents.Agent),
   );
   if (classes.length !== 1) {
-    throw new Error(`server/agent.ts must export exactly one DurableObject class; found ${classes.length}.`);
+    throw new Error(
+      `server/agent.ts must export exactly one DurableObject or Agent class; found ${classes.length}.`,
+    );
   }
   const match = classes[0];
   if (match === undefined) throw new Error("server/agent.ts exports no DurableObject class.");
