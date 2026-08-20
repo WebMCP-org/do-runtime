@@ -77,3 +77,16 @@ it("§1.4 public SQL values follow workerd's JSG conversion", async () => {
     minimum: "-9223372036854776000",
   });
 });
+
+it("§1.4 SQLite strings and blobs are limited to 4 MiB", async () => {
+  const probe = await host.spawn("sql-length-limit");
+  expect(await probe.call("sqliteLengthLimit")).toEqual({
+    allowed: 4_000_000,
+    tooBig: "Error: string or blob too big: SQLITE_TOOBIG",
+  });
+});
+
+it("§1.4 SQLite R*Tree virtual tables are available", async () => {
+  const probe = await host.spawn("sql-rtree");
+  expect(await probe.call("sqliteRtree")).toEqual({ ids: [{ id: 1 }], check: "ok" });
+});

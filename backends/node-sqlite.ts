@@ -19,6 +19,7 @@ import { rmSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import type { SQLInputValue, StatementSync } from "node:sqlite";
 import {
+  requireSqliteLength,
   SQL_WRONG_BINDINGS_MESSAGE,
   type SqlDatabase,
   type SqlDatabaseProvider,
@@ -145,6 +146,9 @@ class NodeSqlStatement implements SqlDatabaseStatement {
 
   execute(params: readonly SqlValue[]): SqlResult {
     if (params.length !== this.parameterCount) throw new Error(SQL_WRONG_BINDINGS_MESSAGE);
+    // ponytail: node:sqlite exposes no sqlite3_limit(); guard JS inputs and outputs here,
+    // and replace this with the native limit if Node exposes it.
+    params.forEach(requireSqliteLength);
 
     const { named, anonymous } = bindParameters(params, this.#layout);
     const statement = this.#statement;
@@ -315,7 +319,10 @@ function skipQuoted(sql: string, open: number, close: string, doubled: boolean):
  * future driver that ignores the flag from handing objects to `getText`.
  */
 function asRow(row: unknown): readonly unknown[] {
-  if (Array.isArray(row)) return row.map(normalizeInteger);
+  if (Array.isArray(row)) {
+    row.forEach(requireSqliteLength);
+    return row.map(normalizeInteger);
+  }
   throw new Error("node:sqlite returned a non-array row despite setReturnArrays(true).");
 }
 

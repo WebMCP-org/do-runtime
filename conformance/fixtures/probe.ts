@@ -627,6 +627,38 @@ export class Probe extends DurableObject<Record<string, unknown>> {
     };
   }
 
+  /** Workerd caps every SQLite string or blob at 4 MiB. */
+  sqliteLengthLimit(): Record<string, unknown> {
+    const sql = this.ctx.storage.sql;
+    const allowed = sql.exec("SELECT length(?) AS length", "x".repeat(4_000_000)).one();
+    try {
+      sql.exec("SELECT length(?)", new Uint8Array(4 * 1024 * 1024 + 1));
+      return { allowed: allowed.length, tooBig: "allowed" };
+    } catch (error) {
+      return { allowed: allowed.length, tooBig: String(error) };
+    }
+  }
+
+  /** Workerd's SQL regulator allows the built-in R*Tree virtual-table module. */
+  sqliteRtree(): Record<string, unknown> {
+    const sql = this.ctx.storage.sql;
+    sql.exec("DROP TABLE IF EXISTS rtree_probe");
+    sql.exec(
+      "CREATE VIRTUAL TABLE rtree_probe USING rtree(id, minX, maxX, minY, maxY)",
+    );
+    sql.exec(
+      "INSERT INTO rtree_probe VALUES (1, -1, 1, -1, 1), (2, 10, 12, 10, 12)",
+    );
+    return {
+      ids: sql
+        .exec(
+          "SELECT id FROM rtree_probe WHERE minX <= 2 AND maxX >= -2 AND minY <= 2 AND maxY >= -2 ORDER BY id",
+        )
+        .toArray(),
+      check: sql.exec("SELECT rtreecheck('rtree_probe') AS result").one().result,
+    };
+  }
+
   // -- §2.4 / decision 16 the value codec ------------------------------------
   /**
    * workerd V8-serializes stored values, so all four come back as themselves.

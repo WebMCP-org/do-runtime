@@ -27,16 +27,11 @@
  *     the harness calls it and exposes `gateBroken` rather than each test
  *     calling it. `monitorOutputGate` keeps its meaning: with it on, `finish()`
  *     fails the test if the gate broke and nothing said so.
- *  5. **`SQLITE_TOOBIG` is not reachable.** The 2.2MB ceiling is workerd's
- *     `SQLITE_MAX_LENGTH` build flag (README), so "rollback on error" injects
- *     the mid-batch failure at the `SqlDatabase` seam, exactly as Section 3's
- *     `sqlite-kv.test.ts` already does. The SAVEPOINT/ROLLBACK TO under test
- *     still runs against real SQLite.
- *  6. **`SQLITE_NOMEM` via `PRAGMA hard_heap_limit` becomes `SQLITE_FULL` via
+ *  5. **`SQLITE_NOMEM` via `PRAGMA hard_heap_limit` becomes `SQLITE_FULL` via
  *     `PRAGMA max_page_count`**, the technique Section 3's critical-error tests
  *     already use, because a heap limit is process-wide in `node:sqlite` and a
  *     page cap is per database.
- *  7. **`db.afterReset` is absent**, so the harness cannot assert
+ *  6. **`db.afterReset` is absent**, so the harness cannot assert
  *     `isCommitScheduled()` from inside a reset. The assertion it stands for —
  *     that `deleteAll()` always leaves a commit scheduled — is made directly in
  *     the `deleteAll` cases instead.
@@ -49,8 +44,7 @@
 
 import { expect, test } from "vitest";
 import { createNodeSqlProvider } from "../../backends/node-sqlite";
-import type { SqlDatabase, SqlResult, SqlValue } from "../util/sqlite";
-import { SqliteCriticalError, SqliteDatabase } from "../util/sqlite";
+import { SQLITE_LENGTH_LIMIT, SqliteCriticalError, SqliteDatabase } from "../util/sqlite";
 import { InputGate, OutputGate } from "./io-gate";
 import { type Actor, IoContext, type Timer } from "./io-context";
 import type {
@@ -127,8 +121,6 @@ type ActorSqliteTestOptions = {
    * gate takes it in its constructor.
    */
   outputGateBrokenTakenElsewhere?: boolean;
-  /** Injects a mid-batch failure, standing in for workerd's SQLITE_TOOBIG. */
-  wrapBackend?: (backend: SqlDatabase) => SqlDatabase;
   /** Caps the database so a large write raises SQLITE_FULL and SQLite auto-rolls-back. */
   maxPageCount?: number;
 };
@@ -256,8 +248,7 @@ async function newActorSqliteTest(options: ActorSqliteTestOptions = {}): Promise
   if (options.maxPageCount !== undefined) {
     raw.exec(`PRAGMA max_page_count = ${options.maxPageCount}`, []);
   }
-  const backend = options.wrapBackend === undefined ? raw : options.wrapBackend(raw);
-  return new ActorSqliteTest(new SqliteDatabase(backend), options);
+  return new ActorSqliteTest(new SqliteDatabase(raw), options);
 }
 
 /** Every case constructs a harness and finishes it, as upstream's destructor does. */
@@ -283,36 +274,6 @@ function expectCancel(result: ArmAlarmResult): CancelAlarmHandler {
     throw new Error("expected armAlarmHandler to return CancelAlarmHandler");
   }
   return result.cancel;
-}
-
-/** ← the `SqlDatabase` wrapper Section 3's `sqlite-kv.test.ts` uses for the same job. */
-function failingOn(backend: SqlDatabase, key: string): SqlDatabase {
-  return {
-    prepare(sql) {
-      const statement = backend.prepare(sql);
-      return {
-        sql: statement.sql,
-        parameterCount: statement.parameterCount,
-        execute(params) {
-          if (params[0] === key) throw new Error("string or blob too big: SQLITE_TOOBIG");
-          return statement.execute(params);
-        },
-        close: () => statement.close(),
-      };
-    },
-    exec(sql: string, params: readonly SqlValue[]): SqlResult {
-      if (params[0] === key) throw new Error("string or blob too big: SQLITE_TOOBIG");
-      return backend.exec(sql, params);
-    },
-    get databaseSize(): number {
-      return backend.databaseSize;
-    },
-    get inTransaction(): boolean {
-      return backend.inTransaction;
-    },
-    reset: () => backend.reset(),
-    close: () => backend.close(),
-  };
 }
 
 // =======================================================================================
@@ -376,7 +337,7 @@ actorTest(
       { key: "foo", value: bytes("bar") },
       { key: "foo2", value: bytes("bar2") },
       { key: "foo3", value: bytes("bar3") },
-      { key: "trip", value: bytes("bar") },
+      { key: "x".repeat(SQLITE_LENGTH_LIMIT + 1), value: bytes("bar") },
     ];
 
     // NoTxn test
@@ -429,7 +390,6 @@ actorTest(
       commit?.fulfill();
     }
   },
-  { wrapBackend: (backend) => failingOn(backend, "trip") },
 );
 
 actorTest("alarm write happens transactionally with storage ops", async (test) => {

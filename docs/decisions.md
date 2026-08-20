@@ -5,9 +5,11 @@ Source comments and conformance tests cite the numbered entries below (`§1.2`,
 than rewrite. Behaviour is pinned by the conformance suite; this document is
 the index the citations resolve to, not a second specification.
 
-Workerd line citations throughout the source use commit
-`e8f1e125bd48f048a3e82c48d37e5e3902fffbd6` of
-[cloudflare/workerd](https://github.com/cloudflare/workerd) (2026-07-13).
+Workerd line citations throughout the source use release `v1.20260713.1`, commit
+`03c396e9b14ea5644dfcfb696086d8df040a4efc` of
+[cloudflare/workerd](https://github.com/cloudflare/workerd). The conformance
+oracle is pinned separately to release `v1.20260820.1`, commit
+`dea490edc7e6fbd7e38d6dbd797b8ff0f2687179`.
 
 A few comments cite `divergence <n>` with n ≥ 100. Those numbers come from the
 mechanical-substitution ledger kept while the port was written; each citation
@@ -209,6 +211,7 @@ owns only placement and physical storage operations.
 | JavaScript cannot terminate the currently executing slice | `abort()` breaks later storage and entry, but the calling method can still return |
 | No common V8 byte serializer across Node and the browser | Values JSON cannot faithfully round-trip are rejected at `put()` |
 | The SQLite backends expose no authorizer callbacks | Reserved `_cf_` identifiers are detected from tokenized statement text and may reject more than workerd |
+| `node:sqlite` exposes no `sqlite3_limit()` | Bound and returned strings and blobs enforce workerd's 4 MiB limit; SQL-computed values that are never returned may exceed it. The browser backend sets the native limit. |
 | A response BYOB reader cannot be re-gated after `read(view)` | BYOB readers throw; callers use a default reader or `arrayBuffer()` |
 | A workerd facet alarm appears to schedule and then breaks asynchronously ([workerd#6810](https://github.com/cloudflare/workerd/issues/6810)) | This runtime refuses facet `setAlarm()` synchronously |
 | A host may lose a physical wake between durable and platform timer writes | The host timer journals an opaque one-shot token before arming; the scheduler remains authoritative |

@@ -18,6 +18,9 @@
  * dispatch with no port. `ActorChannelFactory` and `ColoLocalActorChannelFactory`
  * below are the shape they plug into, holding exactly the fields the two
  * reachable factories' constructors capture.
+ * `ActorRetryRequestMetadata` stays on that same omitted transport seam:
+ * upstream passes it from an outgoing factory to `ActorChannel`, while the
+ * host-provided `Fetcher` here already owns retry policy and exposes no metadata.
  *
  * **`ColoLocalActorNamespace` is ported, not treated as a substrate boundary**,
  * and the reason is worth stating because the opposite call is easy to defend

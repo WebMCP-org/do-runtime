@@ -70,6 +70,24 @@ export interface SqlDatabaseStatement {
 
 export const SQL_WRONG_BINDINGS_MESSAGE = "Wrong number of parameter bindings for SQL query.";
 
+/** ← `SQLITE_LIMIT_LENGTH`, raised from 2.2 MB to 4 MiB in workerd 2026-08-20. */
+export const SQLITE_LENGTH_LIMIT = 4 * 1024 * 1024;
+
+export const SQLITE_TOOBIG_MESSAGE = "string or blob too big: SQLITE_TOOBIG";
+
+const textEncoder = new TextEncoder();
+
+/** The part of `sqlite3_limit(SQLITE_LIMIT_LENGTH)` visible at the JS binding seam. */
+export function requireSqliteLength(value: unknown): void {
+  const length =
+    typeof value === "string"
+      ? textEncoder.encode(value).byteLength
+      : value instanceof Uint8Array
+        ? value.byteLength
+        : 0;
+  if (length > SQLITE_LENGTH_LIMIT) throw new Error(SQLITE_TOOBIG_MESSAGE);
+}
+
 export const SQL_PRELUDE_BINDINGS_MESSAGE =
   "When executing multiple SQL statements in a single call, only the last statement can have " +
   "parameters.";

@@ -219,6 +219,7 @@ The browser cannot reproduce every workerd facility. Where it cannot, the runtim
 | `DurableObjectState.abort()` | Breaks later storage and re-entry; cannot synchronously terminate the calling JavaScript slice. |
 | Stored values | JSON-compatible only; V8-only types are rejected at write time. |
 | Reserved SQL names | `_cf_` detected from tokenized SQL text, which can reject more than workerd's authorizer. |
+| Node SQLite length limit | Bound and returned strings and blobs are capped at 4 MiB; `node:sqlite` cannot cap an unreturned SQL-computed value. The browser backend uses SQLite's native limit. |
 | Response BYOB readers | Refused; their continuation cannot be re-gated. Use a default reader or `arrayBuffer()`. |
 | Facet `setAlarm()` | Refused synchronously, where workerd breaks the actor asynchronously ([workerd#6810](https://github.com/cloudflare/workerd/issues/6810)). |
 | Alarm exception provenance | Unclassified handler failures stay retryable; browser errors lack jsg provenance. |
@@ -265,7 +266,7 @@ pnpm exec playwright install chromium   # browser lane only
 pnpm typecheck && pnpm test
 ```
 
-Change runtime behaviour with the corresponding workerd source open (citations use commit `e8f1e125bd48f048a3e82c48d37e5e3902fffbd6`). Ask the workerd lane an observable question before inventing a local rule; record any intentional divergence in the table above and in a conformance row. Keep host seams small and typed, keep gates internal, and keep product knowledge out of the port. See [`docs/decisions.md`](docs/decisions.md) for the invariants the code cites.
+Change runtime behaviour with the corresponding workerd source open (line citations use release `v1.20260713.1`; the conformance oracle is pinned to `v1.20260820.1`). Ask the workerd lane an observable question before inventing a local rule; record any intentional divergence in the table above and in a conformance row. Keep host seams small and typed, keep gates internal, and keep product knowledge out of the port. See [`docs/decisions.md`](docs/decisions.md) for the invariants the code cites.
 
 ## Acknowledgements
 

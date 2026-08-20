@@ -25,6 +25,8 @@
  */
 
 import {
+  requireSqliteLength,
+  SQLITE_LENGTH_LIMIT,
   SQL_WRONG_BINDINGS_MESSAGE,
   type SqlDatabase,
   type SqlDatabaseProvider,
@@ -71,8 +73,10 @@ export interface OpfsSahPool {
  * satisfy this interface.
  */
 export interface SqliteWasmCapi {
+  readonly SQLITE_LIMIT_LENGTH: number;
   sqlite3_complete(sql: string): 0 | 1;
   sqlite3_get_autocommit(db: number): number;
+  sqlite3_limit(db: number, id: number, newValue: number): number;
 }
 
 /**
@@ -119,6 +123,7 @@ export class SqliteWasmDatabase implements SqlDatabase {
     this.#host = host;
     this.#filename = filename;
     this.#database = new host.pool.OpfsSAHPoolDb(filename);
+    this.#setLengthLimit();
   }
 
   prepare(sql: string): SqlDatabaseStatement {
@@ -161,10 +166,21 @@ export class SqliteWasmDatabase implements SqlDatabase {
       throw new Error(`SAH pool did not unlink ${this.#filename}`);
     }
     this.#database = new this.#host.pool.OpfsSAHPoolDb(this.#filename);
+    this.#setLengthLimit();
   }
 
   close(): void {
     this.#database.close();
+  }
+
+  #setLengthLimit(): void {
+    const pointer = this.#database.pointer;
+    if (pointer === undefined) throw new Error("The database handle is closed.");
+    this.#host.capi.sqlite3_limit(
+      pointer,
+      this.#host.capi.SQLITE_LIMIT_LENGTH,
+      SQLITE_LENGTH_LIMIT,
+    );
   }
 
   #pragma(name: string): number {
@@ -197,6 +213,7 @@ class WasmSqlStatement implements SqlDatabaseStatement {
 
   execute(params: readonly SqlValue[]): SqlResult {
     if (params.length !== this.parameterCount) throw new Error(SQL_WRONG_BINDINGS_MESSAGE);
+    params.forEach(requireSqliteLength);
     if (params.length > 0) this.#statement.bind(params);
 
     const columnCount = this.#statement.columnCount;

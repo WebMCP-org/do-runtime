@@ -24,8 +24,10 @@ test("reset fails closed when the SAH pool does not remove the database", () => 
   const opened: string[] = [];
   const host = {
     capi: {
+      SQLITE_LIMIT_LENGTH: 0,
       sqlite3_complete: () => 1 as const,
       sqlite3_get_autocommit: () => 1,
+      sqlite3_limit: () => 1,
     },
     pool: {
       OpfsSAHPoolDb: class extends FakeDatabase {

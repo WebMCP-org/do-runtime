@@ -1,9 +1,12 @@
+import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { defineConfig } from "vitest/config";
 import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
 const packageRoot = fileURLToPath(new URL("../../", import.meta.url));
+const workerdPath: string = createRequire(import.meta.url)("workerd").default;
+process.env.MINIFLARE_WORKERD_PATH ??= workerdPath;
 
 export default defineConfig({
   plugins: [

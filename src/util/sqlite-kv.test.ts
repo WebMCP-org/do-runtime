@@ -5,27 +5,19 @@
  * `backends/node-sqlite.ts` on `:memory:`, which is the same idea through the
  * substrate we actually have.
  *
- * Three assertions upstream makes cannot be made here, and each one is about
+ * Two assertions upstream makes cannot be made here, and each one is about
  * `sqlite.{h,c++}` rather than about `SqliteKv`:
  *
  *  - `sqliteObserver.rowsRead` / `rowsWritten`. These are billing counters read
  *    from libsql's `STMTSTATUS_ROWS_READ` / `_WRITTEN`, which neither
  *    `node:sqlite` nor sqlite-wasm exposes. Nothing in `sqlite-kv.c++` branches
  *    on them.
- *  - `KJ_EXPECT_THROW_MESSAGE("string or blob too big: SQLITE_TOOBIG", ...)`.
- *    The 2.2MB ceiling is workerd's `SQLITE_MAX_LENGTH` build flag, not a
- *    SQLite default (which is 1e9) and not something either backend can set.
- *    The half of "large key" that survives — a 2MB key round-tripping — is the
- *    half that tests `SqliteKv`.
- *  - The same limit is how "multi-put rollback on error" forces a put to fail
- *    mid-batch. Here the failure is injected at the `SqlDatabase` seam instead,
- *    so the SAVEPOINT/ROLLBACK TO under test still runs against real SQLite.
  */
 
 import { describe, expect, test } from "vitest";
 import { createNodeSqlProvider } from "../../backends/node-sqlite";
 import { SqliteKv } from "./sqlite-kv";
-import { SqliteDatabase, type SqlDatabase, type SqlResult, type SqlValue } from "./sqlite";
+import { SQLITE_LENGTH_LIMIT, SqliteDatabase } from "./sqlite";
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -33,9 +25,9 @@ const decoder = new TextDecoder();
 const bytes = (value: string): Uint8Array => encoder.encode(value);
 const text = (value: Uint8Array): string => decoder.decode(value);
 
-async function openDatabase(wrap?: (backend: SqlDatabase) => SqlDatabase): Promise<SqliteDatabase> {
+async function openDatabase(): Promise<SqliteDatabase> {
   const backend = await createNodeSqlProvider().open("foo");
-  return new SqliteDatabase(wrap === undefined ? backend : wrap(backend));
+  return new SqliteDatabase(backend);
 }
 
 function listing(kv: SqliteKv) {
@@ -135,11 +127,14 @@ describe("SQLite-KV", () => {
   test("large key", async () => {
     const kv = new SqliteKv(await openDatabase());
 
-    // 2MB because we document a 2MB limit for SQLite Durable Objects.
-    const closeToLimitString = "x".repeat(2_000_000);
+    // Workerd documents a 4 MB limit and configures SQLite to 4 MiB.
+    const closeToLimitString = "x".repeat(4_000_000);
     kv.put(closeToLimitString, bytes("hello"));
 
     expect(text(kv.get(closeToLimitString) as Uint8Array)).toBe("hello");
+    expect(() => kv.put("x".repeat(SQLITE_LENGTH_LIMIT + 1), bytes("hello"))).toThrow(
+      "string or blob too big: SQLITE_TOOBIG",
+    );
   });
 
   test("SQLite-KV multi-put", async () => {
@@ -180,7 +175,7 @@ describe("SQLite-KV", () => {
   });
 
   test("SQLite-KV multi-put rollback on error", async () => {
-    const db = await openDatabase((backend) => failingOn(backend, "key3"));
+    const db = await openDatabase();
     const kv = new SqliteKv(db);
 
     // Pre-populate with some data.
@@ -191,7 +186,7 @@ describe("SQLite-KV", () => {
         [
           { key: "key1", value: bytes("value1") },
           { key: "key2", value: bytes("value2") },
-          { key: "key3", value: bytes("value3") },
+          { key: "x".repeat(SQLITE_LENGTH_LIMIT + 1), value: bytes("value3") },
         ],
         { allowUnconfirmed: false },
       ),
@@ -260,36 +255,3 @@ describe("SqliteKv::ListCursor", () => {
     expect(cursor.wasCanceled()).toBe(false);
   });
 });
-
-/** Throws in place of one specific put, standing in for workerd's SQLITE_TOOBIG. */
-function failingOn(backend: SqlDatabase, key: string): SqlDatabase {
-  return {
-    prepare(sql) {
-      const statement = backend.prepare(sql);
-      return {
-        sql: statement.sql,
-        parameterCount: statement.parameterCount,
-        execute(params) {
-          if (params[0] === key) throw new Error("string or blob too big: SQLITE_TOOBIG");
-          return statement.execute(params);
-        },
-        close: () => statement.close(),
-      };
-    },
-    exec(sql: string, params: readonly SqlValue[]): SqlResult {
-      if (params[0] === key) throw new Error("string or blob too big: SQLITE_TOOBIG");
-      return backend.exec(sql, params);
-    },
-    get databaseSize(): number {
-      return backend.databaseSize;
-    },
-    // Delegated, not stubbed: answering this wrong makes the real database look
-    // like it auto-rolled back, and the rollback under test would be reported as
-    // a critical error instead.
-    get inTransaction(): boolean {
-      return backend.inTransaction;
-    },
-    reset: () => backend.reset(),
-    close: () => backend.close(),
-  };
-}

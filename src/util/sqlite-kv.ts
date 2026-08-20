@@ -26,10 +26,8 @@
  *    `STMT` below: same names, same order, SQL copied verbatim, so the
  *    correspondence a reader needs is intact.
  *
- * Not ported: `SqliteKvRegulator`. Its two jobs are re-reporting SQLITE_TOOBIG
- * as a user-visible error — a workerd build limit, see the note in
- * `sqlite-kv.test.ts` — and `shouldAddQueryStats`, which is row-count billing.
- * Both are `sqlite.h` concerns and neither is reachable from our substrate.
+ * Not ported: `SqliteKvRegulator`. Its remaining job is `shouldAddQueryStats`,
+ * which is row-count billing; neither backend exposes those counters.
  *
  * Spec: §2.4 in docs/decisions.md.
  */
