@@ -15,6 +15,14 @@ export type WorkerBoot = {
   readonly sockets: MessagePort;
 };
 
+/** The one Chrome watchdog mirroring the scheduler's earliest durable wake. */
+export const WAKE_ALARM = "do-runtime-wake";
+
+/** What the actor worker can ask its offscreen supervisor to project. */
+export interface SupervisorRpc {
+  projectWake(scheduledTime: number | null): Promise<void>;
+}
+
 /** The state shape the real Agents client receives over its socket. */
 export type CounterState = { readonly value: number };
 
@@ -89,6 +97,7 @@ export type HostOp =
  */
 export type ExtensionMessage =
   | { readonly type: "ensure-host" }
+  | { readonly type: "project-wake"; readonly scheduledTime: number | null }
   | { readonly type: "host-op"; readonly op: HostOp; readonly args: readonly unknown[] };
 
 /** Every answer is a settled result rather than a throw: `sendResponse` cannot reject. */

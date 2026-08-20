@@ -1,15 +1,16 @@
 /**
- * The MV3 service worker. Its only job is to make sure the offscreen document
- * exists.
+ * The MV3 service worker: offscreen lifecycle and the physical alarm watchdog.
  *
  * It deliberately holds no actor, no worker and no session: a service worker is
  * evicted after seconds of idleness and cannot keep a dedicated Worker — or an
  * OPFS sync access handle — across that. Everything durable lives behind the
  * offscreen document; this file is the thing that puts the offscreen document
- * back.
+ * back. It also owns `chrome.alarms`, an API Chrome does not expose inside an
+ * offscreen document, while the worker's `AlarmScheduler` remains authoritative
+ * for alarm identity, retry policy, and delivery.
  */
 
-import type { ExtensionMessage, ExtensionResponse } from "./protocol";
+import { WAKE_ALARM, type ExtensionMessage, type ExtensionResponse } from "./protocol";
 
 const OFFSCREEN_URL = "offscreen.html";
 
@@ -102,8 +103,20 @@ export function ensureOffscreen(): Promise<void> {
   return ensuring;
 }
 
+async function projectWake(scheduledTime: number | null): Promise<void> {
+  if (scheduledTime === null) {
+    await chrome.alarms.clear(WAKE_ALARM);
+    return;
+  }
+  if (!Number.isSafeInteger(scheduledTime) || scheduledTime < 0) {
+    throw new TypeError("projected alarm time must be a non-negative safe integer");
+  }
+  await chrome.alarms.create(WAKE_ALARM, { when: scheduledTime });
+}
+
 /**
- * `ensure-host` is the popup asking for a host before it sends any operation.
+ * `ensure-host` is the popup asking for a host before it sends any operation;
+ * `project-wake` mirrors the scheduler's earliest durable wait into Chrome.
  * `host-op` messages are NOT answered here — the offscreen document receives
  * them directly — so this listener returns `false` for them and lets the channel
  * belong to whoever will actually reply.
@@ -114,8 +127,10 @@ chrome.runtime.onMessage.addListener(
     _sender: chrome.runtime.MessageSender,
     sendResponse: (response: ExtensionResponse) => void,
   ): boolean => {
-    if (message?.type !== "ensure-host") return false;
-    void ensureOffscreen().then(
+    if (message?.type !== "ensure-host" && message?.type !== "project-wake") return false;
+    const operation =
+      message.type === "ensure-host" ? ensureOffscreen() : projectWake(message.scheduledTime);
+    void operation.then(
       () => {
         sendResponse({ ok: true, value: null });
       },
@@ -127,13 +142,15 @@ chrome.runtime.onMessage.addListener(
   },
 );
 
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name !== WAKE_ALARM) return;
+  void ensureOffscreen().catch((error: unknown) => {
+    console.error("[do-runtime example] alarm wake could not recreate the host:", error);
+  });
+});
+
 /**
- * Start the host on install and on browser startup, so an armed alarm can fire
- * without anyone opening the popup first.
- *
- * This is where a production extension would go further and project the
- * scheduler's next wake onto `chrome.alarms`; see this example's README for why
- * that is deliberately not shown here.
+ * Start the host on install and on browser startup, without waiting for a popup.
  */
 chrome.runtime.onInstalled.addListener(() => {
   void ensureOffscreen();

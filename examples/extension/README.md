@@ -6,7 +6,7 @@ Worker that holds the actor, and SQLite on OPFS underneath it.
 
 ```
 popup.html ──sendMessage──▶ service worker ──chrome.offscreen.createDocument──▶ offscreen.html
-    │                       (owns no state)                                          │
+    │                       (offscreen lifecycle + chrome.alarms)                    │
     └──────────sendMessage("host-op")─────────────────────────────────────────▶      │
                                                                               new Worker(type: "module")
                                                                                      │
@@ -42,18 +42,19 @@ popup.html ──sendMessage──▶ service worker ──chrome.offscreen.crea
   COOP/COEP headers, no cross-origin isolation — measured, none of it is needed.
   The extension origin gets its own OPFS, so the actor's database is private to
   the extension and invisible to every page.
-- **Persistence that survives the page.** The e2e reloads the tab, which destroys
-  the document, the Worker, the container and the instance, and finds the same
-  `Agent.setState()` counter and the same event rows in the new one.
-- **Persistence that survives the *context*.** The last e2e step closes the tab
-  and drives the popup instead, so the actor is re-placed inside a real offscreen
-  document — a different renderer — and continues the same count.
+- **Persistence that survives the context.** The e2e closes and recreates the real
+  offscreen document, destroying its Worker, container, and instance, then finds
+  the same `Agent.setState()` counter and event rows in the replacement renderer.
 - **A real `AlarmScheduler`, with its persisted retry ladder.** The alarm is armed
   through `Agent.schedule()`, recorded in both Agent storage and the scheduler's
   `_cf_ALARM` table, and delivered back as a gated event. The ladder — retry counts,
   exponential backoff, abandonment — is rows rather than process memory, which is
   the divergence from workerd that exists precisely because MV3 evicts its
   contexts.
+- **A physical MV3 wake.** The scheduler projects only its earliest durable wait
+  through the offscreen supervisor onto `chrome.alarms`. The e2e destroys the
+  offscreen document before that alarm is due and proves Chrome wakes the service
+  worker, recreates the host, and lets the scheduler deliver the stored event.
 - **The Agents SDK queue.** The e2e enqueues an increment and observes its state
   write through `snapshot()`, exercising the SDK's SQLite-backed queue rather
   than a host callback.
@@ -108,12 +109,9 @@ line per assertion. It exits non-zero on the first failure.
 script is plain `.mjs` with a dynamic import rather than a dependency of this
 package.
 
-**It drives a tab, not the offscreen document.** Playwright has no page handle for
-an offscreen document — it is not a tab, a frame, or a worker target — so the same
-`offscreen.html` is opened at its `chrome-extension://` URL and driven through
-`window.__host`. Nothing on that page is conditional on being offscreen, so the tab
-boots the same worker over the same pool. The final step closes the tab and goes
-through the popup, which is what covers `chrome.offscreen.createDocument` itself.
+Playwright has no page handle for an offscreen document, so the test drives the
+real one through `chrome.runtime.sendMessage`. It opens `offscreen.html` in a tab
+only as a competing supervisor and asserts that Web Locks refuse it before OPFS.
 
 ## The files
 
@@ -122,7 +120,7 @@ through the popup, which is what covers `chrome.offscreen.createDocument` itself
 | `src/worker/counter.ts` | The actor. The only file a product would actually write. |
 | `src/worker/actor.worker.ts` | The host: raw timers, the sqlite boot order, the container, the alarm scheduler. |
 | `src/offscreen/offscreen.ts` | The supervisor: spawns the worker, holds the session, forwards extension messages. |
-| `src/background.ts` | The service worker: `ensureOffscreen()` and nothing else. |
+| `src/background.ts` | The service worker: offscreen lifecycle and `chrome.alarms` projection. |
 | `src/popup/popup.ts` | Four buttons and an output pane. |
 | `src/protocol.ts` | The types both TypeScript projects compile. It imports nothing. |
 | `../platform-shims/memory-websocket-pair.ts` | A local WebSocket pair for the Agents server path. |
@@ -175,31 +173,19 @@ Two values here are permanent:
 ## One holder per pool
 
 An OPFS SAH pool takes an **exclusive** sync access handle on every one of its
-files, so exactly one context in the extension may hold it. Opening
-`offscreen.html` in a tab while the real offscreen document is live gives the
-loser, immediately:
+files, so exactly one context in the extension may hold it. A Web Lock elects
+that owner before the worker starts. Opening `offscreen.html` in a tab while the
+real offscreen document is live gives the loser, immediately:
 
 ```
-NoModificationAllowedError: Failed to execute 'createSyncAccessHandle' on
-'FileSystemFileHandle': Access Handles cannot be created if there is another open
-Access Handle or Writable stream associated with the same file.
+another extension page owns this Durable Object host
 ```
 
-That is a clean fail-closed, and it is why the e2e closes the tab before driving
-the popup. When you want to debug the page as a tab, close the offscreen document
-first (`chrome.offscreen.closeDocument()` from the service worker's console).
+When you want to debug the page as a tab, close the offscreen document first
+(`chrome.offscreen.closeDocument()` from the service worker's console).
 
 ## Deliberately not shown
 
-- **Projecting the scheduler's wake onto `chrome.alarms`.** As written, an alarm
-  is delivered by a `setTimeout` inside the actor's worker, so it survives the
-  service worker being evicted but not the whole extension being shut down or the
-  browser being closed. The shape a production extension wants is to read the
-  scheduler's current one-shot wait and mirror it onto a `chrome.alarms` alarm
-  that wakes the service worker, which recreates the offscreen document — with the
-  scheduler still authoritative for retry policy and delivery. See the root
-  [README's Alarms section](../../README.md#alarms): a host may project the wait
-  onto a physical timer but must not duplicate delivery policy.
 - **Facets.** `ports.facets` here is the refusing host from the root README's
   quickstart. A host that places facets builds a child container per request; the
   worked example is `conformance/browser/actor.worker.ts`.

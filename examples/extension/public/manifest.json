@@ -11,7 +11,7 @@
     "default_popup": "popup.html",
     "default_title": "Durable Object counter"
   },
-  "permissions": ["offscreen", "storage", "unlimitedStorage"],
+  "permissions": ["alarms", "offscreen", "storage", "unlimitedStorage"],
   "content_security_policy": {
     "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'; worker-src 'self';"
   }

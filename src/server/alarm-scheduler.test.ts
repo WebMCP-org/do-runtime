@@ -176,7 +176,12 @@ async function newDatabase(): Promise<SqlDatabase> {
 
 /** `random()` returns 0 by default, so the jitter is deterministic and zero. */
 async function harness(
-  options: { db?: SqlDatabase; random?: () => number; now?: number } = {},
+  options: {
+    db?: SqlDatabase;
+    random?: () => number;
+    now?: number;
+    projectWake?: (scheduledTime: number | null) => void;
+  } = {},
 ): Promise<Harness> {
   const timer = new FakeTimer(options.now);
   const actor = new FakeActor();
@@ -186,6 +191,7 @@ async function harness(
     db,
     getActor: () => actor,
     random: options.random ?? ((): number => 0),
+    ...(options.projectWake === undefined ? {} : { projectWake: options.projectWake }),
   });
   return {
     scheduler,
@@ -248,6 +254,19 @@ describe("the retry ladder constants", () => {
 // The persistent table
 
 describe("_cf_ALARM", () => {
+  test("projects the earliest durable wake after every public schedule change", async () => {
+    const projected: (number | null)[] = [];
+    const { scheduler } = await harness({ projectWake: (wake) => projected.push(wake) });
+    expect(projected).toEqual([null]);
+
+    scheduler.setAlarm("later", 1_009_000);
+    scheduler.setAlarm("earlier", 1_005_000);
+    scheduler.deleteAlarm("earlier");
+    scheduler.deleteAlarm("later");
+
+    expect(projected).toEqual([null, 1_009_000, 1_005_000, 1_009_000, null]);
+  });
+
   test("refuses an incompatible present table before changing the database", async () => {
     const db = await newDatabase();
     db.exec("CREATE TABLE _cf_ALARM (sentinel INTEGER)", []);

@@ -42,7 +42,13 @@ import {
   type UpgradeWebSocket,
 } from "../../../platform-shims/memory-websocket-pair";
 import { serveMessagePortWebSockets } from "../../../platform-shims/message-port-websocket";
-import type { CounterSnapshot, HostRpc, HostStatus, WorkerBoot } from "../protocol";
+import type {
+  CounterSnapshot,
+  HostRpc,
+  HostStatus,
+  SupervisorRpc,
+  WorkerBoot,
+} from "../protocol";
 import { Counter, type CounterEnv } from "./counter";
 
 // =======================================================================================
@@ -274,6 +280,10 @@ async function installSubstrate(): Promise<Substrate> {
       abandonAlarm: async (scheduledTime: number): Promise<number | null> =>
         await (await placed()).container.abandonAlarm(scheduledTime),
     }),
+    projectWake: (scheduledTime) => {
+      if (peer === undefined) throw new Error("cannot project an alarm before the supervisor connects");
+      return peer.projectWake(scheduledTime) as unknown as Promise<void>;
+    },
   });
 
   return { sql: createSqliteWasmProvider(host, { prefix: ACTOR_PREFIX }), scheduler };
@@ -477,7 +487,7 @@ class HostTarget extends RpcTarget implements HostRpc {
 // capnweb over that port.
 
 /** Held so the session is not collected while the worker lives. */
-let peer: unknown;
+let peer: ReturnType<typeof newRpcSession<SupervisorRpc>> | undefined;
 
 async function connectAgentSocket(url: string): Promise<UpgradeWebSocket> {
   const { entry } = await placed();
@@ -504,6 +514,6 @@ self.addEventListener("message", (event: MessageEvent<WorkerBoot>) => {
   // `newRpcSession` from the package, never capnweb's `newMessagePortRpcSession`
   // directly: it applies the `RpcTarget` prototype graft that makes the class
   // above recognisable to capnweb, immediately before opening the session.
-  peer = newRpcSession(event.data.port, new HostTarget());
+  peer = newRpcSession<SupervisorRpc>(event.data.port, new HostTarget());
   serveMessagePortWebSockets(event.data.sockets, connectAgentSocket);
 });

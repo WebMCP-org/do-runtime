@@ -17,11 +17,11 @@
  * `chrome-extension://<id>/offscreen.html` in a normal tab and it boots the same
  * worker and exposes the same operations on `window.__host`. Nothing here is
  * conditional on being offscreen, so the tab is a real reproduction rather than
- * a mock — and the e2e script drives exactly that, because a Playwright page
- * handle cannot be obtained for an offscreen document.
+ * a mock. The e2e drives the real offscreen host through extension messages and
+ * opens this tab only to prove the Web Lock refuses a duplicate supervisor.
  */
 
-import { newMessagePortRpcSession } from "capnweb";
+import { newMessagePortRpcSession, RpcTarget } from "capnweb";
 import { AgentClient, type AgentClientOptions } from "agents/client";
 import {
   browserStorageSummary,
@@ -36,6 +36,7 @@ import type {
   HostRpc,
   HostOp,
   HostStatus,
+  SupervisorRpc,
   WorkerBoot,
 } from "../protocol";
 
@@ -95,7 +96,17 @@ worker.postMessage(
  * the supervisor. A host with more than one actor would pass a target here, the
  * way the runtime's conformance page does.
  */
-const host = newMessagePortRpcSession<HostRpc>(channel.port1);
+class SupervisorTarget extends RpcTarget implements SupervisorRpc {
+  async projectWake(scheduledTime: number | null): Promise<void> {
+    const response = (await chrome.runtime.sendMessage({
+      type: "project-wake",
+      scheduledTime,
+    } satisfies ExtensionMessage)) as ExtensionResponse;
+    if (!response.ok) throw new Error(response.error);
+  }
+}
+
+const host = newMessagePortRpcSession<HostRpc>(channel.port1, new SupervisorTarget());
 const AgentWebSocket = createMessagePortWebSocket(sockets.port1);
 let agent: AgentClient<unknown, CounterState> | undefined;
 let firstState: Promise<void> | undefined;

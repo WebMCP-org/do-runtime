@@ -270,6 +270,12 @@ export type AlarmSchedulerOptions = {
   db: SqlDatabase;
   getActor: GetActorFn;
   /**
+   * Browser hosts can mirror the earliest durable wake onto a platform watchdog
+   * such as `chrome.alarms`. Workerd needs no such seam because its process owns
+   * the scheduler timer.
+   */
+  projectWake?: (scheduledTime: number | null) => Promise<void> | void;
+  /**
    * ← `std::default_random_engine`, seeded from the monotonic clock
    * (`alarm-scheduler.c++:20-27`). A test seam on a runtime-internal class, not
    * a substrate port: the jitter is the one part of the ladder that is
@@ -288,6 +294,8 @@ type AlarmStatus = "WAITING" | "STARTED" | "FINISHED";
 type ScheduledAlarm = {
   readonly actorId: string;
   readonly scheduledTime: number;
+  /** The timer's actual wake, including persisted retry delay; null while running. */
+  wakeTime: number | null;
   /**
    * ← `kj::Promise<void> task`. It exists upstream so the entry OWNS the task and
    * destroying the entry cancels it; JS has no such destruction, so the two
@@ -338,20 +346,24 @@ export class AlarmScheduler {
   readonly #timer: Timer;
   readonly #random: () => number;
   readonly #getActor: GetActorFn;
+  readonly #projectWake: ((scheduledTime: number | null) => Promise<void> | void) | undefined;
   readonly #db: SqliteDatabase;
   /** ← `kj::HashMap<ActorKey, ScheduledAlarm> alarms`, whose key is one string. */
   readonly #alarms = new Map<string, ScheduledAlarm>();
   /** ← `kj::TaskSet tasks`, which holds a task that has outlived its entry. */
   readonly #tasks = new Set<Promise<void>>();
   #taskFailure: { readonly exception: unknown } | undefined;
+  #projection: Promise<void> = Promise.resolve();
 
   constructor(options: AlarmSchedulerOptions) {
     this.#timer = options.timer;
     this.#random = options.random ?? Math.random;
     this.#getActor = options.getActor;
+    this.#projectWake = options.projectWake;
     this.#db = new SqliteDatabase(options.db);
     ensureInitialized(this.#db);
     this.#loadAlarmsFromDb();
+    this.#projectNextWake();
   }
 
   /**
@@ -395,6 +407,8 @@ export class AlarmScheduler {
       this.#replace(entry, this.#scheduleAlarm(this.#timer.now(), actorId, scheduledTime));
     }
 
+    this.#projectNextWake();
+
     return query.rowsWritten > 0;
   }
 
@@ -407,6 +421,7 @@ export class AlarmScheduler {
     this.#alarms.clear();
     // Wipe the persistent store.
     this.#db.run(STMT.deleteAll);
+    this.#projectNextWake();
   }
 
   /** ← `deleteAlarm` (`alarm-scheduler.c++:136-156`). */
@@ -430,6 +445,8 @@ export class AlarmScheduler {
       }
     }
 
+    this.#projectNextWake();
+
     return query.rowsWritten > 0;
   }
 
@@ -447,7 +464,7 @@ export class AlarmScheduler {
       scheduleRun: (scheduledTime: number | null, _priorTask: Promise<void>): Promise<void> => {
         if (scheduledTime !== null) this.setAlarm(actorId, scheduledTime);
         else this.deleteAlarm(actorId);
-        return Promise.resolve();
+        return this.#projection;
       },
     };
   }
@@ -555,6 +572,7 @@ export class AlarmScheduler {
     const entry: ScheduledAlarm = {
       actorId,
       scheduledTime,
+      wakeTime: null,
       task: undefined,
       cancel: new AbortController(),
       queuedAlarm: null,
@@ -568,6 +586,7 @@ export class AlarmScheduler {
     // the row then holds a future `scheduled_time` and a retry due seconds from now, and honouring
     // the retry would fire the newer alarm early.
     const wake = Math.max(scheduledTime, resumed?.retryTime ?? scheduledTime);
+    entry.wakeTime = wake;
     entry.task = this.#makeAlarmTask(wake - now, entry, scheduledTime);
     return entry;
   }
@@ -646,6 +665,8 @@ export class AlarmScheduler {
     }
 
     entry.status = "STARTED";
+    entry.wakeTime = null;
+    this.#projectNextWake();
     const retryCount = entry.countedRetry;
 
     const retryInfo = await this.#runAlarmGuarded(actorId, scheduledTime, retryCount);
@@ -673,6 +694,7 @@ export class AlarmScheduler {
         // creating a new alarm and overwriting the old one will reset
         // `status` to WAITING and `queuedAlarm` to null
         this.#replace(entry, this.#scheduleAlarm(this.#timer.now(), actorId, queued));
+        this.#projectNextWake();
         return;
       }
 
@@ -714,16 +736,19 @@ export class AlarmScheduler {
         // write. If it throws, the outer catch records it and the mark stays set, which a later
         // scheduler reads as an interrupted delivery: the alarm keeps its counters and is retried,
         // rather than being armed here in memory the process is about to lose.
+        const retryTime = this.#timer.now() + retryDelay;
         this.#db.run(
           STMT.saveRetry,
-          this.#timer.now() + retryDelay,
+          retryTime,
           entry.backoff,
           entry.countedRetry,
           entry.previousRetryCountedAgainstLimit ? 1 : 0,
           actorId,
         );
 
+        entry.wakeTime = retryTime;
         entry.task = this.#makeAlarmTask(retryDelay, entry, scheduledTime);
+        this.#projectNextWake();
       } else {
         if (entry.queuedAlarm !== null) {
           throw new Error("An alarm that will not retry still has an alarm queued behind it.");
@@ -781,6 +806,18 @@ export class AlarmScheduler {
   #jitterMsForDelay(delayMs: number): number {
     const max = Math.floor(RETRY_JITTER_FACTOR * delayMs);
     return Math.min(max, Math.floor(this.#random() * (max + 1)));
+  }
+
+  /** The earliest wake a browser watchdog must keep alive across process death. */
+  #projectNextWake(): void {
+    if (this.#projectWake === undefined) return;
+    let earliest: number | null = null;
+    for (const entry of this.#alarms.values()) {
+      const wake = entry.status === "STARTED" ? entry.queuedAlarm : entry.wakeTime;
+      if (wake !== null && (earliest === null || wake < earliest)) earliest = wake;
+    }
+    this.#projection = Promise.resolve(this.#projectWake(earliest));
+    void this.#projection.catch((exception: unknown) => this.#taskFailed(exception));
   }
 
   /** ← `tasks.add`, whose failures reach `taskFailed`. */

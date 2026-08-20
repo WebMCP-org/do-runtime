@@ -227,19 +227,36 @@ async function main() {
     // ---------------------------------------------------------------------
     // 2. A real alarm: armed in the actor's storage, delivered by the
     //    AlarmScheduler's own database in the same worker.
-    const armedFor = await op(popup, "armWake", [2000]);
+    const armedFor = await op(popup, "armWake", [5000]);
     if (typeof armedFor !== "number") fail("armWake answers a scheduled time", String(armedFor));
     else pass(`armWake answers a scheduled time (${armedFor - Date.now()}ms out)`);
+
+    const projectedWake = await worker.evaluate(async () => {
+      if (chrome.alarms === undefined) return null;
+      return (await chrome.alarms.get("do-runtime-wake"))?.scheduledTime ?? null;
+    });
+    if (typeof projectedWake !== "number") {
+      fail("the durable wake is projected onto chrome.alarms", String(projectedWake));
+    } else {
+      pass(`the durable wake is projected onto chrome.alarms (${projectedWake - Date.now()}ms out)`);
+    }
+
+    await worker.evaluate(async () => chrome.offscreen.closeDocument());
+    pass("the offscreen host was removed before the durable wake");
 
     const deadline = Date.now() + ALARM_TIMEOUT_MS;
     let alarms = 0;
     while (Date.now() < deadline) {
-      snapshot = await op(popup, "snapshot");
-      alarms = snapshot.events.filter((event) => event.kind === "sdk-schedule").length;
-      if (alarms > 0) break;
+      try {
+        snapshot = await op(popup, "snapshot");
+        alarms = snapshot.events.filter((event) => event.kind === "sdk-schedule").length;
+        if (alarms > 0) break;
+      } catch {
+        // Expected until chrome.alarms wakes the service worker and it recreates the host.
+      }
       await new Promise((resolve) => setTimeout(resolve, 250));
     }
-    check("the alarm was delivered", alarms, 1);
+    check("chrome.alarms recreated the host and delivered the alarm", alarms, 1);
     check("the alarm handler's write landed", snapshot.value, 13);
 
     // ---------------------------------------------------------------------
