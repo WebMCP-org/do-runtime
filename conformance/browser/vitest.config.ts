@@ -26,13 +26,6 @@ export default defineConfig({
    * time.
    */
   optimizeDeps: { include: ["capnweb", "@sqlite.org/sqlite-wasm"] },
-  server: {
-    headers: {
-      // sqlite-wasm's SAH pool needs cross-origin isolation.
-      "Cross-Origin-Opener-Policy": "same-origin",
-      "Cross-Origin-Embedder-Policy": "require-corp",
-    },
-  },
   test: {
     name: "browser",
     root: packageRoot,

@@ -7,10 +7,12 @@
  * reach them either. The baseline stays exactly what it was: unit 755,
  * workerd 38/38, node 38/38, browser 41/41.
  *
- * Everything below the `include` is copied from `conformance/browser/vitest.config.ts`
- * because the benchmark needs the same platform the lane needs — cross-origin
- * isolation for the SAH pool, and named `optimizeDeps` so the first worker to
- * import the driver does not trigger a mid-run re-optimisation.
+ * `optimizeDeps` is copied from `conformance/browser/vitest.config.ts` — named
+ * so the first worker to import the driver does not trigger a mid-run
+ * re-optimisation. The COOP/COEP headers are the benchmark's own: the SAH pool
+ * runs fine without cross-origin isolation (measured 2026-08-20 — plain-HTTP
+ * page, headless Chromium, pool installs and round-trips), but an isolated page
+ * gets 5 µs `performance.now()` resolution instead of 100 µs.
  */
 
 import { fileURLToPath } from "node:url";
@@ -23,7 +25,7 @@ export default defineConfig({
   optimizeDeps: { include: ["@sqlite.org/sqlite-wasm"] },
   server: {
     headers: {
-      // The SAH pool needs cross-origin isolation. It is also what gives
+      // Not for the SAH pool — it needs no isolation. Isolation is what gives
       // `performance.now()` 5 µs resolution instead of 100 µs, which the report
       // prints as its clock floor.
       "Cross-Origin-Opener-Policy": "same-origin",
