@@ -137,10 +137,10 @@ may select an actor across an `await`.
 
 The public storage surface is the Workers TypeScript contract. Runtime
 internals use a small synchronous `SqlDatabase` seam, with `node:sqlite` and
-sqlite-wasm backends. JSON-incompatible values are rejected before write
-rather than stored lossily. A present browser SAH pool accepts only current
-actor/facet logical database names and SQLite-owned companions; an unknown
-name fails startup.
+sqlite-wasm backends. A versioned browser-safe encoding preserves structured-
+clone value semantics and remains backward-readable with legacy JSON rows. A
+present browser SAH pool accepts only current actor/facet logical database names
+and SQLite-owned companions; an unknown name fails startup.
 
 ### §2.5 Fail-closed substrate boundaries
 
@@ -198,8 +198,9 @@ owns only placement and physical storage operations.
     facet-placement or sandbox-policy abstraction.
 16. Port workerd behavior first and record every intentional semantic or
     substrate divergence in reference docs and conformance tests.
-17. Fail closed where this substrate cannot reproduce V8 value serialization
-    or SQLite authorizer input.
+17. Preserve workerd's public structured-clone value semantics without
+    depending on V8's private wire bytes, and fail closed where SQLite
+    authorizer input is unavailable.
 18. Reconcile Workers and Cap'n Web `RpcTarget` identity inside
     `newRpcSession()` before every session.
 
@@ -209,7 +210,7 @@ owns only placement and physical storage operations.
 | --- | --- |
 | No hibernation while retaining sockets | Hibernatable WebSocket APIs throw; applications use memory-only sockets and reconnect |
 | JavaScript cannot terminate the currently executing slice | `abort()` breaks later storage and entry, but the calling method can still return |
-| No common V8 byte serializer across Node and the browser | Values JSON cannot faithfully round-trip are rejected at `put()` |
+| No common V8 byte serializer across Node and the browser | A versioned browser-safe structured-clone encoding preserves the public value types and reads legacy JSON rows |
 | The SQLite backends expose no authorizer callbacks | Reserved `_cf_` identifiers are detected from tokenized statement text and may reject more than workerd |
 | `node:sqlite` exposes no `sqlite3_limit()` | Bound and returned strings and blobs enforce workerd's 4 MiB limit; SQL-computed values that are never returned may exceed it. The browser backend sets the native limit. |
 | A response BYOB reader cannot be re-gated after `read(view)` | BYOB readers throw; callers use a default reader or `arrayBuffer()` |

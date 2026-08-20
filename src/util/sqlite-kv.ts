@@ -7,10 +7,9 @@
  * application is allowed to perform direct SQL queries, we can block it from
  * accessing any table prefixed with `_cf_`.
  *
- * This layer is bytes in, bytes out, exactly as upstream is. The JSON encoding
- * that the package README records as a divergence from real Durable Object
- * storage happens above it, in `api/actor-state.ts`, which is where upstream
- * V8-serializes.
+ * This layer is bytes in, bytes out, exactly as upstream is. The structured
+ * value encoding happens above it, in `api/actor-state.ts`, which is where
+ * upstream V8-serializes.
  *
  * Three translations, each of them forced:
  *

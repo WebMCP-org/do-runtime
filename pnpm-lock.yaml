@@ -8,6 +8,9 @@ importers:
 
   .:
     dependencies:
+      '@ungap/structured-clone':
+        specifier: 1.3.3
+        version: 1.3.3
       capnweb:
         specifier: 0.10.0
         version: 0.10.0
@@ -24,6 +27,9 @@ importers:
       '@types/node':
         specifier: ^26.1.2
         version: 26.2.0
+      '@types/ungap__structured-clone':
+        specifier: 1.2.0
+        version: 1.2.0
       '@vitest/browser-playwright':
         specifier: 4.1.10
         version: 4.1.10(playwright@1.61.1)(vite@8.2.1(@types/node@26.2.0)(esbuild@0.28.1)(yaml@2.9.0))(vitest@4.1.10)
@@ -888,6 +894,12 @@ packages:
 
   '@types/node@26.2.0':
     resolution: {integrity: sha512-5IviulTZeRNp2vAJ514cc/HUlY5nZ9fCbq9DMyC52BrhFZACo3nI0R7qBxhQmo/d27NFe96ur/b7Wwxklda+kg==}
+
+  '@types/ungap__structured-clone@1.2.0':
+    resolution: {integrity: sha512-ZoaihZNLeZSxESbk9PUAPZOlSpcKx81I1+4emtULDVmBLkYutTcMlCj2K9VNlf9EWODxdO6gkAqEaLorXwZQVA==}
+
+  '@ungap/structured-clone@1.3.3':
+    resolution: {integrity: sha512-60YRaenCQcVjYEKOcG824+DRGGIQ3VKErcBoAEDJZz5bKIs2ZG+X/H9Nk+Q6EVkwJk5QNApxbrc5QtBSwtrXAg==}
 
   '@vitest/browser-playwright@4.1.10':
     resolution: {integrity: sha512-nMoXGEiRpT7m3W7NsbvrM2aKNwiNHZf+zEpUCvMteGjZFvfT96Q9fh7QyB98dvDWXiKvrLxA7bJ1mCOOv+JQPw==}
@@ -2516,6 +2528,10 @@ snapshots:
   '@types/node@26.2.0':
     dependencies:
       undici-types: 8.3.0
+
+  '@types/ungap__structured-clone@1.2.0': {}
+
+  '@ungap/structured-clone@1.3.3': {}
 
   '@vitest/browser-playwright@4.1.10(playwright@1.61.1)(vite@8.2.1(@types/node@26.2.0)(esbuild@0.28.1)(yaml@2.9.0))(vitest@4.1.10)':
     dependencies:

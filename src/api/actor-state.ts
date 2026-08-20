@@ -42,8 +42,9 @@
  *
  * Not ported, because the substrate has no equivalent: Hibernatable WebSockets,
  * which is the whole reason `DurableObjectState`'s eight WebSocket methods are
- * named throwing stubs; `serializeV8Value`/`deserializeV8Value`, replaced by the
- * JSON codec this package already records as a divergence; the billing counters
+ * named throwing stubs; V8's private wire bytes, replaced by a browser-safe
+ * structured-clone encoding with the same public value semantics; the billing
+ * counters
  * (`billingUnits`, `ActorObserver`, `updateStorageWriteUnit`) and the trace
  * spans, both already absent throughout; `enableSql`, a workerd namespace option
  * that exists to simulate a non-SQLite Durable Object; and `ReplicaActorOutgoingFactory`,
@@ -53,6 +54,10 @@
  * docs/decisions.md.
  */
 
+import {
+  deserialize as deserializeStructuredClone,
+  serialize as serializeStructuredClone,
+} from "@ungap/structured-clone";
 import type {
   ActorCacheInterface,
   ActorCacheOps,
@@ -136,84 +141,21 @@ const MAX_CODE_UNIT = 0xffff;
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
+/** A byte JSON could never begin with, `DO`, and the local codec version. */
+const VALUE_CODEC_HEADER = new Uint8Array([0, 0x44, 0x4f, 1]);
 
 /**
- * ← `serializeV8Value`, with JSON where upstream has the V8 serializer at wire
- * version 15.
- *
- * **Decision 16: the types JSON cannot round-trip are refused, not stored
- * wrong.** `Date`, `Map`, `Set`, `ArrayBuffer` and typed arrays survive real
- * Durable Object storage; through JSON a `Date` comes back as an ISO string and
- * the rest come back as `{}`. Both are silent — the failure surfaces later, at a
- * `.getTime()` three layers from the write, with nothing pointing back to it.
- * There is no browser equivalent of V8's serializer to port onto
- * (`structuredClone` copies values without producing bytes, and `v8.serialize`
- * is Node-only, which would make the two lanes disagree), so the only
- * fail-closed move available is to refuse at the write.
- *
- * Nested occurrences count, and are the likelier real case: a `Date` inside a
- * config object is what corrupts most quietly.
+ * ← `serializeV8Value`. The wire bytes differ because V8's serializer is not
+ * available in browsers; the public structured-clone value semantics do not.
+ * The short header keeps the new representation unambiguous while old JSON rows
+ * remain readable.
  */
-export function serializeValue(key: string, value: unknown): Uint8Array {
-  requireRoundTrippable(key, value);
-  const json = JSON.stringify(value);
-  if (json === undefined) {
-    throw new Error("Durable Object storage cannot serialize this value.");
-  }
-  return textEncoder.encode(json);
-}
-
-/**
- * The types decision 16 refuses: everything the V8 serializer round-trips and
- * JSON does not. `Date` returns as an ISO string; the rest all return as `{}`,
- * because none of what makes them what they are is an own enumerable property.
- *
- * Each is named individually rather than lumped together, because the name is
- * the fix — a caller told "cannot round-trip a Uint8Array" knows what to change,
- * and one told "unsupported value" does not.
- */
-function unsupportedType(value: object): string | undefined {
-  if (value instanceof Date) return "Date";
-  if (value instanceof Map) return "Map";
-  if (value instanceof Set) return "Set";
-  if (value instanceof ArrayBuffer) return "ArrayBuffer";
-  if (value instanceof RegExp) return "RegExp";
-  // `name` rather than a fixed string, so a TypeError says TypeError.
-  if (value instanceof Error) return value.name;
-  // Uint8Array, DataView and the rest.
-  if (ArrayBuffer.isView(value)) return Object.prototype.toString.call(value).slice(8, -1);
-  return undefined;
-}
-
-function requireRoundTrippable(key: string, root: unknown): void {
-  // A cycle is left for `JSON.stringify` to report, which it does loudly; this set exists only so
-  // the walk terminates before reaching it.
-  const seen = new Set<object>();
-
-  const visit = (value: unknown, path: string): void => {
-    if (value === null || typeof value !== "object") return;
-
-    const unsupported = unsupportedType(value);
-    if (unsupported !== undefined) {
-      throw new TypeError(
-        `Durable Object storage cannot round-trip a ${unsupported}: key = ${key}, at ${path}. ` +
-          "Values are stored as JSON in this runtime, so it would come back as something else. " +
-          "Store a JSON-representable form instead.",
-      );
-    }
-
-    if (seen.has(value)) return;
-    seen.add(value);
-
-    if (Array.isArray(value)) {
-      value.forEach((entry, index) => visit(entry, `${path}[${index}]`));
-      return;
-    }
-    // Own enumerable properties, which is exactly what `JSON.stringify` will serialize.
-    for (const [name, entry] of Object.entries(value)) visit(entry, `${path}.${name}`);
-  };
-
-  visit(root, "<value>");
+export function serializeValue(_key: string, value: unknown): Uint8Array {
+  const body = textEncoder.encode(JSON.stringify(serializeStructuredClone(value)));
+  const encoded = new Uint8Array(VALUE_CODEC_HEADER.byteLength + body.byteLength);
+  encoded.set(VALUE_CODEC_HEADER);
+  encoded.set(body, VALUE_CODEC_HEADER.byteLength);
+  return encoded;
 }
 
 /**
@@ -222,16 +164,20 @@ function requireRoundTrippable(key: string, root: unknown): void {
  * Upstream logs "the key (to help find the data in the database if it hasn't
  * been deleted), the length of the value, and the first three bytes of the value
  * (which is just the v8-internal version header and the tag that indicates the
- * type of the value, but not its contents)". The first three bytes of a JSON
- * value ARE its contents, so they are not included; the reason upstream can
- * include them does not survive the codec change.
+ * type of the value, but not its contents)". Our four-byte header carries only
+ * a marker and version for the same reason.
  */
 export function deserializeValue(key: string, buffer: Uint8Array): unknown {
   if (buffer.byteLength === 0) {
     throw new Error(`unexpectedly empty value buffer; key = ${key}`);
   }
   try {
-    return JSON.parse(textDecoder.decode(buffer)) as unknown;
+    const structured = VALUE_CODEC_HEADER.every((byte, index) => buffer[index] === byte);
+    const bytes = structured ? buffer.subarray(VALUE_CODEC_HEADER.byteLength) : buffer;
+    const parsed = JSON.parse(textDecoder.decode(bytes)) as unknown;
+    return structured
+      ? deserializeStructuredClone(parsed as ReturnType<typeof serializeStructuredClone>)
+      : parsed;
   } catch (exception) {
     throw new Error(
       "actor storage deserialization failed: failed to deserialize stored value; " +

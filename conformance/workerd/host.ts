@@ -44,7 +44,6 @@ export const host: ConformanceHost = {
     "hibernation",
     "bookmarks",
     "sql-ingest",
-    "v8-value-codec",
   ]),
   spawn: async (name = `probe-${probeCounter++}`) => actor(name),
   respawn: async (a) => actor(a.name),

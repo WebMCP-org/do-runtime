@@ -25,7 +25,8 @@ await build({
       formats: ["es"],
     },
     rollupOptions: {
-      external: (id) => id === "capnweb" || id.startsWith("node:"),
+      external: (id) =>
+        id === "capnweb" || id === "@ungap/structured-clone" || id.startsWith("node:"),
       output: {
         entryFileNames: "[name].js",
         chunkFileNames: "chunks/[name]-[hash].js",

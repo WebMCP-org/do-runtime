@@ -35,7 +35,7 @@
 /** ← `ActorCacheOps::Key`. "Keys are text for now." */
 export type Key = string;
 
-/** ← `ActorCacheOps::Value`. Values are raw bytes; the JSON encoding is `api/`'s. */
+/** ← `ActorCacheOps::Value`. Values are raw bytes; the value encoding is `api/`'s. */
 export type Value = Uint8Array;
 
 /** ← `ActorCacheOps::KeyValuePair`. */

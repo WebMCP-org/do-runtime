@@ -22,15 +22,7 @@ export type Capability =
   /** Substrate boundary: sqlite-wasm lacks the storage capability. */
   | "bookmarks"
   /** Substrate boundary: same. */
-  | "sql-ingest"
-  /**
-   * Not a substrate boundary but a deliberate semantic divergence (decision 16):
-   * workerd V8-serializes stored values, so `Date`/`Map`/`Set`/`ArrayBuffer`
-   * round-trip. This runtime stores JSON and REFUSES them at `put()` rather than
-   * returning them wrong. Both halves are asserted, because a divergence the
-   * suite is silent about is one that gets mistaken for a bug later.
-   */
-  | "v8-value-codec";
+  | "sql-ingest";
 
 export type LaneName = "workerd" | "node" | "browser";
 

@@ -188,7 +188,7 @@ The lifecycle:
 
 ### Storage
 
-`SqlDatabaseProvider.open(name)` is the only seam. The runtime owns database names, tables, transactions, reset behaviour, and facet metadata; the host chooses the physical provider and prefix. Stored KV values are JSON-compatible only — V8-only types are rejected at `put()` rather than stored lossily. `_cf_` names are reserved to the runtime.
+`SqlDatabaseProvider.open(name)` is the only seam. The runtime owns database names, tables, transactions, reset behaviour, and facet metadata; the host chooses the physical provider and prefix. Stored KV values use structured-clone semantics across workerd, Node, and the browser; existing JSON rows remain readable. `_cf_` names are reserved to the runtime.
 
 The browser provider takes an already-installed OPFS SAH pool (`installOpfsSAHPoolVfs`; sync access handles in a dedicated worker — no cross-origin isolation or `SharedArrayBuffer` needed). One pool per worker; the root and each local facet get separate prefixes inside it. The Node provider uses in-memory databases by default and a directory when asked.
 
@@ -217,7 +217,7 @@ The browser cannot reproduce every workerd facility. Where it cannot, the runtim
 | Actor-class stub serialization | Throws; needs workerd's serializer and channel tokens. |
 | Module-scope `waitUntil`, `cache`, `abortIsolate`, Workers RPC stub constructors | Named `cloudflare:workers` boundaries throw. |
 | `DurableObjectState.abort()` | Breaks later storage and re-entry; cannot synchronously terminate the calling JavaScript slice. |
-| Stored values | JSON-compatible only; V8-only types are rejected at write time. |
+| Stored value wire bytes | Browser-safe versioned structured-clone encoding rather than V8's private format; public value types align and legacy JSON rows remain readable. |
 | Reserved SQL names | `_cf_` detected from tokenized SQL text, which can reject more than workerd's authorizer. |
 | Node SQLite length limit | Bound and returned strings and blobs are capped at 4 MiB; `node:sqlite` cannot cap an unreturned SQL-computed value. The browser backend uses SQLite's native limit. |
 | Response BYOB readers | Refused; their continuation cannot be re-gated. Use a default reader or `arrayBuffer()`. |

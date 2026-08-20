@@ -702,12 +702,8 @@ export class Probe extends DurableObject<Record<string, unknown>> {
     };
   }
 
-  // -- §2.4 / decision 16 the value codec ------------------------------------
-  /**
-   * workerd V8-serializes stored values, so all four come back as themselves.
-   * `@mcp-b/do-runtime` stores JSON and refuses them at `put()` rather than
-   * returning a `Date` as a string and the rest as `{}`.
-   */
+  // -- §2.4 the value codec --------------------------------------------------
+  /** Rich values retain the same public structured-clone types in every lane. */
   async richValueRoundTrip(): Promise<Record<string, string>> {
     await this.ctx.storage.put("codec", {
       when: new Date(0),

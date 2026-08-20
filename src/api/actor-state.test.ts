@@ -6,10 +6,9 @@
  *
  * The six `KJ_TEST`s are all about the V8 value codec — the wire version tag,
  * backwards-compatible deserialization, and the error a corrupt row produces.
- * Five of them assert facts about V8's serializer that do not survive the
- * recorded JSON-codec divergence and have nothing to stand in for them; the
- * sixth does, and it is ported: a value that will not decode reports the key
- * rather than returning something wrong.
+ * This port uses a browser-safe structured-clone wire format instead of V8's
+ * private bytes, while pinning the same public value semantics and corrupt-row
+ * failure.
  *
  * The JS suites translate almost line for line, because they are written
  * against `ctx.storage` rather than against workerd internals. What they cannot
@@ -541,7 +540,7 @@ apiTest("a committed transaction refuses further operations", async ({ storage }
 });
 
 // =======================================================================================
-// The value codec — a recorded divergence, so the assertions pin it in both directions
+// The value codec
 
 apiTest("JSON-representable values round-trip", async ({ storage }) => {
   const value = { n: 1, s: "two", b: true, nil: null, arr: [1, 2], nested: { deep: true } };
@@ -549,74 +548,52 @@ apiTest("JSON-representable values round-trip", async ({ storage }) => {
   expect(await storage.get("k")).toEqual(value);
 });
 
-/**
- * Decision 16. Real Durable Object storage V8-serializes these and hands them back unchanged;
- * through JSON a `Date` returns as an ISO string and the rest as `{}`. Both are silent, so they
- * are refused at the write instead — the conformance suite asserts both halves out loud.
- */
-apiTest("every type JSON cannot round-trip is refused, naming the key and the type", ({
-  storage,
-}) => {
-  const cases: [label: string, value: unknown][] = [
-    ["Date", new Date(0)],
-    ["Map", new Map([["a", 1]])],
-    ["Set", new Set([1])],
-    ["ArrayBuffer", new ArrayBuffer(4)],
-    ["Uint8Array", new Uint8Array([1, 2, 3])],
-    ["DataView", new DataView(new ArrayBuffer(4))],
-    // `RegExp` and `Error` have the same silent shape as the rest — JSON turns both into `{}`,
-    // because nothing that makes them what they are is an own enumerable property.
-    ["RegExp", /pattern/g],
-    ["Error", new Error("boom")],
-    // Reported by `name`, so the message says what to fix rather than just "Error".
-    ["TypeError", new TypeError("boom")],
-  ];
-  for (const [label, value] of cases) {
-    expect(() => storage.put("k", value), label).toThrow(
-      `Durable Object storage cannot round-trip a ${label}: key = k, at <value>.`,
-    );
-  }
+apiTest("structured-clone values round-trip with identity and cycles", async ({ storage }) => {
+  const value: Record<string, unknown> = {
+    when: new Date(0),
+    map: new Map([["a", 1]]),
+    set: new Set([1]),
+    bytes: new Uint8Array([1, 2, 3]).buffer,
+    typed: new Uint16Array([4, 5]),
+    view: new DataView(new Uint8Array([6, 7]).buffer),
+    re: /pattern/gi,
+    err: new TypeError("boom"),
+    big: 2n,
+  };
+  value.self = value;
+
+  await storage.put("k", value);
+  const read = (await storage.get("k")) as typeof value;
+  expect(read.when).toEqual(new Date(0));
+  expect(read.map).toEqual(new Map([["a", 1]]));
+  expect(read.set).toEqual(new Set([1]));
+  expect(new Uint8Array(read.bytes as ArrayBuffer)).toEqual(new Uint8Array([1, 2, 3]));
+  expect(read.typed).toEqual(new Uint16Array([4, 5]));
+  expect(new Uint8Array((read.view as DataView).buffer)).toEqual(new Uint8Array([6, 7]));
+  expect(read.re).toEqual(/pattern/gi);
+  expect(read.err).toEqual(new TypeError("boom"));
+  expect(read.big).toBe(2n);
+  expect(read.self).toBe(read);
 });
 
-apiTest("the shape that makes RegExp and Error worth refusing", ({ storage }) => {
-  // Both survive real Durable Object storage; through JSON they are indistinguishable from `{}`,
-  // so a read returns a plausible-looking empty object rather than failing.
-  expect(JSON.stringify({ re: /x/, err: new Error("boom") })).toBe('{"re":{},"err":{}}');
-  expect(() => storage.put("k", { retry: { cause: new Error("boom") } })).toThrow(
-    "Durable Object storage cannot round-trip a Error: key = k, at <value>.retry.cause.",
-  );
+apiTest("kv.put uses the same rich-value codec", ({ storage }) => {
+  storage.kv.put("k", { at: new Date(0) });
+  expect(storage.kv.get("k")).toEqual({ at: new Date(0) });
 });
 
-apiTest("a nested unsupported value is refused, naming its path", ({ storage }) => {
-  expect(() => storage.put("config", { retry: { after: new Date(0) } })).toThrow(
-    "Durable Object storage cannot round-trip a Date: key = config, at <value>.retry.after.",
-  );
-  expect(() => storage.put("list", [{ when: new Date(0) }])).toThrow(
-    "Durable Object storage cannot round-trip a Date: key = list, at <value>[0].when.",
-  );
-});
-
-apiTest("an entries-object put names the offending entry's own key", ({ storage }) => {
-  expect(() => storage.put({ fine: 1, broken: new Date(0) })).toThrow(
-    "Durable Object storage cannot round-trip a Date: key = broken, at <value>.",
-  );
-});
-
-apiTest("kv.put refuses them through the same codec", ({ storage }) => {
-  expect(() => storage.kv.put("k", { at: new Date(0) })).toThrow(
-    "Durable Object storage cannot round-trip a Date: key = k, at <value>.at.",
-  );
-});
-
-apiTest("nothing is written when a value is refused", async ({ storage }) => {
-  expect(() => storage.put("k", new Date(0))).toThrow();
+apiTest("values rejected by structured clone are not written", async ({ storage }) => {
+  expect(() => storage.put("k", () => {})).toThrow("unable to serialize function");
   expect(await storage.get("k")).toBeUndefined();
 });
 
-apiTest("a value JSON cannot represent is refused rather than stored wrong", ({ storage }) => {
-  const cyclic: { self?: unknown } = {};
-  cyclic.self = cyclic;
-  expect(() => storage.put("k", cyclic)).toThrow();
+apiTest("legacy JSON rows remain readable", async ({ storage, db }) => {
+  await storage.put("k", 1);
+  db.run(
+    "UPDATE _cf_KV SET value = ? WHERE key = ?",
+    new TextEncoder().encode('{"from":"json"}'),
+    "k",
+  );
+  expect(await storage.get("k")).toEqual({ from: "json" });
 });
 
 /**

@@ -58,11 +58,13 @@
     "check:oracle": "node scripts/check-workerd-oracle.mjs",
     "check:package": "pnpm build:package && node scripts/check-package.mjs",
     "build:package": "node scripts/build-package.mjs && tsc -p tsconfig.publish.json",
+    "prepare": "pnpm build:package",
     "prepack": "pnpm build:package",
     "bench:node": "vitest run --config conformance/bench/vitest.node.config.ts",
     "bench:browser": "vitest run --config conformance/bench/vitest.browser.config.ts"
   },
   "dependencies": {
+    "@ungap/structured-clone": "1.3.3",
     "capnweb": "0.10.0"
   },
   "devDependencies": {
@@ -70,6 +72,7 @@
     "@cloudflare/workers-types": "4.20260702.1",
     "@sqlite.org/sqlite-wasm": "3.53.0-build1",
     "@types/node": "^26.1.2",
+    "@types/ungap__structured-clone": "1.2.0",
     "@vitest/browser-playwright": "4.1.10",
     "playwright": "1.61.1",
     "typescript": "^5.9.3",
