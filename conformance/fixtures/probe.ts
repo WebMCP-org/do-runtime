@@ -25,6 +25,11 @@ export class Child extends DurableObject {
     return n;
   }
   async slow(ms) { await scheduler.wait(ms); return "child-done"; }
+  async scopedWait(value, ms) {
+    await scheduler.wait(ms);
+    await this.ctx.storage.put("afterWait", value);
+    return await this.ctx.storage.get("afterWait");
+  }
   async callBack(parent) { return await parent.ping(); }
   async grandchildLocalBump() {
     const g = this.ctx.facets.get("g", () => ({ class: this.ctx.exports.Child }));
@@ -312,6 +317,12 @@ export class Probe extends DurableObject<Record<string, unknown>> {
     const a = (await this.#child("bump").bump()) as number;
     const b = (await this.#child("bump").bump()) as number;
     return [a, b];
+  }
+  async facetScopesSurviveOverlappingWaits(): Promise<unknown[]> {
+    return await Promise.all([
+      this.#child("scope-a").scopedWait("a" as never, 30 as never),
+      this.#child("scope-b").scopedWait("b" as never, 10 as never),
+    ]);
   }
   /** Measured: abort kills the instance, storage survives. */
   async facetSurvivesAbort(): Promise<number[]> {

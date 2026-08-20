@@ -13,6 +13,11 @@ it("§1.10 a facet has its own durable storage", async () => {
   expect(await probe.call("facetBump")).toEqual([1, 2]);
 });
 
+it("§1.10 overlapping facets resume async work in their own contexts", async () => {
+  const probe = await host.spawn("facet-async-context");
+  expect(await probe.call("facetScopesSurviveOverlappingWaits")).toEqual(["a", "b"]);
+});
+
 it("§1.10 facets.abort kills the instance and leaves the storage", async () => {
   const probe = await host.spawn("facet-abort");
   expect(await probe.call("facetSurvivesAbort")).toEqual([1, 2]);
