@@ -22,6 +22,7 @@
 import {
   AlarmScheduler,
   createActorContainer,
+  gateRequestBody,
   installActorScope,
   newRpcSession,
   noFacets,
@@ -33,6 +34,7 @@ import {
 } from "@mcp-b/do-runtime";
 import { createSqliteWasmProvider, type SqliteWasmHost } from "@mcp-b/do-runtime/backends/sqlite-wasm";
 import sqlite3InitModule from "@sqlite.org/sqlite-wasm";
+import { routeAgentEmail } from "agents";
 import { RpcTarget } from "cloudflare:workers";
 import {
   installMemoryWebSocketPair,
@@ -372,12 +374,73 @@ async function placed(): Promise<Live> {
  * is not.
  */
 class HostTarget extends RpcTarget implements HostRpc {
+  async email(subject: string, body: string): Promise<void> {
+    const { entry } = await placed();
+    const bytes = new TextEncoder().encode(
+      `From: sender@example.com\r\nTo: counter@example.com\r\nSubject: ${subject}\r\n\r\n${body}`,
+    );
+    const message: ForwardableEmailMessage = {
+      from: "sender@example.com",
+      to: "counter@example.com",
+      headers: new Headers({ Subject: subject }),
+      rawSize: bytes.byteLength,
+      raw: new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(bytes);
+          controller.close();
+        },
+      }),
+      setReject: () => {},
+      forward: async () => {
+        throw new Error("Outbound email is not available in this browser host");
+      },
+      reply: async () => {
+        throw new Error("Outbound email is not available in this browser host");
+      },
+    };
+    const namespace = {
+      idFromName: () => ({}) as DurableObjectId,
+      get: () => entry as unknown as DurableObjectStub<Counter>,
+    } as unknown as DurableObjectNamespace<Counter>;
+    await routeAgentEmail(message, { Counter: namespace }, {
+      resolver: async () => ({ agentName: "Counter", agentId: ACTOR_ID }),
+    });
+  }
+
   async increment(): Promise<number> {
     return await (await placed()).entry.increment();
   }
 
   async enqueueIncrement(amount: number): Promise<string> {
     return await (await placed()).entry.enqueueIncrement(amount);
+  }
+
+  async mcp(method: string, params: Record<string, unknown>): Promise<unknown> {
+    const { container, entry } = await placed();
+    const response = await entry.fetch(
+      gateRequestBody(
+        container,
+        new Request("http://actor.invalid/mcp", {
+          method: "POST",
+          headers: {
+            Accept: "application/json, text/event-stream",
+            "Content-Type": "application/json",
+            "MCP-Protocol-Version": "2025-06-18",
+          },
+          body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+        }),
+      ),
+    );
+    const body = await response.text();
+    const data = response.headers.get("content-type")?.includes("text/event-stream")
+      ? body
+          .split("\n")
+          .find((line) => line.startsWith("data: "))
+          ?.slice(6)
+      : body;
+    const result: unknown = JSON.parse(data ?? "null");
+    if (!response.ok) throw new Error(`MCP request failed with ${response.status}: ${JSON.stringify(result)}`);
+    return result;
   }
 
   async snapshot(): Promise<CounterSnapshot> {

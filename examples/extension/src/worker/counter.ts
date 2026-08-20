@@ -18,7 +18,10 @@
  * the runtime type the same thing, instead of needing a cast at the call site.
  */
 
+import { McpServer } from "@modelcontextprotocol/server";
 import { Agent, callable, type StreamingResponse } from "agents";
+import type { AgentEmail } from "agents/email";
+import { createMcpHandler } from "agents/mcp/server";
 
 /** What `snapshot()` hands back. JSON-compatible: it crosses two RPC hops. */
 export type CounterSnapshot = {
@@ -85,6 +88,25 @@ export class Counter extends Agent<CounterEnv, CounterState> {
     stream.send(this.state.value);
     stream.send(this.state.value + 1);
     stream.end("done");
+  }
+
+  override async onRequest(request: Request): Promise<Response> {
+    const value = this.state.value;
+    const handler = createMcpHandler(() => {
+      const server = new McpServer({ name: "Counter", version: "1.0.0" });
+      server.registerTool(
+        "counter-value",
+        { description: "Read the current counter value" },
+        async () => ({ content: [{ type: "text", text: String(value) }] }),
+      );
+      return server;
+    });
+    return await handler.fetch(request);
+  }
+
+  async onEmail(email: AgentEmail): Promise<void> {
+    this.#schema();
+    this.#record(`sdk-email:${email.headers.get("subject") ?? "(no subject)"}`);
   }
 
   async enqueueIncrement(amount: number): Promise<string> {

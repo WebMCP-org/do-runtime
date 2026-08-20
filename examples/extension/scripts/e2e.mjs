@@ -172,6 +172,23 @@ async function main() {
     }
     check("the client state update reached the Agent", snapshot.value, 10);
 
+    const tools = await op(page, "mcp", ["tools/list", {}]);
+    check(
+      "the current Agents MCP handler listed its tool",
+      tools.result.tools.some((tool) => tool.name === "counter-value"),
+      true,
+    );
+    const tool = await op(page, "mcp", ["tools/call", { name: "counter-value", arguments: {} }]);
+    check("the MCP tool read Agent state", tool.result.content[0].text, "10");
+
+    await op(page, "email", ["Hello Agent", "This came through Email Routing."]);
+    snapshot = await op(page, "snapshot");
+    check(
+      "routeAgentEmail delivered to the Agent hook",
+      snapshot.events.filter((event) => event.kind === "sdk-email:Hello Agent").length,
+      1,
+    );
+
     await op(page, "enqueueIncrement", [2]);
     snapshot = await op(page, "snapshot");
     check("the SDK queue callback updated Agent state", snapshot.value, 12);

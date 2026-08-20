@@ -60,8 +60,10 @@ export type HostStatus = {
  * `ArrayBuffer` view survives the hop.
  */
 export interface HostRpc {
+  email(subject: string, body: string): Promise<void>;
   increment(): Promise<number>;
   enqueueIncrement(amount: number): Promise<string>;
+  mcp(method: string, params: Record<string, unknown>): Promise<unknown>;
   snapshot(): Promise<CounterSnapshot>;
   armWake(delayMs: number): Promise<number>;
   status(): Promise<HostStatus>;

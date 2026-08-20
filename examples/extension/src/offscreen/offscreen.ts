@@ -116,9 +116,13 @@ async function connectedAgent(): Promise<AgentClient<unknown, CounterState>> {
  * views other than `Uint8Array` do not survive the hop.
  */
 const ops = {
+  email: (subject: string, body: string): Promise<void> =>
+    host.email(subject, body) as unknown as Promise<void>,
   increment: (): Promise<number> => host.increment() as unknown as Promise<number>,
   enqueueIncrement: (amount: number): Promise<string> =>
     host.enqueueIncrement(amount) as unknown as Promise<string>,
+  mcp: (method: string, params: Record<string, unknown>): Promise<unknown> =>
+    host.mcp(method, params) as unknown as Promise<unknown>,
   snapshot: (): Promise<CounterSnapshot> => host.snapshot() as unknown as Promise<CounterSnapshot>,
   armWake: (delayMs: number): Promise<number> =>
     host.armWake(delayMs) as unknown as Promise<number>,
@@ -146,10 +150,19 @@ const ops = {
 
 async function runOp(op: HostOp, args: readonly unknown[]): Promise<unknown> {
   switch (op) {
+    case "email":
+      return await ops.email(String(args[0]), String(args[1]));
     case "increment":
       return await ops.increment();
     case "enqueueIncrement":
       return await ops.enqueueIncrement(Number(args[0]));
+    case "mcp": {
+      const params = args[1];
+      if (params === null || typeof params !== "object" || Array.isArray(params)) {
+        throw new TypeError("MCP params must be an object");
+      }
+      return await ops.mcp(String(args[0]), params as Record<string, unknown>);
+    }
     case "snapshot":
       return await ops.snapshot();
     case "armWake":

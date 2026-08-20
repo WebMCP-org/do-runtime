@@ -51,6 +51,9 @@ importers:
       '@mcp-b/do-runtime':
         specifier: workspace:*
         version: link:../..
+      '@modelcontextprotocol/server':
+        specifier: 2.0.0
+        version: 2.0.0
       '@sqlite.org/sqlite-wasm':
         specifier: 3.53.0-build1
         version: 3.53.0-build1
