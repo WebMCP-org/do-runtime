@@ -23,7 +23,14 @@
  * usable state and no hidden half-started storage phase.
  */
 
-export type { SqlDatabase, SqlDatabaseProvider, SqlResult, SqlValue } from "./util/sqlite";
+export type {
+  SqlDatabase,
+  SqlDatabaseProvider,
+  SqlDatabaseSnapshot,
+  SqlDatabaseSnapshotProvider,
+  SqlResult,
+  SqlValue,
+} from "./util/sqlite";
 export type { ReadOptions, WriteOptions } from "./io/actor-cache";
 export type { AlarmOutlet } from "./io/actor-sqlite";
 export type { Timer } from "./io/io-context";

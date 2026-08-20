@@ -9,8 +9,8 @@
  * layout questions this package deliberately knows nothing about. What arrives
  * here is the already-installed pool, and with it the two things a backend
  * needs that a bare `sqlite3` module cannot give: a database constructor bound
- * to that VFS, and `unlink`, which is how `reset()` deletes a file that lives
- * inside the pool rather than in OPFS proper.
+ * to that VFS, plus the pool's file export/import/unlink operations used by
+ * snapshots and `reset()`.
  *
  * The pool is structurally typed rather than imported from
  * `@sqlite.org/sqlite-wasm`, so this package takes no dependency on the driver
@@ -26,10 +26,13 @@
 
 import {
   requireSqliteLength,
+  requireSafeDatabaseName,
+  requireValidSqlDatabaseSnapshot,
   SQLITE_LENGTH_LIMIT,
   SQL_WRONG_BINDINGS_MESSAGE,
   type SqlDatabase,
-  type SqlDatabaseProvider,
+  type SqlDatabaseSnapshot,
+  type SqlDatabaseSnapshotProvider,
   type SqlDatabaseStatement,
   type SqlResult,
   type SqlValue,
@@ -59,6 +62,9 @@ export interface SqliteWasmDatabaseHandle {
 export interface OpfsSahPool {
   /** Constructs a database inside this pool's VFS. Names are absolute, so they start with "/". */
   readonly OpfsSAHPoolDb: new (filename: string) => SqliteWasmDatabaseHandle;
+  exportFile(filename: string): Uint8Array | Promise<Uint8Array>;
+  importDb(filename: string, image: Uint8Array): number | Promise<number>;
+  getFileNames(): string[];
   /** Disassociates a virtual file from the pool. Results are undefined if it is in active use. */
   unlink(filename: string): boolean;
 }
@@ -97,19 +103,54 @@ export type SqliteWasmProviderOptions = {
 export function createSqliteWasmProvider(
   host: SqliteWasmHost,
   options: SqliteWasmProviderOptions,
-): SqlDatabaseProvider {
+): SqlDatabaseSnapshotProvider {
   const { prefix } = options;
   if (!prefix.startsWith("/")) {
     throw new Error(`SAH pool names are absolute; prefix must start with "/": ${prefix}`);
   }
+  const openDatabases = new Set<SqliteWasmDatabase>();
+  const ownedFiles = (): string[] =>
+    host.pool.getFileNames().filter((name) => name.startsWith(`${prefix}.`));
   return {
     async open(name: string): Promise<SqlDatabase> {
       // Names come from inside the package, so this is defence in depth — but
       // it is the one place a name becomes a pool file name.
-      if (!/^[A-Za-z0-9_-]+$/.test(name)) {
-        throw new Error(`Database name is not a safe file name: ${name}`);
+      requireSafeDatabaseName(name);
+      let database: SqliteWasmDatabase;
+      database = new SqliteWasmDatabase(host, `${prefix}.${name}.sqlite`, () =>
+        openDatabases.delete(database),
+      );
+      openDatabases.add(database);
+      return database;
+    },
+    close(): void {
+      for (const database of [...openDatabases]) database.close();
+    },
+    async exportSnapshot(): Promise<SqlDatabaseSnapshot> {
+      requireClosed(openDatabases);
+      const files = ownedFiles();
+      requireNoRecoverySidecars(files);
+      const databases = await Promise.all(
+        files
+          .filter((file) => file.endsWith(".sqlite"))
+          .sort()
+          .map(async (file) => {
+            const name = file.slice(prefix.length + 1, -".sqlite".length);
+            requireSafeDatabaseName(name);
+            return { name, image: new Uint8Array(await host.pool.exportFile(file)) };
+          }),
+      );
+      const snapshot: SqlDatabaseSnapshot = { version: 1, databases };
+      requireValidSqlDatabaseSnapshot(snapshot);
+      return snapshot;
+    },
+    async importSnapshot(snapshot: SqlDatabaseSnapshot): Promise<void> {
+      requireClosed(openDatabases);
+      requireValidSqlDatabaseSnapshot(snapshot);
+      for (const file of ownedFiles()) host.pool.unlink(file);
+      for (const { name, image } of snapshot.databases) {
+        await host.pool.importDb(`${prefix}.${name}.sqlite`, new Uint8Array(image));
       }
-      return new SqliteWasmDatabase(host, `${prefix}.${name}.sqlite`);
     },
   };
 }
@@ -118,8 +159,13 @@ export class SqliteWasmDatabase implements SqlDatabase {
   readonly #host: SqliteWasmHost;
   readonly #filename: string;
   #database: SqliteWasmDatabaseHandle;
+  #closed = false;
 
-  constructor(host: SqliteWasmHost, filename: string) {
+  constructor(
+    host: SqliteWasmHost,
+    filename: string,
+    private readonly onClose: () => void = () => {},
+  ) {
     this.#host = host;
     this.#filename = filename;
     this.#database = new host.pool.OpfsSAHPoolDb(filename);
@@ -170,7 +216,10 @@ export class SqliteWasmDatabase implements SqlDatabase {
   }
 
   close(): void {
+    if (this.#closed) return;
     this.#database.close();
+    this.#closed = true;
+    this.onClose();
   }
 
   #setLengthLimit(): void {
@@ -190,6 +239,19 @@ export class SqliteWasmDatabase implements SqlDatabase {
       throw new Error(`PRAGMA ${name} did not return a number.`);
     }
     return value;
+  }
+}
+
+function requireClosed(openDatabases: ReadonlySet<SqliteWasmDatabase>): void {
+  if (openDatabases.size > 0) {
+    throw new Error("Cannot snapshot or restore while database handles are open.");
+  }
+}
+
+function requireNoRecoverySidecars(files: readonly string[]): void {
+  const sidecar = files.find((file) => !file.endsWith(".sqlite"));
+  if (sidecar !== undefined) {
+    throw new Error(`Cannot export a snapshot with a SQLite recovery sidecar: ${sidecar}`);
   }
 }
 

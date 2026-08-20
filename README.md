@@ -188,9 +188,11 @@ The lifecycle:
 
 ### Storage
 
-`SqlDatabaseProvider.open(name)` is the only seam. The runtime owns database names, tables, transactions, reset behaviour, facet metadata, and streaming `sql.ingest()` statement boundaries; the host chooses the physical provider and prefix. Stored KV values use structured-clone semantics across workerd, Node, and the browser; existing JSON rows remain readable. `_cf_` names are reserved to the runtime.
+`SqlDatabaseProvider.open(name)` is the runtime execution seam. The runtime owns database names, tables, transactions, reset behaviour, facet metadata, and streaming `sql.ingest()` statement boundaries; the host chooses the physical provider and prefix. Stored KV values use structured-clone semantics across workerd, Node, and the browser; existing JSON rows remain readable. `_cf_` names are reserved to the runtime.
 
 The browser provider takes an already-installed OPFS SAH pool (`installOpfsSAHPoolVfs`; sync access handles in a dedicated worker — no cross-origin isolation or `SharedArrayBuffer` needed). One pool per worker; the root and each local facet get separate prefixes inside it. The Node provider uses in-memory databases by default and a directory when asked.
+
+Both concrete providers also implement `SqlDatabaseSnapshotProvider`. After the host has stopped the actor, `provider.close()` releases every database handle; `exportSnapshot()` then returns the SQLite images for the whole actor storage scope, and `importSnapshot()` replaces an idle scope. The same snapshot can seed a cold local replica because SQLite images are portable between these providers. Node snapshots require a dedicated directory-backed provider. This is backup/restore and replica seeding, not Cloudflare's time-indexed PITR or continuously updated read replication.
 
 ### Alarms
 

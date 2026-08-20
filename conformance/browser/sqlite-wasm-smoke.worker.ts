@@ -26,6 +26,11 @@ export type SmokeReport =
       };
       members: { before: boolean; inside: boolean; after: boolean; databaseSize: number };
       reset: { tablesAfterReset: readonly (readonly unknown[])[] };
+      snapshot: {
+        openRefusal: string;
+        restored: readonly (readonly unknown[])[];
+        replica: readonly (readonly unknown[])[];
+      };
     };
 
 async function run(): Promise<SmokeReport> {
@@ -70,6 +75,32 @@ async function run(): Promise<SmokeReport> {
   ).rawRows;
   resetDb.close();
 
+  const snapshotProvider = createSqliteWasmProvider(host, { prefix: "/smoke-snapshot" });
+  const snapshotDb = await snapshotProvider.open("root");
+  snapshotDb.exec("CREATE TABLE state (value TEXT)", []);
+  snapshotDb.exec("INSERT INTO state VALUES ('before')", []);
+  let openRefusal = "allowed";
+  try {
+    await snapshotProvider.exportSnapshot();
+  } catch (error) {
+    openRefusal = error instanceof Error ? error.message : String(error);
+  }
+  snapshotProvider.close();
+  const snapshot = await snapshotProvider.exportSnapshot();
+  const changedDb = await snapshotProvider.open("root");
+  changedDb.exec("UPDATE state SET value = 'after'", []);
+  snapshotProvider.close();
+  await snapshotProvider.importSnapshot(snapshot);
+  const restoredDb = await snapshotProvider.open("root");
+  const restored = restoredDb.exec("SELECT value FROM state", []).rawRows;
+  snapshotProvider.close();
+
+  const replicaProvider = createSqliteWasmProvider(host, { prefix: "/smoke-replica" });
+  await replicaProvider.importSnapshot(snapshot);
+  const replicaDb = await replicaProvider.open("root");
+  const replica = replicaDb.exec("SELECT value FROM state", []).rawRows;
+  replicaProvider.close();
+
   return {
     ok: true,
     roundTrip: {
@@ -79,6 +110,7 @@ async function run(): Promise<SmokeReport> {
     },
     members: { before, inside, after, databaseSize },
     reset: { tablesAfterReset },
+    snapshot: { openRefusal, restored, replica },
   };
 }
 

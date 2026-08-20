@@ -36,6 +36,9 @@ test("reset fails closed when the SAH pool does not remove the database", () => 
           opened.push(filename);
         }
       },
+      exportFile: async () => new Uint8Array(),
+      importDb: async () => 0,
+      getFileNames: () => [],
       unlink: () => false,
     },
   } satisfies SqliteWasmHost;

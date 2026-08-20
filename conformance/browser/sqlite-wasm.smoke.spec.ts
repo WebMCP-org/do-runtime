@@ -56,3 +56,14 @@ test("the two members that reach past oo1.DB answer", () => {
 test("reset() drops the file and reopens an empty database", () => {
   expect(report).toMatchObject({ ok: true, reset: { tablesAfterReset: [] } });
 });
+
+test("a closed provider snapshot restores storage and seeds a replica", () => {
+  expect(report).toMatchObject({
+    ok: true,
+    snapshot: {
+      openRefusal: "Cannot snapshot or restore while database handles are open.",
+      restored: [["before"]],
+      replica: [["before"]],
+    },
+  });
+});

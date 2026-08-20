@@ -142,6 +142,11 @@ clone value semantics and remains backward-readable with legacy JSON rows. A
 present browser SAH pool accepts only current actor/facet logical database names
 and SQLite-owned companions; an unknown name fails startup.
 
+Concrete local providers expose a host-owned, versioned snapshot of every
+database in one actor scope. Export and import require all handles closed; import
+validates every image before replacement. A snapshot can seed a cold replica,
+but it is not the time-indexed or continuously replicated Cloudflare service.
+
 ### §2.5 Fail-closed substrate boundaries
 
 Hibernation, point-in-time recovery, replication, actor-class stub

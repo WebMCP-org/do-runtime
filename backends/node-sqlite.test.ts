@@ -176,6 +176,59 @@ describe("node-sqlite backend", () => {
     facet.close();
   });
 
+  test("a closed provider snapshot restores the whole actor and seeds another provider", async () => {
+    const source = createNodeSqlProvider({ directory: temporaryDirectory() });
+    const root = await source.open("root");
+    const facet = await source.open("facet-1");
+    root.exec("PRAGMA journal_mode=WAL", []);
+    root.exec("CREATE TABLE state (value TEXT)", []);
+    root.exec("INSERT INTO state VALUES ('before')", []);
+    facet.exec("CREATE TABLE state (value TEXT)", []);
+    facet.exec("INSERT INTO state VALUES ('child')", []);
+
+    await expect(source.exportSnapshot()).rejects.toThrow("database handles are open");
+    source.close();
+
+    const snapshot = await source.exportSnapshot();
+    expect(snapshot.version).toBe(1);
+    expect(snapshot.databases.map(({ name }) => name)).toEqual(["facet-1", "root"]);
+
+    const changed = await source.open("root");
+    changed.exec("UPDATE state SET value = 'after'", []);
+    source.close();
+    await source.importSnapshot(snapshot);
+    const restored = await source.open("root");
+    expect(restored.exec("SELECT value FROM state", []).rawRows).toEqual([["before"]]);
+    source.close();
+
+    const replica = createNodeSqlProvider({ directory: temporaryDirectory() });
+    await replica.importSnapshot(snapshot);
+    const replicaRoot = await replica.open("root");
+    const replicaFacet = await replica.open("facet-1");
+    expect(replicaRoot.exec("SELECT value FROM state", []).rawRows).toEqual([["before"]]);
+    expect(replicaFacet.exec("SELECT value FROM state", []).rawRows).toEqual([["child"]]);
+    replica.close();
+  });
+
+  test("snapshot import validates every image before replacing storage", async () => {
+    const provider = createNodeSqlProvider({ directory: temporaryDirectory() });
+    const db = await provider.open("root");
+    db.exec("CREATE TABLE state (value TEXT)", []);
+    db.exec("INSERT INTO state VALUES ('safe')", []);
+    db.close();
+
+    await expect(
+      provider.importSnapshot({
+        version: 1,
+        databases: [{ name: "root", image: new Uint8Array([1, 2, 3]) }],
+      }),
+    ).rejects.toThrow("valid SQLite database image");
+
+    const reopened = await provider.open("root");
+    expect(reopened.exec("SELECT value FROM state", []).rawRows).toEqual([["safe"]]);
+    reopened.close();
+  });
+
   test("a name that is not a safe file name is refused", async () => {
     const provider = createNodeSqlProvider({ directory: temporaryDirectory() });
     await expect(provider.open("../escape")).rejects.toThrow("not a safe file name");

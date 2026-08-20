@@ -15,14 +15,20 @@
  * across 20 of the extension's 24 Node-lane test files.
  */
 
+import { randomUUID } from "node:crypto";
 import { rmSync } from "node:fs";
+import { readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { SQLInputValue, StatementSync } from "node:sqlite";
 import {
   requireSqliteLength,
+  requireSafeDatabaseName,
+  requireValidSqlDatabaseSnapshot,
   SQL_WRONG_BINDINGS_MESSAGE,
   type SqlDatabase,
-  type SqlDatabaseProvider,
+  type SqlDatabaseSnapshot,
+  type SqlDatabaseSnapshotProvider,
   type SqlDatabaseStatement,
   type SqlResult,
   type SqlValue,
@@ -30,20 +36,88 @@ import {
 
 export type NodeSqlProviderOptions = {
   /**
-   * Directory the actor's database files live in. Omit for in-memory
-   * databases, which is what the unit lane uses and what upstream's own tests
-   * get from `kj::newInMemoryDirectory`.
+   * Dedicated directory for one actor's database files. Omit for in-memory
+   * databases, which cannot be snapshotted and are what the unit lane and
+   * upstream's own tests get from `kj::newInMemoryDirectory`.
    */
   directory?: string;
 };
 
-export function createNodeSqlProvider(options: NodeSqlProviderOptions = {}): SqlDatabaseProvider {
+export function createNodeSqlProvider(
+  options: NodeSqlProviderOptions = {},
+): SqlDatabaseSnapshotProvider {
   const directory = options.directory;
+  const openDatabases = new Set<NodeSqlDatabase>();
   return {
     async open(name: string): Promise<SqlDatabase> {
-      assertSafeName(name);
-      const path = directory === undefined ? ":memory:" : `${directory}/${name}.sqlite`;
-      return new NodeSqlDatabase(path);
+      requireSafeDatabaseName(name);
+      const path = directory === undefined ? ":memory:" : join(directory, `${name}.sqlite`);
+      let database: NodeSqlDatabase;
+      database = new NodeSqlDatabase(path, () => openDatabases.delete(database));
+      openDatabases.add(database);
+      return database;
+    },
+    close(): void {
+      for (const database of [...openDatabases]) database.close();
+    },
+    async exportSnapshot(): Promise<SqlDatabaseSnapshot> {
+      const path = requireSnapshotDirectory(directory);
+      requireClosed(openDatabases);
+      const files = await readdir(path);
+      requireNoRecoverySidecars(files);
+      const names = files
+        .filter((file) => file.endsWith(".sqlite"))
+        .map((file) => file.slice(0, -".sqlite".length))
+        .sort();
+      names.forEach(requireSafeDatabaseName);
+      const snapshot: SqlDatabaseSnapshot = {
+        version: 1,
+        databases: await Promise.all(
+          names.map(async (name) => ({
+            name,
+            image: new Uint8Array(await readFile(join(path, `${name}.sqlite`))),
+          })),
+        ),
+      };
+      requireValidSqlDatabaseSnapshot(snapshot);
+      return snapshot;
+    },
+    async importSnapshot(snapshot: SqlDatabaseSnapshot): Promise<void> {
+      const path = requireSnapshotDirectory(directory);
+      requireClosed(openDatabases);
+      requireValidSqlDatabaseSnapshot(snapshot);
+
+      const databases = snapshot.databases.map(({ name, image }) => ({
+        name,
+        image: new Uint8Array(image),
+      }));
+      const temporary: { name: string; file: string }[] = [];
+      try {
+        for (const { name, image } of databases) {
+          const file = join(path, `.${name}.${randomUUID()}.restore`);
+          await writeFile(file, image);
+          temporary.push({ name, file });
+        }
+        const existing = await readdir(path);
+        existing
+          .filter((file) => file.endsWith(".sqlite"))
+          .map((file) => file.slice(0, -".sqlite".length))
+          .forEach(requireSafeDatabaseName);
+        for (const file of existing) {
+          if (/\.sqlite-(?:journal|wal|shm)$/.test(file)) await rm(join(path, file), { force: true });
+        }
+        for (const { name, file } of temporary) {
+          await rename(file, join(path, `${name}.sqlite`));
+        }
+        const restored = new Set(databases.map(({ name }) => `${name}.sqlite`));
+        for (const file of existing) {
+          if (file.endsWith(".sqlite") && !restored.has(file)) {
+            await rm(join(path, file), { force: true });
+          }
+        }
+      } finally {
+        await Promise.all(temporary.map(({ file }) => rm(file, { force: true })));
+      }
     },
   };
 }
@@ -52,7 +126,9 @@ export class NodeSqlDatabase implements SqlDatabase {
   readonly #path: string;
   #database: DatabaseSync;
 
-  constructor(path: string) {
+  #closed = false;
+
+  constructor(path: string, private readonly onClose: () => void = () => {}) {
     this.#path = path;
     this.#database = new DatabaseSync(path);
   }
@@ -99,7 +175,10 @@ export class NodeSqlDatabase implements SqlDatabase {
   }
 
   close(): void {
+    if (this.#closed) return;
     this.#database.close();
+    this.#closed = true;
+    this.onClose();
   }
 
   #pragma(name: string): number {
@@ -339,8 +418,22 @@ function normalizeInteger(value: unknown): unknown {
  * place a name becomes a path, and a silent traversal here writes an actor's
  * storage somewhere nobody will look for it.
  */
-function assertSafeName(name: string): void {
-  if (!/^[A-Za-z0-9_-]+$/.test(name)) {
-    throw new Error(`Database name is not a safe file name: ${name}`);
+function requireSnapshotDirectory(directory: string | undefined): string {
+  if (directory === undefined) {
+    throw new Error("SQLite snapshots require a directory-backed Node provider.");
+  }
+  return directory;
+}
+
+function requireClosed(openDatabases: ReadonlySet<NodeSqlDatabase>): void {
+  if (openDatabases.size > 0) {
+    throw new Error("Cannot snapshot or restore while database handles are open.");
+  }
+}
+
+function requireNoRecoverySidecars(files: readonly string[]): void {
+  const sidecar = files.find((file) => /\.sqlite-(?:journal|wal|shm)$/.test(file));
+  if (sidecar !== undefined) {
+    throw new Error(`Cannot export a snapshot with a SQLite recovery sidecar: ${sidecar}`);
   }
 }

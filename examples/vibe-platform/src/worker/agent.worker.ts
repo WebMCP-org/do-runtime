@@ -10,9 +10,13 @@ import {
   newRpcSession,
   noFacets,
   type ActorContainer,
+  type SqlDatabaseSnapshotProvider,
   type Timer,
 } from "@mcp-b/do-runtime";
-import type { SqliteWasmHost } from "@mcp-b/do-runtime/backends/sqlite-wasm";
+import {
+  createSqliteWasmProvider,
+  type SqliteWasmHost,
+} from "@mcp-b/do-runtime/backends/sqlite-wasm";
 import * as cloudflareWorkers from "cloudflare:workers";
 import { DurableObject, RpcTarget } from "cloudflare:workers";
 import * as agents from "agents";
@@ -25,7 +29,7 @@ import {
   type WireRequest,
   type WireResponse,
 } from "../wire";
-import { TrackedSqliteWasmProvider, type RetryablePoolOptions } from "./sqlite-storage";
+import type { RetryablePoolOptions } from "./sqlite-storage";
 
 // Stable forever: changing either value orphans the authored actor's data.
 const UNIQUE_KEY = "do-runtime-example-vibe-user-agent";
@@ -76,7 +80,7 @@ let live:
       container: ActorContainer;
       entry: { fetch(request: Request): Promise<Response> | Response };
       className: string;
-      storage: TrackedSqliteWasmProvider;
+      storage: SqlDatabaseSnapshotProvider;
     }
   | undefined;
 let scopeContainer: ActorContainer | undefined;
@@ -151,7 +155,7 @@ async function place(): Promise<NonNullable<typeof live>> {
   const host = await pooled;
   installScope();
   const evaluated = await evaluateActor();
-  const storage = new TrackedSqliteWasmProvider(host, STORAGE_PREFIX);
+  const storage = createSqliteWasmProvider(host, { prefix: STORAGE_PREFIX });
   const container = await createActorContainer({
     id: ACTOR_ID,
     uniqueKey: UNIQUE_KEY,

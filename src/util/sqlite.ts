@@ -147,6 +147,73 @@ export interface SqlDatabaseProvider {
   open(name: string): Promise<SqlDatabase>;
 }
 
+/** A portable, host-owned image of every SQLite database in one actor storage scope. */
+export type SqlDatabaseSnapshot = {
+  readonly version: 1;
+  readonly databases: readonly {
+    readonly name: string;
+    readonly image: Uint8Array;
+  }[];
+};
+
+/** Local backup/restore. This is deliberately not Cloudflare's time-indexed PITR service. */
+export interface SqlDatabaseSnapshotProvider extends SqlDatabaseProvider {
+  /** Close every database opened through this provider before snapshot or placement teardown. */
+  close(): void;
+  exportSnapshot(): Promise<SqlDatabaseSnapshot>;
+  importSnapshot(snapshot: SqlDatabaseSnapshot): Promise<void>;
+}
+
+const SAFE_DATABASE_NAME = /^[A-Za-z0-9_-]+$/;
+const SQLITE_HEADER = "SQLite format 3";
+
+export function requireSafeDatabaseName(name: string): void {
+  if (!SAFE_DATABASE_NAME.test(name)) {
+    throw new Error(`Database name is not a safe file name: ${name}`);
+  }
+}
+
+/** Validate the complete snapshot before a backend replaces any files. */
+export function requireValidSqlDatabaseSnapshot(snapshot: SqlDatabaseSnapshot): void {
+  const candidate: unknown = snapshot;
+  if (
+    candidate === null ||
+    typeof candidate !== "object" ||
+    !("version" in candidate) ||
+    candidate.version !== 1 ||
+    !("databases" in candidate) ||
+    !Array.isArray(candidate.databases)
+  ) {
+    throw new Error("Unsupported SQLite snapshot format.");
+  }
+  const names = new Set<string>();
+  for (const database of candidate.databases) {
+    if (
+      database === null ||
+      typeof database !== "object" ||
+      !("name" in database) ||
+      typeof database.name !== "string" ||
+      !("image" in database)
+    ) {
+      throw new Error("SQLite snapshot contains an invalid database entry.");
+    }
+    const { name, image } = database;
+    requireSafeDatabaseName(name);
+    if (names.has(name)) {
+      throw new Error(`SQLite snapshot contains duplicate database name: ${name}`);
+    }
+    names.add(name);
+    if (
+      !(image instanceof Uint8Array) ||
+      image.byteLength < 512 ||
+      image.byteLength % 512 !== 0 ||
+      [...SQLITE_HEADER].some((character, index) => image[index] !== character.charCodeAt(0))
+    ) {
+      throw new Error(`Snapshot entry ${name} is not a valid SQLite database image.`);
+    }
+  }
+}
+
 /**
  * ← `SqliteDatabase::QueryOptions`. The C++ regulator pointer is narrowed to
  * a callback over the exact SQL source SQLite compiled; `api/sql.ts` owns the

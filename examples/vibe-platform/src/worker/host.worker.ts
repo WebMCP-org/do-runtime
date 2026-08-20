@@ -46,7 +46,10 @@ import {
   type ActorContainer,
   type Timer,
 } from "@mcp-b/do-runtime";
-import type { SqliteWasmHost } from "@mcp-b/do-runtime/backends/sqlite-wasm";
+import {
+  createSqliteWasmProvider,
+  type SqliteWasmHost,
+} from "@mcp-b/do-runtime/backends/sqlite-wasm";
 import { RpcTarget } from "@mcp-b/do-runtime/cloudflare-workers";
 import {
   WORKSPACE_LOCKED_MESSAGE,
@@ -57,7 +60,7 @@ import {
   type WorkspaceRpc,
 } from "../wire";
 import { Workspace, type WorkspaceEnv } from "./workspace";
-import { TrackedSqliteWasmProvider, type RetryablePoolOptions } from "./sqlite-storage";
+import type { RetryablePoolOptions } from "./sqlite-storage";
 
 // ---------------------------------------------------------------------------
 // Names that must never change
@@ -183,20 +186,8 @@ function pool(): Promise<SqliteWasmHost> {
   return pooled;
 }
 
-/**
- * The provider a container is built over, plus the one operation
- * `SqlDatabaseProvider` does not model: closing what it opened.
- *
- * The seam is `open(name)` and nothing else — the runtime owns database names,
- * tables and transactions, and a host owns the physical file. That leaves the
- * host holding the only references to the connections, which matters here and
- * not on Node: the SAH pool takes an exclusive handle per file and is built on
- * owning what it opens. A container that broke and was replaced would otherwise
- * leave a second connection on the same file inside a VFS that expects one.
- * Nothing observable goes wrong immediately, which is exactly why the close is
- * deliberate rather than incidental. Both workers share that small tracker
- * from `sqlite-storage.ts`.
- */
+// The concrete provider tracks what the container opens, so `storage.close()`
+// releases every SAH-pool database handle when a placement is replaced.
 // ---------------------------------------------------------------------------
 // 4 + 5. The actor scope and the container
 
@@ -237,7 +228,7 @@ function installScope(): void {
 async function place(): Promise<Live> {
   const host = await pool();
   installScope();
-  const storage = new TrackedSqliteWasmProvider(host, STORAGE_PREFIX);
+  const storage = createSqliteWasmProvider(host, { prefix: STORAGE_PREFIX });
 
   const container = await createActorContainer({
     id: ACTOR_ID,
