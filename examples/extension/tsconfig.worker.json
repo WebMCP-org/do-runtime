@@ -3,8 +3,8 @@
   //
   // Two projects rather than one because the two lib sets cannot coexist. This
   // one is the runtime's own shape — `WebWorker` plus `@cloudflare/workers-types`
-  // — because everything it compiles imports `@mcp-b/do-runtime`, whose package
-  // exports are TypeScript SOURCE specified against exactly those globals.
+  // — because the package declarations are specified against exactly those
+  // globals.
   // Adding "DOM" here re-declares half of workers-types and produces hundreds of
   // duplicate-identifier errors inside the package, not in this example.
   "compilerOptions": {

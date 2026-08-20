@@ -2,6 +2,7 @@ import { fileURLToPath } from "node:url";
 import { defineConfig } from "vite";
 
 const repoRoot = fileURLToPath(new URL("../../", import.meta.url));
+const cloudflareWorkersModule = `${repoRoot}dist/cloudflare-workers.js`;
 
 /**
  * Cross-origin isolation, and who actually needs it.
@@ -31,11 +32,10 @@ const crossOriginIsolation = {
 export default defineConfig({
   resolve: {
     alias: {
-      // The actor imports `DurableObject` from the platform module by its real
-      // specifier, exactly as it would on Cloudflare. Supplying that module is
-      // the host's job here, the same way `wrangler.jsonc` supplies bindings
-      // there.
-      "cloudflare:workers": `${repoRoot}src/api/cloudflare-workers.ts`,
+      // Use the package subpath so application code and runtime transport share
+      // one DurableObject/RpcTarget identity, while authored source keeps the
+      // exact platform specifier it will deploy with.
+      "cloudflare:workers": cloudflareWorkersModule,
       "cloudflare:email": `${repoRoot}examples/platform-shims/cloudflare-email.ts`,
       "node:async_hooks": "unenv/node/async_hooks",
       "node:diagnostics_channel": "unenv/node/diagnostics_channel",
@@ -53,8 +53,7 @@ export default defineConfig({
   server: {
     headers: crossOriginIsolation,
     fs: {
-      // `@mcp-b/do-runtime` is a workspace link whose exports are TypeScript
-      // SOURCE, so the dev server serves files from outside this example's root.
+      // The platform shims above live outside this example's root.
       allow: [repoRoot],
     },
   },

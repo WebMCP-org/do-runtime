@@ -2,11 +2,8 @@ import { fileURLToPath } from "node:url";
 import agents from "agents/vite";
 import { defineConfig } from "vite";
 
-/**
- * The runtime's source, which this example consumes as TypeScript rather than as
- * a build artifact: `@mcp-b/do-runtime`'s package exports point at `src/`.
- */
 const packageRoot = fileURLToPath(new URL("../../", import.meta.url));
+const cloudflareWorkersModule = `${packageRoot}dist/cloudflare-workers.js`;
 
 export default defineConfig({
   /**
@@ -66,13 +63,12 @@ export default defineConfig({
        * `wrangler.jsonc` supplies it on Cloudflare — and what it supplies is this
        * package's own port of the module.
        *
-       * **One specifier, deliberately.** `@mcp-b/do-runtime/cloudflare-workers`
-       * resolves to the same file, but through a different module id, and two
-       * copies of that module in one bundle would give two different `RpcTarget`
-       * classes — so capnweb would refuse an instance of the wrong one. Every
-       * file in this example imports `cloudflare:workers`.
+       * **One module identity, deliberately.** Route the platform specifier to
+       * the package's public subpath so `newRpcSession()` and application code
+       * see the same `RpcTarget` class. A source-file alias would load a second
+       * class beside the package build, and capnweb would refuse its instances.
        */
-      "cloudflare:workers": `${packageRoot}src/api/cloudflare-workers.ts`,
+      "cloudflare:workers": cloudflareWorkersModule,
       "cloudflare:email": `${packageRoot}examples/platform-shims/cloudflare-email.ts`,
       "node:async_hooks": "unenv/node/async_hooks",
       "node:diagnostics_channel": "unenv/node/diagnostics_channel",
