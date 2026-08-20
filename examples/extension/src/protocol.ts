@@ -70,7 +70,13 @@ export interface HostRpc {
 }
 
 /** The operation names the popup, the page hook, and the e2e driver all use. */
-export type HostOp = keyof HostRpc | "sdkIncrement" | "sdkSetState" | "sdkState" | "sdkStream";
+export type HostOp =
+  | keyof HostRpc
+  | "sdkIncrement"
+  | "sdkSetState"
+  | "sdkState"
+  | "sdkStream"
+  | "storageStatus";
 
 /**
  * `chrome.runtime.sendMessage` payloads.

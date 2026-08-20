@@ -15,6 +15,10 @@
 import { rolldown } from "@rolldown/browser";
 import { newMessagePortRpcSession, RpcTarget, type RpcStub } from "capnweb";
 import {
+  browserStorageSummary,
+  holdExclusiveBrowserHost,
+} from "../../platform-shims/browser-storage";
+import {
   AGENT_ORIGIN,
   AGENTS_GLOBAL,
   CLOUDFLARE_WORKERS_GLOBAL,
@@ -61,6 +65,14 @@ function fail(message: string): void {
   status.textContent = "stopped";
   log(message, true);
 }
+
+log(await browserStorageSummary());
+const releaseHost = await holdExclusiveBrowserHost("do-runtime:vibe-platform");
+if (releaseHost === null) {
+  fail("another tab owns this Durable Object host; close it and reload");
+  await new Promise<never>(() => {});
+}
+if (releaseHost !== null) window.addEventListener("pagehide", releaseHost, { once: true });
 
 // ---------------------------------------------------------------------------
 // The worker, and the session to the actor inside it

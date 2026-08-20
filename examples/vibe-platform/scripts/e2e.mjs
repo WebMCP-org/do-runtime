@@ -119,7 +119,8 @@ console.log(`dev server: ${url}`);
 const browser = await chromium.launch({ headless: true });
 // A fresh context per run, so OPFS starts empty and the seed is always the
 // thing under test.
-const page = await browser.newPage();
+const context = await browser.newContext();
+const page = await context.newPage();
 if (forcedOffline) await page.route("https://esm.sh/**", (route) => route.abort());
 
 const pageErrors = [];
@@ -163,6 +164,27 @@ try {
       "/src/plant.ts",
     ]) {
       await file(seeded).waitFor({ timeout: TIMEOUT });
+    }
+  });
+
+  await step("the page reports origin persistence and quota", async () => {
+    await page.waitForFunction(
+      () => /storage: (persistent|best-effort), \d+ B used of \d+ B/.test(document.querySelector("#log").textContent),
+      undefined,
+      { timeout: TIMEOUT },
+    );
+  });
+
+  await step("a second tab is refused before it can contend for OPFS", async () => {
+    const contender = await context.newPage();
+    try {
+      await contender.goto(url, { waitUntil: "domcontentloaded" });
+      await contender
+        .locator("#banner")
+        .filter({ hasText: "another tab owns this Durable Object host" })
+        .waitFor({ timeout: 10_000 });
+    } finally {
+      await contender.close();
     }
   });
 

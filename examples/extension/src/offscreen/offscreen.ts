@@ -23,6 +23,10 @@
 
 import { newMessagePortRpcSession } from "capnweb";
 import { AgentClient, type AgentClientOptions } from "agents/client";
+import {
+  browserStorageSummary,
+  holdExclusiveBrowserHost,
+} from "../../../platform-shims/browser-storage";
 import { createMessagePortWebSocket } from "../../../platform-shims/message-port-websocket";
 import type {
   CounterState,
@@ -34,6 +38,14 @@ import type {
   HostStatus,
   WorkerBoot,
 } from "../protocol";
+
+const storageStatus = browserStorageSummary();
+const releaseHost = await holdExclusiveBrowserHost("do-runtime:extension");
+if (releaseHost === null) {
+  document.body.textContent = "another extension page owns this Durable Object host";
+  await new Promise<never>(() => {});
+}
+if (releaseHost !== null) window.addEventListener("pagehide", releaseHost, { once: true });
 
 /**
  * `{ type: "module" }` and a `new URL(..., import.meta.url)` specifier, which is
@@ -139,6 +151,7 @@ const ops = {
     if (client.state === undefined) throw new Error("Agents client connected without state");
     return client.state;
   },
+  storageStatus: async (): Promise<string> => await storageStatus,
   sdkStream: async (): Promise<{ chunks: unknown[]; final: unknown }> => {
     const chunks: unknown[] = [];
     const final = await (await connectedAgent()).call("streamValues", [], {
@@ -175,6 +188,8 @@ async function runOp(op: HostOp, args: readonly unknown[]): Promise<unknown> {
       return await ops.sdkSetState(Number(args[0]));
     case "sdkState":
       return await ops.sdkState();
+    case "storageStatus":
+      return await ops.storageStatus();
     case "sdkStream":
       return await ops.sdkStream();
   }
