@@ -18,7 +18,7 @@
  * the runtime type the same thing, instead of needing a cast at the call site.
  */
 
-import { Agent } from "agents";
+import { Agent, callable, type StreamingResponse } from "agents";
 
 /** What `snapshot()` hands back. JSON-compatible: it crosses two RPC hops. */
 export type CounterSnapshot = {
@@ -71,12 +71,20 @@ export class Counter extends Agent<CounterEnv, CounterState> {
    * The reply does not leave the actor until that transaction is durable — the
    * output gate — so a caller that reads `3` here can never afterwards see `2`.
    */
+  @callable()
   async increment(): Promise<number> {
     this.#schema();
     const value = this.state.value + 1;
     this.setState({ value });
     this.#record("increment");
     return value;
+  }
+
+  @callable({ streaming: true })
+  async streamValues(stream: StreamingResponse): Promise<void> {
+    stream.send(this.state.value);
+    stream.send(this.state.value + 1);
+    stream.end("done");
   }
 
   async enqueueIncrement(amount: number): Promise<string> {

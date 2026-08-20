@@ -34,6 +34,12 @@ import {
 import { createSqliteWasmProvider, type SqliteWasmHost } from "@mcp-b/do-runtime/backends/sqlite-wasm";
 import sqlite3InitModule from "@sqlite.org/sqlite-wasm";
 import { RpcTarget } from "cloudflare:workers";
+import {
+  installMemoryWebSocketPair,
+  upgradeWebSocket,
+  type UpgradeWebSocket,
+} from "../../../platform-shims/memory-websocket-pair";
+import { serveMessagePortWebSockets } from "../../../platform-shims/message-port-websocket";
 import type { CounterSnapshot, HostRpc, HostStatus, WorkerBoot } from "../protocol";
 import { Counter, type CounterEnv } from "./counter";
 
@@ -148,6 +154,11 @@ let live: Live | undefined;
 let placing: Promise<Live> | undefined;
 /** The last `onBroken` rejection, surfaced through `status()`. */
 let brokenReason: string | null = null;
+
+installMemoryWebSocketPair(() => {
+  if (live === undefined) throw new Error("WebSocket upgrade reached an unplaced actor");
+  return live.container;
+});
 
 /**
  * What the installed globals resolve to, and it REFUSES rather than falling
@@ -405,6 +416,24 @@ class HostTarget extends RpcTarget implements HostRpc {
 /** Held so the session is not collected while the worker lives. */
 let peer: unknown;
 
+async function connectAgentSocket(url: string): Promise<UpgradeWebSocket> {
+  const { entry } = await placed();
+  const request = new Request(url.replace(/^ws/, "http"), {
+    headers: { Upgrade: "websocket" },
+  });
+  const nativeGet = request.headers.get.bind(request.headers);
+  Object.defineProperty(request.headers, "get", {
+    value: (name: string): string | null =>
+      name.toLowerCase() === "upgrade" ? "websocket" : nativeGet(name),
+  });
+  const response = await entry.fetch(request);
+  const socket = upgradeWebSocket(response);
+  if (response.status !== 101 || socket === undefined) {
+    throw new Error(`Agent WebSocket upgrade failed with ${response.status}`);
+  }
+  return socket;
+}
+
 self.addEventListener("message", (event: MessageEvent<WorkerBoot>) => {
   if (peer !== undefined) {
     throw new Error("do-runtime example: this actor worker was booted twice.");
@@ -413,4 +442,5 @@ self.addEventListener("message", (event: MessageEvent<WorkerBoot>) => {
   // directly: it applies the `RpcTarget` prototype graft that makes the class
   // above recognisable to capnweb, immediately before opening the session.
   peer = newRpcSession(event.data.port, new HostTarget());
+  serveMessagePortWebSockets(event.data.sockets, connectAgentSocket);
 });

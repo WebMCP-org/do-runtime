@@ -153,9 +153,28 @@ async function main() {
       3,
     );
 
+    const synced = await op(page, "sdkState");
+    check("the Agents client received state over a live socket", synced.value, 3);
+
+    const called = await op(page, "sdkIncrement");
+    check("the Agents client called a decorated method", called, 4);
+
+    const streamed = await op(page, "sdkStream");
+    check("the streaming callable delivered every chunk", streamed.chunks.join(","), "4,5");
+    check("the streaming callable delivered its final value", streamed.final, "done");
+
+    const clientState = await op(page, "sdkSetState", [10]);
+    check("the Agents client accepted a local state update", clientState.value, 10);
+    for (let attempts = 0; attempts < 20; attempts += 1) {
+      snapshot = await op(page, "snapshot");
+      if (snapshot.value === 10) break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    check("the client state update reached the Agent", snapshot.value, 10);
+
     await op(page, "enqueueIncrement", [2]);
     snapshot = await op(page, "snapshot");
-    check("the SDK queue callback updated Agent state", snapshot.value, 5);
+    check("the SDK queue callback updated Agent state", snapshot.value, 12);
     check(
       "the SDK queue callback completed",
       snapshot.events.filter((event) => event.kind === "sdk-queue").length,
@@ -178,14 +197,14 @@ async function main() {
       await new Promise((resolve) => setTimeout(resolve, 250));
     }
     check("the alarm was delivered", alarms, 1);
-    check("the alarm handler's write landed", snapshot.value, 6);
+    check("the alarm handler's write landed", snapshot.value, 13);
 
     // ---------------------------------------------------------------------
     // 3. Persistence across a page reload: a new document, a new worker, a new
     //    container, the same OPFS files.
     await page.reload({ timeout: BOOT_TIMEOUT_MS });
     snapshot = await op(page, "snapshot");
-    check("the Agent state survived the reload", snapshot.value, 6);
+    check("the Agent state survived the reload", snapshot.value, 13);
     check(
       "the alarm event survived the reload",
       snapshot.events.filter((event) => event.kind === "sdk-schedule").length,
@@ -193,7 +212,7 @@ async function main() {
     );
 
     const afterReload = await op(page, "increment");
-    check("increment after the reload continues the count", afterReload, 7);
+    check("increment after the reload continues the count", afterReload, 14);
 
     // ---------------------------------------------------------------------
     // 4. Nothing broke in the background.
@@ -220,8 +239,10 @@ async function main() {
     });
     await popup.click("#increment");
     const printed = await waitForOutput(popup, /"increment"|increment failed/, BOOT_TIMEOUT_MS);
-    const viaOffscreen = /^\s*8\s*$/m.test(printed) ? 8 : printed.split("\n").slice(0, 3).join(" ");
-    check("the offscreen document continues the same storage", viaOffscreen, 8);
+    const viaOffscreen = /^\s*15\s*$/m.test(printed)
+      ? 15
+      : printed.split("\n").slice(0, 3).join(" ");
+    check("the offscreen document continues the same storage", viaOffscreen, 15);
 
     const offscreenContexts = await worker.evaluate(async () =>
       (await chrome.runtime.getContexts({ contextTypes: ["OFFSCREEN_DOCUMENT"] })).length,

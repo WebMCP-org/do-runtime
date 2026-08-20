@@ -12,7 +12,11 @@
 /** The `MessagePort` boot message, sent raw because capnweb cannot carry a port. */
 export type WorkerBoot = {
   readonly port: MessagePort;
+  readonly sockets: MessagePort;
 };
+
+/** The state shape the real Agents client receives over its socket. */
+export type CounterState = { readonly value: number };
 
 /** The recent-events rows `snapshot()` reports. Mirrors `worker/counter.ts`. */
 export type CounterEvent = {
@@ -64,7 +68,7 @@ export interface HostRpc {
 }
 
 /** The operation names the popup, the page hook, and the e2e driver all use. */
-export type HostOp = keyof HostRpc;
+export type HostOp = keyof HostRpc | "sdkIncrement" | "sdkSetState" | "sdkState" | "sdkStream";
 
 /**
  * `chrome.runtime.sendMessage` payloads.

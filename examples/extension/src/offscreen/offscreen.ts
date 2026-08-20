@@ -22,7 +22,10 @@
  */
 
 import { newMessagePortRpcSession } from "capnweb";
+import { AgentClient, type AgentClientOptions } from "agents/client";
+import { createMessagePortWebSocket } from "../../../platform-shims/message-port-websocket";
 import type {
+  CounterState,
   CounterSnapshot,
   ExtensionMessage,
   ExtensionResponse,
@@ -64,7 +67,11 @@ worker.addEventListener("messageerror", () => {
  * can exist to carry it.
  */
 const channel = new MessageChannel();
-worker.postMessage({ port: channel.port2 } satisfies WorkerBoot, [channel.port2]);
+const sockets = new MessageChannel();
+worker.postMessage(
+  { port: channel.port2, sockets: sockets.port2 } satisfies WorkerBoot,
+  [channel.port2, sockets.port2],
+);
 
 /**
  * The page side uses capnweb directly because it sends no Workers `RpcTarget`.
@@ -77,6 +84,28 @@ worker.postMessage({ port: channel.port2 } satisfies WorkerBoot, [channel.port2]
  * way the runtime's conformance page does.
  */
 const host = newMessagePortRpcSession<HostRpc>(channel.port1);
+const AgentWebSocket = createMessagePortWebSocket(sockets.port1);
+let agent: AgentClient<unknown, CounterState> | undefined;
+let firstState: Promise<void> | undefined;
+
+async function connectedAgent(): Promise<AgentClient<unknown, CounterState>> {
+  if (agent === undefined) {
+    let stateReceived!: () => void;
+    firstState = new Promise<void>((resolve) => {
+      stateReceived = resolve;
+    });
+    agent = new AgentClient<unknown, CounterState>({
+      agent: "Counter",
+      name: "counter",
+      host: "actor.invalid",
+      protocol: "ws",
+      WebSocket: AgentWebSocket,
+      onStateUpdate: () => stateReceived(),
+    } as AgentClientOptions<CounterState> & { WebSocket: typeof WebSocket });
+  }
+  await firstState;
+  return agent;
+}
 
 /**
  * The operations, in one place, so the extension-message path and the
@@ -94,6 +123,25 @@ const ops = {
   armWake: (delayMs: number): Promise<number> =>
     host.armWake(delayMs) as unknown as Promise<number>,
   status: (): Promise<HostStatus> => host.status() as unknown as Promise<HostStatus>,
+  sdkIncrement: async (): Promise<number> => await (await connectedAgent()).call("increment"),
+  sdkSetState: async (value: number): Promise<CounterState> => {
+    if (!Number.isSafeInteger(value)) throw new TypeError("value must be a safe integer");
+    const client = await connectedAgent();
+    client.setState({ value });
+    return client.state as CounterState;
+  },
+  sdkState: async (): Promise<CounterState> => {
+    const client = await connectedAgent();
+    if (client.state === undefined) throw new Error("Agents client connected without state");
+    return client.state;
+  },
+  sdkStream: async (): Promise<{ chunks: unknown[]; final: unknown }> => {
+    const chunks: unknown[] = [];
+    const final = await (await connectedAgent()).call("streamValues", [], {
+      stream: { onChunk: (chunk) => chunks.push(chunk) },
+    });
+    return { chunks, final };
+  },
 } satisfies Record<HostOp, (...args: never[]) => Promise<unknown>>;
 
 async function runOp(op: HostOp, args: readonly unknown[]): Promise<unknown> {
@@ -108,6 +156,14 @@ async function runOp(op: HostOp, args: readonly unknown[]): Promise<unknown> {
       return await ops.armWake(Number(args[0] ?? 0));
     case "status":
       return await ops.status();
+    case "sdkIncrement":
+      return await ops.sdkIncrement();
+    case "sdkSetState":
+      return await ops.sdkSetState(Number(args[0]));
+    case "sdkState":
+      return await ops.sdkState();
+    case "sdkStream":
+      return await ops.sdkStream();
   }
 }
 

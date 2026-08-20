@@ -64,6 +64,9 @@ importers:
         specifier: 2.0.0-rc.24
         version: 2.0.0-rc.24
     devDependencies:
+      '@babel/plugin-proposal-decorators':
+        specifier: 8.0.2
+        version: 8.0.2(@babel/core@8.0.1)
       '@cloudflare/workers-types':
         specifier: 4.20260702.1
         version: 4.20260702.1

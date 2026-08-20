@@ -1,4 +1,5 @@
 import { fileURLToPath } from "node:url";
+import agents from "agents/vite";
 import { defineConfig } from "vite";
 
 /**
@@ -54,6 +55,7 @@ export default defineConfig({
    */
   worker: {
     format: "es",
+    plugins: () => agents(),
   },
 
   resolve: {
