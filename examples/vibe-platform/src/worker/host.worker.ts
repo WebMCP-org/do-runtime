@@ -35,19 +35,18 @@
 const rawSetTimeout = globalThis.setTimeout.bind(globalThis);
 const rawClearTimeout = globalThis.clearTimeout.bind(globalThis);
 
-import sqlite3InitModule, { type Sqlite3Static } from "@sqlite.org/sqlite-wasm";
+import sqlite3InitModule from "@sqlite.org/sqlite-wasm";
 import {
   createActorContainer,
   DEFAULT_ALARM_OUTLET,
+  gateRequestBody,
   installActorScope,
   newRpcSession,
   noFacets,
   type ActorContainer,
-  type SqlDatabase,
-  type SqlDatabaseProvider,
   type Timer,
 } from "@mcp-b/do-runtime";
-import { createSqliteWasmProvider, type SqliteWasmHost } from "@mcp-b/do-runtime/backends/sqlite-wasm";
+import type { SqliteWasmHost } from "@mcp-b/do-runtime/backends/sqlite-wasm";
 import { RpcTarget } from "@mcp-b/do-runtime/cloudflare-workers";
 import {
   WORKSPACE_LOCKED_MESSAGE,
@@ -57,8 +56,8 @@ import {
   type WorkspaceBoot,
   type WorkspaceRpc,
 } from "../wire";
-import { gateRequestBody } from "./gate-request-body";
 import { Workspace, type WorkspaceEnv } from "./workspace";
+import { TrackedSqliteWasmProvider, type RetryablePoolOptions } from "./sqlite-storage";
 
 // ---------------------------------------------------------------------------
 // Names that must never change
@@ -117,10 +116,6 @@ const sleep = (ms: number): Promise<void> =>
  * `dist/index.mjs`), so every retry below would return the first failure
  * forever.
  */
-type PoolOptions = Parameters<Sqlite3Static["installOpfsSAHPoolVfs"]>[0] & {
-  forceReinitIfPreviouslyFailed?: boolean;
-};
-
 /** How long to keep trying for the pool before telling the user it is locked. */
 const POOL_ATTEMPTS = 20;
 const POOL_RETRY_MS = 150;
@@ -146,7 +141,7 @@ async function installPool(): Promise<SqliteWasmHost> {
 
   const sqlite3 = await sqlite3InitModule();
 
-  const options: PoolOptions = {
+  const options: RetryablePoolOptions = {
     name: POOL_NAME,
     // NOT the conformance lane's `true`. That lane wants a pristine profile on
     // every run; this one is a workspace, and clearing on init would delete the
@@ -199,28 +194,9 @@ function pool(): Promise<SqliteWasmHost> {
  * owning what it opens. A container that broke and was replaced would otherwise
  * leave a second connection on the same file inside a VFS that expects one.
  * Nothing observable goes wrong immediately, which is exactly why the close is
- * deliberate rather than incidental.
+ * deliberate rather than incidental. Both workers share that small tracker
+ * from `sqlite-storage.ts`.
  */
-class WorkspaceStorage implements SqlDatabaseProvider {
-  readonly #provider: SqlDatabaseProvider;
-  readonly #open: SqlDatabase[] = [];
-
-  constructor(host: SqliteWasmHost) {
-    this.#provider = createSqliteWasmProvider(host, { prefix: STORAGE_PREFIX });
-  }
-
-  async open(name: string): Promise<SqlDatabase> {
-    const database = await this.#provider.open(name);
-    this.#open.push(database);
-    return database;
-  }
-
-  /** Drop every handle this container held. Uncommitted transactions go with them. */
-  close(): void {
-    for (const database of this.#open.splice(0)) database.close();
-  }
-}
-
 // ---------------------------------------------------------------------------
 // 4 + 5. The actor scope and the container
 
@@ -261,7 +237,7 @@ function installScope(): void {
 async function place(): Promise<Live> {
   const host = await pool();
   installScope();
-  const storage = new WorkspaceStorage(host);
+  const storage = new TrackedSqliteWasmProvider(host, STORAGE_PREFIX);
 
   const container = await createActorContainer({
     id: ACTOR_ID,

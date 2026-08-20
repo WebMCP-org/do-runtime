@@ -39,10 +39,10 @@ contains only the code you wrote.
 
 **The authored Durable Object runs here too.** `/server/agent.ts` imports `DurableObject` from
 `cloudflare:workers`, exactly as deployed code does. Rolldown strips its TypeScript without changing
-the stored file; `agent.worker.ts` rewrites only that platform import, blob-imports the module, and
-hosts the exported class through `createActorContainer`. It has a separate worker, actor realm, and
-stable OPFS pool. Saving any `server/*` file terminates that worker first and places a new instance
-over the same SQLite files, so code is volatile while state is durable.
+the stored file and maps that external to the runtime's module; `agent.worker.ts` blob-imports the
+result and hosts the exported class through `createActorContainer`. It has a separate worker, actor
+realm, and stable OPFS pool. Saving any `server/*` file drains requests, releases storage, and places
+a new instance over the same SQLite files, so code is volatile while state is durable.
 
 **The sandbox has one narrow capability.** The preview keeps `sandbox="allow-scripts"`. Its `fetch`
 wrapper sends only `/api/*` requests to the parent over a one-request `MessageChannel`; the page
@@ -98,8 +98,9 @@ set the headers directly.
 
 **One tab at a time.** Each OPFS SAH pool takes exclusive sync access handles — that exclusivity is
 what makes SQLite synchronous here — so a second tab cannot install the workspace or user-agent
-pool. Both retry because a terminated worker releases handles asynchronously. Close the other tab
-and reload; measured, it recovers.
+pool. An agent edit closes SQLite and pauses its VFS before replacing the worker; both installers
+still retry for reloads and crashes, where the old worker cannot acknowledge release. Close the
+other tab and reload; measured, it recovers.
 
 **The preview needs the network.** React comes from esm.sh at preview time. Offline, the bundle
 still builds and the workspace still saves and persists — the iframe just renders nothing. The e2e

@@ -34,8 +34,6 @@
  * docs/decisions.md.
  */
 
-import type { IoContext } from "../io/io-context";
-
 /**
  * The `Body` mixin's consuming methods (`http.h`'s `Body` resource type). Each
  * one reads the whole stream, so each one is an await that has to resume gated.
@@ -46,9 +44,13 @@ import type { IoContext } from "../io/io-context";
  */
 const BODY_CONSUMERS = ["arrayBuffer", "blob", "bytes", "formData", "json", "text"] as const;
 
+type IoAwaiter = {
+  awaitIo<T>(promise: Promise<T>): Promise<T>;
+};
+
 /**
- * Wrap a `Response` so every asynchronous step of reading it resumes inside a
- * gated slice.
+ * Wrap a `Request` or `Response` so every asynchronous step of reading it
+ * resumes inside a gated slice.
  *
  * A `Proxy` rather than a subclass, for a reason that is the substrate's rather
  * than a preference: `Response`'s internals are exotic, `new Response(res.body)`
@@ -58,13 +60,13 @@ const BODY_CONSUMERS = ["arrayBuffer", "blob", "bytes", "formData", "json", "tex
  * rest to the real object, bound to it, so a member this file has never heard of
  * behaves exactly as the substrate's does.
  *
- * `clone()` is wrapped too. It returns a second `Response` over a tee of the
+ * `clone()` is wrapped too. It returns a second body owner over a tee of the
  * same stream, and an unwrapped one would be the same hole one call further out.
  */
-export function gateResponseBody(ctx: IoContext, response: Response): Response {
+function gateBody<T extends Request | Response>(ctx: IoAwaiter, value: T): T {
   const bound = new Map<string | symbol, unknown>();
 
-  return new Proxy(response, {
+  return new Proxy(value, {
     get(subject, property): unknown {
       const cached = bound.get(property);
       if (cached !== undefined) return cached;
@@ -78,7 +80,7 @@ export function gateResponseBody(ctx: IoContext, response: Response): Response {
       }
 
       if (property === "clone") {
-        const clone = (): Response => gateResponseBody(ctx, subject.clone());
+        const clone = (): T => gateBody(ctx, subject.clone() as T);
         bound.set(property, clone);
         return clone;
       }
@@ -109,6 +111,16 @@ export function gateResponseBody(ctx: IoContext, response: Response): Response {
   });
 }
 
+/** Wrap a host-provided request so consuming or streaming its body resumes gated. */
+export function gateRequestBody(ctx: IoAwaiter, request: Request): Request {
+  return gateBody(ctx, request);
+}
+
+/** Wrap an outbound response so consuming or streaming its body resumes gated. */
+export function gateResponseBody(ctx: IoAwaiter, response: Response): Response {
+  return gateBody(ctx, response);
+}
+
 /**
  * ← the same property one layer down: a body read through `getReader()` is a
  * sequence of awaits, so each `read()` is one.
@@ -121,7 +133,7 @@ export const BYOB_READER_UNGATABLE_MESSAGE =
   "`ReadableStream.getReader` is the only seam it has and a byte stream's `read(view)` " +
   "returns the caller's own buffer. Read the body through `arrayBuffer()` or a default reader.";
 
-export function gateReadableStream<T>(ctx: IoContext, stream: ReadableStream<T>): ReadableStream<T> {
+export function gateReadableStream<T>(ctx: IoAwaiter, stream: ReadableStream<T>): ReadableStream<T> {
   const bound = new Map<string | symbol, unknown>();
 
   return new Proxy(stream, {
@@ -163,7 +175,7 @@ export function gateReadableStream<T>(ctx: IoContext, stream: ReadableStream<T>)
 }
 
 function gateReader<T>(
-  ctx: IoContext,
+  ctx: IoAwaiter,
   reader: ReadableStreamDefaultReader<T>,
 ): ReadableStreamDefaultReader<T> {
   return new Proxy(reader, {

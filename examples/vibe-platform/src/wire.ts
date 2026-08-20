@@ -66,6 +66,8 @@ export interface AgentRpc {
   ready(): Promise<string>;
   /** One `fetch()` event on the authored Durable Object. */
   request(wire: WireRequest): Promise<WireResponse>;
+  /** Finish requests, close SQLite, and release the OPFS pool before replacement. */
+  dispose(): Promise<void>;
 }
 
 /** What the page exposes to the worker: somewhere to put a line the user should see. */
@@ -79,11 +81,14 @@ export type WorkspaceBoot = {
   port: MessagePort;
 };
 
-/** The evaluated source is a Rolldown output; the workspace keeps the originals untouched. */
+/** The evaluated source is a Rolldown IIFE exporting its module record as default. */
 export type AgentBoot = {
   port: MessagePort;
   source: string;
 };
+
+/** The global Rolldown uses for the browser's `cloudflare:workers` external. */
+export const CLOUDFLARE_WORKERS_GLOBAL = "__vibeCloudflareWorkers";
 
 /**
  * The origin the actor answers on. It is never resolved and never reaches the

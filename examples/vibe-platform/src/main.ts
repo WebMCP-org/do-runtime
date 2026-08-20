@@ -13,10 +13,10 @@
  */
 
 import { rolldown } from "@rolldown/browser";
-import { newRpcSession } from "@mcp-b/do-runtime";
-import { RpcTarget } from "@mcp-b/do-runtime/cloudflare-workers";
+import { newMessagePortRpcSession, RpcTarget, type RpcStub } from "capnweb";
 import {
   AGENT_ORIGIN,
+  CLOUDFLARE_WORKERS_GLOBAL,
   WORKSPACE_ORIGIN,
   type AgentBoot,
   type AgentRpc,
@@ -89,7 +89,7 @@ class PageTarget extends RpcTarget implements PageRpc {
 // capnweb can serialise. Everything after this is capnweb.
 const channel = new MessageChannel();
 workspaceWorker.postMessage({ port: channel.port2 } satisfies WorkspaceBoot, [channel.port2]);
-const workspace = newRpcSession<WorkspaceRpc>(channel.port1, new PageTarget());
+const workspace = newMessagePortRpcSession<WorkspaceRpc>(channel.port1, new PageTarget());
 
 // ---------------------------------------------------------------------------
 // The Durable Object, addressed as an origin
@@ -167,6 +167,7 @@ function resolveRelative(base: string, relative: string): string {
 async function bundleWorkspace(
   entry: string,
   external: (id: string) => boolean,
+  iifeName?: string,
 ): Promise<string> {
   // One listing per build, so `resolveId` is a set lookup rather than a round
   // trip per candidate extension.
@@ -192,11 +193,19 @@ async function bundleWorkspace(
       },
     ],
   });
-  const { output } = await bundle.generate({ format: "esm" });
+  const { output } = await bundle.generate(
+    iifeName === undefined
+      ? { format: "esm" }
+      : {
+          format: "iife",
+          name: iifeName,
+          globals: { "cloudflare:workers": CLOUDFLARE_WORKERS_GLOBAL },
+        },
+  );
   await bundle.close();
   const first = output[0];
   if (first === undefined) throw new Error("rolldown produced no output chunk");
-  return first.code;
+  return iifeName === undefined ? first.code : `${first.code}\nexport default ${iifeName};\n`;
 }
 
 const build = (): Promise<string> =>
@@ -206,22 +215,46 @@ const build = (): Promise<string> =>
 // The authored Durable Object, in its own worker and persistent pool
 
 const AGENT_ENTRY = "/server/agent.ts";
+const AGENT_MODULE = "__vibeAuthoredModule";
+const AGENT_STOP_TIMEOUT_MS = 1_000;
 let agentWorker: Worker | undefined;
-let agent: ReturnType<typeof newRpcSession<AgentRpc>> | undefined;
+let agent: RpcStub<AgentRpc> | undefined;
 let agentClassName: string | undefined;
 
-function stopAgent(): void {
-  agentWorker?.terminate();
+async function stopAgent(): Promise<void> {
+  const currentWorker = agentWorker;
+  const currentAgent = agent;
   agentWorker = undefined;
   agent = undefined;
   agentClassName = undefined;
+  if (currentWorker === undefined) return;
+  try {
+    await Promise.race([
+      currentAgent?.dispose(),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("agent shutdown timed out")), AGENT_STOP_TIMEOUT_MS),
+      ),
+    ]);
+    log("agent storage released");
+  } catch (error) {
+    log(
+      `agent shutdown fell back to termination: ${error instanceof Error ? error.message : String(error)}`,
+      true,
+    );
+  } finally {
+    currentWorker.terminate();
+  }
 }
 
 async function restartAgent(initial = false): Promise<void> {
-  // OPFS sync handles are exclusive: terminate first, then give their async
-  // release time to overlap the Rolldown build before the new worker retries.
-  stopAgent();
-  const source = await bundleWorkspace(AGENT_ENTRY, (id) => id === "cloudflare:workers");
+  // A normal replacement closes SQLite and pauses the VFS before termination.
+  // A crashed/reloaded worker cannot acknowledge teardown, so installPool still retries.
+  await stopAgent();
+  const source = await bundleWorkspace(
+    AGENT_ENTRY,
+    (id) => id === "cloudflare:workers",
+    AGENT_MODULE,
+  );
   const nextWorker = new Worker(new URL("./worker/agent.worker.ts", import.meta.url), {
     type: "module",
   });
@@ -237,7 +270,7 @@ async function restartAgent(initial = false): Promise<void> {
     { port: nextChannel.port2, source } satisfies AgentBoot,
     [nextChannel.port2],
   );
-  const nextAgent = newRpcSession<AgentRpc>(nextChannel.port1, new PageTarget());
+  const nextAgent = newMessagePortRpcSession<AgentRpc>(nextChannel.port1, new PageTarget());
   try {
     const className = await nextAgent.ready();
     agentWorker = nextWorker;
@@ -279,14 +312,15 @@ const IMPORT_MAP = {
  */
 function renderPreview(code: string): void {
   const escaped = code.replaceAll("</script", "<\\/script");
+  const parentOrigin = JSON.stringify(location.origin);
   preview.srcdoc = `<!doctype html>
 <html><head><meta charset="utf-8" />
 <script type="importmap">${JSON.stringify(IMPORT_MAP)}</script>
 <script>
   // Runtime failures inside the preview are the point of the log pane, and an
   // opaque origin can still postMessage to its parent.
-  addEventListener("error", (e) => parent.postMessage({ preview: String(e.message) }, "*"));
-  addEventListener("unhandledrejection", (e) => parent.postMessage({ preview: String(e.reason) }, "*"));
+  addEventListener("error", (e) => parent.postMessage({ preview: String(e.message) }, ${parentOrigin}));
+  addEventListener("unhandledrejection", (e) => parent.postMessage({ preview: String(e.reason) }, ${parentOrigin}));
 
   // The opaque preview gets one capability: /api/* requests. A transferred
   // MessagePort is the reply channel for exactly one request.
@@ -324,7 +358,7 @@ function renderPreview(code: string): void {
         ...(body === undefined ? {} : { body }),
       },
     };
-    parent.postMessage(message, "*", body === undefined
+    parent.postMessage(message, ${parentOrigin}, body === undefined
       ? [channel.port2]
       : [channel.port2, body.buffer]);
     const response = await reply;

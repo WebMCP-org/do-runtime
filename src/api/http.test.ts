@@ -12,7 +12,12 @@ import { describe, expect, test } from "vitest";
 import type { Actor, Timer } from "../io/io-context";
 import { IoContext } from "../io/io-context";
 import { InputGate, OutputGate } from "../io/io-gate";
-import { BYOB_READER_UNGATABLE_MESSAGE, gateReadableStream, gateResponseBody } from "./http";
+import {
+  BYOB_READER_UNGATABLE_MESSAGE,
+  gateReadableStream,
+  gateRequestBody,
+  gateResponseBody,
+} from "./http";
 
 class TestActor implements Actor {
   readonly inputGate = new InputGate();
@@ -139,6 +144,31 @@ describe("gateResponseBody", () => {
   test("a null body stays null", async () => {
     const ctx = newContext();
     expect(gateResponseBody(ctx, new Response(null, { status: 204 })).body).toBeNull();
+  });
+});
+
+describe("gateRequestBody", () => {
+  test("a host-provided request body and its clones resume gated", async () => {
+    const ctx = newContext();
+    const seen: string[] = [];
+
+    await ctx.run(async () => {
+      const request = gateRequestBody(
+        ctx,
+        new Request("http://example.invalid", {
+          method: "POST",
+          body: slowBody(["hel", "lo"]),
+          duplex: "half",
+        } as RequestInit & { duplex: "half" }),
+      );
+      const copy = request.clone();
+      expect(await copy.text()).toBe("hello");
+      seen.push(ctx.hasCurrent() ? "clone:gated" : "clone:UNGATED");
+      expect(await request.text()).toBe("hello");
+      seen.push(ctx.hasCurrent() ? "original:gated" : "original:UNGATED");
+    });
+
+    expect(seen).toEqual(["clone:gated", "original:gated"]);
   });
 });
 

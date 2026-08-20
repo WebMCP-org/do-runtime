@@ -1,41 +1,18 @@
 {
-  // The page half: `lib.dom`, because this code touches the document.
-  //
-  // Two projects rather than one, because the two halves cannot share a global
-  // environment. `lib.dom` and `@cloudflare/workers-types` declare about sixty
-  // of the same names — `Request`, `Response`, `Headers`, `ReadableStream`,
-  // `URL`, `Blob`, `MessagePort`, `crypto`, `performance`, `WebSocket` and the
-  // rest — with different shapes, and a program with both loaded has to pick a
-  // winner for each. The worker half wants the Workers copies (it hosts an
-  // actor); this half wants the DOM's.
-  //
-  // The catch, and it is worth knowing before copying this file: `types` below
-  // is not empty even though this half wants none of it. `@mcp-b/do-runtime`
-  // exports TypeScript source, and its one public entry is typed against
-  // workers-types globals, so ANY importer has to load them — including a page
-  // that only wants `newRpcSession`. `skipLibCheck` is what lets the two
-  // declaration sets coexist afterwards: every duplicate is inside a `.d.ts`,
-  // so the check that would report them is the one being skipped. The names
-  // above therefore resolve to the workers-types copy in this half too; page
-  // code here is written to stay off them.
-  //
-  // Exactly one member is lost that way, and it is worth knowing about because
-  // it looks like a bug in your own code: `Element.append`. workers-types
-  // declares an `Element` for HTMLRewriter whose `append` takes
-  // `string | Response | ReadableStream`, and that is the one the merged
-  // interface keeps — so `parent.append(child)` fails with a message about
-  // `Response`. `src/main.ts` uses `appendChild` instead.
+  // The DOM-only supervisor uses capnweb directly. The actor worker uses the
+  // runtime's session entry because that side sends Workers RpcTarget values.
   "compilerOptions": {
     "target": "ES2023",
     "module": "ESNext",
     "moduleResolution": "bundler",
     "lib": ["ESNext", "DOM", "DOM.Iterable"],
-    "types": ["@cloudflare/workers-types"],
+    "types": ["node"],
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "noUnusedLocals": true,
     "noUnusedParameters": true,
     "verbatimModuleSyntax": true,
+    // capnweb 0.10's recursive tuple declarations fail under TypeScript 5.9.
     "skipLibCheck": true,
     "noEmit": true
   },

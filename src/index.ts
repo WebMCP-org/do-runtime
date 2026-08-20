@@ -195,7 +195,7 @@ export {
 } from "./api/global-scope";
 export type { AcceptedWebSocket, RawWebSocket } from "./api/web-socket";
 export { ALREADY_ACCEPTED_MESSAGE } from "./api/web-socket";
-export { BYOB_READER_UNGATABLE_MESSAGE } from "./api/http";
+export { BYOB_READER_UNGATABLE_MESSAGE, gateRequestBody } from "./api/http";
 /**
  * The transport, for the same reason the loader binding and the scheduler are
  * here: the hops a host owns are not something `createActorContainer` could

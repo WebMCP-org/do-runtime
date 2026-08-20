@@ -6,29 +6,17 @@
   // separates this project from `tsconfig.worker.json`: "DOM" and "WebWorker"
   // declare incompatible versions of the same globals, so no single project can
   // check both halves.
-  //
-  // **`@cloudflare/workers-types` is here too, and that is forced rather than
-  // chosen.** `offscreen.ts` imports `newRpcSession` from `@mcp-b/do-runtime`,
-  // whose package exports are TypeScript SOURCE — so checking this project
-  // checks the whole runtime, and the runtime is specified against workers-types
-  // globals. Without it, ~200 `Cannot find name 'DurableObjectPutOptions'`-class
-  // errors come out of `src/api/` rather than out of this example.
-  //
-  // Loading it beside "DOM" duplicates a long list of global declarations
-  // (`Response`, `Request`, `WebSocket`, `crypto`, …). `skipLibCheck` is what
-  // makes that survivable: the duplicates are all in `.d.ts` files, so they are
-  // suppressed, and nothing in this example touches a global the two disagree
-  // about. See the "Rough edges" section of this example's README.
   "compilerOptions": {
     "target": "ES2023",
     "module": "ESNext",
     "moduleResolution": "bundler",
     "lib": ["ESNext", "DOM", "DOM.Iterable"],
-    "types": ["chrome-types", "@cloudflare/workers-types"],
+    "types": ["chrome-types"],
     "strict": true,
     "noUnusedLocals": true,
     "noUnusedParameters": true,
     "verbatimModuleSyntax": true,
+    // capnweb 0.10's recursive tuple declarations fail under TypeScript 5.9.
     "skipLibCheck": true,
     "noEmit": true
   },

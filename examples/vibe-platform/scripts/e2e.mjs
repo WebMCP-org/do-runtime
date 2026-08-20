@@ -229,6 +229,9 @@ try {
       undefined,
       { timeout: TIMEOUT },
     );
+    if (!(await page.locator("#log").innerText()).includes("agent storage released")) {
+      throw new Error("the replaced agent did not acknowledge OPFS release");
+    }
     const state = await previewApi();
     if (state.visits !== 1) throw new Error(`visit count after respawn is ${String(state.visits)}`);
   });

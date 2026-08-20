@@ -101,10 +101,9 @@ export class Workspace extends DurableObject<WorkspaceEnv> {
           // io-context operation, so the code after this line resumes holding a
           // fresh input lock and may touch storage. A browser `Request` carries
           // no such property, so the host hands this method one whose body reads
-          // are wrapped in `container.awaitIo()` — see `gateRequestBody` in
-          // `host.worker.ts`, which also has the measurement of what happens
-          // without it. From in here it is invisible, which is the point: the
-          // actor is written the way a Durable Object is written.
+          // are wrapped by the runtime's `gateRequestBody(container, request)`.
+          // From in here it is invisible, which is the point: the actor is
+          // written the way a Durable Object is written.
           const content = await request.text();
           this.#save(path, content);
           return new Response(`saved ${path}`, { headers: { "content-type": "text/plain" } });

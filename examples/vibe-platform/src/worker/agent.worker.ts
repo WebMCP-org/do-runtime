@@ -1,46 +1,35 @@
 const rawSetTimeout = globalThis.setTimeout.bind(globalThis);
 const rawClearTimeout = globalThis.clearTimeout.bind(globalThis);
 
-import sqlite3InitModule, { type Sqlite3Static } from "@sqlite.org/sqlite-wasm";
+import sqlite3InitModule from "@sqlite.org/sqlite-wasm";
 import {
-  actorScopeBindings,
   createActorContainer,
   DEFAULT_ALARM_OUTLET,
+  gateRequestBody,
   installActorScope,
   newRpcSession,
   noFacets,
   type ActorContainer,
   type Timer,
 } from "@mcp-b/do-runtime";
-import { createSqliteWasmProvider, type SqliteWasmHost } from "@mcp-b/do-runtime/backends/sqlite-wasm";
+import type { SqliteWasmHost } from "@mcp-b/do-runtime/backends/sqlite-wasm";
 import * as cloudflareWorkers from "@mcp-b/do-runtime/cloudflare-workers";
 import { DurableObject, RpcTarget } from "@mcp-b/do-runtime/cloudflare-workers";
 import {
+  CLOUDFLARE_WORKERS_GLOBAL,
   type AgentBoot,
   type AgentRpc,
   type PageRpc,
   type WireRequest,
   type WireResponse,
 } from "../wire";
-import { gateRequestBody } from "./gate-request-body";
+import { TrackedSqliteWasmProvider, type RetryablePoolOptions } from "./sqlite-storage";
 
 // Stable forever: changing either value orphans the authored actor's data.
 const UNIQUE_KEY = "do-runtime-example-vibe-user-agent";
 const POOL_NAME = "vibe-user-agent";
 const STORAGE_PREFIX = "/agent";
 const ACTOR_ID = "default";
-
-const CLOUDFLARE_WORKERS_GLOBAL = "__vibeCloudflareWorkers";
-const ACTOR_SCOPE_GLOBAL = "__vibeActorScope";
-const ACTOR_SCOPE_NAMES = [
-  "scheduler",
-  "setTimeout",
-  "clearTimeout",
-  "setInterval",
-  "clearInterval",
-  "fetch",
-  "crypto",
-] as const;
 
 const timer: Timer = {
   now: () => Date.now(),
@@ -51,17 +40,17 @@ const timer: Timer = {
     }),
 };
 
-type PoolOptions = Parameters<Sqlite3Static["installOpfsSAHPoolVfs"]>[0] & {
-  forceReinitIfPreviouslyFailed?: boolean;
+type ReleasableSqliteWasmHost = SqliteWasmHost & {
+  pool: SqliteWasmHost["pool"] & { pauseVfs(): unknown };
 };
 
-async function installPool(): Promise<SqliteWasmHost> {
+async function installPool(): Promise<ReleasableSqliteWasmHost> {
   Object.defineProperty(globalThis, "sqlite3ApiConfig", {
     configurable: true,
     value: { disable: { vfs: { opfs: true, "opfs-wl": true } } },
   });
   const sqlite3 = await sqlite3InitModule();
-  const options: PoolOptions = {
+  const options: RetryablePoolOptions = {
     name: POOL_NAME,
     clearOnInit: false,
     initialCapacity: 8,
@@ -85,13 +74,16 @@ let live:
       container: ActorContainer;
       entry: { fetch(request: Request): Promise<Response> | Response };
       className: string;
+      storage: TrackedSqliteWasmProvider;
     }
   | undefined;
 let scopeContainer: ActorContainer | undefined;
 let placing: Promise<NonNullable<typeof live>> | undefined;
 let authoredSource = "";
 let scopeInstalled = false;
-let pooled: Promise<SqliteWasmHost> | undefined;
+let shuttingDown = false;
+let pooled: Promise<ReleasableSqliteWasmHost> | undefined;
+const requests = new Set<Promise<WireResponse>>();
 
 function installScope(): void {
   if (scopeInstalled) return;
@@ -102,7 +94,6 @@ function installScope(): void {
     }
     return scopeContainer.globals;
   };
-  (globalThis as Record<string, unknown>)[ACTOR_SCOPE_GLOBAL] = actorScopeBindings(resolve);
   installActorScope(globalThis, resolve);
 }
 
@@ -112,23 +103,16 @@ async function evaluateActor(): Promise<{
   exports: Record<string, unknown>;
 }> {
   (globalThis as Record<string, unknown>)[CLOUDFLARE_WORKERS_GLOBAL] = cloudflareWorkers;
-  const rewritten =
-    `const { ${ACTOR_SCOPE_NAMES.join(", ")} } = globalThis.${ACTOR_SCOPE_GLOBAL};\n` +
-    authoredSource.replace(
-      /import\s+(\{[^}]*\})\s+from\s+["']cloudflare:workers["'];?/g,
-      (_match, clause: string) =>
-        `const ${clause.replace(/\bas\b/g, ":")} = globalThis.${CLOUDFLARE_WORKERS_GLOBAL};`,
-    );
-  if (rewritten.includes("cloudflare:workers")) {
-    throw new Error("An unsupported cloudflare:workers import remains in server/agent.ts.");
-  }
-
-  const url = URL.createObjectURL(new Blob([rewritten], { type: "text/javascript" }));
-  let module: Record<string, unknown>;
+  const url = URL.createObjectURL(new Blob([authoredSource], { type: "text/javascript" }));
+  let imported: Record<string, unknown>;
   try {
-    module = (await import(/* @vite-ignore */ url)) as Record<string, unknown>;
+    imported = (await import(/* @vite-ignore */ url)) as Record<string, unknown>;
   } finally {
     URL.revokeObjectURL(url);
+  }
+  const module = imported.default;
+  if (typeof module !== "object" || module === null) {
+    throw new Error("The authored bundle did not export a module record.");
   }
 
   const classes = Object.entries(module).filter(
@@ -150,7 +134,7 @@ async function evaluateActor(): Promise<{
       env: Record<string, never>,
     ) => object,
     className,
-    exports: module,
+    exports: module as Record<string, unknown>,
   };
 }
 
@@ -159,13 +143,14 @@ async function place(): Promise<NonNullable<typeof live>> {
   const host = await pooled;
   installScope();
   const evaluated = await evaluateActor();
+  const storage = new TrackedSqliteWasmProvider(host, STORAGE_PREFIX);
   const container = await createActorContainer({
     id: ACTOR_ID,
     uniqueKey: UNIQUE_KEY,
     exports: evaluated.exports,
     env: {},
     ports: {
-      sql: createSqliteWasmProvider(host, { prefix: STORAGE_PREFIX }),
+      sql: storage,
       alarms: DEFAULT_ALARM_OUTLET,
       facets: noFacets,
       timer,
@@ -175,6 +160,7 @@ async function place(): Promise<NonNullable<typeof live>> {
   void container.onBroken.catch((error: unknown) => {
     if (scopeContainer === container) scopeContainer = undefined;
     if (live?.container === container) live = undefined;
+    storage.close();
     report(`the user agent broke: ${describe(error)}`, true);
   });
   const instance = await container.start(
@@ -189,11 +175,13 @@ async function place(): Promise<NonNullable<typeof live>> {
       instance as { fetch(request: Request): Promise<Response> | Response },
     ),
     className: evaluated.className,
+    storage,
   };
   return live;
 }
 
 async function placed(): Promise<NonNullable<typeof live>> {
+  if (shuttingDown) throw new Error("The user agent is shutting down.");
   if (live !== undefined) return live;
   placing ??= place().finally(() => {
     placing = undefined;
@@ -212,18 +200,36 @@ class AgentTarget extends RpcTarget implements AgentRpc {
   }
 
   async request(wire: WireRequest): Promise<WireResponse> {
-    const { container, entry } = await placed();
-    const request = new Request(wire.url, {
-      method: wire.method,
-      headers: wire.headers,
-      ...(wire.body === undefined ? {} : { body: wire.body.slice() }),
-    });
-    const response = await entry.fetch(gateRequestBody(container, request));
-    return {
-      status: response.status,
-      headers: [...response.headers.entries()],
-      body: new Uint8Array(await response.arrayBuffer()),
-    };
+    const pending = (async (): Promise<WireResponse> => {
+      const { container, entry } = await placed();
+      const request = new Request(wire.url, {
+        method: wire.method,
+        headers: wire.headers,
+        ...(wire.body === undefined ? {} : { body: wire.body.slice() }),
+      });
+      const response = await entry.fetch(gateRequestBody(container, request));
+      return {
+        status: response.status,
+        headers: [...response.headers.entries()],
+        body: new Uint8Array(await response.arrayBuffer()),
+      };
+    })();
+    requests.add(pending);
+    try {
+      return await pending;
+    } finally {
+      requests.delete(pending);
+    }
+  }
+
+  async dispose(): Promise<void> {
+    shuttingDown = true;
+    await Promise.allSettled(requests);
+    const current = live;
+    live = undefined;
+    scopeContainer = undefined;
+    current?.storage.close();
+    (await pooled)?.pool.pauseVfs();
   }
 }
 

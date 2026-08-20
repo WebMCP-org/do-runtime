@@ -145,9 +145,9 @@ Every step is where it is because moving it was measured to fail.
 5. **Consume `container.onBroken`.** A host that ignores it gets an actor that
    answers nothing and logs nothing.
 6. **Boot the worker with one raw `postMessage` carrying the `MessagePort` in the
-   transfer list, then `newRpcSession` from the package.** A port is not a value
-   capnweb can serialise, and `newRpcSession` applies an `RpcTarget` prototype
-   graft that capnweb's own `newMessagePortRpcSession` does not.
+   transfer list.** A port is not a value capnweb can serialise. The DOM side
+   opens capnweb directly; the actor side uses the runtime's `newRpcSession` so
+   Workers `RpcTarget` values get the required prototype graft.
 
 Two values here are permanent:
 
@@ -206,13 +206,6 @@ Written down because this example exists partly to find them.
   `DurableObject<Env = Cloudflare.Env>` defaults `Env` to an empty interface, and
   the container's `env: unknown` is not assignable to it —
   `src/worker/counter.ts` therefore writes `extends DurableObject<unknown>`.
-- **The package's page-side entry drags workers-types into a DOM project.**
-  `newRpcSession` is exported from `@mcp-b/do-runtime`, whose exports are
-  TypeScript *source* specified against `@cloudflare/workers-types` globals. A DOM
-  project that imports it must load workers-types too and lean on `skipLibCheck`
-  to suppress the duplicate global declarations. A `.d.ts`-shaped entry, or a
-  transport subpath export that pulls in no `api/` types, would make the supervisor
-  half of the documented topology typecheck on its own.
 - **`FacetHost` has no "places no facets" implementation in the package.**
   `noFacets` appears only as a snippet in the root README, so every host retypes
   four members to say the same thing.

@@ -21,7 +21,7 @@
  * handle cannot be obtained for an offscreen document.
  */
 
-import { newRpcSession } from "@mcp-b/do-runtime";
+import { newMessagePortRpcSession } from "capnweb";
 import type {
   CounterSnapshot,
   ExtensionMessage,
@@ -67,17 +67,16 @@ const channel = new MessageChannel();
 worker.postMessage({ port: channel.port2 } satisfies WorkerBoot, [channel.port2]);
 
 /**
- * `newRpcSession` from the runtime rather than capnweb's own
- * `newMessagePortRpcSession`: the package applies an `RpcTarget` prototype graft
- * immediately before opening each session, without which capnweb does not
- * recognise the worker's `RpcTarget` subclass as one.
+ * The page side uses capnweb directly because it sends no Workers `RpcTarget`.
+ * The actor worker uses the runtime's `newRpcSession`, which applies the
+ * identity graft before it exposes its Workers targets.
  *
  * No local main is passed because nothing calls back: this example's alarm
  * scheduler lives in the actor's own worker, so the worker never needs to reach
  * the supervisor. A host with more than one actor would pass a target here, the
  * way the runtime's conformance page does.
  */
-const host = newRpcSession<HostRpc>(channel.port1);
+const host = newMessagePortRpcSession<HostRpc>(channel.port1);
 
 /**
  * The operations, in one place, so the extension-message path and the
