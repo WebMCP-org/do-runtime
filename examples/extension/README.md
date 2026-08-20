@@ -57,6 +57,18 @@ popup.html ──sendMessage──▶ service worker ──chrome.offscreen.crea
 - **The Agents SDK queue.** The e2e enqueues an increment and observes its state
   write through `snapshot()`, exercising the SDK's SQLite-backed queue rather
   than a host callback.
+- **A real non-hibernating `AgentClient` connection.** The offscreen page opens
+  the SDK client over a `MessagePort`-backed WebSocket, while the actor receives
+  the server half through `container.acceptWebSocket()`. The e2e proves
+  server-to-client state broadcasts, client-to-server `setState()`, a decorated
+  `@callable()` method, and a streaming callable's chunks and final value.
+- **The SDK's stateless MCP handler.** The actor serves `createMcpHandler()` and
+  exposes a real `McpServer` tool that reads its current state. The e2e performs
+  MCP `tools/list` and `tools/call` requests through the gated actor fetch path.
+- **Inbound Agents email routing.** A namespace-shaped local binding carries an
+  in-memory `ForwardableEmailMessage` through `routeAgentEmail()` to the actor's
+  `onEmail()` hook. Forwarding and replies still refuse because this host has no
+  outbound email binding.
 - **Offscreen corpse recovery.** A crashed offscreen document disappears from
   `chrome.runtime.getContexts` while still holding the one offscreen slot.
   `src/background.ts` catches the resulting "single offscreen document" error —
@@ -113,6 +125,8 @@ through the popup, which is what covers `chrome.offscreen.createDocument` itself
 | `src/background.ts` | The service worker: `ensureOffscreen()` and nothing else. |
 | `src/popup/popup.ts` | Four buttons and an output pane. |
 | `src/protocol.ts` | The types both TypeScript projects compile. It imports nothing. |
+| `../platform-shims/memory-websocket-pair.ts` | A local WebSocket pair for the Agents server path. |
+| `../platform-shims/message-port-websocket.ts` | The client-side WebSocket adapter carried over a `MessagePort`. |
 | `public/manifest.json` | Copied verbatim into `dist/` by Vite's `publicDir`. |
 
 Two `tsconfig`s, because `"DOM"` and `"WebWorker"` declare incompatible versions of
@@ -198,14 +212,29 @@ first (`chrome.offscreen.closeDocument()` from the service worker's console).
   than reaching an ungated one that would appear to work.
 - **Worker Loader / Code Mode.** No dynamic isolates.
 
+## Agents compatibility boundary
+
+The self-contained demo runs every Agents SDK surface that has a faithful local
+substrate. Cloudflare-managed products remain explicit integration boundaries:
+
+| Runs in this host | Needs a Cloudflare service or separate integration |
+| --- | --- |
+| HTTP and durable state | Workflows: a real Workflow binding and Workflow runtime |
+| Non-hibernating WebSockets and bidirectional state sync | WebSocket hibernation: platform-owned socket survival across eviction |
+| Decorated callable and streaming RPC | AI chat and tool approval: `@cloudflare/ai-chat` plus a model provider |
+| SQLite-backed queue and `Agent.schedule()` | Outbound email: an Email Routing send binding |
+| Stateless MCP server and tools | |
+| Inbound `routeAgentEmail()` and `onEmail()` | |
+
 ## Rough edges
 
 Written down because this example exists partly to find them.
 
 - **The Agents SDK root entry eagerly imports Workers-only Node and email modules.**
-  Vite maps the Node imports through `unenv`; `cloudflare:email` is a fail-closed
-  shim because these demos do not expose email delivery. This proves Agent state
-  and HTTP/RPC handlers, not every SDK feature. Both demos disable Agent WebSocket
+  Vite maps the Node imports through `unenv`; `cloudflare:email` remains a
+  fail-closed shim. The inbound test supplies a host-created
+  `ForwardableEmailMessage`; its forwarding and reply methods refuse because the
+  demo has no outbound Email Routing binding. Both demos disable Agent WebSocket
   hibernation because this runtime deliberately refuses hibernatable sockets.
 - **`FacetHost` has no "places no facets" implementation in the package.**
   `noFacets` appears only as a snippet in the root README, so every host retypes

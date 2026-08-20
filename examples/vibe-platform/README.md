@@ -110,7 +110,10 @@ failing; `VIBE_E2E_OFFLINE=1 node scripts/e2e.mjs` takes that path on purpose.
 
 **This is the Agents SDK's HTTP state path, not its whole platform.** The SDK eagerly imports Node
 and email modules, so Vite maps the Node imports through `unenv` and a fail-closed email shim. The
-starter disables Agent WebSocket hibernation because this runtime refuses hibernatable sockets.
+starter disables Agent WebSocket hibernation because this runtime refuses hibernatable sockets. The
+[MV3 extension example](../extension/README.md) is the broader compatibility harness: it runs the
+SDK client and non-hibernating socket server, bidirectional state sync, callable and streaming RPC,
+the SDK queue and scheduler, stateless MCP, and inbound email routing.
 
 ## Deploying an export
 
@@ -131,9 +134,11 @@ later real deployment will succeed.
 - **Alarms.** `ports.alarms` is a named refusal here. A real one is an `AlarmScheduler` over a
   database of its own, which in a browser means a second worker with a second pool and delivery
   routed back through the page.
-- **Agents SDK WebSockets, schedules, workflows, MCP, and email.** The real SDK is loaded, but this
-  demo intentionally proves the smallest useful slice: `initialState`, `state`, `setState()`, and
-  `onRequest()` through an actor restart, page reload, and deploy dry-run.
+- **Broader Agents SDK surfaces in authored code.** This lane intentionally proves the smallest
+  useful exportable slice: `initialState`, `state`, `setState()`, and `onRequest()` through an actor
+  restart, page reload, and deploy dry-run. The extension example covers the locally executable SDK
+  surfaces. Workflows, outbound email, AI chat/model calls, and WebSocket hibernation need real
+  platform bindings or a separate provider, so neither browser demo simulates them.
 - **Facets.** `ports.facets` refuses too. Facets are child actors with their own gates and their own
   database inside the parent's pool — the mechanism you would reach for to give each *project* in a
   platform its own storage under one root.
