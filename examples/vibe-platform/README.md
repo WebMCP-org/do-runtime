@@ -1,8 +1,8 @@
 # vibe-platform
 
-A vibe-coding platform with a durable backend and no server: the page edits an app's source, a
-**real Durable Object** stores it in SQLite, an **in-page bundler** builds it, and the result runs
-in a sandboxed iframe. Reload the tab and the workspace is still there.
+A vibe-coding platform with no server: the page edits a front-end and a **user-authored Durable
+Object**, runs each half in-tab, and exports the unchanged sources as a deployable Wrangler project.
+Reload the tab or edit the actor class and its SQLite state is still there.
 
 ```
 pnpm --filter do-runtime-example-vibe-platform dev     # http://localhost:5173
@@ -16,7 +16,7 @@ pnpm exec tsc -p examples/vibe-platform/tsconfig.worker.json
 
 ## What it demonstrates
 
-**A Durable Object with real actor semantics, in a browser tab.** `src/worker/workspace.ts` is a
+**A workspace Durable Object with real actor semantics, in a browser tab.** `src/worker/workspace.ts` is a
 `class Workspace extends DurableObject` that imports `cloudflare:workers`, keeps its files in
 `ctx.storage.sql`, and answers `fetch()`. It would run on Cloudflare unchanged. Underneath it are
 the input gate (one event at a time, so the read-modify-write in a `PUT` needs no lock), the
@@ -37,18 +37,38 @@ whose `resolveId`/`load` are HTTP requests to the actor. Bare imports (`react`, 
 stay external and are resolved at runtime by an import map pointing at esm.sh, so the bundle
 contains only the code you wrote.
 
-**Persistence you can check by hand.** Edit the fern's title, save, reload the tab. The starter app
-is seeded exactly once, in the actor's constructor, under boot semantics.
+**The authored Durable Object runs here too.** `/server/agent.ts` imports `DurableObject` from
+`cloudflare:workers`, exactly as deployed code does. Rolldown strips its TypeScript without changing
+the stored file; `agent.worker.ts` rewrites only that platform import, blob-imports the module, and
+hosts the exported class through `createActorContainer`. It has a separate worker, actor realm, and
+stable OPFS pool. Saving any `server/*` file terminates that worker first and places a new instance
+over the same SQLite files, so code is volatile while state is durable.
+
+**The sandbox has one narrow capability.** The preview keeps `sandbox="allow-scripts"`. Its `fetch`
+wrapper sends only `/api/*` requests to the parent over a one-request `MessageChannel`; the page
+forwards the flattened request to the authored actor and returns its real status, headers, and body.
+The starter guestbook renders state served by that path.
+
+**Persistence you can check by hand.** Sign the guestbook, edit a harmless string in
+`server/agent.ts`, and save. The log says `agent restarted; storage intact`, and the count remains.
+The workspace starter is also seeded exactly once, under boot semantics.
+
+**Export is a real Wrangler project.** The Export button downloads a store-only ZIP made with no
+dependency. `server/*` and `src/*` are byte-for-byte the workspace rows; generated `worker.ts` routes
+`/api/*` to the Durable Object and other requests to the built front-end assets. `wrangler.jsonc`
+contains the Durable Object binding, `new_sqlite_classes` migration, and assets configuration.
 
 ## Shape
 
 | Path | What it is |
 | --- | --- |
-| `index.html`, `src/main.ts` | The page: supervisor, editor, bundler, preview. Plain DOM. |
+| `index.html`, `src/main.ts` | The page: supervisor, editor, two builds, preview bridge, export. Plain DOM. |
 | `src/wire.ts` | The page↔actor protocol, and why it is shaped for capnweb. |
-| `src/worker/host.worker.ts` | The host: pool, ports, container, RPC. The boot order is the lesson. |
+| `src/worker/host.worker.ts` | The workspace host: pool, ports, container, RPC. |
+| `src/worker/agent.worker.ts` | The authored-class host: evaluation, stable pool, container, RPC. |
 | `src/worker/workspace.ts` | The actor. Knows nothing about browsers. |
-| `scripts/e2e.mjs` | Six assertions, a dev server, and headless Chromium. |
+| `src/zip.ts` | The store-only ZIP writer used by Export. |
+| `scripts/e2e.mjs` | The full edit, restart, recovery, export, and Wrangler dry-run loop. |
 
 The page is the supervisor and owns no storage, exactly as `conformance/browser/host.ts` is and
 does. One worker hosts one root actor, which is what lets `installActorScope` put the runtime's
@@ -76,16 +96,29 @@ set the headers directly.
 
 ## Two things that will bite you
 
-**One tab at a time.** The OPFS SAH pool takes an exclusive sync access handle on every file in its
-directory — that exclusivity is what makes SQLite synchronous here — so a second tab of this page
-cannot install the same pool. It retries for about three seconds (a reload can leave the previous
-worker's handles held for a moment, with no signal for when they drop) and then shows a banner
-saying the workspace is open elsewhere. Close the other tab and reload; measured, it recovers.
+**One tab at a time.** Each OPFS SAH pool takes exclusive sync access handles — that exclusivity is
+what makes SQLite synchronous here — so a second tab cannot install the workspace or user-agent
+pool. Both retry because a terminated worker releases handles asynchronously. Close the other tab
+and reload; measured, it recovers.
 
 **The preview needs the network.** React comes from esm.sh at preview time. Offline, the bundle
 still builds and the workspace still saves and persists — the iframe just renders nothing. The e2e
 detects this and prints `SKIP` for the three steps that need a rendered React app rather than
 failing; `VIBE_E2E_OFFLINE=1 node scripts/e2e.mjs` takes that path on purpose.
+
+## Deploying an export
+
+Extract the ZIP, run `pnpm install`, then:
+
+```
+pnpm exec wrangler deploy --dry-run
+pnpm exec wrangler deploy
+```
+
+The dry run bundles the Worker, validates its Durable Object migration and asset manifest, and
+writes local output without credentials or an upload. It does **not** create the Durable Object
+namespace, exercise the deployed `/api/*` route, validate your Cloudflare account, or prove that a
+later real deployment will succeed.
 
 ## Deliberately not shown
 
@@ -95,9 +128,7 @@ failing; `VIBE_E2E_OFFLINE=1 node scripts/e2e.mjs` takes that path on purpose.
 - **Facets.** `ports.facets` refuses too. Facets are child actors with their own gates and their own
   database inside the parent's pool — the mechanism you would reach for to give each *project* in a
   platform its own storage under one root.
-- **More than one actor.** One workspace, one worker, one pool. A supervisor that places actors on
-  demand, routes actor→actor calls and keeps a registry is what `conformance/browser/host.ts` is.
-- **Publishing.** The bundle goes into an iframe and nowhere else. Export, deploy, and share are the
-  parts of a real platform that need a server, which is exactly why they are not here.
+- **A multi-project scheduler.** The page supervises one workspace actor and one authored actor.
+  Placement registries, eviction, and actor-to-actor routing are shown in `conformance/browser/host.ts`.
 - **Multi-file editing niceties**: no create/rename/delete in the UI, though the actor already
   implements `DELETE /file`.

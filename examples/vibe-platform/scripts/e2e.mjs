@@ -14,12 +14,17 @@
  */
 
 import { fileURLToPath } from "node:url";
+import { execFile } from "node:child_process";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 
 const root = fileURLToPath(new URL("..", import.meta.url));
 const TITLE_BEFORE = "The fern that lives in a Durable Object";
 const TITLE_AFTER = `A fern that survived a reload at ${new Date().toISOString().slice(11, 19)}`;
 const TIMEOUT = 60_000;
+const execFileAsync = promisify(execFile);
 
 let failures = 0;
 let skipped = 0;
@@ -42,6 +47,33 @@ async function step(name, run) {
   } catch (error) {
     fail(name, error);
   }
+}
+
+async function extractStoreZip(bytes, directory) {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const decoder = new TextDecoder();
+  let offset = 0;
+  let extracted = 0;
+  while (offset + 4 <= bytes.length && view.getUint32(offset, true) === 0x04034b50) {
+    const flags = view.getUint16(offset + 6, true);
+    const method = view.getUint16(offset + 8, true);
+    const size = view.getUint32(offset + 18, true);
+    const nameLength = view.getUint16(offset + 26, true);
+    const extraLength = view.getUint16(offset + 28, true);
+    if ((flags & 0x08) !== 0 || method !== 0) throw new Error("export ZIP is not store-only");
+    const nameStart = offset + 30;
+    const name = decoder.decode(bytes.subarray(nameStart, nameStart + nameLength));
+    const destination = path.resolve(directory, name);
+    if (!destination.startsWith(`${path.resolve(directory)}${path.sep}`)) {
+      throw new Error(`unsafe ZIP path: ${name}`);
+    }
+    const dataStart = nameStart + nameLength + extraLength;
+    await mkdir(path.dirname(destination), { recursive: true });
+    await writeFile(destination, bytes.subarray(dataStart, dataStart + size));
+    offset = dataStart + size;
+    extracted += 1;
+  }
+  if (extracted === 0) throw new Error("export ZIP had no local entries");
 }
 
 /** esm.sh in under three seconds, or this run is offline. */
@@ -99,11 +131,33 @@ const builtOk = () =>
     timeout: TIMEOUT,
   });
 
+const previewApi = (method = "GET") =>
+  preview()
+    .locator("body")
+    .evaluate(async (_body, verb) => {
+      const response = await fetch("/api/visits", {
+        method: verb,
+        headers: { "content-type": "application/json" },
+        ...(verb === "POST" ? { body: JSON.stringify({ note: "e2e" }) } : {}),
+      });
+      const text = await response.text();
+      if (!response.ok) throw new Error(`${response.status}: ${text}`);
+      return JSON.parse(text);
+    }, method);
+
+let agentSourceForExport;
+let exportDirectory;
+
 try {
   // 1 -----------------------------------------------------------------------
   await step("page loads and the actor seeded its starter files", async () => {
     await page.goto(url, { waitUntil: "domcontentloaded" });
-    for (const seeded of ["/src/main.tsx", "/src/App.tsx", "/src/plant.ts"]) {
+    for (const seeded of [
+      "/server/agent.ts",
+      "/src/main.tsx",
+      "/src/App.tsx",
+      "/src/plant.ts",
+    ]) {
       await file(seeded).waitFor({ timeout: TIMEOUT });
     }
   });
@@ -122,6 +176,18 @@ try {
   await step("build & run bundles the workspace out of the Durable Object", async () => {
     await page.locator("#build").click();
     await builtOk();
+  });
+
+  await step("the seeded front-end reaches the user Durable Object through /api/*", async () => {
+    await page.waitForFunction(
+      () => document.querySelector("#log").textContent.includes("user agent placed: MyAgent"),
+      undefined,
+      { timeout: TIMEOUT },
+    );
+    const before = await previewApi();
+    if (before.visits !== 0) throw new Error(`initial visit count is ${String(before.visits)}`);
+    const after = await previewApi("POST");
+    if (after.visits !== 1) throw new Error(`visit count after POST is ${String(after.visits)}`);
   });
 
   if (!online) {
@@ -144,6 +210,49 @@ try {
       if ((await stage.innerText()) === before) throw new Error("the preview did not re-render");
     });
   }
+
+  await step("editing server/agent.ts respawns the actor and preserves its SQL state", async () => {
+    await file("/server/agent.ts").click();
+    await page.waitForFunction(
+      () => document.querySelector("#editor").value.includes("export class MyAgent"),
+      undefined,
+      { timeout: TIMEOUT },
+    );
+    const source = await page.locator("#editor").inputValue();
+    agentSourceForExport = source.replace("a quiet hello", "a cheerful hello");
+    if (agentSourceForExport === source) throw new Error("agent edit marker was missing");
+    await page.locator("#editor").fill(agentSourceForExport);
+    await page.locator("#save").click();
+    await builtOk();
+    await page.waitForFunction(
+      () => document.querySelector("#log").textContent.includes("agent restarted; storage intact"),
+      undefined,
+      { timeout: TIMEOUT },
+    );
+    const state = await previewApi();
+    if (state.visits !== 1) throw new Error(`visit count after respawn is ${String(state.visits)}`);
+  });
+
+  await step("a user DO syntax error reaches the log and recovers after it is fixed", async () => {
+    const broken = agentSourceForExport.replace("export class", "export clss");
+    await page.locator("#editor").fill(broken);
+    await page.locator("#save").click();
+    await page.waitForFunction(
+      () => document.querySelector("#status").textContent === "saving failed",
+      undefined,
+      { timeout: TIMEOUT },
+    );
+    const log = await page.locator("#log").innerText();
+    if (!log.includes("saving failed:") || !log.match(/Parse|Expected|Unexpected|syntax/i)) {
+      throw new Error("the syntax error message did not reach the UI log");
+    }
+
+    await page.locator("#editor").fill(agentSourceForExport);
+    await page.locator("#save").click();
+    await builtOk();
+    const state = await previewApi();
+    if (state.visits !== 1) throw new Error(`visit count after recovery is ${String(state.visits)}`);
+  });
 
   // 5 -----------------------------------------------------------------------
   await step("editing a file in the UI, saving it, and rebuilding", async () => {
@@ -174,6 +283,7 @@ try {
   // 6 -----------------------------------------------------------------------
   await step("the edit survives a page reload (OPFS persistence)", async () => {
     await page.reload({ waitUntil: "domcontentloaded" });
+    await builtOk();
     await file("/src/App.tsx").waitFor({ timeout: TIMEOUT });
     await file("/src/App.tsx").click();
     await page.waitForFunction(
@@ -188,6 +298,39 @@ try {
     if (source.includes(TITLE_BEFORE)) {
       throw new Error("the reloaded workspace was re-seeded instead of reopened");
     }
+    const state = await previewApi();
+    if (state.visits !== 1) throw new Error(`user agent state after reload is ${String(state.visits)}`);
+  });
+
+  await step("Export preserves server bytes and passes wrangler deploy --dry-run", async () => {
+    const downloadStarted = page.waitForEvent("download", { timeout: TIMEOUT });
+    await page.locator("#export").click();
+    const download = await downloadStarted;
+    const archivePath = await download.path();
+    if (archivePath === null) throw new Error("Playwright did not retain the export download");
+    exportDirectory = await mkdtemp(path.join(tmpdir(), "vibe-export-"));
+    await extractStoreZip(await readFile(archivePath), exportDirectory);
+    const exportedAgent = await readFile(path.join(exportDirectory, "server/agent.ts"), "utf8");
+    if (exportedAgent !== agentSourceForExport) {
+      throw new Error("exported server/agent.ts differs from the workspace bytes");
+    }
+
+    const repoRoot = path.resolve(root, "../..");
+    const outdir = path.join(exportDirectory, "dry-run");
+    const result = await execFileAsync(
+      "pnpm",
+      ["exec", "wrangler", "deploy", "--dry-run", "--outdir", outdir],
+      {
+        cwd: exportDirectory,
+        env: {
+          ...process.env,
+          PATH: `${path.join(repoRoot, "node_modules/.bin")}${path.delimiter}${process.env.PATH}`,
+        },
+        timeout: TIMEOUT,
+      },
+    );
+    const transcript = `${result.stdout}\n${result.stderr}`.trim();
+    console.log(`      ${transcript.split("\n").slice(-4).join("\n      ")}`);
   });
 
   if (failures > 0) {
@@ -201,6 +344,7 @@ try {
 } finally {
   await browser.close();
   await server.close();
+  if (exportDirectory !== undefined) await rm(exportDirectory, { recursive: true, force: true });
 }
 
 console.log(
