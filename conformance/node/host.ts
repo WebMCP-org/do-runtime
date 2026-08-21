@@ -36,6 +36,7 @@ import type { Timer } from "../../src/index";
 import { AlarmScheduler, createActorContainer } from "../../src/index";
 import type {
   ActorContainer,
+  ActorEntry,
   FacetHandle,
   FacetHost,
   FacetId,
@@ -602,7 +603,7 @@ type Record_ = {
   readonly name: string;
   readonly container: ActorContainer;
   readonly instance: Probe;
-  readonly stub: Probe;
+  readonly stub: ActorEntry<Probe>;
   readonly host: NodeFacetHost;
 };
 
@@ -712,7 +713,7 @@ function treeOf(container: ActorContainer): FacetTree {
   return container.facetTree;
 }
 
-function stubFor(name: string): Probe {
+function stubFor(name: string): ActorEntry<Probe> {
   const record = live.get(name);
   if (record === undefined) throw new Error(`Node lane has no live actor named ${name}.`);
   return record.stub;

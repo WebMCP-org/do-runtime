@@ -9,7 +9,7 @@
  * all because it has no upstream body.
  */
 
-import { describe, expect, test, vi } from "vitest";
+import { describe, expect, expectTypeOf, test, vi } from "vitest";
 import { createNodeSqlProvider } from "../../backends/node-sqlite";
 import { DurableObjectClass } from "../api/actor";
 import { FACET_TREE_MAX_DEPTH } from "../api/actor-state";
@@ -23,6 +23,7 @@ import { FacetTreeIndex } from "./facet-tree-index";
 import type {
   ActorContainer,
   ActorContainerOptions,
+  ActorEntry,
   FacetHandle,
   FacetHost,
   FacetId,
@@ -297,14 +298,14 @@ class Alarmless {
  * hands back an `ActorChannelImpl` over a promise for the same reason — so a
  * test that wants the placement to have happened has to call something on it.
  */
-async function openFacet(stub: Counter, name: string): Promise<string> {
+async function openFacet(stub: ActorEntry<Counter>, name: string): Promise<string> {
   const facet = (await stub.facet(name)) as { ping(): Promise<string> };
   return await facet.ping();
 }
 
 async function counterContainer(
   overrides: Partial<ActorContainerOptions> = {},
-): Promise<{ container: ActorContainer; instance: Counter; stub: Counter }> {
+): Promise<{ container: ActorContainer; instance: Counter; stub: ActorEntry<Counter> }> {
   const container = await createActorContainer(options(overrides));
   const instance = await container.start((ctx, env) => new Counter(ctx, env));
   return { container, instance, stub: container.entry(instance) };
@@ -365,6 +366,20 @@ describe("newDatabaseIndexFile", () => {
 });
 
 describe("the composition", () => {
+  test("entry types every method call as an asynchronous event", async () => {
+    const container = await createActorContainer(options());
+    const entry = container.entry({
+      label: "counter",
+      increment(value: number): number {
+        return value + 1;
+      },
+    });
+
+    expectTypeOf(entry.increment).returns.toEqualTypeOf<Promise<number>>();
+    expectTypeOf(entry.label).toEqualTypeOf<string>();
+    expect(await entry.increment(1)).toBe(2);
+  });
+
   test("isCurrentSlice identifies this container's synchronous body only", async () => {
     const first = await counterContainer();
     const second = await counterContainer();

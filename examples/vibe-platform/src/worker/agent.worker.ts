@@ -10,6 +10,7 @@ import {
   newRpcSession,
   noFacets,
   type ActorContainer,
+  type ActorEntry,
   type SqlDatabaseSnapshotProvider,
   type Timer,
 } from "@mcp-b/do-runtime";
@@ -75,10 +76,14 @@ async function installPool(): Promise<ReleasableSqliteWasmHost> {
   }
 }
 
+type AuthoredActor = {
+  fetch(request: Request): Promise<Response> | Response;
+};
+
 let live:
   | {
       container: ActorContainer;
-      entry: { fetch(request: Request): Promise<Response> | Response };
+      entry: ActorEntry<AuthoredActor>;
       className: string;
       storage: SqlDatabaseSnapshotProvider;
     }
@@ -184,7 +189,7 @@ async function place(): Promise<NonNullable<typeof live>> {
   live = {
     container,
     entry: container.entry(
-      instance as { fetch(request: Request): Promise<Response> | Response },
+      instance as AuthoredActor,
     ),
     className: evaluated.className,
     storage,

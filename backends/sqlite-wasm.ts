@@ -31,6 +31,7 @@ import {
   SQLITE_LENGTH_LIMIT,
   SQL_WRONG_BINDINGS_MESSAGE,
   type SqlDatabase,
+  type SqlDatabaseProvider,
   type SqlDatabaseSnapshot,
   type SqlDatabaseSnapshotProvider,
   type SqlDatabaseStatement,
@@ -99,6 +100,79 @@ export type SqliteWasmProviderOptions = {
   /** Absolute path prefix inside the pool, e.g. `/actor-<id>`. Must start with "/". */
   prefix: string;
 };
+
+/**
+ * One actor's named databases and their file lifecycle inside an OPFS SAH pool.
+ *
+ * A root or facet container only needs the `SqlDatabaseProvider` surface. Its
+ * host also has to close every connection when that placement dies, remove the
+ * prefix on delete, and copy every database on clone. Those file operations
+ * belong here because SAH-pool files are virtual and can only be reached through
+ * the pool that owns them.
+ */
+export class SqliteWasmActorStorage implements SqlDatabaseProvider {
+  readonly #host: SqliteWasmHost;
+  readonly #prefix: string;
+  readonly #provider: SqlDatabaseSnapshotProvider;
+
+  constructor(host: SqliteWasmHost, prefix: string) {
+    this.#host = host;
+    this.#prefix = prefix;
+    this.#provider = createSqliteWasmProvider(host, { prefix });
+  }
+
+  open(name: string): Promise<SqlDatabase> {
+    return this.#provider.open(name);
+  }
+
+  /**
+   * Drop every handle. Leaving one behind per respawn or facet abort would
+   * accumulate concurrent writers inside a VFS that expects to own its files.
+   */
+  close(): void {
+    this.#provider.close();
+  }
+
+  /** Close every handle, then physically remove every database under this prefix. */
+  deleteAll(): void {
+    this.close();
+    for (const file of this.#ownedFiles()) {
+      if (!this.#host.pool.unlink(file)) throw new Error(`SAH pool did not unlink ${file}`);
+    }
+  }
+
+  /**
+   * Replace this prefix with every database under `source`, including files
+   * from an earlier placement that this session never opened.
+   *
+   * The source may still be running, so this uses the pool's file operations
+   * rather than the snapshot API, which correctly refuses open handles. A
+   * recovery sidecar means the bytes are not a stable database image and is
+   * refused before the destination is touched.
+   */
+  async copyFrom(source: SqliteWasmActorStorage): Promise<void> {
+    const files = source.#ownedFiles();
+    const sidecar = files.find((file) => !file.endsWith(".sqlite"));
+    if (sidecar !== undefined) {
+      throw new Error(`Cannot clone actor storage with a SQLite recovery sidecar: ${sidecar}`);
+    }
+    this.deleteAll();
+    for (const file of files) {
+      const name = file.slice(source.#prefix.length + 1, -".sqlite".length);
+      requireSafeDatabaseName(name);
+      await this.#host.pool.importDb(
+        `${this.#prefix}.${name}.sqlite`,
+        new Uint8Array(await source.#host.pool.exportFile(file)),
+      );
+    }
+  }
+
+  #ownedFiles(): string[] {
+    return this.#host.pool
+      .getFileNames()
+      .filter((name) => name.startsWith(`${this.#prefix}.`));
+  }
+}
 
 export function createSqliteWasmProvider(
   host: SqliteWasmHost,

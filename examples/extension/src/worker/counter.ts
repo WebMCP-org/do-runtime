@@ -11,11 +11,6 @@
  * own module; on Cloudflare the specifier resolves natively and this file does
  * not change.
  *
- * **Every method is `async` on purpose.** `container.entry(instance)` returns a
- * proxy whose every method invocation is one gated event, so a synchronous
- * method still answers a promise at runtime — while `entry<T>(target: T): T`
- * types it as unchanged. Declaring the methods async makes the declared type and
- * the runtime type the same thing, instead of needing a cast at the call site.
  */
 
 import { McpServer } from "@modelcontextprotocol/server";

@@ -234,10 +234,6 @@ Written down because this example exists partly to find them.
   output banner binds the complete chunk—including SDK internals—to that
   facet's async primitives. A product build can minify it; sharing the SDK chunk
   would reintroduce the parent-global bug this e2e catches.
-- **`container.entry<T>(target: T): T` understates its own return type.** The proxy
-  makes every method asynchronous; the type says otherwise. This example dodges it
-  by declaring every method on `Counter` `async`, and the conformance lanes dodge
-  it with a cast.
 - **Vite emits the sqlite proxy workers even when they are disabled.** The driver
   references `sqlite3-opfs-async-proxy.js` and `sqlite3-worker1.mjs` through
   `new URL(..., import.meta.url)`, so both land in `dist/assets/` (~600 kB) even

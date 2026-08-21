@@ -72,9 +72,13 @@ import {
   asLoopbackDurableObjectClass,
   LoopbackDurableObjectClass,
 } from "../../src/api/export-loopback";
+import {
+  SqliteWasmActorStorage,
+  type SqliteWasmHost,
+} from "../../backends/sqlite-wasm";
 import { Probe } from "../fixtures/probe";
 import type { ActorBoot, ActorRpc, SupervisorRpc } from "./protocol";
-import { installPool, LaneStorage, timer, UNIQUE_KEY, type LanePool } from "./substrate";
+import { installPool, timer, UNIQUE_KEY } from "./substrate";
 
 type Session<T> = ReturnType<typeof newRpcSession<T>>;
 
@@ -90,8 +94,8 @@ type Live = {
  * never, so a respawn is a new container over the same files rather than a race
  * for them. Every facet is a further prefix inside this one pool.
  */
-let pool: Promise<LanePool> | undefined;
-function lanePool(): Promise<LanePool> {
+let pool: Promise<SqliteWasmHost> | undefined;
+function lanePool(): Promise<SqliteWasmHost> {
   pool ??= installPool(requireBoot().poolName);
   return pool;
 }
@@ -276,7 +280,7 @@ function classNameFor(isolateName: string, exportName: string): string {
 
 type Placement = {
   readonly container: ActorContainer;
-  readonly storage: LaneStorage;
+  readonly storage: SqliteWasmActorStorage;
   readonly stub: object;
 };
 
@@ -291,12 +295,12 @@ type Placement = {
  */
 class BrowserFacetHost implements FacetHost {
   readonly #placements = new Map<FacetId, Placement>();
-  #pool: LanePool | undefined;
+  #pool: SqliteWasmHost | undefined;
   #tree: FacetTree | undefined;
   #env: unknown;
 
   /** Called by the root placement, which is the only thing that knows the tree. */
-  attach(lane: LanePool, tree: FacetTree, env: unknown): void {
+  attach(lane: SqliteWasmHost, tree: FacetTree, env: unknown): void {
     this.#pool = lane;
     this.#tree = tree;
     this.#env = env;
@@ -317,7 +321,7 @@ class BrowserFacetHost implements FacetHost {
       // to be late-bound and the binding is the one with no work in it.
       const gate: FacetGate = { container: undefined };
       const { ActorClass, exports } = await facetModule(request.className, gate);
-      const storage = new LaneStorage(this.#requirePool(), prefixFor(request.id));
+      const storage = new SqliteWasmActorStorage(this.#requirePool(), prefixFor(request.id));
       const container = await createActorContainer({
         // Absent `routedId` means the child inherits its parent's id, which in this tree is the
         // root actor's name.
@@ -345,7 +349,7 @@ class BrowserFacetHost implements FacetHost {
         // The container opened this facet's database and took an exclusive sync access handle on
         // its pool file; the instance does not exist, so nothing will ever reach this placement
         // through `#placements` to close it. Leaving it would accumulate a dead writer per failed
-        // attempt inside a VFS that expects to own what it opens — see `LaneStorage`'s note on
+        // attempt inside a VFS that expects to own what it opens — see the backend storage's
         // `close()`, which is the same hazard for the same reason.
         container.abort(exception);
         storage.close();
@@ -380,7 +384,7 @@ class BrowserFacetHost implements FacetHost {
     this.#placements.delete(id);
     placement.container.abort(new Error(reason ?? "Facet placement closed."));
     // Where the node lane drops a connection the GC will collect, this drops an exclusive sync
-    // access handle on a pool file — see `LaneStorage`'s note on `close()`.
+    // access handle on a pool file — see `SqliteWasmActorStorage.close()`.
     placement.storage.close();
   }
 
@@ -391,7 +395,7 @@ class BrowserFacetHost implements FacetHost {
       // the same as declining to remove it.
       const storage = this.#storageFor(target);
       this.abort(target);
-      storage.unlink();
+      storage.deleteAll();
     }
   }
 
@@ -404,11 +408,14 @@ class BrowserFacetHost implements FacetHost {
     for (const id of [...this.#placements.keys()]) this.abort(id);
   }
 
-  #storageFor(id: FacetId): LaneStorage {
-    return this.#placements.get(id)?.storage ?? new LaneStorage(this.#requirePool(), prefixFor(id));
+  #storageFor(id: FacetId): SqliteWasmActorStorage {
+    return (
+      this.#placements.get(id)?.storage ??
+      new SqliteWasmActorStorage(this.#requirePool(), prefixFor(id))
+    );
   }
 
-  #requirePool(): LanePool {
+  #requirePool(): SqliteWasmHost {
     if (this.#pool === undefined) throw new Error("Browser lane: no pool attached.");
     return this.#pool;
   }
@@ -642,13 +649,13 @@ const FACET_HAS_NO_ALARM_SLOT: AlarmOutlet = {
 // The container lifecycle
 
 /** The root's own databases, for the close a respawn owes the pool. */
-let rootStorage: LaneStorage | undefined;
+let rootStorage: SqliteWasmActorStorage | undefined;
 
 async function place(): Promise<Live> {
   const current = requireBoot();
   const lane = await lanePool();
   installRootScope();
-  const storage = new LaneStorage(lane, "/actor");
+  const storage = new SqliteWasmActorStorage(lane, "/actor");
 
   const env: Record<string, unknown> = { PROBE: probeNamespace() };
 
@@ -707,7 +714,7 @@ function treeOf(container: ActorContainer): FacetTree {
  * The node lane's `respawn` does exactly this — it re-places over the same
  * directory — and closing the databases is what this substrate adds, because
  * there is one handle per file rather than one connection per container. See
- * `LaneStorage.close`.
+ * `SqliteWasmActorStorage.close()`.
  */
 function teardown(): void {
   facets.closeAll();

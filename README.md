@@ -181,7 +181,7 @@ The lifecycle:
 
 1. `await createActorContainer(options)`.
 2. `container.start((ctx, env) => new ActorClass(ctx, env))` once, under boot semantics (input gate held for the constructor, deletion receipts replayed first).
-3. Expose `container.entry(instance)` to callers. Every method call through it is one gated event.
+3. Expose `container.entry(instance)` to callers. Its `ActorEntry<T>` type makes every method return a promise because each call is one gated event.
 4. Use `container.run(fn)` for events that are not method calls: a WebSocket frame, a host callback.
 5. Reach the platform through `container.globals` (or install it with `installActorScope`). For a host-provided promise an actor must await, wrap it once in `container.awaitIo()`.
 6. Watch `container.onBroken`; dispose the placement; recreate it on the next event over the same storage.
@@ -190,7 +190,7 @@ The lifecycle:
 
 `SqlDatabaseProvider.open(name)` is the runtime execution seam. The runtime owns database names, tables, transactions, reset behaviour, facet metadata, and streaming `sql.ingest()` statement boundaries; the host chooses the physical provider and prefix. Stored KV values use structured-clone semantics across workerd, Node, and the browser; existing JSON rows remain readable. `_cf_` names are reserved to the runtime.
 
-The browser provider takes an already-installed OPFS SAH pool (`installOpfsSAHPoolVfs`; sync access handles in a dedicated worker — no cross-origin isolation or `SharedArrayBuffer` needed). One pool per worker; the root and each local facet get separate prefixes inside it. The Node provider uses in-memory databases by default and a directory when asked.
+The browser provider takes an already-installed OPFS SAH pool (`installOpfsSAHPoolVfs`; sync access handles in a dedicated worker — no cross-origin isolation or `SharedArrayBuffer` needed). One pool per worker; the root and each local facet get separate prefixes inside it. `SqliteWasmActorStorage` adds the close, physical delete, and clone operations a local placement host needs around one prefix. The Node provider uses in-memory databases by default and a directory when asked.
 
 Both concrete providers also implement `SqlDatabaseSnapshotProvider`. After the host has stopped the actor, `provider.close()` releases every database handle; `exportSnapshot()` then returns the SQLite images for the whole actor storage scope, and `importSnapshot()` replaces an idle scope. The same snapshot can seed a cold local replica because SQLite images are portable between these providers. Node snapshots require a dedicated directory-backed provider. This is backup/restore and replica seeding, not Cloudflare's time-indexed PITR or continuously updated read replication.
 

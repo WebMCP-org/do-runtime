@@ -44,6 +44,7 @@ import {
   newRpcSession,
   noFacets,
   type ActorContainer,
+  type ActorEntry,
   type Timer,
 } from "@mcp-b/do-runtime";
 import {
@@ -194,7 +195,7 @@ function pool(): Promise<SqliteWasmHost> {
 type Live = {
   readonly container: ActorContainer;
   /** `container.entry(instance)`: every call through it is one gated event. */
-  readonly entry: Workspace;
+  readonly entry: ActorEntry<Workspace>;
 };
 
 let live: Live | undefined;

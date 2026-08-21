@@ -30,6 +30,7 @@ import {
   installActorScope,
   newRpcSession,
   type ActorContainer,
+  type ActorEntry,
   type ActorGlobalScope,
   type ActorScopeBindings,
   type AlarmResult,
@@ -39,10 +40,13 @@ import {
   type FacetStartRequest,
   type FacetTree,
   type SqlDatabaseProvider,
-  type SqlDatabaseSnapshotProvider,
   type Timer,
 } from "@mcp-b/do-runtime";
-import { createSqliteWasmProvider, type SqliteWasmHost } from "@mcp-b/do-runtime/backends/sqlite-wasm";
+import {
+  createSqliteWasmProvider,
+  SqliteWasmActorStorage,
+  type SqliteWasmHost,
+} from "@mcp-b/do-runtime/backends/sqlite-wasm";
 import sqlite3InitModule from "@sqlite.org/sqlite-wasm";
 import { routeAgentEmail } from "agents";
 import { RpcTarget } from "cloudflare:workers";
@@ -172,56 +176,9 @@ const COUNTER_CHILD_MODULE_URL = "../counter-child.js";
 const facetScopes: Record<string, ActorScopeBindings> = {};
 (globalThis as Record<string, unknown>)[FACET_SCOPES_GLOBAL] = facetScopes;
 
-/** One prefix in the root's OPFS pool, plus the lifecycle `FacetHost` owes it. */
-class FacetStorage implements SqlDatabaseProvider {
-  readonly #provider: SqlDatabaseSnapshotProvider;
-
-  constructor(
-    readonly host: SqliteWasmHost,
-    readonly prefix: string,
-  ) {
-    this.#provider = createSqliteWasmProvider(host, { prefix });
-  }
-
-  open(name: string) {
-    return this.#provider.open(name);
-  }
-
-  close(): void {
-    this.#provider.close();
-  }
-
-  unlink(): void {
-    this.close();
-    for (const name of this.#ownedFiles()) this.host.pool.unlink(name);
-  }
-
-  async copyFrom(source: FacetStorage): Promise<void> {
-    const files = source.#ownedFiles();
-    const sidecar = files.find((name) => !name.endsWith(".sqlite"));
-    if (sidecar !== undefined) {
-      throw new Error(`Cannot clone actor storage with a SQLite recovery sidecar: ${sidecar}`);
-    }
-    this.unlink();
-    for (const file of files) {
-      const database = file.slice(source.prefix.length + 1, -".sqlite".length);
-      await this.host.pool.importDb(
-        `${this.prefix}.${database}.sqlite`,
-        await source.host.pool.exportFile(file),
-      );
-    }
-  }
-
-  #ownedFiles(): string[] {
-    return this.host.pool
-      .getFileNames()
-      .filter((name) => name.startsWith(`${this.prefix}.`));
-  }
-}
-
 type FacetPlacement = {
   readonly container: ActorContainer;
-  readonly storage: FacetStorage;
+  readonly storage: SqliteWasmActorStorage;
   readonly stub: object;
 };
 
@@ -270,7 +227,7 @@ class ExtensionFacetHost implements FacetHost {
         throw new Error(`do-runtime example: no bundled facet class named ${request.className}`);
       }
       const ActorClass = exported as FacetConstructor;
-      const storage = new FacetStorage(this.#requireHost(), `/facet-${request.id}`);
+      const storage = new SqliteWasmActorStorage(this.#requireHost(), `/facet-${request.id}`);
       const container = await createActorContainer({
         id: request.routedId ?? ACTOR_ID,
         uniqueKey: UNIQUE_KEY,
@@ -326,7 +283,7 @@ class ExtensionFacetHost implements FacetHost {
     for (const target of [...subtree, id]) {
       const storage = this.#storageFor(target);
       this.abort(target);
-      storage.unlink();
+      storage.deleteAll();
     }
   }
 
@@ -334,10 +291,10 @@ class ExtensionFacetHost implements FacetHost {
     await this.#storageFor(dst).copyFrom(this.#storageFor(src));
   }
 
-  #storageFor(id: FacetId): FacetStorage {
+  #storageFor(id: FacetId): SqliteWasmActorStorage {
     return (
       this.#placements.get(id)?.storage ??
-      new FacetStorage(this.#requireHost(), `/facet-${id}`)
+      new SqliteWasmActorStorage(this.#requireHost(), `/facet-${id}`)
     );
   }
 
@@ -382,7 +339,7 @@ type Live = {
    * `container.entry(instance)` — the door. Every method call through it is one
    * gated event, so this is the only handle anything outside the actor gets.
    */
-  readonly entry: Counter;
+  readonly entry: ActorEntry<Counter>;
 };
 
 let live: Live | undefined;

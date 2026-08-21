@@ -95,6 +95,7 @@ export type {
 export type {
   ActorContainer,
   ActorContainerOptions,
+  ActorEntry,
   ActorPorts,
   FacetHandle,
   FacetHost,

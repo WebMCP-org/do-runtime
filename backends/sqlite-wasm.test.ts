@@ -1,5 +1,6 @@
 import { expect, test } from "vitest";
 import {
+  SqliteWasmActorStorage,
   SqliteWasmDatabase,
   type SqliteWasmDatabaseHandle,
   type SqliteWasmHost,
@@ -46,4 +47,48 @@ test("reset fails closed when the SAH pool does not remove the database", () => 
 
   expect(() => database.reset()).toThrow("SAH pool did not unlink /actor.root.sqlite");
   expect(opened).toEqual(["/actor.root.sqlite"]);
+});
+
+test("actor storage copies and deletes every database under its prefix", async () => {
+  const files = new Map<string, Uint8Array>([
+    ["/source.root.sqlite", new Uint8Array([1])],
+    ["/source.facets.sqlite", new Uint8Array([2])],
+    ["/destination.old.sqlite", new Uint8Array([3])],
+  ]);
+  const host = {
+    capi: {
+      SQLITE_LIMIT_LENGTH: 0,
+      sqlite3_complete: () => 1 as const,
+      sqlite3_get_autocommit: () => 1,
+      sqlite3_limit: () => 1,
+    },
+    pool: {
+      OpfsSAHPoolDb: FakeDatabase,
+      exportFile: async (name: string) => {
+        const image = files.get(name);
+        if (image === undefined) throw new Error(`missing test file ${name}`);
+        return image;
+      },
+      importDb: async (name: string, image: Uint8Array) => {
+        files.set(name, image);
+        return 0;
+      },
+      getFileNames: () => [...files.keys()],
+      unlink: (name: string) => files.delete(name),
+    },
+  } satisfies SqliteWasmHost;
+
+  const source = new SqliteWasmActorStorage(host, "/source");
+  const destination = new SqliteWasmActorStorage(host, "/destination");
+  await destination.copyFrom(source);
+
+  expect([...files]).toEqual([
+    ["/source.root.sqlite", new Uint8Array([1])],
+    ["/source.facets.sqlite", new Uint8Array([2])],
+    ["/destination.root.sqlite", new Uint8Array([1])],
+    ["/destination.facets.sqlite", new Uint8Array([2])],
+  ]);
+
+  destination.deleteAll();
+  expect([...files.keys()]).toEqual(["/source.root.sqlite", "/source.facets.sqlite"]);
 });

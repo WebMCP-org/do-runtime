@@ -361,6 +361,13 @@ export type ActorContainerOptions = {
   };
 };
 
+/** The local entry proxy: data properties stay local; every method becomes one async event. */
+export type ActorEntry<T extends object> = {
+  [K in keyof T]: T[K] extends (...args: infer Args) => infer Result
+    ? (...args: Args) => Promise<Awaited<Result>>
+    : T[K];
+};
+
 export interface ActorContainer {
   /** Implements the workers-types interface. No `as unknown as` cast (§2.4). */
   readonly state: DurableObjectState;
@@ -409,7 +416,7 @@ export interface ActorContainer {
    * `DurableObjectNamespace` binding skips this door entirely because the lock it
    * would take is the one it is already holding.
    */
-  entry<T extends object>(target: T): T;
+  entry<T extends object>(target: T): ActorEntry<T>;
 
   /**
    * The door for events that are not method calls — one WebSocket frame, one
@@ -1336,7 +1343,7 @@ class ActorContainerImpl implements ActorContainer {
     }
   }
 
-  entry<T extends object>(target: T): T {
+  entry<T extends object>(target: T): ActorEntry<T> {
     const bound = new Map<string | symbol, unknown>();
 
     return new Proxy(target, {
@@ -1363,7 +1370,7 @@ class ActorContainerImpl implements ActorContainer {
         bound.set(property, gated);
         return gated;
       },
-    });
+    }) as ActorEntry<T>;
   }
 
   /**

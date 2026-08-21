@@ -25,8 +25,9 @@
 
 import { AlarmScheduler, newRpcSession } from "../../src/index";
 import { RpcTarget } from "../../src/api/cloudflare-workers";
+import { SqliteWasmActorStorage } from "../../backends/sqlite-wasm";
 import type { AlarmsBoot, AlarmsRpc, SupervisorRpc } from "./protocol";
-import { installPool, LaneStorage, timer } from "./substrate";
+import { installPool, timer } from "./substrate";
 
 type Session<T> = ReturnType<typeof newRpcSession<T>>;
 
@@ -71,7 +72,7 @@ self.addEventListener("message", (event: MessageEvent<AlarmsBoot>) => {
   const boot = event.data;
   supervisor = newRpcSession<SupervisorRpc>(boot.port, new AlarmsTarget());
   scheduler = (async (): Promise<AlarmScheduler> => {
-    const storage = new LaneStorage(await installPool(boot.poolName), "/namespace");
+    const storage = new SqliteWasmActorStorage(await installPool(boot.poolName), "/namespace");
     return new AlarmScheduler({
       timer,
       db: await storage.open("alarms"),

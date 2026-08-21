@@ -21,7 +21,7 @@
  * cannot supply a piece of the platform, the affected row fails with a named
  * message rather than being softened. `copyStorage` used to be that example and
  * is no longer one: in-process facets put both databases in this worker's one
- * pool, so it is the pool's own export/import pair (`LaneStorage.copyFrom`).
+ * pool, so it is the pool's own export/import pair (`SqliteWasmActorStorage.copyFrom`).
  *
  * **A placement this lane cannot finish fails its row.** A facet whose storage could not be
  * OPENED timed the row out at 15s with nothing reaching the test or the console,

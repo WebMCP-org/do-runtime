@@ -26,8 +26,8 @@
  */
 
 import sqlite3InitModule from "@sqlite.org/sqlite-wasm";
-import { createSqliteWasmProvider, type SqliteWasmHost } from "../../backends/sqlite-wasm";
-import type { SqlDatabase, SqlDatabaseProvider, Timer } from "../../src/index";
+import type { SqliteWasmHost } from "../../backends/sqlite-wasm";
+import type { Timer } from "../../src/index";
 
 /**
  * ← the namespace's configured `uniqueKey`. One constant for the whole lane, for
@@ -37,23 +37,7 @@ import type { SqlDatabase, SqlDatabaseProvider, Timer } from "../../src/index";
  */
 export const UNIQUE_KEY = "do-runtime-conformance-browser";
 
-/**
- * The pool's file-level operations, which `SqlDatabaseProvider` does not model
- * and `backends/sqlite-wasm.ts` therefore does not declare: a database is a
- * connection there, and these three are about the bytes underneath one.
- * `FacetHost.copyStorage` is the caller — see `LaneStorage.copyFrom`.
- */
-export type PoolFiles = {
-  /** Every virtual file the pool holds, under the absolute names `OpfsSAHPoolDb` takes. */
-  getFileNames(): string[];
-  exportFile(filename: string): Promise<Uint8Array>;
-  importDb(name: string, data: Uint8Array): Promise<number>;
-};
-
-/** The pool, the one C-API function `oo1.DB` does not wrap, and the file operations. */
-export type LanePool = SqliteWasmHost & { readonly files: PoolFiles };
-
-export async function installPool(name: string): Promise<LanePool> {
+export async function installPool(name: string): Promise<SqliteWasmHost> {
   const sqlite3 = await sqlite3InitModule();
   const pool = await sqlite3.installOpfsSAHPoolVfs({
     name,
@@ -73,12 +57,12 @@ export async function installPool(name: string): Promise<LanePool> {
     // a commit and that was wrong on both halves. What it does not name is this
     // line, which is the knob.
     //
-    // A headroom check in `LaneStorage.open` was tried and is NOT here, because
-    // it measured worse at the time. Refusing before the facet's database opens
-    // at all — rather than later, when its journal does — fails the placement
-    // inside `createActorContainer`, and the lane wedged on that: the rows timed
-    // out at 15s and the refusal reached neither the test nor the console. A
-    // failure the caller can see beats a better-worded one it cannot.
+    // A headroom check in `SqliteWasmActorStorage.open` was tried and is NOT
+    // here, because it measured worse at the time. Refusing before the facet's
+    // database opens at all — rather than later, when its journal does — fails
+    // the placement inside `createActorContainer`, and the lane wedged on that:
+    // the rows timed out at 15s and the refusal reached neither the test nor the
+    // console. A failure the caller can see beats a better-worded one it cannot.
     //
     // A placement failure now reaches the first call on the facet's stub, so the
     // check would no longer be silent. It still does not come back. Its only job
@@ -87,113 +71,7 @@ export async function installPool(name: string): Promise<LanePool> {
     // decides whether the tree fits.
     initialCapacity: 64,
   });
-  return { pool, capi: sqlite3.capi, files: pool };
-}
-
-/**
- * The provider one container is built over, plus the two lifecycle operations a
- * pooled file needs and a Node connection does not.
- *
- * **Why `close()`, stated as what it actually is.** A first draft of this comment
- * claimed the §1.7.1 rows depend on it: that the replacement container reuses one
- * handle per file, so an implicit transaction the dead container left open would
- * still be open, and closing is what discards it. **Measured, and that is wrong on
- * both halves.** Deleting the `close()` and re-running `transactions.spec.ts`
- * leaves all four rows green, because nothing forces the replacement to reuse the
- * handle — it opens a second connection, exactly as the node lane's replacement
- * does, and SQLite's isolation shows it the last committed state while the dead
- * connection's `BEGIN` stays invisible. (`ActorSqlite` does not roll back on
- * abort: `broken` is what tells its transaction classes to skip that.)
- *
- * So this is hygiene the suite cannot see, kept deliberately rather than because
- * a row asks for it. The SAH pool takes an exclusive sync access handle per file
- * and is built on owning what it opens; leaving a connection behind on every
- * respawn and every facet abort accumulates concurrent writers on one file inside
- * a VFS that does not expect any. The failure that would eventually produce is
- * corruption, which is the class this repo's fail-closed tenet exists to prevent
- * and precisely the class a green suite does not rule out.
- */
-export class LaneStorage implements SqlDatabaseProvider {
-  readonly #host: LanePool;
-  readonly #prefix: string;
-  readonly #open = new Map<string, SqlDatabase>();
-  readonly #names = new Set<string>();
-
-  constructor(host: LanePool, prefix: string) {
-    this.#host = host;
-    this.#prefix = prefix;
-  }
-
-  async open(name: string): Promise<SqlDatabase> {
-    const database = await createSqliteWasmProvider(this.#host, { prefix: this.#prefix }).open(
-      name,
-    );
-    this.#open.set(name, database);
-    this.#names.add(name);
-    return database;
-  }
-
-  /** Drop every handle. Uncommitted transactions go with them. */
-  close(): void {
-    for (const database of this.#open.values()) database.close();
-    this.#open.clear();
-  }
-
-  /**
-   * Physical removal, for `FacetHost.deleteStorage`. The pool's files are not
-   * visible in OPFS under these names, so this goes through the pool rather than
-   * the filesystem — the same route `backends/sqlite-wasm.ts`'s `reset()` takes,
-   * and for the same reason.
-   */
-  unlink(): void {
-    this.close();
-    for (const name of this.#ownedFiles()) this.#host.pool.unlink(name);
-    this.#names.clear();
-  }
-
-  /**
-   * Physical copy of every database another `LaneStorage` holds onto this one's
-   * prefix, for `FacetHost.copyStorage`.
-   *
-   * **This is the one substrate operation in-process facets turned from a
-   * refusal into four lines.** While a facet ran in a worker of its own the two
-   * databases were in two pools, each holding exclusive sync access handles the
-   * other worker cannot touch, so a copy meant `exportFile` in one worker,
-   * capnweb carrying the bytes, `importDb` in the other, and placing a worker for
-   * a destination that was never started. Both files are now in this worker's one
-   * pool, so it is the pool's own export/import pair and nothing else.
-   *
-   * The file list comes from the pool rather than from what this session
-   * happened to open, so a source placed in an earlier session and not yet
-   * re-placed still copies. A source that was never placed has no files and
-   * copies nothing, which is `cloneFacet`'s own reading of a `src` that was never
-   * created: an empty subtree.
-   *
-   * No conformance row reaches this — `facets.clone()` has no body anywhere in
-   * workerd (§1.10), so the suite cannot assert it against the oracle and does
-   * not try.
-   */
-  async copyFrom(source: LaneStorage): Promise<void> {
-    const files = source.#ownedFiles();
-    const sidecar = files.find((file) => !file.endsWith(".sqlite"));
-    if (sidecar !== undefined) {
-      throw new Error(`Cannot clone actor storage with a SQLite recovery sidecar: ${sidecar}`);
-    }
-    this.unlink();
-    for (const file of files) {
-      const name = file.slice(source.#prefix.length + 1, -".sqlite".length);
-      await this.#host.files.importDb(
-        `${this.#prefix}.${name}.sqlite`,
-        await this.#host.files.exportFile(file),
-      );
-      this.#names.add(name);
-    }
-  }
-
-  /** Every file in the pool that belongs to this prefix, as the pool names them. */
-  #ownedFiles(): string[] {
-    return this.#host.files.getFileNames().filter((name) => name.startsWith(`${this.#prefix}.`));
-  }
+  return { pool, capi: sqlite3.capi };
 }
 
 /**
