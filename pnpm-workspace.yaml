@@ -1,5 +1,6 @@
 # The runtime lives at the root; runnable examples are workspace packages.
 packages:
+  - "."
   - "examples/*"
 allowBuilds:
   workerd: true
