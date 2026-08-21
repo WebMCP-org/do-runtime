@@ -1,6 +1,14 @@
 import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 
 const root = new URL("../", import.meta.url);
+const manifest = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+if (manifest.license !== "FSL-1.1-MIT") {
+  throw new Error(`package license is ${manifest.license}; expected FSL-1.1-MIT`);
+}
+if (manifest.publishConfig?.access !== "public") {
+  throw new Error("scoped package must publish with public access");
+}
 const packed = spawnSync("pnpm", ["pack", "--dry-run", "--json"], {
   cwd: root,
   encoding: "utf8",
@@ -19,6 +27,8 @@ for (const required of [
   "dist/src/index.d.ts",
   "dist/backends/node-sqlite.js",
   "dist/backends/sqlite-wasm.js",
+  "LICENSE.workerd",
+  "NOTICE",
 ]) {
   if (!files.has(required)) throw new Error(`packed package is missing ${required}`);
 }
@@ -27,9 +37,24 @@ for (const file of files) {
     throw new Error(`packed package contains development source: ${file}`);
   }
 }
+for (const [name, target] of Object.entries(manifest.exports)) {
+  const paths = typeof target === "string" ? [target] : Object.values(target);
+  for (const path of paths) {
+    if (typeof path === "string" && path.startsWith("./") && !files.has(path.slice(2))) {
+      throw new Error(`packed package export ${name} is missing ${path}`);
+    }
+  }
+}
 
-const runtime = await import(new URL("../dist/index.js", import.meta.url));
-const nodeBackend = await import(new URL("../dist/backends/node-sqlite.js", import.meta.url));
+const modules = new Map();
+for (const [name, target] of Object.entries(manifest.exports)) {
+  const path = typeof target === "string" ? target : target.import;
+  if (typeof path === "string" && path.endsWith(".js")) {
+    modules.set(name, await import(new URL(`../${path.slice(2)}`, import.meta.url)));
+  }
+}
+const runtime = modules.get(".");
+const nodeBackend = modules.get("./backends/node-sqlite");
 if (typeof runtime.createActorContainer !== "function") {
   throw new Error("packed root entry does not export createActorContainer");
 }
