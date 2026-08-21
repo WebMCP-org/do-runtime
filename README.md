@@ -157,7 +157,7 @@ Open a second container over the same directory and `increment()` answers `3`: t
 
 Two runnable browser hosts live in [`examples/`](examples/), each with its own README and Playwright e2e (`pnpm test:examples`):
 
-- [`examples/extension/`](examples/extension/) — a Chrome MV3 compatibility harness: service worker → offscreen document (with corpse recovery) → worker hosting an Agents SDK `Counter`. Proves persistent state, exclusive host ownership, non-hibernating `AgentClient` WebSockets, state sync, callable and streaming RPC, SDK queues and scheduling, stateless MCP, inbound email routing, the MV3 CSP story (`'wasm-unsafe-eval'`), and `chrome.alarms` recreation of an evicted host before durable alarm delivery.
+- [`examples/extension/`](examples/extension/) — a Chrome MV3 compatibility harness: service worker → offscreen document (with corpse recovery) → worker hosting an Agents SDK `Counter` and local sub-agents. Proves persistent state, sibling and nested facet isolation, overlapping async work, abort/delete lifecycle, sub-agent scheduling across host recreation, exclusive host ownership, non-hibernating `AgentClient` WebSockets, state sync, callable and streaming RPC, SDK queues, stateless MCP, inbound email routing, the MV3 CSP story (`'wasm-unsafe-eval'`), and `chrome.alarms` recreation of an evicted host before durable alarm delivery.
 - [`examples/vibe-platform/`](examples/vibe-platform/) — a self-contained vibe-coding page that authors both a front-end and an Agents SDK `Agent`, runs them in-tab with durable SQLite-backed state, and exports the unchanged sources as a Wrangler project that passes `wrangler deploy --dry-run`.
 
 ## Hosting an actor

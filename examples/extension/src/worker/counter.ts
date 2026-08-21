@@ -36,10 +36,17 @@ export type CounterEvent = {
   readonly kind: string;
 };
 
+export type SubAgentSnapshot = {
+  readonly name: string;
+  readonly value: number;
+  readonly parentValue: number;
+};
+export type NestedSubAgentSnapshot = { childValue: number; leafValue: number };
+
 /** How many event rows `snapshot()` reports. The table keeps all of them. */
 const RECENT_EVENTS = 10;
 
-export type CounterEnv = Record<string, never>;
+export type CounterEnv = { Counter: DurableObjectNamespace<Counter> };
 type CounterState = { value: number };
 
 export class Counter extends Agent<CounterEnv, CounterState> {
@@ -129,6 +136,60 @@ export class Counter extends Agent<CounterEnv, CounterState> {
   }
 
   /**
+   * The production-shaped facet proof: this is the Agents SDK's public
+   * `subAgent()` API, not a direct `ctx.facets` probe. Both children are entered
+   * together, keep their own Agent state, and call back through `parentAgent()`.
+   */
+  async subAgents(): Promise<SubAgentSnapshot[]> {
+    const [alpha, beta] = await Promise.all([
+      this.subAgent(CounterChild, "alpha"),
+      this.subAgent(CounterChild, "beta"),
+    ]);
+    return await Promise.all([alpha.bump(), beta.bump()]);
+  }
+
+  async overlapSubAgents(): Promise<SubAgentSnapshot[]> {
+    const [alpha, beta] = await Promise.all([
+      this.subAgent(CounterChild, "alpha"),
+      this.subAgent(CounterChild, "beta"),
+    ]);
+    return await Promise.all([alpha.bumpAfter(20), beta.bumpAfter(0)]);
+  }
+
+  async subAgentLifecycle(): Promise<number[]> {
+    const first = await this.subAgent(CounterChild, "lifecycle");
+    const firstValue = (await first.bump()).value;
+
+    this.abortSubAgent(CounterChild, "lifecycle", new Error("restart lifecycle proof"));
+    const restarted = await this.subAgent(CounterChild, "lifecycle");
+    const restartedValue = (await restarted.bump()).value;
+
+    await this.deleteSubAgent(CounterChild, "lifecycle");
+    const recreated = await this.subAgent(CounterChild, "lifecycle");
+    const recreatedValue = (await recreated.bump()).value;
+    return [firstValue, restartedValue, recreatedValue];
+  }
+
+  async nestedSubAgent(): Promise<NestedSubAgentSnapshot> {
+    const child = await this.subAgent(CounterChild, "nested");
+    await child.bump();
+    return await child.bumpLeaf();
+  }
+
+  async armSubAgentWake(delayMs: number): Promise<number> {
+    return await (await this.subAgent(CounterChild, "scheduled")).armWake(delayMs);
+  }
+
+  async scheduledSubAgentValue(): Promise<number> {
+    return await (await this.subAgent(CounterChild, "scheduled")).currentValue();
+  }
+
+  /** Reached through `CounterChild.parentAgent(Counter)`. */
+  async currentValue(): Promise<number> {
+    return this.state.value;
+  }
+
+  /**
    * Arm a wake `delayMs` from now, and answer the absolute time it was armed
    * for.
    *
@@ -158,4 +219,16 @@ export class Counter extends Agent<CounterEnv, CounterState> {
     this.#record("sdk-schedule");
     this.setState({ value: this.state.value + 1 });
   }
+}
+
+/**
+ * The root's typed class token. The facet host resolves this name to the
+ * separately bundled MV3 module; this copy is never instantiated.
+ */
+export class CounterChild extends Agent<CounterEnv, CounterState> {
+  declare bump: () => Promise<SubAgentSnapshot>;
+  declare bumpAfter: (delayMs: number) => Promise<SubAgentSnapshot>;
+  declare bumpLeaf: () => Promise<NestedSubAgentSnapshot>;
+  declare armWake: (delayMs: number) => Promise<number>;
+  declare currentValue: () => Promise<number>;
 }

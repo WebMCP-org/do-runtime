@@ -21,15 +21,25 @@
 
 import {
   AlarmScheduler,
+  DEFAULT_ALARM_OUTLET,
+  LoopbackDurableObjectClass,
+  actorScopeBindings,
+  asLoopbackDurableObjectClass,
   createActorContainer,
   gateRequestBody,
   installActorScope,
   newRpcSession,
-  noFacets,
   type ActorContainer,
   type ActorGlobalScope,
+  type ActorScopeBindings,
   type AlarmResult,
+  type FacetHandle,
+  type FacetHost,
+  type FacetId,
+  type FacetStartRequest,
+  type FacetTree,
   type SqlDatabaseProvider,
+  type SqlDatabaseSnapshotProvider,
   type Timer,
 } from "@mcp-b/do-runtime";
 import { createSqliteWasmProvider, type SqliteWasmHost } from "@mcp-b/do-runtime/backends/sqlite-wasm";
@@ -46,6 +56,8 @@ import type {
   CounterSnapshot,
   HostRpc,
   HostStatus,
+  NestedSubAgentSnapshot,
+  SubAgentSnapshot,
   SupervisorRpc,
   WorkerBoot,
 } from "../protocol";
@@ -136,14 +148,230 @@ const ALARM_DATABASE = "scheduler";
  * The default of 6 is not enough. This root opens **two** databases — its own
  * storage and the facet tree index the runtime keeps beside it — the scheduler
  * opens a third, and SQLite puts a rollback journal beside each of those as a
- * further file. That is six before anything unusual happens. Twelve leaves
- * headroom for the journals and for a second actor later.
+ * further file. That is six before anything unusual happens. Each sub-agent
+ * opens another database and journal, so size the pool for a useful actor tree
+ * rather than the root alone.
  *
  * Running out is nameable but not obvious: the pool logs `SAH pool is full.
  * Cannot create file …` on the console and the caller gets
  * `SQLITE_CANTOPEN: sqlite3 result code 14`. This line is the knob.
  */
-const POOL_CAPACITY = 12;
+const POOL_CAPACITY = 64;
+
+// =======================================================================================
+// Facet placement: bundled Agent classes, one database and gate set per child
+
+type FacetConstructor = new (ctx: DurableObjectState, env: CounterEnv) => object;
+type FacetModule = {
+  readonly gate: { container: ActorContainer | undefined };
+  readonly loaded: Promise<Record<string, unknown>>;
+};
+
+const FACET_SCOPES_GLOBAL = "__doRuntimeExtensionFacetScopes";
+const COUNTER_CHILD_MODULE_URL = "../counter-child.js";
+const facetScopes: Record<string, ActorScopeBindings> = {};
+(globalThis as Record<string, unknown>)[FACET_SCOPES_GLOBAL] = facetScopes;
+
+/** One prefix in the root's OPFS pool, plus the lifecycle `FacetHost` owes it. */
+class FacetStorage implements SqlDatabaseProvider {
+  readonly #provider: SqlDatabaseSnapshotProvider;
+
+  constructor(
+    readonly host: SqliteWasmHost,
+    readonly prefix: string,
+  ) {
+    this.#provider = createSqliteWasmProvider(host, { prefix });
+  }
+
+  open(name: string) {
+    return this.#provider.open(name);
+  }
+
+  close(): void {
+    this.#provider.close();
+  }
+
+  unlink(): void {
+    this.close();
+    for (const name of this.#ownedFiles()) this.host.pool.unlink(name);
+  }
+
+  async copyFrom(source: FacetStorage): Promise<void> {
+    const files = source.#ownedFiles();
+    const sidecar = files.find((name) => !name.endsWith(".sqlite"));
+    if (sidecar !== undefined) {
+      throw new Error(`Cannot clone actor storage with a SQLite recovery sidecar: ${sidecar}`);
+    }
+    this.unlink();
+    for (const file of files) {
+      const database = file.slice(source.prefix.length + 1, -".sqlite".length);
+      await this.host.pool.importDb(
+        `${this.prefix}.${database}.sqlite`,
+        await source.host.pool.exportFile(file),
+      );
+    }
+  }
+
+  #ownedFiles(): string[] {
+    return this.host.pool
+      .getFileNames()
+      .filter((name) => name.startsWith(`${this.prefix}.`));
+  }
+}
+
+type FacetPlacement = {
+  readonly container: ActorContainer;
+  readonly storage: FacetStorage;
+  readonly stub: object;
+};
+
+/**
+ * The extension equivalent of workerd's in-process facet placement. Classes
+ * are bundled and trusted, so MV3 needs neither eval nor a Worker Loader: the
+ * `DurableObjectClass` token names an export in that module.
+ */
+class ExtensionFacetHost implements FacetHost {
+  readonly #placements = new Map<FacetId, FacetPlacement>();
+  readonly #modules = new Map<FacetId, FacetModule>();
+  #host: SqliteWasmHost | undefined;
+  #tree: FacetTree | undefined;
+  #env: CounterEnv | undefined;
+  #exports: Record<string, unknown> | undefined;
+
+  attach(
+    host: SqliteWasmHost,
+    tree: FacetTree,
+    env: CounterEnv,
+    workerExports: Record<string, unknown>,
+  ): void {
+    this.#host = host;
+    this.#tree = tree;
+    this.#env = env;
+    this.#exports = workerExports;
+  }
+
+  start(request: FacetStartRequest): FacetHandle {
+    const existing = this.#placements.get(request.id);
+    if (existing !== undefined) {
+      return { stub: Promise.resolve(existing.stub), broken: existing.container.onBroken };
+    }
+
+    const tree = this.#tree;
+    const env = this.#env;
+    const workerExports = this.#exports;
+    if (tree === undefined || env === undefined || workerExports === undefined) {
+      throw new Error("do-runtime example: facet host was reached before the root was attached");
+    }
+
+    const started = (async (): Promise<FacetPlacement> => {
+      const facetModule = this.#moduleFor(request.id);
+      const exported = (await facetModule.loaded)[request.className];
+      if (typeof exported !== "function") {
+        throw new Error(`do-runtime example: no bundled facet class named ${request.className}`);
+      }
+      const ActorClass = exported as FacetConstructor;
+      const storage = new FacetStorage(this.#requireHost(), `/facet-${request.id}`);
+      const container = await createActorContainer({
+        id: request.routedId ?? ACTOR_ID,
+        uniqueKey: UNIQUE_KEY,
+        exports: workerExports,
+        env,
+        ports: {
+          sql: storage,
+          alarms: DEFAULT_ALARM_OUTLET,
+          facets: this,
+          timer,
+        },
+        facet: { depth: request.depth, id: request.id, tree },
+      });
+      facetModule.gate.container = container;
+      let instance: object;
+      try {
+        instance = await container.start(
+          (ctx, childEnv) => new ActorClass(ctx, childEnv as CounterEnv),
+        );
+      } catch (error) {
+        facetModule.gate.container = undefined;
+        container.abort(error);
+        storage.close();
+        throw error;
+      }
+      const placement = { container, storage, stub: container.entry(instance) };
+      this.#placements.set(request.id, placement);
+      return placement;
+    })();
+
+    const { promise: broken, reject } = Promise.withResolvers<never>();
+    void broken.catch(() => {});
+    void started.then(
+      ({ container }) => {
+        void container.onBroken.catch(reject);
+      },
+      () => {},
+    );
+    return { stub: started.then(({ stub }) => stub), broken };
+  }
+
+  abort(id: FacetId, reason?: string): void {
+    const placement = this.#placements.get(id);
+    if (placement === undefined) return;
+    this.#placements.delete(id);
+    const module = this.#modules.get(id);
+    if (module !== undefined) module.gate.container = undefined;
+    placement.container.abort(new Error(reason ?? "Facet placement closed."));
+    placement.storage.close();
+  }
+
+  async deleteStorage(id: FacetId, subtree: readonly FacetId[]): Promise<void> {
+    for (const target of [...subtree, id]) {
+      const storage = this.#storageFor(target);
+      this.abort(target);
+      storage.unlink();
+    }
+  }
+
+  async copyStorage(src: FacetId, dst: FacetId): Promise<void> {
+    await this.#storageFor(dst).copyFrom(this.#storageFor(src));
+  }
+
+  #storageFor(id: FacetId): FacetStorage {
+    return (
+      this.#placements.get(id)?.storage ??
+      new FacetStorage(this.#requireHost(), `/facet-${id}`)
+    );
+  }
+
+  #moduleFor(id: FacetId): FacetModule {
+    const existing = this.#modules.get(id);
+    if (existing !== undefined) return existing;
+
+    const gate: FacetModule["gate"] = { container: undefined };
+    const key = `facet-${id}`;
+    facetScopes[key] = actorScopeBindings(() => {
+      if (gate.container === undefined) {
+        throw new Error(
+          `do-runtime example: ${key} reached an async primitive outside its live placement`,
+        );
+      }
+      return gate.container.globals;
+    });
+    const url = new URL(COUNTER_CHILD_MODULE_URL, globalThis.location.href);
+    url.searchParams.set("scope", key);
+    const module = {
+      gate,
+      loaded: import(/* @vite-ignore */ url.href) as Promise<Record<string, unknown>>,
+    };
+    this.#modules.set(id, module);
+    return module;
+  }
+
+  #requireHost(): SqliteWasmHost {
+    if (this.#host === undefined) throw new Error("do-runtime example: facet host has no pool");
+    return this.#host;
+  }
+}
+
+const facets = new ExtensionFacetHost();
 
 // =======================================================================================
 // The container this worker hosts
@@ -194,6 +422,8 @@ function rootScope(): ActorGlobalScope {
 // The substrate: storage and the alarm scheduler, installed once per worker
 
 type Substrate = {
+  /** The installed pool shared by the root and every facet in its tree. */
+  readonly host: SqliteWasmHost;
   /** The provider the root container's storage is opened from. */
   readonly sql: SqlDatabaseProvider;
   /** The namespace's one scheduler. It owns `_cf_ALARM`, the retry ladder, and delivery. */
@@ -286,37 +516,64 @@ async function installSubstrate(): Promise<Substrate> {
     },
   });
 
-  return { sql: createSqliteWasmProvider(host, { prefix: ACTOR_PREFIX }), scheduler };
+  return { host, sql: createSqliteWasmProvider(host, { prefix: ACTOR_PREFIX }), scheduler };
 }
 
 // =======================================================================================
 // Placement
 
 async function place(): Promise<Live> {
-  const { sql, scheduler } = await installedSubstrate();
+  const { host, sql, scheduler } = await installedSubstrate();
+
+  const rootNamespace = {
+    idFromName: (name: string) => ({ name, toString: () => name }),
+    get: () => {
+      if (live === undefined) throw new Error("do-runtime example: root loopback reached before placement");
+      return live.entry;
+    },
+    getByName: () => {
+      if (live === undefined) throw new Error("do-runtime example: root loopback reached before placement");
+      return live.entry;
+    },
+  } as unknown as DurableObjectNamespace<Counter>;
+  const facetClass = (className: string): unknown =>
+    asLoopbackDurableObjectClass(
+      new LoopbackDurableObjectClass({
+        getActorClass: () => ({
+          className,
+          requireAllowsTransfer: () => {},
+        }),
+      }),
+    );
+  const workerExports: Record<string, unknown> = {
+    Counter: rootNamespace,
+    CounterChild: facetClass("CounterChild"),
+    CounterLeaf: facetClass("CounterLeaf"),
+  };
+  const env: CounterEnv = { Counter: rootNamespace };
 
   const container = await createActorContainer({
     id: ACTOR_ID,
     uniqueKey: UNIQUE_KEY,
-    // The `ctx.exports` registry. One entry, so a future facet or a loopback
-    // stub can name this class; nothing in this example reads it.
-    exports: { Counter },
-    // No bindings. A real extension puts its `DurableObjectNamespace` loopback,
-    // its Worker Loader, and its configuration here.
-    env: {},
+    // A configured root namespace plus an unconfigured exported child class:
+    // the same two `ctx.exports` shapes workerd gives the Agents SDK.
+    exports: workerExports,
+    env,
     ports: {
       sql,
       // ← `ActorSqliteHooks`: one three-line adapter per actor over the
       // namespace's one scheduler, which is how an actor's storage engine
       // reaches it. The host composes the two rather than writing a ladder.
       alarms: scheduler.hooks(ACTOR_ID),
-      facets: noFacets,
+      facets,
       timer,
       // `ports.fetch` is deliberately omitted, which is upstream's
       // `globalOutbound: null` posture: `fetch` inside the actor refuses BY NAME
       // rather than reaching an ungated one that would appear to work.
     },
   });
+
+  facets.attach(host, container.facetTree, env, workerExports);
 
   // **Consume `onBroken` at the moment the container exists.** It rejects when a
   // gate breaks, and a host that ignores it gets an actor that answers nothing
@@ -331,7 +588,7 @@ async function place(): Promise<Live> {
     if (live?.container === container) live = undefined;
   });
 
-  const instance = await container.start((ctx, env) => new Counter(ctx, env as CounterEnv));
+  const instance = await container.start((ctx, actorEnv) => new Counter(ctx, actorEnv as CounterEnv));
   // A break during boot has already run the handler above, and `live` was not
   // this container yet — so nothing dropped it. Refuse to publish a container
   // that is already broken rather than handing callers one that answers nothing.
@@ -455,6 +712,30 @@ class HostTarget extends RpcTarget implements HostRpc {
 
   async snapshot(): Promise<CounterSnapshot> {
     return await (await placed()).entry.snapshot();
+  }
+
+  async subAgents(): Promise<readonly SubAgentSnapshot[]> {
+    return await (await placed()).entry.subAgents();
+  }
+
+  async overlapSubAgents(): Promise<readonly SubAgentSnapshot[]> {
+    return await (await placed()).entry.overlapSubAgents();
+  }
+
+  async subAgentLifecycle(): Promise<readonly number[]> {
+    return await (await placed()).entry.subAgentLifecycle();
+  }
+
+  async nestedSubAgent(): Promise<NestedSubAgentSnapshot> {
+    return await (await placed()).entry.nestedSubAgent();
+  }
+
+  async armSubAgentWake(delayMs: number): Promise<number> {
+    return await (await placed()).entry.armSubAgentWake(delayMs);
+  }
+
+  async scheduledSubAgentValue(): Promise<number> {
+    return await (await placed()).entry.scheduledSubAgentValue();
   }
 
   async armWake(delayMs: number): Promise<number> {

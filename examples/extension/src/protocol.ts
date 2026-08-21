@@ -37,6 +37,17 @@ export type CounterSnapshot = {
   readonly events: readonly CounterEvent[];
 };
 
+export type SubAgentSnapshot = {
+  readonly name: string;
+  readonly value: number;
+  readonly parentValue: number;
+};
+
+export type NestedSubAgentSnapshot = {
+  readonly childValue: number;
+  readonly leafValue: number;
+};
+
 /**
  * What the worker reports about the host itself, as opposed to about the actor.
  *
@@ -73,6 +84,12 @@ export interface HostRpc {
   enqueueIncrement(amount: number): Promise<string>;
   mcp(method: string, params: Record<string, unknown>): Promise<unknown>;
   snapshot(): Promise<CounterSnapshot>;
+  subAgents(): Promise<readonly SubAgentSnapshot[]>;
+  overlapSubAgents(): Promise<readonly SubAgentSnapshot[]>;
+  subAgentLifecycle(): Promise<readonly number[]>;
+  nestedSubAgent(): Promise<NestedSubAgentSnapshot>;
+  armSubAgentWake(delayMs: number): Promise<number>;
+  scheduledSubAgentValue(): Promise<number>;
   armWake(delayMs: number): Promise<number>;
   status(): Promise<HostStatus>;
 }

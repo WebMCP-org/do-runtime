@@ -1,8 +1,9 @@
 # Chrome MV3 extension example
 
-One Agents SDK actor, running for real inside a Manifest V3 extension: a
-service worker that owns nothing, an offscreen document that supervises, a module
-Worker that holds the actor, and SQLite on OPFS underneath it.
+One Agents SDK actor and its local sub-agents, running for real inside a Manifest
+V3 extension: a service worker that owns nothing, an offscreen document that
+supervises, a module Worker that holds the actor tree, and SQLite on OPFS
+underneath it.
 
 ```
 popup.html ──sendMessage──▶ service worker ──chrome.offscreen.createDocument──▶ offscreen.html
@@ -13,6 +14,7 @@ popup.html ──sendMessage──▶ service worker ──chrome.offscreen.crea
                                                                         ┌────────────▼────────────┐
                                                                         │ actor.worker.ts         │
                                                                         │  ActorContainer(Counter)│
+                                                                        │  FacetHost(children)    │
                                                                         │  AlarmScheduler         │
                                                                         │  OPFS SAH pool          │
                                                                         └─────────────────────────┘
@@ -58,6 +60,11 @@ popup.html ──sendMessage──▶ service worker ──chrome.offscreen.crea
 - **The Agents SDK queue.** The e2e enqueues an increment and observes its state
   write through `snapshot()`, exercising the SDK's SQLite-backed queue rather
   than a host callback.
+- **Real Agents SDK sub-agents.** The root uses the public `subAgent()`,
+  `parentAgent()`, `abortSubAgent()`, and `deleteSubAgent()` APIs. The e2e proves
+  sibling isolation, overlapping awaits, nested children, restart persistence,
+  abort-versus-delete storage semantics, and a child schedule delivered after
+  Chrome recreates an evicted host.
 - **A real non-hibernating `AgentClient` connection.** The offscreen page opens
   the SDK client over a `MessagePort`-backed WebSocket, while the actor receives
   the server half through `container.acceptWebSocket()`. The e2e proves
@@ -117,8 +124,9 @@ only as a competing supervisor and asserts that Web Locks refuse it before OPFS.
 
 | Path | What it is |
 | --- | --- |
-| `src/worker/counter.ts` | The actor. The only file a product would actually write. |
-| `src/worker/actor.worker.ts` | The host: raw timers, the sqlite boot order, the container, the alarm scheduler. |
+| `src/worker/counter.ts` | The root actor and its typed sub-agent class token. |
+| `src/worker/counter-child.worker.ts` | The real bundled child and nested-child classes. |
+| `src/worker/actor.worker.ts` | The host: raw timers, sqlite boot order, root/facet placement, and alarm scheduler. |
 | `src/offscreen/offscreen.ts` | The supervisor: spawns the worker, holds the session, forwards extension messages. |
 | `src/background.ts` | The service worker: offscreen lifecycle and `chrome.alarms` projection. |
 | `src/popup/popup.ts` | Four buttons and an output pane. |
@@ -186,9 +194,6 @@ When you want to debug the page as a tab, close the offscreen document first
 
 ## Deliberately not shown
 
-- **Facets.** `ports.facets` here is the refusing host from the root README's
-  quickstart. A host that places facets builds a child container per request; the
-  worked example is `conformance/browser/actor.worker.ts`.
 - **More than one actor, and actor-to-actor calls.** One worker hosts one root
   here. A supervisor with several actors keeps a registry and routes
   `alice → bob` through itself, which is what `conformance/browser/host.ts` does
@@ -208,7 +213,8 @@ substrate. Cloudflare-managed products remain explicit integration boundaries:
 | HTTP and durable state | Workflows: a real Workflow binding and Workflow runtime |
 | Non-hibernating WebSockets and bidirectional state sync | WebSocket hibernation: platform-owned socket survival across eviction |
 | Decorated callable and streaming RPC | AI chat and tool approval: `@cloudflare/ai-chat` plus a model provider |
-| SQLite-backed queue and `Agent.schedule()` | Outbound email: an Email Routing send binding |
+| SQLite-backed queue and root/sub-agent `Agent.schedule()` | Outbound email: an Email Routing send binding |
+| Local sub-agents, nesting, restart, abort, and delete | |
 | Stateless MCP server and tools | |
 | Inbound `routeAgentEmail()` and `onEmail()` | |
 
@@ -222,9 +228,12 @@ Written down because this example exists partly to find them.
   `ForwardableEmailMessage`; its forwarding and reply methods refuse because the
   demo has no outbound Email Routing binding. Both demos disable Agent WebSocket
   hibernation because this runtime deliberately refuses hibernatable sockets.
-- **`FacetHost` has no "places no facets" implementation in the package.**
-  `noFacets` appears only as a snippet in the root README, so every host retypes
-  four members to say the same thing.
+- **The facet entry repeats the Agents SDK bundle.** The root worker and
+  `counter-child.js` each carry their own copy (about 1.3 MB unminified for the
+  child in this readable demo build). The separate entry is intentional: its
+  output banner binds the complete chunk—including SDK internals—to that
+  facet's async primitives. A product build can minify it; sharing the SDK chunk
+  would reintroduce the parent-global bug this e2e catches.
 - **`container.entry<T>(target: T): T` understates its own return type.** The proxy
   makes every method asynchronous; the type says otherwise. This example dodges it
   by declaring every method on `Counter` `async`, and the conformance lanes dodge

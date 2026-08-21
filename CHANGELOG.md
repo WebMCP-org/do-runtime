@@ -8,3 +8,4 @@
 - Add host-owned whole-actor snapshots for local restore and cold replica seeding.
 - Run one conformance suite against pinned workerd, Node, and Chromium.
 - Add real browser and MV3 Agents SDK demos, including exclusive host ownership, OPFS crash recovery, and `chrome.alarms` wake projection.
+- Run Agents SDK sub-agents as same-worker browser facets, including nested children, durable schedules, and abort/delete lifecycle coverage in real MV3 Chromium.

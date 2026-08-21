@@ -224,9 +224,49 @@ async function main() {
       1,
     );
 
+    const subAgents = await op(popup, "subAgents");
+    check(
+      "two concurrent Agents SDK sub-agents keep independent durable state",
+      JSON.stringify(subAgents),
+      JSON.stringify([
+        { name: "alpha", value: 1, parentValue: 12 },
+        { name: "beta", value: 1, parentValue: 12 },
+      ]),
+    );
+    const overlappedSubAgents = await op(popup, "overlapSubAgents");
+    check(
+      "overlapping sub-agent awaits resume in the owning Agent contexts",
+      JSON.stringify(overlappedSubAgents),
+      JSON.stringify([
+        { name: "alpha", value: 2, parentValue: 12 },
+        { name: "beta", value: 2, parentValue: 12 },
+      ]),
+    );
+
+    const subAgentLifecycle = await op(popup, "subAgentLifecycle");
+    check(
+      "sub-agent abort preserves storage and delete wipes it",
+      subAgentLifecycle.join(","),
+      "1,2,1",
+    );
+
+    const nestedSubAgent = await op(popup, "nestedSubAgent");
+    check(
+      "a nested sub-agent keeps its own state and reaches its direct parent",
+      JSON.stringify(nestedSubAgent),
+      JSON.stringify({ childValue: 1, leafValue: 1 }),
+    );
+
     // ---------------------------------------------------------------------
     // 2. A real alarm: armed in the actor's storage, delivered by the
     //    AlarmScheduler's own database in the same worker.
+    const childArmedFor = await op(popup, "armSubAgentWake", [5000]);
+    if (typeof childArmedFor !== "number") {
+      fail("a sub-agent answers its scheduled time", String(childArmedFor));
+    } else {
+      pass(`a sub-agent answers its scheduled time (${childArmedFor - Date.now()}ms out)`);
+    }
+
     const armedFor = await op(popup, "armWake", [5000]);
     if (typeof armedFor !== "number") fail("armWake answers a scheduled time", String(armedFor));
     else pass(`armWake answers a scheduled time (${armedFor - Date.now()}ms out)`);
@@ -258,6 +298,11 @@ async function main() {
     }
     check("chrome.alarms recreated the host and delivered the alarm", alarms, 1);
     check("the alarm handler's write landed", snapshot.value, 13);
+    check(
+      "the recreated host delivered durable work to the sub-agent",
+      await op(popup, "scheduledSubAgentValue"),
+      1,
+    );
 
     // ---------------------------------------------------------------------
     // 3. Persistence across offscreen recreation: a new document, a new worker, a new
@@ -275,6 +320,26 @@ async function main() {
     const afterReload = await op(popup, "increment");
     check("increment after offscreen recreation continues the count", afterReload, 14);
 
+    const restartedSubAgents = await op(popup, "subAgents");
+    check(
+      "sub-agent state survived offscreen recreation",
+      JSON.stringify(restartedSubAgents),
+      JSON.stringify([
+        { name: "alpha", value: 3, parentValue: 14 },
+        { name: "beta", value: 3, parentValue: 14 },
+      ]),
+    );
+    check(
+      "nested sub-agent state survived offscreen recreation",
+      JSON.stringify(await op(popup, "nestedSubAgent")),
+      JSON.stringify({ childValue: 2, leafValue: 2 }),
+    );
+    check(
+      "scheduled sub-agent state survived offscreen recreation",
+      await op(popup, "scheduledSubAgentValue"),
+      1,
+    );
+
     // ---------------------------------------------------------------------
     // 4. Nothing broke in the background.
     const status = await op(popup, "status");
@@ -284,10 +349,8 @@ async function main() {
     // ---------------------------------------------------------------------
     // 5. The popup reaches that same real offscreen host.
     await popup.click("#increment");
-    const printed = await waitForOutput(popup, /"increment"|increment failed/, BOOT_TIMEOUT_MS);
-    const viaOffscreen = /^\s*15\s*$/m.test(printed)
-      ? 15
-      : printed.split("\n").slice(0, 3).join(" ");
+    const printed = await waitForOutput(popup, /^[^\n]+  increment\n/, BOOT_TIMEOUT_MS);
+    const viaOffscreen = Number(printed.split("\n")[1]);
     check("the offscreen document continues the same storage", viaOffscreen, 15);
 
     const offscreenContexts = await worker.evaluate(async () =>

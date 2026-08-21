@@ -36,6 +36,8 @@ import type {
   HostRpc,
   HostOp,
   HostStatus,
+  NestedSubAgentSnapshot,
+  SubAgentSnapshot,
   SupervisorRpc,
   WorkerBoot,
 } from "../protocol";
@@ -147,6 +149,18 @@ const ops = {
   mcp: (method: string, params: Record<string, unknown>): Promise<unknown> =>
     host.mcp(method, params) as unknown as Promise<unknown>,
   snapshot: (): Promise<CounterSnapshot> => host.snapshot() as unknown as Promise<CounterSnapshot>,
+  subAgents: (): Promise<readonly SubAgentSnapshot[]> =>
+    host.subAgents() as unknown as Promise<readonly SubAgentSnapshot[]>,
+  overlapSubAgents: (): Promise<readonly SubAgentSnapshot[]> =>
+    host.overlapSubAgents() as unknown as Promise<readonly SubAgentSnapshot[]>,
+  subAgentLifecycle: (): Promise<readonly number[]> =>
+    host.subAgentLifecycle() as unknown as Promise<readonly number[]>,
+  nestedSubAgent: (): Promise<NestedSubAgentSnapshot> =>
+    host.nestedSubAgent() as unknown as Promise<NestedSubAgentSnapshot>,
+  armSubAgentWake: (delayMs: number): Promise<number> =>
+    host.armSubAgentWake(delayMs) as unknown as Promise<number>,
+  scheduledSubAgentValue: (): Promise<number> =>
+    host.scheduledSubAgentValue() as unknown as Promise<number>,
   armWake: (delayMs: number): Promise<number> =>
     host.armWake(delayMs) as unknown as Promise<number>,
   status: (): Promise<HostStatus> => host.status() as unknown as Promise<HostStatus>,
@@ -189,6 +203,18 @@ async function runOp(op: HostOp, args: readonly unknown[]): Promise<unknown> {
     }
     case "snapshot":
       return await ops.snapshot();
+    case "subAgents":
+      return await ops.subAgents();
+    case "overlapSubAgents":
+      return await ops.overlapSubAgents();
+    case "subAgentLifecycle":
+      return await ops.subAgentLifecycle();
+    case "nestedSubAgent":
+      return await ops.nestedSubAgent();
+    case "armSubAgentWake":
+      return await ops.armSubAgentWake(Number(args[0] ?? 0));
+    case "scheduledSubAgentValue":
+      return await ops.scheduledSubAgentValue();
     case "armWake":
       return await ops.armWake(Number(args[0] ?? 0));
     case "status":
