@@ -317,8 +317,10 @@ async function main() {
       1,
     );
 
-    const afterReload = await op(popup, "increment");
-    check("increment after offscreen recreation continues the count", afterReload, 14);
+    const reconnectedState = await op(popup, "sdkState");
+    check("a recreated Agents client resynced durable state", reconnectedState.value, 13);
+    const afterReload = await op(popup, "sdkIncrement");
+    check("a recreated Agents client called a decorated method", afterReload, 14);
 
     const restartedSubAgents = await op(popup, "subAgents");
     check(

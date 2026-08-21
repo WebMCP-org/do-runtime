@@ -119,6 +119,28 @@ export class Probe extends DurableObject<Record<string, unknown>> {
     this.trace.push("facet:exit");
     return this.marker;
   }
+  /** Outbound Durable Object RPC. Measured: releases this actor while the target runs. */
+  async gateViaActor(actorName: string): Promise<{ marker: string; target: number }> {
+    this.marker = "A";
+    this.trace.push("actor:enter");
+    const namespace = (this.env as { PROBE: DurableObjectNamespace }).PROBE;
+    const target = namespace.get(namespace.idFromName(actorName)) as unknown as {
+      remoteBump(): Promise<number>;
+    };
+    const value = await target.remoteBump();
+    await this.ctx.storage.put("crossActorResult", value);
+    this.trace.push("actor:exit");
+    return { marker: this.marker, target: value };
+  }
+  async remoteBump(): Promise<number> {
+    await scheduler.wait(60);
+    const next = (((await this.ctx.storage.get("remoteCount")) as number | undefined) ?? 0) + 1;
+    await this.ctx.storage.put("remoteCount", next);
+    return next;
+  }
+  async readRemoteCount(): Promise<number> {
+    return ((await this.ctx.storage.get("remoteCount")) as number | undefined) ?? 0;
+  }
   /** Bare timer. Measured: RELEASES, so this returns "B". */
   async gateViaTimer(): Promise<string> {
     this.marker = "A";

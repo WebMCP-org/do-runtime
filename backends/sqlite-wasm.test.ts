@@ -92,3 +92,36 @@ test("actor storage copies and deletes every database under its prefix", async (
   destination.deleteAll();
   expect([...files.keys()]).toEqual(["/source.root.sqlite", "/source.facets.sqlite"]);
 });
+
+test("actor storage preserves the destination when the source cannot be exported", async () => {
+  const files = new Map<string, Uint8Array>([
+    ["/source.root.sqlite", new Uint8Array([1])],
+    ["/destination.root.sqlite", new Uint8Array([2])],
+  ]);
+  const host = {
+    capi: {
+      SQLITE_LIMIT_LENGTH: 0,
+      sqlite3_complete: () => 1 as const,
+      sqlite3_get_autocommit: () => 1,
+      sqlite3_limit: () => 1,
+    },
+    pool: {
+      OpfsSAHPoolDb: FakeDatabase,
+      exportFile: async () => {
+        throw new Error("source export failed");
+      },
+      importDb: async (name: string, image: Uint8Array) => {
+        files.set(name, image);
+        return 0;
+      },
+      getFileNames: () => [...files.keys()],
+      unlink: (name: string) => files.delete(name),
+    },
+  } satisfies SqliteWasmHost;
+
+  const source = new SqliteWasmActorStorage(host, "/source");
+  const destination = new SqliteWasmActorStorage(host, "/destination");
+  await expect(destination.copyFrom(source)).rejects.toThrow("source export failed");
+
+  expect(files.get("/destination.root.sqlite")).toEqual(new Uint8Array([2]));
+});

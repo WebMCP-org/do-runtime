@@ -39,7 +39,6 @@ import {
   type FacetId,
   type FacetStartRequest,
   type FacetTree,
-  type SqlDatabaseProvider,
   type Timer,
 } from "@mcp-b/do-runtime";
 import {
@@ -381,8 +380,6 @@ function rootScope(): ActorGlobalScope {
 type Substrate = {
   /** The installed pool shared by the root and every facet in its tree. */
   readonly host: SqliteWasmHost;
-  /** The provider the root container's storage is opened from. */
-  readonly sql: SqlDatabaseProvider;
   /** The namespace's one scheduler. It owns `_cf_ALARM`, the retry ladder, and delivery. */
   readonly scheduler: AlarmScheduler;
 };
@@ -473,14 +470,15 @@ async function installSubstrate(): Promise<Substrate> {
     },
   });
 
-  return { host, sql: createSqliteWasmProvider(host, { prefix: ACTOR_PREFIX }), scheduler };
+  return { host, scheduler };
 }
 
 // =======================================================================================
 // Placement
 
 async function place(): Promise<Live> {
-  const { host, sql, scheduler } = await installedSubstrate();
+  const { host, scheduler } = await installedSubstrate();
+  const storage = new SqliteWasmActorStorage(host, ACTOR_PREFIX);
 
   const rootNamespace = {
     idFromName: (name: string) => ({ name, toString: () => name }),
@@ -517,7 +515,7 @@ async function place(): Promise<Live> {
     exports: workerExports,
     env,
     ports: {
-      sql,
+      sql: storage,
       // ← `ActorSqliteHooks`: one three-line adapter per actor over the
       // namespace's one scheduler, which is how an actor's storage engine
       // reaches it. The host composes the two rather than writing a ladder.
@@ -543,14 +541,23 @@ async function place(): Promise<Live> {
     brokenReason = String(reason);
     console.error("[do-runtime example] the actor container broke:", reason);
     if (live?.container === container) live = undefined;
+    storage.close();
   });
 
-  const instance = await container.start((ctx, actorEnv) => new Counter(ctx, actorEnv as CounterEnv));
-  // A break during boot has already run the handler above, and `live` was not
-  // this container yet — so nothing dropped it. Refuse to publish a container
-  // that is already broken rather than handing callers one that answers nothing.
-  if (brokeWhileStarting) {
-    throw new Error(`The actor broke while starting: ${brokenReason ?? "unknown"}`);
+  let instance: Counter;
+  try {
+    instance = await container.start(
+      (ctx, actorEnv) => new Counter(ctx, actorEnv as CounterEnv),
+    );
+    // A break during boot has already run the handler above, and `live` was not
+    // this container yet — so nothing dropped it. Refuse to publish a container
+    // that is already broken rather than handing callers one that answers nothing.
+    if (brokeWhileStarting) {
+      throw new Error(`The actor broke while starting: ${brokenReason ?? "unknown"}`);
+    }
+  } catch (error) {
+    storage.close();
+    throw error;
   }
   live = { container, entry: container.entry(instance) };
   return live;

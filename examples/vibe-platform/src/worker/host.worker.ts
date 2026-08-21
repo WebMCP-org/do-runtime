@@ -48,7 +48,7 @@ import {
   type Timer,
 } from "@mcp-b/do-runtime";
 import {
-  createSqliteWasmProvider,
+  SqliteWasmActorStorage,
   type SqliteWasmHost,
 } from "@mcp-b/do-runtime/backends/sqlite-wasm";
 import { RpcTarget } from "@mcp-b/do-runtime/cloudflare-workers";
@@ -229,7 +229,7 @@ function installScope(): void {
 async function place(): Promise<Live> {
   const host = await pool();
   installScope();
-  const storage = createSqliteWasmProvider(host, { prefix: STORAGE_PREFIX });
+  const storage = new SqliteWasmActorStorage(host, STORAGE_PREFIX);
 
   const container = await createActorContainer({
     id: ACTOR_ID,
@@ -266,9 +266,15 @@ async function place(): Promise<Live> {
     report(`the actor broke: ${describe(error)}`, true);
   });
 
-  const instance = await container.start(
-    (ctx, env): Workspace => new Workspace(ctx, env as WorkspaceEnv),
-  );
+  let instance: Workspace;
+  try {
+    instance = await container.start(
+      (ctx, env): Workspace => new Workspace(ctx, env as WorkspaceEnv),
+    );
+  } catch (error) {
+    storage.close();
+    throw error;
+  }
 
   live = { container, entry: container.entry(instance) };
   return live;

@@ -11,11 +11,10 @@ import {
   noFacets,
   type ActorContainer,
   type ActorEntry,
-  type SqlDatabaseSnapshotProvider,
   type Timer,
 } from "@mcp-b/do-runtime";
 import {
-  createSqliteWasmProvider,
+  SqliteWasmActorStorage,
   type SqliteWasmHost,
 } from "@mcp-b/do-runtime/backends/sqlite-wasm";
 import * as cloudflareWorkers from "cloudflare:workers";
@@ -85,7 +84,7 @@ let live:
       container: ActorContainer;
       entry: ActorEntry<AuthoredActor>;
       className: string;
-      storage: SqlDatabaseSnapshotProvider;
+      storage: SqliteWasmActorStorage;
     }
   | undefined;
 let scopeContainer: ActorContainer | undefined;
@@ -160,7 +159,7 @@ async function place(): Promise<NonNullable<typeof live>> {
   const host = await pooled;
   installScope();
   const evaluated = await evaluateActor();
-  const storage = createSqliteWasmProvider(host, { prefix: STORAGE_PREFIX });
+  const storage = new SqliteWasmActorStorage(host, STORAGE_PREFIX);
   const container = await createActorContainer({
     id: ACTOR_ID,
     uniqueKey: UNIQUE_KEY,
@@ -180,17 +179,23 @@ async function place(): Promise<NonNullable<typeof live>> {
     storage.close();
     report(`the user agent broke: ${describe(error)}`, true);
   });
-  const instance = await container.start(
-    (ctx, env) => new evaluated.ActorClass(ctx, env as Record<string, never>),
-  );
-  if (!("fetch" in instance) || typeof instance.fetch !== "function") {
-    throw new Error(`${evaluated.className} has no fetch() handler.`);
+  let instance: object;
+  try {
+    instance = await container.start(
+      (ctx, env) => new evaluated.ActorClass(ctx, env as Record<string, never>),
+    );
+    if (!("fetch" in instance) || typeof instance.fetch !== "function") {
+      throw new Error(`${evaluated.className} has no fetch() handler.`);
+    }
+  } catch (error) {
+    if (scopeContainer === container) scopeContainer = undefined;
+    storage.close();
+    report("failed agent storage released", false);
+    throw error;
   }
   live = {
     container,
-    entry: container.entry(
-      instance as AuthoredActor,
-    ),
+    entry: container.entry(instance as AuthoredActor),
     className: evaluated.className,
     storage,
   };

@@ -594,9 +594,11 @@ function probeNamespace(): { idFromName(name: string): unknown; get(id: unknown)
 /** Any other actor in the namespace, routed through the page. Still cross-worker. */
 function remoteActorStub(actorName: string): object {
   const supervisor = requirePeer();
+  const caller = requireLive().container;
   const stub: Record<string, unknown> = {};
   for (const method of methodNames(Probe.prototype)) {
-    stub[method] = (...args: unknown[]) => supervisor.callActor(actorName, method, args);
+    stub[method] = (...args: unknown[]) =>
+      caller.awaitIo(supervisor.callActor(actorName, method, args));
   }
   return stub;
 }
@@ -686,9 +688,15 @@ async function place(): Promise<Live> {
 
   facets.attach(lane, treeOf(container), env);
 
-  const instance = await container.start(
-    (ctx, workerEnv): object => new Probe(ctx as never, workerEnv as never),
-  );
+  let instance: object;
+  try {
+    instance = await container.start(
+      (ctx, workerEnv): object => new Probe(ctx as never, workerEnv as never),
+    );
+  } catch (error) {
+    storage.close();
+    throw error;
+  }
   const entry = container.entry(instance) as Record<
     string,
     (...args: unknown[]) => Promise<unknown>

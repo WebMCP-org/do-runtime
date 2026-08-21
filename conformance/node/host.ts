@@ -714,9 +714,22 @@ function treeOf(container: ActorContainer): FacetTree {
 }
 
 function stubFor(name: string): ActorEntry<Probe> {
-  const record = live.get(name);
-  if (record === undefined) throw new Error(`Node lane has no live actor named ${name}.`);
-  return record.stub;
+  return new Proxy({} as ActorEntry<Probe>, {
+    get: (_target, property): unknown => {
+      if (property === "then") return undefined;
+      return (...args: unknown[]): Promise<unknown> => {
+        const caller = current.getStore();
+        const invocation = placed(name).then((record) => {
+          const method = (record.stub as unknown as Record<PropertyKey, unknown>)[property];
+          if (typeof method !== "function") {
+            throw new Error(`Probe has no method ${String(property)}`);
+          }
+          return (method as (...rest: unknown[]) => Promise<unknown>)(...args);
+        });
+        return caller === undefined ? invocation : caller.awaitIo(invocation);
+      };
+    },
+  });
 }
 
 function actor(name: string): ProbeActor {

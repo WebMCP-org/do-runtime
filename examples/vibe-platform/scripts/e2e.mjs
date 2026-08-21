@@ -283,6 +283,33 @@ try {
     if (state.visits !== 1) throw new Error(`visit count after recovery is ${String(state.visits)}`);
   });
 
+  await step("a user DO constructor failure releases storage before retrying", async () => {
+    const broken = agentSourceForExport.replace(
+      "export class MyAgent extends Agent {",
+      'export class MyAgent extends Agent {\n  constructor(ctx, env) {\n    super(ctx, env);\n    throw new Error("e2e constructor failed");\n  }',
+    );
+    await page.locator("#editor").fill(broken);
+    await page.locator("#save").click();
+    await page.waitForFunction(
+      () => document.querySelector("#status").textContent === "saving failed",
+      undefined,
+      { timeout: TIMEOUT },
+    );
+    await page.waitForFunction(
+      () => document.querySelector("#log").textContent.includes("failed agent storage released"),
+      undefined,
+      { timeout: TIMEOUT },
+    );
+
+    await page.locator("#editor").fill(agentSourceForExport);
+    await page.locator("#save").click();
+    await builtOk();
+    const state = await previewApi();
+    if (state.visits !== 1) {
+      throw new Error(`visit count after constructor recovery is ${String(state.visits)}`);
+    }
+  });
+
   // 5 -----------------------------------------------------------------------
   await step("editing a file in the UI, saving it, and rebuilding", async () => {
     await file("/src/App.tsx").click();

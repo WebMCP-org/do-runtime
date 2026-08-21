@@ -67,3 +67,14 @@ test("a closed provider snapshot restores storage and seeds a replica", () => {
     },
   });
 });
+
+test("a full SAH pool fails visibly without leaking a slot and recovers after space is freed", () => {
+  if (!report.ok) throw new Error(report.error);
+  expect(report.exhaustion.fullError).toMatch(/pool is full|CANTOPEN|result code 14/i);
+  expect(report).toMatchObject({
+    ok: true,
+    exhaustion: { recovered: true },
+  });
+  expect(report.exhaustion.filesAfterFailure).toHaveLength(report.exhaustion.capacity);
+  expect(report.exhaustion.filesAfterFailure).not.toContain("/overflow.root.sqlite");
+});

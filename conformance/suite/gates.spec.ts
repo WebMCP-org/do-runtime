@@ -30,6 +30,19 @@ it("§1.2 an outbound facet RPC releases the input gate", async () => {
   expect(await probe.call("readTrace")).toEqual(["facet:enter", "setMarker", "facet:exit"]);
 });
 
+it("§1.2 an outbound actor RPC releases the caller and resumes it gated", async () => {
+  const caller = await host.spawn("gate-actor-caller");
+  const slow = caller.post("gateViaActor", "gate-actor-target");
+  const fast = caller.post("setMarker");
+
+  await fast.settled;
+  expect(await slow.settled).toEqual({ marker: "B", target: 1 });
+  expect(await caller.call("readTrace")).toEqual(["actor:enter", "setMarker", "actor:exit"]);
+
+  const target = await host.spawn("gate-actor-target");
+  expect(await target.call("readRemoteCount")).toBe(1);
+});
+
 it("§1.2 a bare timer releases the input gate", async () => {
   const probe = await host.spawn("gate-timer");
   const slow = probe.post("gateViaTimer");

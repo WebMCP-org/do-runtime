@@ -31,6 +31,12 @@ export type SmokeReport =
         restored: readonly (readonly unknown[])[];
         replica: readonly (readonly unknown[])[];
       };
+      exhaustion: {
+        capacity: number;
+        fullError: string;
+        filesAfterFailure: readonly string[];
+        recovered: boolean;
+      };
     };
 
 async function run(): Promise<SmokeReport> {
@@ -101,6 +107,28 @@ async function run(): Promise<SmokeReport> {
   const replica = replicaDb.exec("SELECT value FROM state", []).rawRows;
   replicaProvider.close();
 
+  const capacity = pool.getCapacity();
+  const fillerImage = await pool.exportFile("/smoke-snapshot.root.sqlite");
+  let filler = "";
+  for (let index = 0; pool.getFileNames().length < capacity; index += 1) {
+    filler = `/capacity-${index}.sqlite`;
+    await pool.importDb(filler, fillerImage);
+  }
+  if (filler === "") throw new Error("the smoke pool had no free slot to exhaust");
+
+  const overflowProvider = createSqliteWasmProvider(host, { prefix: "/overflow" });
+  let fullError = "allowed";
+  try {
+    (await overflowProvider.open("root")).close();
+  } catch (error) {
+    fullError = error instanceof Error ? error.message : String(error);
+  }
+  const filesAfterFailure = pool.getFileNames();
+  if (!pool.unlink(filler)) throw new Error(`the smoke pool did not release ${filler}`);
+  const recoveredDb = await overflowProvider.open("root");
+  const recovered = recoveredDb.exec("SELECT 1", []).rawRows[0]?.[0] === 1;
+  recoveredDb.close();
+
   return {
     ok: true,
     roundTrip: {
@@ -111,6 +139,7 @@ async function run(): Promise<SmokeReport> {
     members: { before, inside, after, databaseSize },
     reset: { tablesAfterReset },
     snapshot: { openRefusal, restored, replica },
+    exhaustion: { capacity, fullError, filesAfterFailure, recovered },
   };
 }
 

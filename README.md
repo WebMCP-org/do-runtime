@@ -257,7 +257,7 @@ pnpm test:conformance-browser   # the suite in headless Chromium over sqlite-was
 pnpm test                       # all of the above
 ```
 
-The workerd lane is what makes the others mean something: every row it passes is a contract the Node and browser lanes must also pass, and a substrate that lacks a feature asserts the named refusal instead of skipping the row. `pnpm bench:node` and `pnpm bench:browser` measure `sql.exec` latency over a realistic message store on each substrate.
+The workerd lane is what makes the others mean something: every row it passes is a contract the Node and browser lanes must also pass, including cross-root RPC gate release and resumption. The browser smoke lane also fills the real OPFS SAH pool to capacity and proves visible failure, no leaked slot, and recovery. A substrate that lacks a feature asserts the named refusal instead of skipping the row. `pnpm bench:node` and `pnpm bench:browser` measure `sql.exec` latency over a realistic message store on each substrate.
 
 ## Development
 

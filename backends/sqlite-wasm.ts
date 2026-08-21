@@ -148,7 +148,8 @@ export class SqliteWasmActorStorage implements SqlDatabaseProvider {
    * The source may still be running, so this uses the pool's file operations
    * rather than the snapshot API, which correctly refuses open handles. A
    * recovery sidecar means the bytes are not a stable database image and is
-   * refused before the destination is touched.
+   * refused before the destination is touched. Every source image is also
+   * exported before replacement starts, so a failed read preserves the target.
    */
   async copyFrom(source: SqliteWasmActorStorage): Promise<void> {
     const files = source.#ownedFiles();
@@ -156,13 +157,20 @@ export class SqliteWasmActorStorage implements SqlDatabaseProvider {
     if (sidecar !== undefined) {
       throw new Error(`Cannot clone actor storage with a SQLite recovery sidecar: ${sidecar}`);
     }
-    this.deleteAll();
+    const images: Array<{ name: string; bytes: Uint8Array }> = [];
     for (const file of files) {
       const name = file.slice(source.#prefix.length + 1, -".sqlite".length);
       requireSafeDatabaseName(name);
+      images.push({
+        name,
+        bytes: new Uint8Array(await source.#host.pool.exportFile(file)),
+      });
+    }
+    this.deleteAll();
+    for (const { name, bytes } of images) {
       await this.#host.pool.importDb(
         `${this.#prefix}.${name}.sqlite`,
-        new Uint8Array(await source.#host.pool.exportFile(file)),
+        bytes,
       );
     }
   }
