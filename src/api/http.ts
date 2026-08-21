@@ -133,45 +133,36 @@ export const BYOB_READER_UNGATABLE_MESSAGE =
   "`ReadableStream.getReader` is the only seam it has and a byte stream's `read(view)` " +
   "returns the caller's own buffer. Read the body through `arrayBuffer()` or a default reader.";
 
+// Instrument the native object itself. Chromium's `Response` constructor does not recognise a
+// `Proxy` around a `ReadableStream` as `BodyInit`; it stringifies the proxy instead.
 export function gateReadableStream<T>(ctx: IoAwaiter, stream: ReadableStream<T>): ReadableStream<T> {
-  const bound = new Map<string | symbol, unknown>();
+  const getReader = stream.getReader.bind(stream);
+  const tee = stream.tee.bind(stream);
 
-  return new Proxy(stream, {
-    get(subject, property): unknown {
-      const cached = bound.get(property);
-      if (cached !== undefined) return cached;
-
-      if (property === "getReader") {
-        const getReader = (options?: { mode?: string }): unknown => {
-          // Fail closed. A byte reader whose `read(view)` this layer cannot intercept would hand
-          // its continuation back ungated, which is the exact failure this module exists to
-          // prevent, and it would do it silently.
-          if (options?.mode === "byob") throw new Error(BYOB_READER_UNGATABLE_MESSAGE);
-          return gateReader(ctx, subject.getReader());
-        };
-        bound.set(property, getReader);
-        return getReader;
-      }
-
-      // `tee()` splits into two streams; both are bodies and both get the same treatment.
-      if (property === "tee") {
-        const tee = (): [ReadableStream<T>, ReadableStream<T>] => {
-          const [a, b] = subject.tee();
-          return [gateReadableStream(ctx, a), gateReadableStream(ctx, b)];
-        };
-        bound.set(property, tee);
-        return tee;
-      }
-
-      const value: unknown = Reflect.get(subject, property, subject);
-      if (typeof value === "function") {
-        const method = (value as (...a: unknown[]) => unknown).bind(subject);
-        bound.set(property, method);
-        return method;
-      }
-      return value;
+  Object.defineProperties(stream, {
+    getReader: {
+      configurable: true,
+      writable: true,
+      value(options?: { mode?: string }): unknown {
+        // Fail closed. A byte reader whose `read(view)` this layer cannot intercept would hand
+        // its continuation back ungated, which is the exact failure this module exists to
+        // prevent, and it would do it silently.
+        if (options?.mode === "byob") throw new Error(BYOB_READER_UNGATABLE_MESSAGE);
+        return gateReader(ctx, getReader());
+      },
+    },
+    // `tee()` splits into two streams; both are bodies and both get the same treatment.
+    tee: {
+      configurable: true,
+      writable: true,
+      value(): [ReadableStream<T>, ReadableStream<T>] {
+        const [a, b] = tee();
+        return [gateReadableStream(ctx, a), gateReadableStream(ctx, b)];
+      },
     },
   });
+
+  return stream;
 }
 
 function gateReader<T>(
