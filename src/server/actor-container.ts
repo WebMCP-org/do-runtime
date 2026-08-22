@@ -395,6 +395,22 @@ export interface ActorContainer {
   isCurrentSlice(): boolean;
 
   /**
+   * Whether this actor's input lock is on the current invocation stack.
+   *
+   * ← `IoContext::hasCurrent()`. Wider than `isCurrentSlice()`: a slice ends
+   * when its synchronous body returns, but the lock it took drains the whole
+   * microtask checkpoint (§1.2), so actor code chained one promise past a gated
+   * resumption is lock-holding without being slice-current. That window is
+   * where a host stub still has a caller to identify: an outbound call made
+   * there must resume through the caller's `awaitIo`, or the code after it
+   * comes back with no input lock and its next storage call throws. A host
+   * that resolves callers with `isCurrentSlice()` alone routes exactly those
+   * calls ungated, which is how the loss stays invisible until three layers
+   * later.
+   */
+  hasCurrent(): boolean;
+
+  /**
    * Construct the instance under workerd's boot semantics: the input gate is
    * held for the constructor's synchronous slice, and boot-time
    * deletion-receipt replay precedes it.
@@ -1315,6 +1331,10 @@ class ActorContainerImpl implements ActorContainer {
 
   isCurrentSlice(): boolean {
     return this.#ctx.isCurrentSlice();
+  }
+
+  hasCurrent(): boolean {
+    return this.#ctx.hasCurrent();
   }
 
   /**
