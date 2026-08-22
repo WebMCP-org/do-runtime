@@ -189,7 +189,29 @@ const INPUT_GATE_BROKEN_PREFIX = "broken.inputGateBroken; ";
  */
 export function requireInputLock(ctx: IoContext, op: string): void {
   if (ctx.hasCurrent()) return;
-  throw new Error(`${op}: no input lock available in this context`);
+  throw new Error(`${op}: no input lock available in this context${ctx.describeLostLock()}`);
+}
+
+/**
+ * A stack for `noteGateUse`, captured where user frames are still on the stack.
+ *
+ * The invocation stack's own push and pop are scheduler moments — `#runImpl`
+ * runs from a gate resumption and `#exit` from a `MessageChannel` callback — so
+ * a trace taken there names only runtime internals. The moments that still see
+ * the caller are the synchronous entries into the gate machinery: an `awaitIo`
+ * call, an `entry` dispatch, a callback's registration. V8's zero-cost async
+ * traces extend those with the awaiting chain, which is usually the frame the
+ * reader actually wants.
+ *
+ * The first slice drops the `Error` header (absent on SpiderMonkey) and the two
+ * runtime frames: this helper and the gate entry point that called it.
+ */
+export function captureGateStack(): string | undefined {
+  const stack = new Error().stack;
+  if (stack === undefined) return undefined;
+  const frames = stack.split("\n");
+  const trimmed = frames.slice(frames[0]?.startsWith("Error") ? 3 : 2).join("\n");
+  return trimmed === "" ? undefined : trimmed;
 }
 
 /**
@@ -656,6 +678,14 @@ export class IoContext {
    */
   readonly #currentInputLocks: Lock[] = [];
 
+  /**
+   * Where this context's gate was last deliberately engaged, for
+   * `describeLostLock`. One slot, overwritten on every engagement — the gate
+   * serialises slices, so the latest note is the best available ancestor of
+   * whatever continuation is running lockless now.
+   */
+  #lastGateUse: { readonly what: string; readonly stack: string | undefined; readonly at: number } | undefined;
+
   #abortException: { readonly exception: unknown } | undefined;
   readonly #abortPromise: Promise<never>;
   readonly #rejectAbort: (exception: unknown) => void;
@@ -733,6 +763,42 @@ export class IoContext {
    */
   isCurrentSlice(): boolean {
     return currentSlice === this;
+  }
+
+  /**
+   * Record that user code just engaged this context's gate — an `awaitIo`, an
+   * `entry` dispatch, a re-entry callback firing. No upstream analogue, because
+   * upstream cannot lose the lock; here a continuation that awaits a promise
+   * the runtime does not own comes back lockless, the throw lands at the next
+   * storage call three layers later, and the gap between "where the code last
+   * verifiably ran gated" and the throw site is exactly where the foreign await
+   * hides. This is that first coordinate. Always on: the capture rides calls
+   * that already allocate promise machinery, and a stack costs microseconds
+   * against the diagnosis it replaces.
+   */
+  noteGateUse(what: string, stack: string | undefined): void {
+    this.#lastGateUse = { what, stack, at: this.now() };
+  }
+
+  /**
+   * The suffix `requireInputLock` appends when the invocation stack is empty:
+   * where this context's gate was last engaged, and how long before the throw.
+   *
+   * "Last engaged" is the honest claim, not "this continuation's ancestor" —
+   * once the offending chain went lockless the gate reopened, so another slice
+   * may have run in between and be the note this reports. In practice the loss
+   * is discovered within the same event storm and the note is the parent; when
+   * it is not, an engagement of this actor moments earlier is still the right
+   * neighbourhood to search.
+   */
+  describeLostLock(): string {
+    const use = this.#lastGateUse;
+    if (use === undefined) {
+      return " (this context has never held its gate: the call arrived from outside any actor invocation)";
+    }
+    const age = Math.round(this.now() - use.at);
+    const stackSuffix = use.stack === undefined ? "" : `, at:\n${use.stack}`;
+    return ` (an await after the last gated point resumed from a promise the runtime does not own; the gate was last engaged by ${use.what} ${age}ms before this call${stackSuffix})`;
   }
 
   /**
@@ -970,8 +1036,12 @@ export class IoContext {
     // inside the IoContext. Initial entry should just use run().
     this.#requireCurrent();
     const criticalSection = this.getCriticalSection();
+    // Captured once, here, because the fire is a scheduler moment with no user
+    // frames — the registration site is the trace a reader can act on.
+    const registrationStack = captureGateStack();
 
     return async (...args: Args): Promise<Result> => {
+      this.noteGateUse("a re-entry callback registered at the site below", registrationStack);
       const call = this.run((lock) => func(lock, ...args), criticalSection);
 
       // ← the `addTask()` + `registerPendingEvent()` pair, which keeps the context live while
@@ -1012,6 +1082,7 @@ export class IoContext {
     promise: Promise<T>,
     func: (value: T) => R | PromiseLike<R> = identity as (value: T) => R,
   ): Promise<R> {
+    this.noteGateUse("awaitIo", captureGateStack());
     return this.#awaitIoImpl(promise, this.getCriticalSection(), func);
   }
 
@@ -1042,6 +1113,7 @@ export class IoContext {
     } catch (exception) {
       return Promise.reject(exception);
     }
+    this.noteGateUse("awaitIoWithInputLock", captureGateStack());
     return this.#awaitIoImpl(promise, inputLock, func);
   }
 
@@ -1059,6 +1131,7 @@ export class IoContext {
    */
   blockConcurrencyWhile<T>(callback: (lock: Lock) => T | PromiseLike<T>): Promise<T> {
     const lock = this.getInputLock();
+    this.noteGateUse("blockConcurrencyWhile", captureGateStack());
     const criticalSection = lock.startCriticalSection();
     const { promise: result, resolve } = Promise.withResolvers<T>();
 
@@ -1138,7 +1211,7 @@ export class IoContext {
   #requireCurrent(): Lock {
     const lock = this.#currentInputLocks.at(-1);
     if (lock === undefined) {
-      throw new Error("no input lock available in this context");
+      throw new Error(`no input lock available in this context${this.describeLostLock()}`);
     }
     return lock;
   }

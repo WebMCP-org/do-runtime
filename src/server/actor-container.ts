@@ -57,7 +57,7 @@ import type { AlarmOutlet } from "../io/actor-sqlite";
 import { ActorSqlite, DEFAULT_ALARM_OUTLET } from "../io/actor-sqlite";
 import type { AlarmResult } from "./alarm-scheduler";
 import type { Actor, Timer } from "../io/io-context";
-import { IoContext } from "../io/io-context";
+import { IoContext, captureGateStack } from "../io/io-context";
 import { InputGate, OutputGate } from "../io/io-gate";
 import type { FacetManager, FacetStartInfo } from "../io/worker";
 import { asFacetStub } from "../io/worker";
@@ -1376,6 +1376,9 @@ class ActorContainerImpl implements ActorContainer {
         const cached = bound.get(property);
         if (cached !== undefined) return cached;
         const gated = async (...args: unknown[]): Promise<unknown> => {
+          // The dispatch is the one moment that knows both the method name and
+          // the caller's frames — the provenance `describeLostLock` reports.
+          this.#ctx.noteGateUse(`entry ${String(property)}()`, captureGateStack());
           const result = await this.#ctx.run(() =>
             this.#withExternalEntry(() =>
               (value as (...rest: unknown[]) => unknown).apply(subject, args),

@@ -303,6 +303,28 @@ async function openFacet(stub: ActorEntry<Counter>, name: string): Promise<strin
   return await facet.ping();
 }
 
+/**
+ * One raw MessagePort hop — a macrotask the runtime does not own.
+ *
+ * Used where a test must land AFTER a slice's lock release. The release rides
+ * `atCheckpointEnd`'s own MessageChannel, and port messages deliver in post
+ * order (measured in `io-context.ts`'s checkpoint-end note), so a hop posted
+ * after the slice's synchronous body ends is ordered behind its release. A
+ * `setTimeout(0)` gets no such guarantee against a port — CI showed a timer
+ * firing ahead of a pending release, which read as a lock that never drained.
+ */
+function portHop(): Promise<void> {
+  return new Promise((resolve) => {
+    const { port1, port2 } = new MessageChannel();
+    port1.onmessage = () => {
+      port1.close();
+      port2.close();
+      resolve();
+    };
+    port2.postMessage(0);
+  });
+}
+
 async function counterContainer(
   overrides: Partial<ActorContainerOptions> = {},
 ): Promise<{ container: ActorContainer; instance: Counter; stub: ActorEntry<Counter> }> {
@@ -396,9 +418,10 @@ describe("the composition", () => {
   });
 
   test("hasCurrent spans the checkpoint the slice's lock drains", async () => {
-    // A checkpoint ends at the next macrotask; awaiting one is how a test
+    // A checkpoint ends at the next macrotask; a port hop posted after the
+    // slice ended is ordered behind its release, so awaiting one is how a test
     // stands outside every drained lock.
-    const checkpointEnd = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+    const checkpointEnd = portHop;
     const first = await counterContainer();
     const second = await counterContainer();
 
@@ -421,6 +444,52 @@ describe("the composition", () => {
     expect(afterAwait).toBe(true);
     await checkpointEnd();
     expect(first.container.hasCurrent()).toBe(false);
+  });
+
+  test("a lost lock names where the gate was last engaged", async () => {
+    const { container, instance } = await counterContainer();
+    // Two hops, because one is not deterministically foreign enough: the first
+    // is posted DURING the slice's synchronous body, before the release is, so
+    // it can deliver while the lock still drains. Its continuation posts the
+    // second after the release is already queued, which is ordered behind it —
+    // by then the lock is verifiably gone.
+    const foreign = async (): Promise<void> => {
+      await portHop();
+      await portHop();
+    };
+
+    // The production shape: a gated await succeeds, a foreign await then drops
+    // the lock, and the next storage call throws — three layers from the cause.
+    // The suffix must hand back the last gated site, and that capture's stack
+    // has the actor method synchronously on it.
+    const interior = container.entry({
+      async loseAfterGatedAwait(): Promise<unknown> {
+        await container.awaitIo(foreign());
+        await foreign();
+        return await instance.ctx.storage.get("k");
+      },
+    });
+    const afterGated = await interior.loseAfterGatedAwait().then(
+      () => undefined,
+      (error: unknown) => (error as Error).message,
+    );
+    expect(afterGated).toContain("no input lock available in this context");
+    expect(afterGated).toMatch(/the gate was last engaged by awaitIo \d+ms before this call, at:\n/);
+    expect(afterGated).toContain("loseAfterGatedAwait");
+
+    // The other shape: nothing gated ran after dispatch, so the freshest note
+    // is the entry itself — the method name is the coordinate.
+    const early = container.entry({
+      async loseBeforeAnyStorage(): Promise<unknown> {
+        await foreign();
+        return await instance.ctx.storage.get("k");
+      },
+    });
+    const beforeStorage = await early.loseBeforeAnyStorage().then(
+      () => undefined,
+      (error: unknown) => (error as Error).message,
+    );
+    expect(beforeStorage).toContain("the gate was last engaged by entry loseBeforeAnyStorage()");
   });
 
   test("currentExternalEntry identifies each external synchronous body only", async () => {
