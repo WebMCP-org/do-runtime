@@ -292,6 +292,70 @@ describe("gateReadableStream", () => {
     expect(seen).toEqual(["gated", "gated", "gated"]);
   });
 
+  test("reader closed resumes gated and is cached once", async () => {
+    const ctx = newContext();
+    const seen: string[] = [];
+
+    await ctx.run(async () => {
+      const stream = gateReadableStream(
+        ctx,
+        new ReadableStream<void>({
+          start(controller) {
+            setTimeout(() => controller.close(), 0);
+          },
+        }),
+      );
+      const reader = stream.getReader();
+      const tasks = ctx.taskCount();
+      const closed = reader.closed;
+      expect(reader.closed).toBe(closed);
+      expect(ctx.taskCount()).toBe(tasks + 1);
+      await closed;
+      seen.push(ctx.hasCurrent() ? "closed:gated" : "closed:UNGATED");
+    });
+
+    expect(seen).toEqual(["closed:gated"]);
+  });
+
+  test("reader cancel resumes gated", async () => {
+    const ctx = newContext();
+    const seen: string[] = [];
+
+    await ctx.run(async () => {
+      const reader = gateReadableStream(
+        ctx,
+        new ReadableStream<void>({
+          cancel() {
+            return new Promise<void>((resolve) => setTimeout(resolve, 0));
+          },
+        }),
+      ).getReader();
+      await reader.cancel();
+      seen.push(ctx.hasCurrent() ? "reader.cancel:gated" : "reader.cancel:UNGATED");
+    });
+
+    expect(seen).toEqual(["reader.cancel:gated"]);
+  });
+
+  test("stream cancel resumes gated", async () => {
+    const ctx = newContext();
+    const seen: string[] = [];
+
+    await ctx.run(async () => {
+      const stream = gateReadableStream(
+        ctx,
+        new ReadableStream<void>({
+          cancel() {
+            return new Promise<void>((resolve) => setTimeout(resolve, 0));
+          },
+        }),
+      );
+      await stream.cancel();
+      seen.push(ctx.hasCurrent() ? "gated" : "UNGATED");
+    });
+    expect(seen).toEqual(["gated"]);
+  });
+
   test("tee() gates both halves", async () => {
     const ctx = newContext();
     const seen: string[] = [];

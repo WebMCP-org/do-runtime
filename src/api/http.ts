@@ -180,6 +180,7 @@ export const BYOB_READER_UNGATABLE_MESSAGE =
 // Instrument the native object itself. Chromium's `Response` constructor does not recognise a
 // `Proxy` around a `ReadableStream` as `BodyInit`; it stringifies the proxy instead.
 export function gateReadableStream<T>(ctx: IoAwaiter, stream: ReadableStream<T>): ReadableStream<T> {
+  const cancel = stream.cancel.bind(stream);
   const getReader = stream.getReader.bind(stream);
   const tee = stream.tee.bind(stream);
   const pipeThrough = stream.pipeThrough.bind(stream);
@@ -214,6 +215,13 @@ export function gateReadableStream<T>(ctx: IoAwaiter, stream: ReadableStream<T>)
   };
 
   Object.defineProperties(stream, {
+    cancel: {
+      configurable: true,
+      writable: true,
+      value(reason?: unknown): Promise<void> {
+        return ctx.awaitIo(cancel(reason));
+      },
+    },
     getReader: {
       configurable: true,
       writable: true,
@@ -271,15 +279,37 @@ function gateReader<T>(
   ctx: IoAwaiter,
   reader: ReadableStreamDefaultReader<T>,
 ): ReadableStreamDefaultReader<T> {
+  const bound = new Map<string | symbol, unknown>();
+
   return new Proxy(reader, {
     get(subject, property): unknown {
+      const cached = bound.get(property);
+      if (cached !== undefined) return cached;
+
+      if (property === "closed") {
+        // `closed` can remain pending for the stream's lifetime. Gate and register that one
+        // promise once rather than adding a new pending actor task on every property read.
+        const closed = ctx.awaitIo(subject.closed);
+        bound.set(property, closed);
+        return closed;
+      }
       if (property === "read") {
-        return (): Promise<ReadableStreamReadResult<T>> => ctx.awaitIo(subject.read());
+        const read = (): Promise<ReadableStreamReadResult<T>> => ctx.awaitIo(subject.read());
+        bound.set(property, read);
+        return read;
+      }
+      if (property === "cancel") {
+        const cancel = (reason?: unknown): Promise<void> => ctx.awaitIo(subject.cancel(reason));
+        bound.set(property, cancel);
+        return cancel;
       }
       const value: unknown = Reflect.get(subject, property, subject);
-      return typeof value === "function"
-        ? (value as (...a: unknown[]) => unknown).bind(subject)
-        : value;
+      if (typeof value === "function") {
+        const method = (value as (...a: unknown[]) => unknown).bind(subject);
+        bound.set(property, method);
+        return method;
+      }
+      return value;
     },
   });
 }
