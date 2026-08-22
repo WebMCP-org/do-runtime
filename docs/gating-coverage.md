@@ -27,7 +27,10 @@ enumerates it. Every row is one of:
 | --- | --- | --- |
 | `fetch` | output-gate wait, then `awaitIo`; response wrapped on resolve | `api/global-scope.ts` |
 | Body consumers (`arrayBuffer` `blob` `bytes` `formData` `json` `text`) | `awaitIo` per read, on `Request` and `Response`, clones included | `api/http.ts` |
+| Second-order `Blob` reads (`arrayBuffer` `bytes` `text` `stream` `slice`) | async members use `awaitIo`; streams and slices are recursively gated | `api/http.ts` |
 | `body.getReader().read()` | gated reader proxy | `api/http.ts` |
+| `body.values()` / async iteration | iterator reads through the gated reader; early return preserves native cancel and lock-release semantics | `api/http.ts` |
+| Reader/stream lifecycle (`reader.closed`, both `cancel()` methods) | settlement uses `awaitIo`; `closed` is gated and registered once | `api/http.ts` |
 | `body.tee()` | both halves re-gated | `api/http.ts` |
 | `body.pipeThrough()` / `pipeTo()` | returned readable re-gated (recurses through chains); settlement `awaitIo`d — native pipe machinery bypasses the `getReader` override and would launder the stream | `api/http.ts`, 0.2.2 |
 | `setTimeout` / `setInterval` | arming captures the critical section; firing re-enters via `ctx.run` | `api/global-scope.ts` |
@@ -38,21 +41,12 @@ enumerates it. Every row is one of:
 
 ## Open holes, ranked
 
-1. **`ReadableStream` async iteration** — `for await (const chunk of body)` and
-   `.values()`. The same launder as `pipeThrough`: the async iterator acquires
-   its reader through the internal spec operation, not the instrumented
-   `getReader` property, so every chunk resumes foreign. **In live use**: `ai@6`
-   iterates streams with `for await`. Fix: define `Symbol.asyncIterator` and
-   `values` on gated streams to loop over the gated reader.
-2. **Second-order `Blob` reads** — the gated `res.blob()` consumer returns a
-   raw `Blob`; `blob.text()` / `arrayBuffer()` / `bytes()` / `stream()` are new
-   foreign promises (upstream these are jsg promises, gated by construction).
-   Same for `File` entries in a `formData()` result. Fix: wrap the returned
-   Blob's async members.
-3. **Reader lifecycle promises** — `reader.closed`, `reader.cancel()`,
-   `stream.cancel()` settle ungated. Narrow (nothing observed awaiting them
-   before storage), cheap to `awaitIo`.
-4. **`WritableStream` seams** — none handed out by the runtime today, so no
+1. **`File` entries returned by `formData()`** — the FormData consumer itself is
+   gated, but its `File` values are raw second-order Blobs. Covering every path
+   requires wrapping `get`, `getAll`, `entries`, `values`, `forEach`, and both
+   iteration protocols; no current consumer calls `formData()`, so that proxy is
+   deferred rather than silently claiming the Files are covered.
+2. **`WritableStream` seams** — none handed out by the runtime today, so no
    hole yet; the moment an API returns one, `writer.write()` / `ready` /
    `close()` need the same treatment. This row exists so that PR adds the seam.
 
