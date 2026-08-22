@@ -38,6 +38,11 @@ function newContext(): IoContext {
   return new IoContext(new TestActor(), NEVER_FIRES);
 }
 
+type AsyncIterableStream<T> = ReadableStream<T> &
+  AsyncIterable<T> & {
+    values(options?: { preventCancel?: boolean }): AsyncIterableIterator<T>;
+  };
+
 /** A body that only settles on the next macrotask, so an ungated read is visibly ungated. */
 function slowBody(chunks: readonly string[]): ReadableStream<Uint8Array> {
   const encoder = new TextEncoder();
@@ -173,6 +178,49 @@ describe("gateRequestBody", () => {
 });
 
 describe("gateReadableStream", () => {
+  test("for await resumes gated for every chunk", async () => {
+    const ctx = newContext();
+    const seen: string[] = [];
+
+    await ctx.run(async () => {
+      const body = gateReadableStream(ctx, slowBody(["a", "b"])) as AsyncIterableStream<
+        Uint8Array
+      >;
+      for await (const chunk of body) {
+        seen.push(`${new TextDecoder().decode(chunk)}:${ctx.hasCurrent() ? "gated" : "UNGATED"}`);
+      }
+    });
+    expect(seen).toEqual(["a:gated", "b:gated"]);
+  });
+
+  test("early return cancels unless values() prevents it and always releases the lock", async () => {
+    const ctx = newContext();
+    let cancels = 0;
+    const stream = (): AsyncIterableStream<string> =>
+      gateReadableStream(
+        ctx,
+        new ReadableStream<string>({
+          start(controller) {
+            controller.enqueue("a");
+          },
+          cancel() {
+            cancels += 1;
+          },
+        }),
+      ) as AsyncIterableStream<string>;
+
+    await ctx.run(async () => {
+      const canceled = stream();
+      for await (const _chunk of canceled) break;
+      expect(canceled.locked).toBe(false);
+
+      const preserved = stream();
+      for await (const _chunk of preserved.values({ preventCancel: true })) break;
+      expect(preserved.locked).toBe(false);
+    });
+    expect(cancels).toBe(1);
+  });
+
   test("every read() through the default reader resumes gated", async () => {
     const ctx = newContext();
     const seen: string[] = [];

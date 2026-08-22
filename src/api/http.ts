@@ -140,6 +140,34 @@ export function gateReadableStream<T>(ctx: IoAwaiter, stream: ReadableStream<T>)
   const tee = stream.tee.bind(stream);
   const pipeThrough = stream.pipeThrough.bind(stream);
   const pipeTo = stream.pipeTo.bind(stream);
+  const values = async function* (options?: {
+    preventCancel?: boolean;
+  }): AsyncGenerator<T, void, unknown> {
+    const reader = gateReader(ctx, getReader());
+    let finished = false;
+    try {
+      for (;;) {
+        let result: ReadableStreamReadResult<T>;
+        try {
+          result = await reader.read();
+        } catch (exception) {
+          finished = true;
+          throw exception;
+        }
+        if (result.done) {
+          finished = true;
+          return;
+        }
+        yield result.value;
+      }
+    } finally {
+      try {
+        if (!finished && options?.preventCancel !== true) await reader.cancel();
+      } finally {
+        reader.releaseLock();
+      }
+    }
+  };
 
   Object.defineProperties(stream, {
     getReader: {
@@ -185,6 +213,11 @@ export function gateReadableStream<T>(ctx: IoAwaiter, stream: ReadableStream<T>)
         return ctx.awaitIo(pipeTo(destination, options));
       },
     },
+    // Async iteration launders the gating exactly like pipeThrough: the native iterator takes
+    // its reader through an internal spec operation rather than the getReader property above.
+    // Iterating through the gated reader keeps every chunk inside an input-gated slice.
+    values: { configurable: true, writable: true, value: values },
+    [Symbol.asyncIterator]: { configurable: true, writable: true, value: values },
   });
 
   return stream;
