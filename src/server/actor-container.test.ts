@@ -423,6 +423,44 @@ describe("the composition", () => {
     expect(first.container.hasCurrent()).toBe(false);
   });
 
+  test("a lost lock names where the gate was last engaged", async () => {
+    const { container, instance } = await counterContainer();
+    const foreign = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+    // The production shape: a gated await succeeds, a foreign await then drops
+    // the lock, and the next storage call throws — three layers from the cause.
+    // The suffix must hand back the last gated site, and that capture's stack
+    // has the actor method synchronously on it.
+    const interior = container.entry({
+      async loseAfterGatedAwait(): Promise<unknown> {
+        await container.awaitIo(foreign());
+        await foreign();
+        return await instance.ctx.storage.get("k");
+      },
+    });
+    const afterGated = await interior.loseAfterGatedAwait().then(
+      () => undefined,
+      (error: unknown) => (error as Error).message,
+    );
+    expect(afterGated).toContain("no input lock available in this context");
+    expect(afterGated).toMatch(/the gate was last engaged by awaitIo \d+ms before this call, at:\n/);
+    expect(afterGated).toContain("loseAfterGatedAwait");
+
+    // The other shape: nothing gated ran after dispatch, so the freshest note
+    // is the entry itself — the method name is the coordinate.
+    const early = container.entry({
+      async loseBeforeAnyStorage(): Promise<unknown> {
+        await foreign();
+        return await instance.ctx.storage.get("k");
+      },
+    });
+    const beforeStorage = await early.loseBeforeAnyStorage().then(
+      () => undefined,
+      (error: unknown) => (error as Error).message,
+    );
+    expect(beforeStorage).toContain("the gate was last engaged by entry loseBeforeAnyStorage()");
+  });
+
   test("currentExternalEntry identifies each external synchronous body only", async () => {
     const { container } = await counterContainer();
     const probe = container.entry({
