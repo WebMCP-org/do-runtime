@@ -46,7 +46,48 @@ const BODY_CONSUMERS = ["arrayBuffer", "blob", "bytes", "formData", "json", "tex
 
 type IoAwaiter = {
   awaitIo<T>(promise: Promise<T>): Promise<T>;
+  awaitIo<T, R>(promise: Promise<T>, func: (value: T) => R | PromiseLike<R>): Promise<R>;
 };
+
+/** A consumed Blob is a second-order body: every read it produces needs the same gate. */
+function gateBlob(ctx: IoAwaiter, blob: Blob): Blob {
+  const arrayBuffer = blob.arrayBuffer.bind(blob);
+  const bytes = blob.bytes.bind(blob);
+  const slice = blob.slice.bind(blob);
+  const stream = blob.stream.bind(blob);
+  const text = blob.text.bind(blob);
+
+  Object.defineProperties(blob, {
+    arrayBuffer: {
+      configurable: true,
+      writable: true,
+      value: (): Promise<ArrayBuffer> => ctx.awaitIo(arrayBuffer()),
+    },
+    bytes: {
+      configurable: true,
+      writable: true,
+      value: (): Promise<Uint8Array<ArrayBuffer>> => ctx.awaitIo(bytes()),
+    },
+    slice: {
+      configurable: true,
+      writable: true,
+      value: (start?: number, end?: number, contentType?: string): Blob =>
+        gateBlob(ctx, slice(start, end, contentType)),
+    },
+    stream: {
+      configurable: true,
+      writable: true,
+      value: (): ReadableStream<Uint8Array<ArrayBuffer>> => gateReadableStream(ctx, stream()),
+    },
+    text: {
+      configurable: true,
+      writable: true,
+      value: (): Promise<string> => ctx.awaitIo(text()),
+    },
+  });
+
+  return blob;
+}
 
 /**
  * Wrap a `Request` or `Response` so every asynchronous step of reading it
@@ -86,13 +127,16 @@ function gateBody<T extends Request | Response>(ctx: IoAwaiter, value: T): T {
       }
 
       if ((BODY_CONSUMERS as readonly (string | symbol)[]).includes(property)) {
-        const consume = (...args: unknown[]): Promise<unknown> =>
-          ctx.awaitIo(
-            (subject[property as (typeof BODY_CONSUMERS)[number]] as (...a: unknown[]) => Promise<unknown>).apply(
-              subject,
-              args,
-            ),
+        const consume = (...args: unknown[]): Promise<unknown> => {
+          const result = (
+            subject[property as (typeof BODY_CONSUMERS)[number]] as (
+              ...a: unknown[]
+            ) => Promise<unknown>
+          ).apply(subject, args);
+          return ctx.awaitIo(result, (value) =>
+            property === "blob" ? gateBlob(ctx, value as Blob) : value,
           );
+        };
         bound.set(property, consume);
         return consume;
       }

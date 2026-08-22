@@ -60,6 +60,25 @@ function slowBody(chunks: readonly string[]): ReadableStream<Uint8Array> {
   });
 }
 
+function slowBlob(contents: string): Blob {
+  const blob = new Blob([contents]);
+  const arrayBuffer = blob.arrayBuffer.bind(blob);
+  const bytes = blob.bytes.bind(blob);
+  const text = blob.text.bind(blob);
+  const nextTask = <T>(read: () => Promise<T>): Promise<T> =>
+    new Promise<T>((resolve, reject) => {
+      setTimeout(() => void read().then(resolve, reject), 0);
+    });
+
+  Object.defineProperties(blob, {
+    arrayBuffer: { configurable: true, value: () => nextTask(arrayBuffer) },
+    bytes: { configurable: true, value: () => nextTask(bytes) },
+    stream: { configurable: true, value: () => slowBody([contents]) },
+    text: { configurable: true, value: () => nextTask(text) },
+  });
+  return blob;
+}
+
 describe("gateResponseBody", () => {
   test("§1.3 the continuation after text() holds a fresh input lock", async () => {
     const ctx = newContext();
@@ -99,6 +118,40 @@ describe("gateResponseBody", () => {
     });
 
     expect(seen).toEqual(["json:gated", "arrayBuffer:gated", "bytes:gated", "blob:gated"]);
+  });
+
+  test("a consumed Blob's reads, stream and slices resume gated", async () => {
+    const ctx = newContext();
+    const seen: string[] = [];
+
+    await ctx.run(async () => {
+      const response = new Response();
+      Object.defineProperty(response, "blob", {
+        configurable: true,
+        value: () => Promise.resolve(slowBlob("abc")),
+      });
+      const blob = await gateResponseBody(ctx, response).blob();
+
+      expect(await blob.text()).toBe("abc");
+      seen.push(ctx.hasCurrent() ? "text:gated" : "text:UNGATED");
+      expect((await blob.arrayBuffer()).byteLength).toBe(3);
+      seen.push(ctx.hasCurrent() ? "arrayBuffer:gated" : "arrayBuffer:UNGATED");
+      expect((await blob.bytes()).length).toBe(3);
+      seen.push(ctx.hasCurrent() ? "bytes:gated" : "bytes:UNGATED");
+
+      await blob.stream().getReader().read();
+      seen.push(ctx.hasCurrent() ? "stream:gated" : "stream:UNGATED");
+      expect(await blob.slice(1).text()).toBe("bc");
+      seen.push(ctx.hasCurrent() ? "slice:gated" : "slice:UNGATED");
+    });
+
+    expect(seen).toEqual([
+      "text:gated",
+      "arrayBuffer:gated",
+      "bytes:gated",
+      "stream:gated",
+      "slice:gated",
+    ]);
   });
 
   test("an ungated response is what this exists to prevent", async () => {
