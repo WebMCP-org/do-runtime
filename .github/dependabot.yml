@@ -18,5 +18,10 @@ updates:
       actions:
         patterns:
           - "*"
+    ignore:
+      # changesets/action v2 requires Changesets CLI v3; we are on CLI v2.
+      # Lift this when the CLI is upgraded.
+      - dependency-name: changesets/action
+        update-types: ["version-update:semver-major"]
     commit-message:
       prefix: "ci(deps)"
