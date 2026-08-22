@@ -1,6 +1,6 @@
 {
   "name": "@mcp-b/do-runtime",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Cloudflare's Durable Object runtime (workerd), ported to TypeScript: actors with input/output gates, SQLite storage, facets and alarms, running in the browser and in Node.",
   "keywords": [
     "actors",
