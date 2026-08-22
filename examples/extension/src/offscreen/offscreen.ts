@@ -141,6 +141,8 @@ async function connectedAgent(): Promise<AgentClient<unknown, CounterState>> {
  * views other than `Uint8Array` do not survive the hop.
  */
 const ops = {
+  directStubIncrement: (): Promise<number> =>
+    host.directStubIncrement() as unknown as Promise<number>,
   email: (subject: string, body: string): Promise<void> =>
     host.email(subject, body) as unknown as Promise<void>,
   increment: (): Promise<number> => host.increment() as unknown as Promise<number>,
@@ -188,6 +190,8 @@ const ops = {
 
 async function runOp(op: HostOp, args: readonly unknown[]): Promise<unknown> {
   switch (op) {
+    case "directStubIncrement":
+      return await ops.directStubIncrement();
     case "email":
       return await ops.email(String(args[0]), String(args[1]));
     case "increment":

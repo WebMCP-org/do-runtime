@@ -848,6 +848,19 @@ test("the startup callback honours an explicit id", async () => {
   expect((await h.facets.lastStartInfo?.())?.id).toBe("routed");
 });
 
+test("the startup callback preserves a named id for host placement", async () => {
+  const h = await newHarness();
+  const id: DurableObjectId = {
+    name: "routed-name",
+    toString: () => "serialized-id",
+    equals: (other) => other.toString() === "serialized-id",
+  };
+  await h.run(() => {
+    h.state.facets.get("child", () => ({ class: testClass(), id }));
+  });
+  expect((await h.facets.lastStartInfo?.())?.id).toBe("routed-name");
+});
+
 test("the startup callback runs inside the critical section it was created in", async () => {
   // ← `makeReentryCallback` (`actor-state.c++:1011`): without it a facet started from inside
   // blockConcurrencyWhile() cannot start at all, because its callback queues behind the section.

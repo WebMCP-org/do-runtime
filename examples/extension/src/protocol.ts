@@ -79,6 +79,7 @@ export type HostStatus = {
  * `ArrayBuffer` view survives the hop.
  */
 export interface HostRpc {
+  directStubIncrement(): Promise<number>;
   email(subject: string, body: string): Promise<void>;
   increment(): Promise<number>;
   enqueueIncrement(amount: number): Promise<string>;
