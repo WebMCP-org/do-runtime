@@ -91,3 +91,17 @@ export function installMemoryWebSocketPair(resolve: () => ActorContainer): void 
 export function upgradeWebSocket(response: Response): UpgradeWebSocket | undefined {
   return (response as unknown as { webSocket?: UpgradeWebSocket }).webSocket;
 }
+
+/** Preserve workerd's WebSocket upgrade signal across browser `Request.clone()` calls. */
+export function withWebSocketUpgrade<T extends { headers: Headers; clone(): T }>(request: T): T {
+  const get = request.headers.get.bind(request.headers);
+  Object.defineProperty(request.headers, "get", {
+    value: (name: string): string | null =>
+      name.toLowerCase() === "upgrade" ? "websocket" : get(name),
+  });
+  const clone = request.clone.bind(request);
+  Object.defineProperty(request, "clone", {
+    value: (): T => withWebSocketUpgrade(clone()),
+  });
+  return request;
+}

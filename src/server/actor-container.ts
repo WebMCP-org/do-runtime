@@ -91,10 +91,10 @@ export type FacetStartRequest = {
    *
    * The scaffolding called this "the DurableObjectId name". It is not
    * necessarily a name: `FacetStartupOptions.id` is `DurableObjectId | string`
-   * (`actor-state.h:453`), so this carries a 64-hex id string whenever the app
-   * passed a `DurableObjectId`, and whatever the app chose whenever it passed a
-   * string. The host decides what to do with it, exactly as upstream's
-   * `Worker::Actor::Id` leaves that to the supervisor.
+   * (`actor-state.h:453`), so this carries a named id's stable name, an unnamed
+   * id's 64-hex string, or the string the app supplied. The host decides what to
+   * do with it, exactly as upstream's `Worker::Actor::Id` leaves that to the
+   * supervisor.
    */
   routedId?: string;
 };

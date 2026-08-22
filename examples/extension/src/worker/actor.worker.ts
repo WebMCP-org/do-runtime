@@ -26,6 +26,7 @@ import {
   actorScopeBindings,
   asLoopbackDurableObjectClass,
   createActorContainer,
+  createDurableObjectNamespace,
   gateRequestBody,
   installActorScope,
   newRpcSession,
@@ -47,11 +48,12 @@ import {
   type SqliteWasmHost,
 } from "@mcp-b/do-runtime/backends/sqlite-wasm";
 import sqlite3InitModule from "@sqlite.org/sqlite-wasm";
-import { routeAgentEmail } from "agents";
+import { getAgentByName, routeAgentEmail, routeAgentRequest } from "agents";
 import { RpcTarget } from "cloudflare:workers";
 import {
   installMemoryWebSocketPair,
   upgradeWebSocket,
+  withWebSocketUpgrade,
   type UpgradeWebSocket,
 } from "../../../platform-shims/memory-websocket-pair";
 import { serveMessagePortWebSockets } from "../../../platform-shims/message-port-websocket";
@@ -191,18 +193,15 @@ class ExtensionFacetHost implements FacetHost {
   readonly #modules = new Map<FacetId, FacetModule>();
   #host: SqliteWasmHost | undefined;
   #tree: FacetTree | undefined;
-  #env: CounterEnv | undefined;
   #exports: Record<string, unknown> | undefined;
 
   attach(
     host: SqliteWasmHost,
     tree: FacetTree,
-    env: CounterEnv,
     workerExports: Record<string, unknown>,
   ): void {
     this.#host = host;
     this.#tree = tree;
-    this.#env = env;
     this.#exports = workerExports;
   }
 
@@ -213,9 +212,8 @@ class ExtensionFacetHost implements FacetHost {
     }
 
     const tree = this.#tree;
-    const env = this.#env;
     const workerExports = this.#exports;
-    if (tree === undefined || env === undefined || workerExports === undefined) {
+    if (tree === undefined || workerExports === undefined) {
       throw new Error("do-runtime example: facet host was reached before the root was attached");
     }
 
@@ -227,10 +225,12 @@ class ExtensionFacetHost implements FacetHost {
       }
       const ActorClass = exported as FacetConstructor;
       const storage = new SqliteWasmActorStorage(this.#requireHost(), `/facet-${request.id}`);
+      const env: CounterEnv = { Counter: counterNamespace(facetModule.gate) };
+      const exports = { ...workerExports, Counter: env.Counter };
       const container = await createActorContainer({
         id: request.routedId ?? ACTOR_ID,
         uniqueKey: UNIQUE_KEY,
-        exports: workerExports,
+        exports,
         env,
         ports: {
           sql: storage,
@@ -346,6 +346,39 @@ let live: Live | undefined;
 let placing: Promise<Live> | undefined;
 /** The last `onBroken` rejection, surfaced through `status()`. */
 let brokenReason: string | null = null;
+
+function counterNamespace(gate?: FacetModule["gate"]) {
+  return createDurableObjectNamespace<Counter>(UNIQUE_KEY, {
+    getGlobalActor: ({ id }) => {
+      const name = id.getName();
+      if (name !== ACTOR_ID) {
+        throw new Error(
+          `do-runtime example: this worker does not host the actor named ${String(name)}`,
+        );
+      }
+      if (live === undefined) {
+        throw new Error("do-runtime example: root loopback reached before placement");
+      }
+      const target = live.entry as unknown as Fetcher;
+      const caller = gate?.container;
+      if (caller === undefined) return target;
+      return new Proxy(target, {
+        get(subject, property): unknown {
+          const value: unknown = Reflect.get(subject, property, subject);
+          if (typeof value !== "function") return value;
+          return (...args: unknown[]) =>
+            caller.awaitIo(
+              caller.waitOutputLocks().then(() =>
+                Reflect.apply(value as (...values: unknown[]) => unknown, subject, args),
+              ),
+            );
+        },
+      });
+    },
+  });
+}
+
+const rootNamespace = counterNamespace();
 
 installMemoryWebSocketPair(() => {
   if (live === undefined) throw new Error("WebSocket upgrade reached an unplaced actor");
@@ -479,18 +512,9 @@ async function installSubstrate(): Promise<Substrate> {
 async function place(): Promise<Live> {
   const { host, scheduler } = await installedSubstrate();
   const storage = new SqliteWasmActorStorage(host, ACTOR_PREFIX);
+  const rootGate: FacetModule["gate"] = { container: undefined };
+  const actorNamespace = counterNamespace(rootGate);
 
-  const rootNamespace = {
-    idFromName: (name: string) => ({ name, toString: () => name }),
-    get: () => {
-      if (live === undefined) throw new Error("do-runtime example: root loopback reached before placement");
-      return live.entry;
-    },
-    getByName: () => {
-      if (live === undefined) throw new Error("do-runtime example: root loopback reached before placement");
-      return live.entry;
-    },
-  } as unknown as DurableObjectNamespace<Counter>;
   const facetClass = (className: string): unknown =>
     asLoopbackDurableObjectClass(
       new LoopbackDurableObjectClass({
@@ -501,11 +525,11 @@ async function place(): Promise<Live> {
       }),
     );
   const workerExports: Record<string, unknown> = {
-    Counter: rootNamespace,
+    Counter: actorNamespace,
     CounterChild: facetClass("CounterChild"),
     CounterLeaf: facetClass("CounterLeaf"),
   };
-  const env: CounterEnv = { Counter: rootNamespace };
+  const env: CounterEnv = { Counter: actorNamespace };
 
   const container = await createActorContainer({
     id: ACTOR_ID,
@@ -527,8 +551,9 @@ async function place(): Promise<Live> {
       // rather than reaching an ungated one that would appear to work.
     },
   });
+  rootGate.container = container;
 
-  facets.attach(host, container.facetTree, env, workerExports);
+  facets.attach(host, container.facetTree, workerExports);
 
   // **Consume `onBroken` at the moment the container exists.** It rejects when a
   // gate breaks, and a host that ignores it gets an actor that answers nothing
@@ -605,8 +630,14 @@ async function placed(): Promise<Live> {
  * is not.
  */
 class HostTarget extends RpcTarget implements HostRpc {
+  async directStubIncrement(): Promise<number> {
+    await placed();
+    const stub = await getAgentByName<CounterEnv, Counter>(rootNamespace, ACTOR_ID);
+    return await stub.increment();
+  }
+
   async email(subject: string, body: string): Promise<void> {
-    const { entry } = await placed();
+    await placed();
     const bytes = new TextEncoder().encode(
       `From: sender@example.com\r\nTo: counter@example.com\r\nSubject: ${subject}\r\n\r\n${body}`,
     );
@@ -629,11 +660,7 @@ class HostTarget extends RpcTarget implements HostRpc {
         throw new Error("Outbound email is not available in this browser host");
       },
     };
-    const namespace = {
-      idFromName: () => ({}) as DurableObjectId,
-      get: () => entry as unknown as DurableObjectStub<Counter>,
-    } as unknown as DurableObjectNamespace<Counter>;
-    await routeAgentEmail(message, { Counter: namespace }, {
+    await routeAgentEmail(message, { Counter: rootNamespace }, {
       resolver: async () => ({ agentName: "Counter", agentId: ACTOR_ID }),
     });
   }
@@ -735,16 +762,14 @@ class HostTarget extends RpcTarget implements HostRpc {
 let peer: ReturnType<typeof newRpcSession<SupervisorRpc>> | undefined;
 
 async function connectAgentSocket(url: string): Promise<UpgradeWebSocket> {
-  const { entry } = await placed();
-  const request = new Request(url.replace(/^ws/, "http"), {
-    headers: { Upgrade: "websocket" },
-  });
-  const nativeGet = request.headers.get.bind(request.headers);
-  Object.defineProperty(request.headers, "get", {
-    value: (name: string): string | null =>
-      name.toLowerCase() === "upgrade" ? "websocket" : nativeGet(name),
-  });
-  const response = await entry.fetch(request);
+  await placed();
+  const request = withWebSocketUpgrade(new Request(url.replace(/^ws/, "http")));
+  const response = await routeAgentRequest(
+    request,
+    { Counter: rootNamespace },
+    { onBeforeConnect: withWebSocketUpgrade },
+  );
+  if (response == null) throw new Error(`No Agent route matched ${request.url}`);
   const socket = upgradeWebSocket(response);
   if (response.status !== 101 || socket === undefined) {
     throw new Error(`Agent WebSocket upgrade failed with ${response.status}`);

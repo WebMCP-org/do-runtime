@@ -46,9 +46,8 @@ import type { ActorClassChannel } from "./io-channels";
  * reentry callback (`actor-state.c++:1044`) — so `api/actor-state.ts` now does
  * the same and this field carries the resolved channel.
  *
- * `id` is upstream's `Worker::Actor::Id` as the string form of a
- * `DurableObjectId`, which is all a `DurableObjectId` is once it leaves this
- * package, since ids never cross the host boundary.
+ * `id` is upstream's `Worker::Actor::Id` as its stable name when present, or
+ * the string form of an unnamed `DurableObjectId`.
  */
 export type FacetStartInfo = {
   readonly actorClass: ActorClassChannel;

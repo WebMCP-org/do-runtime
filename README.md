@@ -186,6 +186,15 @@ The lifecycle:
 5. Reach the platform through `container.globals` (or install it with `installActorScope`). For a host-provided promise an actor must await, wrap it once in `container.awaitIo()`.
 6. Watch `container.onBroken`; dispose the placement; recreate it on the next event over the same storage.
 
+For a standard Durable Object binding, call
+`createDurableObjectNamespace(uniqueKey, channel)` and put the result in `env`
+and `ctx.exports`. The channel maps each routed id to a placed `Fetcher`; that
+binding works directly with Agents SDK `routeAgentRequest()` and
+`getAgentByName()`. When an actor uses the binding to call another actor, wrap
+the transport promise with the caller's `container.awaitIo()` so its continuation
+re-enters the owning input gate. The extension example shows both the external
+router binding and the per-container actor binding.
+
 ### Storage
 
 `SqlDatabaseProvider.open(name)` is the runtime execution seam. The runtime owns database names, tables, transactions, reset behaviour, facet metadata, and streaming `sql.ingest()` statement boundaries; the host chooses the physical provider and prefix. Stored KV values use structured-clone semantics across workerd, Node, and the browser; existing JSON rows remain readable. `_cf_` names are reserved to the runtime.

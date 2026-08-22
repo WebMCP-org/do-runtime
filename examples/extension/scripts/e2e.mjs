@@ -185,8 +185,11 @@ async function main() {
     const called = await op(popup, "sdkIncrement");
     check("the Agents client called a decorated method", called, 4);
 
+    const stubbed = await op(popup, "directStubIncrement");
+    check("getAgentByName returned a direct SDK stub", stubbed, 5);
+
     const streamed = await op(popup, "sdkStream");
-    check("the streaming callable delivered every chunk", streamed.chunks.join(","), "4,5");
+    check("the streaming callable delivered every chunk", streamed.chunks.join(","), "5,6");
     check("the streaming callable delivered its final value", streamed.final, "done");
 
     const clientState = await op(popup, "sdkSetState", [10]);

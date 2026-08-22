@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.0 — 2026-08-21
+
+### Added
+
+- Expose `createDurableObjectNamespace()` and its placement-channel types for standard named Durable Object bindings.
+- Run Agents SDK `routeAgentRequest()`, `getAgentByName()` direct stubs, decorated callables, streaming RPC, email routing, and sub-agents through the MV3 extension host.
+
+### Fixed
+
+- Preserve named facet identities instead of re-hashing serialized Durable Object IDs.
+- Re-enter the calling actor's input gate after outbound namespace-stub calls.
+- Preserve browser WebSocket upgrade requests across PartyServer request clones.
+
 ## 0.1.2
 
 ### Patch Changes

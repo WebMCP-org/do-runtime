@@ -67,16 +67,18 @@ popup.html ──sendMessage──▶ service worker ──chrome.offscreen.crea
   Chrome recreates an evicted host.
 - **A real non-hibernating `AgentClient` connection.** The offscreen page opens
   the SDK client over a `MessagePort`-backed WebSocket, while the actor receives
-  the server half through `container.acceptWebSocket()`. The e2e proves
-  server-to-client state broadcasts, client-to-server `setState()`, a decorated
-  `@callable()` method, and a streaming callable's chunks and final value.
+  the server half through `routeAgentRequest()` and
+  `container.acceptWebSocket()`. The e2e proves standard named routing,
+  `getAgentByName()` direct stubs, server-to-client state broadcasts,
+  client-to-server `setState()`, a decorated `@callable()` method, and a
+  streaming callable's chunks and final value.
 - **The SDK's stateless MCP handler.** The actor serves `createMcpHandler()` and
   exposes a real `McpServer` tool that reads its current state. The e2e performs
   MCP `tools/list` and `tools/call` requests through the gated actor fetch path.
-- **Inbound Agents email routing.** A namespace-shaped local binding carries an
-  in-memory `ForwardableEmailMessage` through `routeAgentEmail()` to the actor's
-  `onEmail()` hook. Forwarding and replies still refuse because this host has no
-  outbound email binding.
+- **Inbound Agents email routing.** The same real local namespace binding
+  carries an in-memory `ForwardableEmailMessage` through `routeAgentEmail()` to
+  the actor's `onEmail()` hook. Forwarding and replies still refuse because this
+  host has no outbound email binding.
 - **Offscreen corpse recovery.** A crashed offscreen document disappears from
   `chrome.runtime.getContexts` while still holding the one offscreen slot.
   `src/background.ts` catches the resulting "single offscreen document" error —

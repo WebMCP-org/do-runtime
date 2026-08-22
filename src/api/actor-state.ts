@@ -884,7 +884,12 @@ export class DurableObjectFacets implements globalThis.DurableObjectFacets {
         // ← `actorClass.getChannel(ioCtx)` (`actor-state.c++:1045`).
         actorClass: requireFacetClass(options.class).getChannel(),
         // Child inherits parent ID.
-        id: id === undefined ? this.#parentId : typeof id === "string" ? id : id.toString(),
+        id:
+          id === undefined
+            ? this.#parentId
+            : typeof id === "string"
+              ? id
+              : id.name ?? id.toString(),
       };
     });
 
