@@ -395,6 +395,34 @@ describe("the composition", () => {
     expect(first.container.isCurrentSlice()).toBe(false);
   });
 
+  test("hasCurrent spans the checkpoint the slice's lock drains", async () => {
+    // A checkpoint ends at the next macrotask; awaiting one is how a test
+    // stands outside every drained lock.
+    const checkpointEnd = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+    const first = await counterContainer();
+    const second = await counterContainer();
+
+    // No macrotask has passed since `start()`'s gated slice, so the boot lock
+    // is still draining here — which is the whole claim.
+    expect(first.container.hasCurrent()).toBe(true);
+    await checkpointEnd();
+    expect(first.container.hasCurrent()).toBe(false);
+
+    const afterAwait = await first.container.run(async () => {
+      expect(first.container.hasCurrent()).toBe(true);
+      expect(second.container.hasCurrent()).toBe(false);
+      await Promise.resolve();
+      // The synchronous body has returned, so the slice is gone — but the lock
+      // drains the whole microtask checkpoint, and this is the window where a
+      // host stub still has a caller to route through `awaitIo`.
+      expect(first.container.isCurrentSlice()).toBe(false);
+      return first.container.hasCurrent();
+    });
+    expect(afterAwait).toBe(true);
+    await checkpointEnd();
+    expect(first.container.hasCurrent()).toBe(false);
+  });
+
   test("currentExternalEntry identifies each external synchronous body only", async () => {
     const { container } = await counterContainer();
     const probe = container.entry({
