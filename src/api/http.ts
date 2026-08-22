@@ -138,6 +138,8 @@ export const BYOB_READER_UNGATABLE_MESSAGE =
 export function gateReadableStream<T>(ctx: IoAwaiter, stream: ReadableStream<T>): ReadableStream<T> {
   const getReader = stream.getReader.bind(stream);
   const tee = stream.tee.bind(stream);
+  const pipeThrough = stream.pipeThrough.bind(stream);
+  const pipeTo = stream.pipeTo.bind(stream);
 
   Object.defineProperties(stream, {
     getReader: {
@@ -158,6 +160,29 @@ export function gateReadableStream<T>(ctx: IoAwaiter, stream: ReadableStream<T>)
       value(): [ReadableStream<T>, ReadableStream<T>] {
         const [a, b] = tee();
         return [gateReadableStream(ctx, a), gateReadableStream(ctx, b)];
+      },
+    },
+    // The pipe operations launder the gating: the native machinery reads the source through
+    // internal spec operations (not the `getReader` property above), and `pipeThrough` hands
+    // back the transform's readable — a brand-new stream with none of this instrumentation.
+    // `res.body.pipeThrough(new TextDecoderStream()).getReader().read()` would resume foreign
+    // on every chunk. The pipe's own internals never surface a user continuation, so the two
+    // seams that do are the ones gated: the returned readable, and `pipeTo`'s settlement.
+    pipeThrough: {
+      configurable: true,
+      writable: true,
+      value<U>(
+        transform: ReadableWritablePair<U, T>,
+        options?: StreamPipeOptions,
+      ): ReadableStream<U> {
+        return gateReadableStream(ctx, pipeThrough(transform, options));
+      },
+    },
+    pipeTo: {
+      configurable: true,
+      writable: true,
+      value(destination: WritableStream<T>, options?: StreamPipeOptions): Promise<void> {
+        return ctx.awaitIo(pipeTo(destination, options));
       },
     },
   });
