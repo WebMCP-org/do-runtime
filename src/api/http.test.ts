@@ -205,6 +205,55 @@ describe("gateReadableStream", () => {
     expect(seen).toEqual(["left:gated", "right:gated"]);
   });
 
+  test("pipeThrough hands back a gated stream, not a laundered raw one", async () => {
+    // The MCP SDK's SSE path in miniature:
+    // `res.body.pipeThrough(new TextDecoderStream()).pipeThrough(parser).getReader()`.
+    // Native pipeThrough reads the source through internal spec operations and returns the
+    // transform's readable — a brand-new stream — so without the override every read() on it
+    // resumes foreign, and the storage call in the message handler throws. The second pipe
+    // also proves the re-gating recurses through a chain.
+    const ctx = newContext();
+    const seen: string[] = [];
+
+    await ctx.run(async () => {
+      const response = gateResponseBody(ctx, new Response(slowBody(["a", "b"])));
+      const body = response.body;
+      if (body === null) throw new Error("expected a body");
+      const upper = new TransformStream<string, string>({
+        transform(chunk, controller) {
+          controller.enqueue(chunk.toUpperCase());
+        },
+      });
+      const reader = body.pipeThrough(new TextDecoderStream()).pipeThrough(upper).getReader();
+      for (;;) {
+        const { done, value } = await reader.read();
+        seen.push(`${value ?? "done"}:${ctx.hasCurrent() ? "gated" : "UNGATED"}`);
+        if (done) break;
+      }
+    });
+    expect(seen).toEqual(["A:gated", "B:gated", "done:gated"]);
+  });
+
+  test("the promise pipeTo returns resumes gated", async () => {
+    const ctx = newContext();
+    const seen: string[] = [];
+
+    await ctx.run(async () => {
+      const sink: string[] = [];
+      const decoder = new TextDecoder();
+      await gateReadableStream(ctx, slowBody(["a", "b"])).pipeTo(
+        new WritableStream<Uint8Array>({
+          write(chunk) {
+            sink.push(decoder.decode(chunk));
+          },
+        }),
+      );
+      expect(sink).toEqual(["a", "b"]);
+      seen.push(ctx.hasCurrent() ? "gated" : "UNGATED");
+    });
+    expect(seen).toEqual(["gated"]);
+  });
+
   test("a BYOB reader is refused rather than handed back ungated", async () => {
     // Fail closed. A byte reader's `read(view)` returns the caller's own buffer and
     // `getReader` is the only seam this layer has, so it cannot be intercepted — and one
