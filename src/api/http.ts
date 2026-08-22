@@ -46,7 +46,48 @@ const BODY_CONSUMERS = ["arrayBuffer", "blob", "bytes", "formData", "json", "tex
 
 type IoAwaiter = {
   awaitIo<T>(promise: Promise<T>): Promise<T>;
+  awaitIo<T, R>(promise: Promise<T>, func: (value: T) => R | PromiseLike<R>): Promise<R>;
 };
+
+/** A consumed Blob is a second-order body: every read it produces needs the same gate. */
+function gateBlob(ctx: IoAwaiter, blob: Blob): Blob {
+  const arrayBuffer = blob.arrayBuffer.bind(blob);
+  const bytes = blob.bytes.bind(blob);
+  const slice = blob.slice.bind(blob);
+  const stream = blob.stream.bind(blob);
+  const text = blob.text.bind(blob);
+
+  Object.defineProperties(blob, {
+    arrayBuffer: {
+      configurable: true,
+      writable: true,
+      value: (): Promise<ArrayBuffer> => ctx.awaitIo(arrayBuffer()),
+    },
+    bytes: {
+      configurable: true,
+      writable: true,
+      value: (): Promise<Uint8Array<ArrayBuffer>> => ctx.awaitIo(bytes()),
+    },
+    slice: {
+      configurable: true,
+      writable: true,
+      value: (start?: number, end?: number, contentType?: string): Blob =>
+        gateBlob(ctx, slice(start, end, contentType)),
+    },
+    stream: {
+      configurable: true,
+      writable: true,
+      value: (): ReadableStream<Uint8Array<ArrayBuffer>> => gateReadableStream(ctx, stream()),
+    },
+    text: {
+      configurable: true,
+      writable: true,
+      value: (): Promise<string> => ctx.awaitIo(text()),
+    },
+  });
+
+  return blob;
+}
 
 /**
  * Wrap a `Request` or `Response` so every asynchronous step of reading it
@@ -86,13 +127,16 @@ function gateBody<T extends Request | Response>(ctx: IoAwaiter, value: T): T {
       }
 
       if ((BODY_CONSUMERS as readonly (string | symbol)[]).includes(property)) {
-        const consume = (...args: unknown[]): Promise<unknown> =>
-          ctx.awaitIo(
-            (subject[property as (typeof BODY_CONSUMERS)[number]] as (...a: unknown[]) => Promise<unknown>).apply(
-              subject,
-              args,
-            ),
+        const consume = (...args: unknown[]): Promise<unknown> => {
+          const result = (
+            subject[property as (typeof BODY_CONSUMERS)[number]] as (
+              ...a: unknown[]
+            ) => Promise<unknown>
+          ).apply(subject, args);
+          return ctx.awaitIo(result, (value) =>
+            property === "blob" ? gateBlob(ctx, value as Blob) : value,
           );
+        };
         bound.set(property, consume);
         return consume;
       }
@@ -136,12 +180,48 @@ export const BYOB_READER_UNGATABLE_MESSAGE =
 // Instrument the native object itself. Chromium's `Response` constructor does not recognise a
 // `Proxy` around a `ReadableStream` as `BodyInit`; it stringifies the proxy instead.
 export function gateReadableStream<T>(ctx: IoAwaiter, stream: ReadableStream<T>): ReadableStream<T> {
+  const cancel = stream.cancel.bind(stream);
   const getReader = stream.getReader.bind(stream);
   const tee = stream.tee.bind(stream);
   const pipeThrough = stream.pipeThrough.bind(stream);
   const pipeTo = stream.pipeTo.bind(stream);
+  const values = async function* (options?: {
+    preventCancel?: boolean;
+  }): AsyncGenerator<T, void, unknown> {
+    const reader = gateReader(ctx, getReader());
+    let finished = false;
+    try {
+      for (;;) {
+        let result: ReadableStreamReadResult<T>;
+        try {
+          result = await reader.read();
+        } catch (exception) {
+          finished = true;
+          throw exception;
+        }
+        if (result.done) {
+          finished = true;
+          return;
+        }
+        yield result.value;
+      }
+    } finally {
+      try {
+        if (!finished && options?.preventCancel !== true) await reader.cancel();
+      } finally {
+        reader.releaseLock();
+      }
+    }
+  };
 
   Object.defineProperties(stream, {
+    cancel: {
+      configurable: true,
+      writable: true,
+      value(reason?: unknown): Promise<void> {
+        return ctx.awaitIo(cancel(reason));
+      },
+    },
     getReader: {
       configurable: true,
       writable: true,
@@ -185,6 +265,11 @@ export function gateReadableStream<T>(ctx: IoAwaiter, stream: ReadableStream<T>)
         return ctx.awaitIo(pipeTo(destination, options));
       },
     },
+    // Async iteration launders the gating exactly like pipeThrough: the native iterator takes
+    // its reader through an internal spec operation rather than the getReader property above.
+    // Iterating through the gated reader keeps every chunk inside an input-gated slice.
+    values: { configurable: true, writable: true, value: values },
+    [Symbol.asyncIterator]: { configurable: true, writable: true, value: values },
   });
 
   return stream;
@@ -194,15 +279,37 @@ function gateReader<T>(
   ctx: IoAwaiter,
   reader: ReadableStreamDefaultReader<T>,
 ): ReadableStreamDefaultReader<T> {
+  const bound = new Map<string | symbol, unknown>();
+
   return new Proxy(reader, {
     get(subject, property): unknown {
+      const cached = bound.get(property);
+      if (cached !== undefined) return cached;
+
+      if (property === "closed") {
+        // `closed` can remain pending for the stream's lifetime. Gate and register that one
+        // promise once rather than adding a new pending actor task on every property read.
+        const closed = ctx.awaitIo(subject.closed);
+        bound.set(property, closed);
+        return closed;
+      }
       if (property === "read") {
-        return (): Promise<ReadableStreamReadResult<T>> => ctx.awaitIo(subject.read());
+        const read = (): Promise<ReadableStreamReadResult<T>> => ctx.awaitIo(subject.read());
+        bound.set(property, read);
+        return read;
+      }
+      if (property === "cancel") {
+        const cancel = (reason?: unknown): Promise<void> => ctx.awaitIo(subject.cancel(reason));
+        bound.set(property, cancel);
+        return cancel;
       }
       const value: unknown = Reflect.get(subject, property, subject);
-      return typeof value === "function"
-        ? (value as (...a: unknown[]) => unknown).bind(subject)
-        : value;
+      if (typeof value === "function") {
+        const method = (value as (...a: unknown[]) => unknown).bind(subject);
+        bound.set(property, method);
+        return method;
+      }
+      return value;
     },
   });
 }

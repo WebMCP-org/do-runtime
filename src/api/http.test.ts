@@ -38,6 +38,11 @@ function newContext(): IoContext {
   return new IoContext(new TestActor(), NEVER_FIRES);
 }
 
+type AsyncIterableStream<T> = ReadableStream<T> &
+  AsyncIterable<T> & {
+    values(options?: { preventCancel?: boolean }): AsyncIterableIterator<T>;
+  };
+
 /** A body that only settles on the next macrotask, so an ungated read is visibly ungated. */
 function slowBody(chunks: readonly string[]): ReadableStream<Uint8Array> {
   const encoder = new TextEncoder();
@@ -53,6 +58,25 @@ function slowBody(chunks: readonly string[]): ReadableStream<Uint8Array> {
       });
     },
   });
+}
+
+function slowBlob(contents: string): Blob {
+  const blob = new Blob([contents]);
+  const arrayBuffer = blob.arrayBuffer.bind(blob);
+  const bytes = blob.bytes.bind(blob);
+  const text = blob.text.bind(blob);
+  const nextTask = <T>(read: () => Promise<T>): Promise<T> =>
+    new Promise<T>((resolve, reject) => {
+      setTimeout(() => void read().then(resolve, reject), 0);
+    });
+
+  Object.defineProperties(blob, {
+    arrayBuffer: { configurable: true, value: () => nextTask(arrayBuffer) },
+    bytes: { configurable: true, value: () => nextTask(bytes) },
+    stream: { configurable: true, value: () => slowBody([contents]) },
+    text: { configurable: true, value: () => nextTask(text) },
+  });
+  return blob;
 }
 
 describe("gateResponseBody", () => {
@@ -94,6 +118,40 @@ describe("gateResponseBody", () => {
     });
 
     expect(seen).toEqual(["json:gated", "arrayBuffer:gated", "bytes:gated", "blob:gated"]);
+  });
+
+  test("a consumed Blob's reads, stream and slices resume gated", async () => {
+    const ctx = newContext();
+    const seen: string[] = [];
+
+    await ctx.run(async () => {
+      const response = new Response();
+      Object.defineProperty(response, "blob", {
+        configurable: true,
+        value: () => Promise.resolve(slowBlob("abc")),
+      });
+      const blob = await gateResponseBody(ctx, response).blob();
+
+      expect(await blob.text()).toBe("abc");
+      seen.push(ctx.hasCurrent() ? "text:gated" : "text:UNGATED");
+      expect((await blob.arrayBuffer()).byteLength).toBe(3);
+      seen.push(ctx.hasCurrent() ? "arrayBuffer:gated" : "arrayBuffer:UNGATED");
+      expect((await blob.bytes()).length).toBe(3);
+      seen.push(ctx.hasCurrent() ? "bytes:gated" : "bytes:UNGATED");
+
+      await blob.stream().getReader().read();
+      seen.push(ctx.hasCurrent() ? "stream:gated" : "stream:UNGATED");
+      expect(await blob.slice(1).text()).toBe("bc");
+      seen.push(ctx.hasCurrent() ? "slice:gated" : "slice:UNGATED");
+    });
+
+    expect(seen).toEqual([
+      "text:gated",
+      "arrayBuffer:gated",
+      "bytes:gated",
+      "stream:gated",
+      "slice:gated",
+    ]);
   });
 
   test("an ungated response is what this exists to prevent", async () => {
@@ -173,6 +231,49 @@ describe("gateRequestBody", () => {
 });
 
 describe("gateReadableStream", () => {
+  test("for await resumes gated for every chunk", async () => {
+    const ctx = newContext();
+    const seen: string[] = [];
+
+    await ctx.run(async () => {
+      const body = gateReadableStream(ctx, slowBody(["a", "b"])) as AsyncIterableStream<
+        Uint8Array
+      >;
+      for await (const chunk of body) {
+        seen.push(`${new TextDecoder().decode(chunk)}:${ctx.hasCurrent() ? "gated" : "UNGATED"}`);
+      }
+    });
+    expect(seen).toEqual(["a:gated", "b:gated"]);
+  });
+
+  test("early return cancels unless values() prevents it and always releases the lock", async () => {
+    const ctx = newContext();
+    let cancels = 0;
+    const stream = (): AsyncIterableStream<string> =>
+      gateReadableStream(
+        ctx,
+        new ReadableStream<string>({
+          start(controller) {
+            controller.enqueue("a");
+          },
+          cancel() {
+            cancels += 1;
+          },
+        }),
+      ) as AsyncIterableStream<string>;
+
+    await ctx.run(async () => {
+      const canceled = stream();
+      for await (const _chunk of canceled) break;
+      expect(canceled.locked).toBe(false);
+
+      const preserved = stream();
+      for await (const _chunk of preserved.values({ preventCancel: true })) break;
+      expect(preserved.locked).toBe(false);
+    });
+    expect(cancels).toBe(1);
+  });
+
   test("every read() through the default reader resumes gated", async () => {
     const ctx = newContext();
     const seen: string[] = [];
@@ -189,6 +290,70 @@ describe("gateReadableStream", () => {
       }
     });
     expect(seen).toEqual(["gated", "gated", "gated"]);
+  });
+
+  test("reader closed resumes gated and is cached once", async () => {
+    const ctx = newContext();
+    const seen: string[] = [];
+
+    await ctx.run(async () => {
+      const stream = gateReadableStream(
+        ctx,
+        new ReadableStream<void>({
+          start(controller) {
+            setTimeout(() => controller.close(), 0);
+          },
+        }),
+      );
+      const reader = stream.getReader();
+      const tasks = ctx.taskCount();
+      const closed = reader.closed;
+      expect(reader.closed).toBe(closed);
+      expect(ctx.taskCount()).toBe(tasks + 1);
+      await closed;
+      seen.push(ctx.hasCurrent() ? "closed:gated" : "closed:UNGATED");
+    });
+
+    expect(seen).toEqual(["closed:gated"]);
+  });
+
+  test("reader cancel resumes gated", async () => {
+    const ctx = newContext();
+    const seen: string[] = [];
+
+    await ctx.run(async () => {
+      const reader = gateReadableStream(
+        ctx,
+        new ReadableStream<void>({
+          cancel() {
+            return new Promise<void>((resolve) => setTimeout(resolve, 0));
+          },
+        }),
+      ).getReader();
+      await reader.cancel();
+      seen.push(ctx.hasCurrent() ? "reader.cancel:gated" : "reader.cancel:UNGATED");
+    });
+
+    expect(seen).toEqual(["reader.cancel:gated"]);
+  });
+
+  test("stream cancel resumes gated", async () => {
+    const ctx = newContext();
+    const seen: string[] = [];
+
+    await ctx.run(async () => {
+      const stream = gateReadableStream(
+        ctx,
+        new ReadableStream<void>({
+          cancel() {
+            return new Promise<void>((resolve) => setTimeout(resolve, 0));
+          },
+        }),
+      );
+      await stream.cancel();
+      seen.push(ctx.hasCurrent() ? "gated" : "UNGATED");
+    });
+    expect(seen).toEqual(["gated"]);
   });
 
   test("tee() gates both halves", async () => {
