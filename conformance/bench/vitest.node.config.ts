@@ -13,6 +13,9 @@ export default defineConfig({
     name: "bench-node",
     root: packageRoot,
     environment: "node",
-    include: ["conformance/bench/sql-latency.node.bench.ts"],
+    include: [
+      "conformance/bench/await-transform.bench.ts",
+      "conformance/bench/sql-latency.node.bench.ts",
+    ],
   },
 });

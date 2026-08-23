@@ -27,6 +27,8 @@ for (const required of [
   "dist/src/index.d.ts",
   "dist/backends/node-sqlite.js",
   "dist/backends/sqlite-wasm.js",
+  "dist/gate.js",
+  "dist/vite.js",
   "LICENSE.workerd",
   "NOTICE",
 ]) {
@@ -55,11 +57,19 @@ for (const [name, target] of Object.entries(manifest.exports)) {
 }
 const runtime = modules.get(".");
 const nodeBackend = modules.get("./backends/node-sqlite");
+const gate = modules.get("./gate");
+const vite = modules.get("./vite");
 if (typeof runtime.createActorContainer !== "function") {
   throw new Error("packed root entry does not export createActorContainer");
 }
 if (typeof nodeBackend.createNodeSqlProvider !== "function") {
   throw new Error("packed Node backend does not export createNodeSqlProvider");
+}
+if (typeof gate.__gate !== "function" || typeof gate.__gateAsyncIterable !== "function") {
+  throw new Error("packed gate entry does not export its helpers");
+}
+if (typeof vite.doRuntimeAwaitTransform !== "function") {
+  throw new Error("packed Vite entry does not export doRuntimeAwaitTransform");
 }
 
 console.log(`package smoke passed with ${files.size} files`);

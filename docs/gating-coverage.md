@@ -39,6 +39,26 @@ enumerates it. Every row is one of:
 | `WebSocket` | frames each take a fresh input lock at the `accept()` loop; `send` carries its own output-gate promise (§1.8) | `api/web-socket.ts` |
 | storage / `sql` / alarms / `blockConcurrencyWhile` / `awaitIo` / `makeReentryCallback` / entry dispatch | the runtime's own primitives | `io/io-context.ts`, `server/actor-container.ts` |
 
+## Transform
+
+`@mcp-b/do-runtime/vite` provides `doRuntimeAwaitTransform()`, a post-transform
+Vite plugin for actor-bundled modules. It rewrites every `await value` to route
+through `@mcp-b/do-runtime/gate`, and wraps every `for await` source so
+`next()`, `return()`, and `throw()` settlements re-enter the owning actor.
+
+The gate helper fails open outside actor code. Inside an actor it publishes each
+continuation through a fresh input-gated slice, including awaits of plain values;
+the actor identity exists only for that continuation's microtask and is cleared
+before another publication. Publications are serialized across actors so two
+promises settling in the same checkpoint cannot overwrite each other's identity.
+
+The transform covers every syntactic await in modules selected by the consumer's
+include policy, including top-level await and async generators. It does not cover
+bare `.then()` chains on foreign promises or code outside the filter. The runtime
+itself is excluded: its internal promise machinery must keep using raw awaits.
+Every seam row above remains defense in depth for untransformed consumers and for
+promise continuations that do not pass through syntax the transform can rewrite.
+
 ## Open holes, ranked
 
 1. **`File` entries returned by `formData()`** — the FormData consumer itself is
@@ -58,10 +78,10 @@ enumerates it. Every row is one of:
 
 ## Foreign by design
 
-No runtime seam can exist for promises the actor manufactures itself. The
-discipline: resolve them through `ctx.awaitIo(...)`, or deliver events through
-`makeReentryCallback`. Provenance (0.2.1) names the window when the discipline
-slips.
+For modules outside the transform, no runtime seam can exist for promises the
+actor manufactures itself. The discipline: resolve them through
+`ctx.awaitIo(...)`, or deliver events through `makeReentryCallback`. Provenance
+(0.2.1) names the window when the discipline slips.
 
 - `new Promise` resolved from an event: `MessagePort.onmessage`,
   `addEventListener`, `FileReader`, `AbortSignal` `"abort"`.
@@ -97,7 +117,6 @@ this one is absent rather than ungated).
    `for await`, `.pipeThrough(`, `.getReader(`, `new Promise(` near ports and
    events. Both the pipeThrough hole and the async-iterator hole were findable
    this way; one of them was found this way.
-4. **The total answer, if the tail gets long**: a compile-time await transform
-   over actor-owned modules (rewrite every `await x` to the gated equivalent).
-   That is the only "all of JavaScript" guarantee; everything above is the
-   surgical version, kept small by the microtask-inheritance fact at the top.
+4. **The total answer**: the [transform](#transform) rewrites every syntactic
+   await in actor-owned modules. The rows above remain the independently tested
+   surgical layer underneath it.

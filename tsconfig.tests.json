@@ -11,9 +11,11 @@
   "extends": "./tsconfig.base.json",
   "include": [
     "src/**/*.test.ts",
+    "src/fixtures/**/*.ts",
     "backends/**/*.test.ts"
   ],
   "references": [
+    { "path": "./src" },
     { "path": "./src/util" },
     { "path": "./src/io" },
     { "path": "./src/api" },

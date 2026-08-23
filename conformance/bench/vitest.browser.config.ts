@@ -35,7 +35,10 @@ export default defineConfig({
   test: {
     name: "bench-browser",
     root: packageRoot,
-    include: ["conformance/bench/sql-latency.browser.bench.ts"],
+    include: [
+      "conformance/bench/await-transform.bench.ts",
+      "conformance/bench/sql-latency.browser.bench.ts",
+    ],
     browser: {
       enabled: true,
       provider: playwright(),

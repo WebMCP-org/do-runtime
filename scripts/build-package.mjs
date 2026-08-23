@@ -20,13 +20,19 @@ await build({
         "backends/sqlite-wasm": new URL("backends/sqlite-wasm.ts", root).pathname,
         "backends/node-sqlite": new URL("backends/node-sqlite.ts", root).pathname,
         "cloudflare-workers": new URL("src/api/cloudflare-workers.ts", root).pathname,
+        gate: new URL("src/gate.ts", root).pathname,
+        vite: new URL("src/vite.ts", root).pathname,
         conformance: new URL("conformance/host.ts", root).pathname,
       },
       formats: ["es"],
     },
     rollupOptions: {
       external: (id) =>
-        id === "capnweb" || id === "@ungap/structured-clone" || id.startsWith("node:"),
+        id === "capnweb" ||
+        id === "@ungap/structured-clone" ||
+        id === "magic-string" ||
+        id === "vite" ||
+        id.startsWith("node:"),
       output: {
         entryFileNames: "[name].js",
         chunkFileNames: "chunks/[name]-[hash].js",
