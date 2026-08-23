@@ -8,8 +8,8 @@
  * **`DurableObjectStorage` satisfies workers-types with no cast (§2.4).** That
  * was checked rather than asserted, and two shapes here exist only because it
  * has to: `sql.Cursor` and `sql.Statement` must be constructible with no
- * arguments (see `sql.ts`), and `storage.kv` is required, which is why
- * `api/sync-kv.ts` exists at all. The narrowings that remain are all one thing —
+ * arguments (see `sql.ts`), and `storage.kv` is required. The narrowings that
+ * remain are all one thing —
  * `get<T>` returns the caller's claim about the shape of a value SQLite handed
  * back as bytes, which no check can confirm and which upstream states the same
  * way, as a `jsg::JsRef<jsg::JsValue>` behind a `JSG_TS_OVERRIDE`'d
@@ -19,8 +19,7 @@
  * That is upstream's: a `JSG_REQUIRE` inside a method returning `jsg::Promise`
  * throws into the isolate before the promise exists, so `put(k, undefined)`
  * throws rather than rejecting. The same goes for a value that will not decode,
- * because §1.4 makes the SQLite path take `transformCacheResult`'s value arm and
- * run the decoder synchronously.
+ * because §1.4 makes the SQLite path run the decoder before `Promise.resolve`.
  *
  * **What the input gate does and does not do here.** Every entry point calls
  * `requireInputLock` — see its comment in `io/io-context.ts`, which is the one
@@ -32,13 +31,10 @@
  * section.
  *
  * **Decision 2's branch has one reachable site**, and it is not where upstream's
- * is. `transformCacheResult` branches on `allowConcurrency` because upstream's
- * `ActorCacheOps` returns `kj::OneOf<T, kj::Promise<T>>`; §1.4 measures that the
- * SQLite arm is always the immediate one, so Section 4 collapsed the `OneOf` and
- * the branch has nothing to select between. `transformMaybeBackpressure` keeps
- * it, because `DeleteAllResults.backpressure` is still a promise in
- * `io/actor-cache.ts`. Both helpers are kept under upstream's names so the
- * question "where did `allowConcurrency` go" is answered by reading them.
+ * is. §1.4 measures that SQLite cache operations are immediate, so their
+ * `kj::OneOf<T, kj::Promise<T>>` branch has nothing to select between.
+ * `transformMaybeBackpressure` keeps the branch because
+ * `DeleteAllResults.backpressure` is still a promise in `io/actor-cache.ts`.
  *
  * Not ported, because the substrate has no equivalent: Hibernatable WebSockets,
  * which is the whole reason `DurableObjectState`'s eight WebSocket methods are
@@ -69,13 +65,12 @@ import type {
 import type { IoContext } from "../io/io-context";
 import { requireInputLock, setUserErrorDetail } from "../io/io-context";
 import type { FacetManager, FacetStartInfo } from "../io/worker";
-import type { SqliteKv } from "../util/sqlite-kv";
+import type { SqliteKv, SqliteKvListCursor } from "../util/sqlite-kv";
 import type { SqliteDatabase } from "../util/sqlite";
 import { DurableObjectClass } from "./actor";
 import { LoopbackColoLocalActorNamespace, LoopbackDurableObjectNamespace } from "./export-loopback";
 import type { ActorScopeBindings } from "./global-scope";
 import { SqlStorage } from "./sql";
-import { SyncKvStorage } from "./sync-kv";
 
 // =======================================================================================
 // Constants
@@ -150,7 +145,7 @@ const VALUE_CODEC_HEADER = new Uint8Array([0, 0x44, 0x4f, 1]);
  * The short header keeps the new representation unambiguous while old JSON rows
  * remain readable.
  */
-export function serializeValue(_key: string, value: unknown): Uint8Array {
+function serializeValue(value: unknown): Uint8Array {
   const body = textEncoder.encode(JSON.stringify(serializeStructuredClone(value)));
   const encoded = new Uint8Array(VALUE_CODEC_HEADER.byteLength + body.byteLength);
   encoded.set(VALUE_CODEC_HEADER);
@@ -167,7 +162,7 @@ export function serializeValue(_key: string, value: unknown): Uint8Array {
  * type of the value, but not its contents)". Our four-byte header carries only
  * a marker and version for the same reason.
  */
-export function deserializeValue(key: string, buffer: Uint8Array): unknown {
+function deserializeValue<T = unknown>(key: string, buffer: Uint8Array): T {
   if (buffer.byteLength === 0) {
     throw new Error(`unexpectedly empty value buffer; key = ${key}`);
   }
@@ -175,9 +170,10 @@ export function deserializeValue(key: string, buffer: Uint8Array): unknown {
     const structured = VALUE_CODEC_HEADER.every((byte, index) => buffer[index] === byte);
     const bytes = structured ? buffer.subarray(VALUE_CODEC_HEADER.byteLength) : buffer;
     const parsed = JSON.parse(textDecoder.decode(bytes)) as unknown;
-    return structured
+    const value = structured
       ? deserializeStructuredClone(parsed as ReturnType<typeof serializeStructuredClone>)
       : parsed;
+    return value as T;
   } catch (exception) {
     throw new Error(
       "actor storage deserialization failed: failed to deserialize stored value; " +
@@ -187,30 +183,8 @@ export function deserializeValue(key: string, buffer: Uint8Array): unknown {
   }
 }
 
-/** ← `deserializeMaybeV8Value`. */
-function deserializeMaybeValue(key: string, buffer: Uint8Array | undefined): unknown {
-  return buffer === undefined ? undefined : deserializeValue(key, buffer);
-}
-
 // =======================================================================================
 // The option transforms
-
-/**
- * ← `transformCacheResult` and `transformCacheResultWithCacheStatus`
- * (`actor-state.c++:49-101`), with the arm that cannot happen removed.
- *
- * Upstream's body is a two-arm switch on `kj::OneOf<T, kj::Promise<T>>`, and the
- * `allowConcurrency` branch lives in the promise arm. §1.4 measures that a
- * SQLite-backed actor returns the immediate arm at every call site, so Section 4
- * collapsed the `OneOf` to `T` and there is no promise left to await — and
- * therefore no gate decision to make. The name is kept so a reader comparing the
- * two files finds the answer here rather than inferring an omission. The
- * `WithCacheStatus` variant differs only in a `cached` flag feeding billing
- * counters that have no port, so the two collapse to one function.
- */
-function transformCacheResult<T, R>(value: T, func: (value: T) => R): Promise<R> {
-  return Promise.resolve(func(value));
-}
 
 /**
  * ← `transformMaybeBackpressure` (`actor-state.c++:103-119`). THIS is decision
@@ -236,7 +210,7 @@ function transformMaybeBackpressure(
 // compileListOptions
 
 /** ← `DurableObjectStorageOperations::CompiledListOptions`. */
-export type CompiledListOptions = {
+type CompiledListOptions = {
   readonly start: string;
   readonly end: string | undefined;
   readonly reverse: boolean;
@@ -246,8 +220,8 @@ export type CompiledListOptions = {
 /**
  * ← `DurableObjectStorageOperations::compileListOptions`
  * (`actor-state.c++:314-417`). Returns undefined if the list operation would
- * provably return no results. Public because `SyncKvStorage` reuses it, exactly
- * as upstream's comment says it must.
+ * provably return no results. `SyncKvStorage` reuses it, exactly as upstream's
+ * comment says it must.
  *
  * Two translations. `startAfter` gains ONE null character where upstream's
  * `kj::String` gains two, because the second of upstream's is the terminator and
@@ -257,7 +231,7 @@ export type CompiledListOptions = {
  * outside the astral planes, and a key that mixes astral characters with a
  * prefix can land on the wrong side of a clamp this function computes.
  */
-export function compileListOptions(
+function compileListOptions(
   options: DurableObjectListOptions | undefined,
 ): CompiledListOptions | undefined {
   let start = "";
@@ -342,6 +316,76 @@ function firstKeyAfterPrefix(prefix: string): string | undefined {
 }
 
 // =======================================================================================
+// SyncKvStorage
+
+/**
+ * ← workerd `src/workerd/api/sync-kv.{h,c++}`. The synchronous surface lives
+ * beside the asynchronous storage owner because both share the same codec and
+ * list-option compiler over one `SqliteKv`.
+ */
+class SyncKvStorage implements globalThis.SyncKvStorage {
+  readonly #ctx: IoContext;
+  readonly #kv: SqliteKv;
+
+  constructor(ctx: IoContext, kv: SqliteKv) {
+    this.#ctx = ctx;
+    this.#kv = kv;
+  }
+
+  get<T = unknown>(key: string): T | undefined {
+    requireInputLock(this.#ctx, "kv.get()");
+    const value = this.#kv.get(key);
+    if (value === undefined) return undefined;
+    return deserializeValue<T>(key, value);
+  }
+
+  list<T = unknown>(options?: globalThis.SyncKvListOptions): Iterable<[string, T]> {
+    requireInputLock(this.#ctx, "kv.list()");
+    const compiled = compileListOptions(options);
+    if (compiled === undefined) {
+      // Key range is empty. Upstream allocates a cursor over a null query for exactly this.
+      return [];
+    }
+
+    const cursor = this.#kv.list(
+      compiled.start,
+      compiled.end,
+      compiled.limit,
+      compiled.reverse ? "REVERSE" : "FORWARD",
+    );
+    return listIterator<T>(cursor);
+  }
+
+  put<T>(key: string, value: T): void {
+    requireInputLock(this.#ctx, "kv.put()");
+    this.#kv.put(key, serializeValue(value));
+  }
+
+  delete(key: string): boolean {
+    requireInputLock(this.#ctx, "kv.delete()");
+    return this.#kv.delete(key);
+  }
+}
+
+/** ← `SyncKvStorage::listNext`, whose cancellation branch is the reason it is not a plain loop. */
+function* listIterator<T>(cursor: SqliteKvListCursor): IterableIterator<[string, T]> {
+  for (;;) {
+    const pair = cursor.next();
+    if (pair !== undefined) {
+      yield [pair.key, deserializeValue<T>(pair.key, pair.value)];
+      continue;
+    }
+    if (cursor.wasCanceled()) {
+      throw new Error(
+        "kv.list() iterator was invalidated because a new call to kv.list() was started. " +
+          "Only one kv.list() iterator can exist at a time.",
+      );
+    }
+    return;
+  }
+}
+
+// =======================================================================================
 // DurableObjectStorageOperations
 
 /**
@@ -349,7 +393,7 @@ function firstKeyAfterPrefix(prefix: string): string | undefined {
  * DurableObjectStorage and DurableObjectTransaction. This class is designed to
  * be used as a mixin."
  */
-export abstract class DurableObjectStorageOperations {
+abstract class DurableObjectStorageOperations {
   protected readonly ctx: IoContext;
 
   constructor(ctx: IoContext) {
@@ -358,23 +402,6 @@ export abstract class DurableObjectStorageOperations {
 
   protected abstract getCache(op: string): ActorCacheOps;
 
-  /** Whether to skip caching and allow concurrency on all operations. */
-  protected useDirectIo(): boolean {
-    return false;
-  }
-
-  /**
-   * ← `configureOptions`. Both subclasses answer `useDirectIo()` false, so this
-   * is the identity today; it is upstream's hook and the only place the two
-   * flags are forced on.
-   */
-  protected configureOptions<T extends { allowConcurrency?: boolean; noCache?: boolean }>(
-    options: T,
-  ): T {
-    if (!this.useDirectIo()) return options;
-    return { ...options, allowConcurrency: true, noCache: true };
-  }
-
   get<T = unknown>(key: string, options?: DurableObjectGetOptions): Promise<T | undefined>;
   get<T = unknown>(keys: string[], options?: DurableObjectGetOptions): Promise<Map<string, T>>;
   get<T = unknown>(
@@ -382,7 +409,7 @@ export abstract class DurableObjectStorageOperations {
     maybeOptions?: DurableObjectGetOptions,
   ): Promise<T | undefined> | Promise<Map<string, T>> {
     requireInputLock(this.ctx, OP_GET);
-    const options = this.configureOptions({ ...maybeOptions });
+    const options = { ...maybeOptions };
     if (typeof keyOrKeys === "string") return this.#getOne<T>(keyOrKeys, options);
     return this.#getMultiple<T>(keyOrKeys, options);
   }
@@ -391,8 +418,8 @@ export abstract class DurableObjectStorageOperations {
     requireInputLock(this.ctx, OP_GET_ALARM);
     // Even if we do not have an alarm handler, we might once have had one. It's fine to return
     // whatever a previous alarm setting or a falsy result.
-    const options = this.configureOptions({ ...maybeOptions, noCache: false });
-    return transformCacheResult(this.getCache(OP_GET_ALARM).getAlarm(options), (date) => date);
+    const options = { ...maybeOptions, noCache: false };
+    return Promise.resolve(this.getCache(OP_GET_ALARM).getAlarm(options));
   }
 
   list<T = unknown>(maybeOptions?: DurableObjectListOptions): Promise<Map<string, T>> {
@@ -400,12 +427,12 @@ export abstract class DurableObjectStorageOperations {
     const compiled = compileListOptions(maybeOptions);
     if (compiled === undefined) return Promise.resolve(new Map<string, T>());
 
-    const options = this.configureOptions({ ...maybeOptions });
+    const options = { ...maybeOptions };
     const cache = this.getCache(OP_LIST);
     const result = compiled.reverse
       ? cache.listReverse(compiled.start, compiled.end, compiled.limit, options)
       : cache.list(compiled.start, compiled.end, compiled.limit, options);
-    return transformCacheResult(result, (rows) => listResultsToMap<T>(rows));
+    return Promise.resolve(listResultsToMap<T>(result));
   }
 
   put<T>(key: string, value: T, options?: DurableObjectPutOptions): Promise<void>;
@@ -424,15 +451,11 @@ export abstract class DurableObjectStorageOperations {
       if (valueOrOptions === undefined) {
         throw new TypeError("put() called with undefined value.");
       }
-      return this.#putOne(
-        keyOrEntries,
-        valueOrOptions as T,
-        this.configureOptions({ ...maybeOptions }),
-      );
+      return this.#putOne(keyOrEntries, valueOrOptions as T, { ...maybeOptions });
     }
     return this.#putMultiple(
       keyOrEntries,
-      this.configureOptions({ ...(valueOrOptions as DurableObjectPutOptions | undefined) }),
+      { ...(valueOrOptions as DurableObjectPutOptions | undefined) },
     );
   }
 
@@ -443,17 +466,11 @@ export abstract class DurableObjectStorageOperations {
     maybeOptions?: DurableObjectPutOptions,
   ): Promise<boolean> | Promise<number> {
     requireInputLock(this.ctx, OP_DELETE);
-    const options = this.configureOptions({ ...maybeOptions });
+    const options = { ...maybeOptions };
     if (typeof keyOrKeys === "string") {
-      return transformCacheResult(
-        this.getCache(OP_DELETE).delete(keyOrKeys, options),
-        (deleted) => deleted,
-      );
+      return Promise.resolve(this.getCache(OP_DELETE).delete(keyOrKeys, options));
     }
-    return transformCacheResult(
-      this.getCache(OP_DELETE).deleteMultiple(keyOrKeys, options),
-      (count) => count,
-    );
+    return Promise.resolve(this.getCache(OP_DELETE).deleteMultiple(keyOrKeys, options));
   }
 
   setAlarm(scheduledTime: number | Date, maybeOptions?: DurableObjectSetAlarmOptions): Promise<void> {
@@ -467,7 +484,7 @@ export abstract class DurableObjectStorageOperations {
     // (post-ctor) JS durable object with an alarm handler."
     this.ctx.getActorOrThrow().assertCanSetAlarm();
 
-    const options = this.configureOptions({ ...maybeOptions, noCache: false });
+    const options = { ...maybeOptions, noCache: false };
 
     // "We fudge times set in the past to Date.now() to ensure that any one user can't DDOS the
     // alarm polling system by putting dates far in the past and therefore getting sorted earlier by
@@ -480,23 +497,23 @@ export abstract class DurableObjectStorageOperations {
     requireInputLock(this.ctx, OP_DELETE_ALARM);
     // Even if we do not have an alarm handler, we might once have had one. It's fine to remove that
     // alarm or noop on the absence of one.
-    const options = this.configureOptions({ ...maybeOptions, noCache: false });
+    const options = { ...maybeOptions, noCache: false };
     this.getCache(OP_DELETE_ALARM).setAlarm(null, options);
     return Promise.resolve();
   }
 
   #getOne<T>(key: string, options: ReadOptions): Promise<T | undefined> {
     const value = this.getCache(OP_GET).get(key, options);
-    return transformCacheResult(value, (bytes) => deserializeMaybeValue(key, bytes) as T | undefined);
+    return Promise.resolve(value === undefined ? undefined : deserializeValue<T>(key, value));
   }
 
   #getMultiple<T>(keys: string[], options: ReadOptions): Promise<Map<string, T>> {
     const result = this.getCache(OP_GET).getMultiple(keys, options);
-    return transformCacheResult(result, (rows) => listResultsToMap<T>(rows));
+    return Promise.resolve(listResultsToMap<T>(result));
   }
 
   #putOne<T>(key: string, value: T, options: WriteOptions): Promise<void> {
-    this.getCache(OP_PUT).put(key, serializeValue(key, value), options);
+    this.getCache(OP_PUT).put(key, serializeValue(value), options);
     return Promise.resolve();
   }
 
@@ -508,7 +525,7 @@ export abstract class DurableObjectStorageOperations {
       // working code, and a stray undefined here or there is probably closer to what the user
       // desires."
       if (value === undefined) continue;
-      pairs.push({ key, value: serializeValue(key, value) });
+      pairs.push({ key, value: serializeValue(value) });
     }
     this.getCache(OP_PUT).putMultiple(pairs, options);
     return Promise.resolve();
@@ -519,7 +536,7 @@ export abstract class DurableObjectStorageOperations {
 function listResultsToMap<T>(rows: GetResultList): Map<string, T> {
   const map = new Map<string, T>();
   for (const entry of rows) {
-    map.set(entry.key, deserializeValue(entry.key, entry.value) as T);
+    map.set(entry.key, deserializeValue<T>(entry.key, entry.value));
   }
   return map;
 }
@@ -550,7 +567,7 @@ export class DurableObjectStorage
 {
   readonly #cache: StorageCache;
   #sql: SqlStorage | undefined;
-  #kv: SyncKvStorage | undefined;
+  #kv: globalThis.SyncKvStorage | undefined;
 
   constructor(ctx: IoContext, cache: StorageCache) {
     super(ctx);
@@ -567,11 +584,6 @@ export class DurableObjectStorage
     return this.#cache.getSqliteDatabase();
   }
 
-  /** ← `DurableObjectStorage::getSqliteKv`. */
-  getSqliteKv(): SqliteKv {
-    return this.#cache.getSqliteKv();
-  }
-
   protected override getCache(): ActorCacheOps {
     return this.#cache;
   }
@@ -583,8 +595,8 @@ export class DurableObjectStorage
   }
 
   /** ← `JSG_LAZY_INSTANCE_PROPERTY(kv, getKv)`. */
-  get kv(): SyncKvStorage {
-    this.#kv ??= new SyncKvStorage(this.ctx, this);
+  get kv(): globalThis.SyncKvStorage {
+    this.#kv ??= new SyncKvStorage(this.ctx, this.#cache.getSqliteKv());
     return this.#kv;
   }
 
@@ -597,7 +609,7 @@ export class DurableObjectStorage
    */
   deleteAll(maybeOptions?: DurableObjectPutOptions): Promise<void> {
     requireInputLock(this.ctx, "deleteAll()");
-    const options = this.configureOptions({ ...maybeOptions });
+    const options = { ...maybeOptions };
     const result = this.#cache.deleteAll(options, { deleteAlarm: true });
     return transformMaybeBackpressure(this.ctx, options, result.backpressure);
   }
@@ -717,7 +729,7 @@ export class DurableObjectStorage
 // =======================================================================================
 // DurableObjectTransaction
 
-export class DurableObjectTransaction
+class DurableObjectTransaction
   extends DurableObjectStorageOperations
   implements globalThis.DurableObjectTransaction
 {
@@ -1027,7 +1039,7 @@ export class DurableObjectState implements globalThis.DurableObjectState {
    * gated slice.
    */
   blockConcurrencyWhile<T>(callback: () => Promise<T>): Promise<T> {
-    return this.#ctx.blockConcurrencyWhile(() => callback());
+    return this.#ctx.blockConcurrencyWhile(callback);
   }
 
   /**

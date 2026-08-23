@@ -827,7 +827,7 @@ type Assignable<Value extends Declared, Declared> = Value;
  * pinned type is one this file accepts. `Module` is a strict superset by the two
  * byte fields, for the reason its own comment gives.
  */
-export type PinnedWorkerLoaderTypes = [
+type PinnedWorkerLoaderTypes = [
   Assignable<WorkerLoader, globalThis.WorkerLoader>,
   Assignable<WorkerStub, globalThis.WorkerStub>,
   Assignable<globalThis.WorkerLoaderWorkerCode, WorkerCode>,
