@@ -123,6 +123,26 @@ describe("__gate", () => {
       requireInputLock(context, "after rejection");
     });
   });
+
+  test("re-enters the critical section captured by blockConcurrencyWhile", async () => {
+    const context = newContext();
+    const completed = context.run(() =>
+      context.blockConcurrencyWhile(async () => {
+        await __gate(portHop());
+        requireInputLock(context, "critical section continuation");
+        return "done";
+      }),
+    );
+    const deadline = new Promise<never>((_, reject) => {
+      setTimeout(() => reject(new Error("critical-section continuation did not resume")), 1_000);
+    });
+
+    try {
+      await expect(Promise.race([completed, deadline])).resolves.toBe("done");
+    } finally {
+      context.abort(new Error("test cleanup"));
+    }
+  });
 });
 
 describe("__gateAsyncIterable", () => {

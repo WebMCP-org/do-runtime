@@ -1088,12 +1088,12 @@ export class IoContext {
     return this.#awaitIoImpl(promise, this.getCriticalSection(), func);
   }
 
-  /**
-   * The await transform's hot path. It preserves provenance without capturing
-   * an Error stack for every await: the first call and every 64th call refresh
-   * the sampled site, while intervening calls keep that stack and say so.
-   */
-  awaitIoFromTransform<T>(promise: Promise<T>): Promise<T> {
+  /** Capture the current critical section for one transformed continuation. */
+  makeTransformReentryCallback<Args extends unknown[], Result>(
+    func: (...args: Args) => Result | PromiseLike<Result>,
+  ): (...args: Args) => Promise<Result> {
+    this.#requireCurrent();
+    const criticalSection = this.getCriticalSection();
     const shouldSample = this.#transformGateUses++ % 64 === 0 || this.#transformGateStack === undefined;
     if (shouldSample) this.#transformGateStack = captureGateStack();
     this.#lastGateUse = {
@@ -1103,7 +1103,17 @@ export class IoContext {
       stack: this.#transformGateStack,
       at: this.now(),
     };
-    return this.#awaitIoImpl(promise, this.getCriticalSection(), identity);
+
+    return (...args: Args): Promise<Result> => {
+      const call = this.run(() => func(...args), criticalSection);
+      this.addTask(
+        call.then(
+          () => {},
+          () => {},
+        ),
+      );
+      return call;
+    };
   }
 
   /**

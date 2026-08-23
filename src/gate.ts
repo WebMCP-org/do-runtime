@@ -10,11 +10,15 @@ type ContinuationContext = {
 let continuationContext: ContinuationContext | undefined;
 
 type Publication = {
-  readonly context: IoContext;
-  readonly settle: () => void;
+  readonly publish: () => Promise<void>;
   readonly reject: (exception: unknown) => void;
 };
 
+type Outcome<T> =
+  | { readonly ok: true; readonly value: T }
+  | { readonly ok: false; readonly exception: unknown };
+
+// ponytail: one module-wide queue; shard by actor only if settled-await contention is measured.
 const publications: Publication[] = [];
 
 function isThenable(value: unknown): value is PromiseLike<unknown> {
@@ -29,7 +33,7 @@ export function __gate<T>(value: T): T | Promise<Awaited<T>> {
   const context = tryCurrentSlice() ?? continuationContext?.context;
   if (!isThenable(value) && context === undefined) return value;
   if (context === undefined) return value;
-  return resumeWithContext(context, context.awaitIoFromTransform(Promise.resolve(value)));
+  return resumeWithContext(context, Promise.resolve(value));
 }
 
 /**
@@ -45,12 +49,23 @@ function enqueuePublication(publication: Publication): void {
 
 function resumeWithContext<T>(context: IoContext, promise: Promise<T>): Promise<T> {
   return new Promise<T>((resolve, reject) => {
+    const publish = context.makeTransformReentryCallback((outcome: Outcome<T>) => {
+      const token = {};
+      continuationContext = { context, token };
+      if (outcome.ok) resolve(outcome.value);
+      else reject(outcome.exception);
+      queueMicrotask(() => {
+        if (continuationContext?.token === token) continuationContext = undefined;
+        publications.shift();
+        if (publications.length > 0) schedulePublication();
+      });
+    });
     void promise.then(
       (value) => {
-        enqueuePublication({ context, settle: () => resolve(value), reject });
+        enqueuePublication({ publish: () => publish({ ok: true, value }), reject });
       },
       (exception: unknown) => {
-        enqueuePublication({ context, settle: () => reject(exception), reject });
+        enqueuePublication({ publish: () => publish({ ok: false, exception }), reject });
       },
     );
   });
@@ -64,22 +79,11 @@ function schedulePublication(): void {
     const publication = publications[0];
     if (publication === undefined) return;
 
-    void publication.context
-      .run(() => {
-        const token = {};
-        continuationContext = { context: publication.context, token };
-        publication.settle();
-        queueMicrotask(() => {
-          if (continuationContext?.token === token) continuationContext = undefined;
-          publications.shift();
-          if (publications.length > 0) schedulePublication();
-        });
-      })
-      .catch((exception: unknown) => {
-        publication.reject(exception);
-        publications.shift();
-        if (publications.length > 0) schedulePublication();
-      });
+    void publication.publish().catch((exception: unknown) => {
+      publication.reject(exception);
+      publications.shift();
+      if (publications.length > 0) schedulePublication();
+    });
   };
   channel.port2.postMessage(undefined);
 }

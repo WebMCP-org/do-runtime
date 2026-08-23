@@ -47,10 +47,12 @@ through `@mcp-b/do-runtime/gate`, and wraps every `for await` source so
 `next()`, `return()`, and `throw()` settlements re-enter the owning actor.
 
 The gate helper fails open outside actor code. Inside an actor it publishes each
-continuation through a fresh input-gated slice, including awaits of plain values;
-the actor identity exists only for that continuation's microtask and is cleared
-before another publication. Publications are serialized across actors so two
-promises settling in the same checkpoint cannot overwrite each other's identity.
+continuation through a fresh input-gated slice, including awaits of plain values.
+The slice preserves a surrounding `blockConcurrencyWhile` critical section so
+the section can await its own continuation without deadlocking. The actor identity
+exists only for that continuation's microtask and is cleared before another
+publication. Publications are serialized across actors so two promises settling
+in the same checkpoint cannot overwrite each other's identity.
 
 The transform covers every syntactic await in modules selected by the consumer's
 include policy, including top-level await and async generators. It does not cover
