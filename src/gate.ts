@@ -1,6 +1,6 @@
 /* @do-runtime-gated */
 
-import { tryCurrentSlice, type IoContext } from "./io/io-context";
+import { atCheckpointEnd, tryCurrentSlice, type IoContext } from "./io/io-context";
 
 type ContinuationContext = {
   readonly context: IoContext;
@@ -18,6 +18,14 @@ type Outcome<T> =
   | { readonly ok: true; readonly value: T }
   | { readonly ok: false; readonly exception: unknown };
 
+const TRANSFORMED_AWAIT = Symbol("@mcp-b/do-runtime/transformed-await");
+
+type TransformedAwait<T> = {
+  readonly [TRANSFORMED_AWAIT]: true;
+  readonly context: IoContext;
+  readonly outcome: Outcome<T>;
+};
+
 function isThenable(value: unknown): value is PromiseLike<unknown> {
   return (
     (typeof value === "object" && value !== null) ||
@@ -33,20 +41,46 @@ export function __gate<T>(value: T): T | Promise<Awaited<T>> {
   return resumeWithContext(context, Promise.resolve(value));
 }
 
-function resumeWithContext<T>(context: IoContext, promise: Promise<T>): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
+/** Capture an actor await without publishing its context before the continuation runs. */
+export function __gateAwait<T>(value: T): T | Promise<TransformedAwait<Awaited<T>>> {
+  const context = tryCurrentSlice() ?? continuationContext?.context;
+  if (context === undefined) return value;
+  return resumeAwaitWithContext(context, Promise.resolve(value));
+}
+
+/** Restore the captured actor at the first instruction after a transformed await. */
+export function __resumeAwait<T>(value: T | TransformedAwait<T>): T {
+  if (!isTransformedAwait(value)) return value as T;
+
+  restoreContinuation(value.context);
+  if (value.outcome.ok) return value.outcome.value;
+  throw value.outcome.exception;
+}
+
+function isTransformedAwait<T>(value: T | TransformedAwait<T>): value is TransformedAwait<T> {
+  return Reflect.get(Object(value), TRANSFORMED_AWAIT) === true;
+}
+
+function restoreContinuation(context: IoContext): void {
+  const token = {};
+  continuationContext = { context, token };
+  atCheckpointEnd(() => {
+    if (continuationContext?.token === token) continuationContext = undefined;
+  });
+}
+
+function publishOutcome<T, Result>(
+  context: IoContext,
+  promise: Promise<T>,
+  finish: (outcome: Outcome<T>) => Result,
+): Promise<Result> {
+  return new Promise<Result>((resolve, reject) => {
     const publish = context.makeTransformReentryCallback((outcome: Outcome<T>) => {
       if (continuationContext !== undefined) {
         schedulePublication({ publish: () => publish(outcome), reject });
         return;
       }
-      const token = {};
-      continuationContext = { context, token };
-      if (outcome.ok) resolve(outcome.value);
-      else reject(outcome.exception);
-      queueMicrotask(() => {
-        if (continuationContext?.token === token) continuationContext = undefined;
-      });
+      resolve(finish(outcome));
     });
     void promise.then(
       (value) => {
@@ -56,6 +90,25 @@ function resumeWithContext<T>(context: IoContext, promise: Promise<T>): Promise<
         schedulePublication({ publish: () => publish({ ok: false, exception }), reject });
       },
     );
+  });
+}
+
+function resumeAwaitWithContext<T>(
+  context: IoContext,
+  promise: Promise<T>,
+): Promise<TransformedAwait<T>> {
+  return publishOutcome(context, promise, (outcome) => ({
+    [TRANSFORMED_AWAIT]: true,
+    context,
+    outcome,
+  }));
+}
+
+function resumeWithContext<T>(context: IoContext, promise: Promise<T>): Promise<T> {
+  return publishOutcome(context, promise, (outcome) => {
+    restoreContinuation(context);
+    if (outcome.ok) return outcome.value;
+    throw outcome.exception;
   });
 }
 
