@@ -404,7 +404,7 @@ type Assignable<Value extends Declared, Declared> = Value;
  * entry — `LoopbackForExport<T>` intersected with the namespace — because the
  * two named interfaces there are call-signature-less, per the note above.
  */
-export type PinnedLoopbackTypes = [
+type PinnedLoopbackTypes = [
   Assignable<LoopbackServiceStubValue, globalThis.LoopbackServiceStub>,
   Assignable<LoopbackDurableObjectClassValue, globalThis.LoopbackDurableObjectClass>,
   Assignable<
