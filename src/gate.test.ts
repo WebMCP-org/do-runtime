@@ -95,6 +95,54 @@ describe("__gate", () => {
     ]);
   });
 
+  test("does not let one blocked actor hold up another actor's publication", async () => {
+    const blockedActor = new TestActor();
+    const blocked = new IoContext(blockedActor, timer);
+    const unblocking = newContext();
+    const blockedValue = Promise.withResolvers<void>();
+    const unblockingValue = Promise.withResolvers<void>();
+    let releaseBlockedLock = () => {};
+    let blockedContinuation!: Promise<void>;
+    let unblockingContinuation!: Promise<void>;
+
+    await blocked.run(() => {
+      const lock = blocked.getInputLock();
+      let released = false;
+      releaseBlockedLock = () => {
+        if (released) return;
+        released = true;
+        lock.release();
+      };
+      blockedContinuation = Promise.resolve(__gate(blockedValue.promise));
+    });
+    await portHop();
+
+    await unblocking.run(() => {
+      unblockingContinuation = (async () => {
+        await __gate(unblockingValue.promise);
+        releaseBlockedLock();
+      })();
+    });
+    await portHop();
+
+    blockedValue.resolve();
+    await expect.poll(() => blockedActor.inputGate.waiters.length).toBe(1);
+    unblockingValue.resolve();
+    const completed = Promise.all([blockedContinuation, unblockingContinuation]);
+    const deadline = new Promise<never>((_, reject) => {
+      setTimeout(() => reject(new Error("an unrelated blocked publication stalled the actor")), 1_000);
+    });
+
+    try {
+      await expect(Promise.race([completed, deadline])).resolves.toEqual([undefined, undefined]);
+    } finally {
+      releaseBlockedLock();
+      await Promise.allSettled([blockedContinuation, unblockingContinuation]);
+      blocked.abort(new Error("test cleanup"));
+      unblocking.abort(new Error("test cleanup"));
+    }
+  });
+
   test("clears continuation context before a later macrotask", async () => {
     const context = newContext();
     await context.run(async () => {
