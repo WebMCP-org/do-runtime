@@ -1074,6 +1074,16 @@ it("isCurrentSlice is true only while a synchronous body of this context is runn
   expect(seen).toEqual([true]);
 });
 
+it("publishes the current slice for separately bundled runtime copies", async () => {
+  const { ctx } = newContext();
+  const key = Symbol.for("@mcp-b/do-runtime/current-slice");
+
+  await ctx.run(() => {
+    expect(Reflect.get(globalThis, key)).toBe(ctx);
+  });
+  expect(Reflect.has(globalThis, key)).toBe(false);
+});
+
 it("isCurrentSlice distinguishes two contexts in one realm", async () => {
   // The whole point: two actors share a realm here, where upstream would have two
   // isolates. A global bound to one has to be able to tell it is being called by the

@@ -350,23 +350,28 @@ const pendingCheckpointEnds: (() => void)[] = [];
  * tripwire that refuses on mismatch and stays quiet on `undefined` — never a
  * resolver. See `requireOwnSlice` in `api/global-scope.ts`.
  */
-let currentSlice: IoContext | undefined;
+const CURRENT_SLICE = Symbol.for("@mcp-b/do-runtime/current-slice");
+
+function currentSlice(): IoContext | undefined {
+  return Reflect.get(globalThis, CURRENT_SLICE) as IoContext | undefined;
+}
 
 /** ← `IoContext::tryCurrent()` (`io-context.c++:1416-1422`), over the narrowed scope above. */
 export function tryCurrentSlice(): IoContext | undefined {
-  return currentSlice;
+  return currentSlice();
 }
 
 /**
  * ← the `SuppressIoContextScope` constructor's `threadLocalRequest = this` half
  * (`io-context.c++:1208`), as a function rather than an assignment in `#runImpl`.
  *
- * A function because `currentSlice = this` reads to a linter as a `this` alias — the
- * ES5 `var self = this` habit — when it is the opposite: publishing the running
- * context to a module scope, which is exactly what the C++ does to a thread local.
+ * The symbol registry makes this realm-local state visible to separately bundled
+ * copies of the runtime. A transformed application bundle can then re-enter the
+ * container created by a host bundle without either bundle owning the other.
  */
 function enterSlice(context: IoContext | undefined): void {
-  currentSlice = context;
+  if (context === undefined) Reflect.deleteProperty(globalThis, CURRENT_SLICE);
+  else Reflect.set(globalThis, CURRENT_SLICE, context);
 }
 
 /** ← `kj::OneOf<T, kj::Exception>`, the result of `promiseForExceptionOrT()`. */
@@ -764,7 +769,7 @@ export class IoContext {
    * actor's?
    */
   isCurrentSlice(): boolean {
-    return currentSlice === this;
+    return currentSlice() === this;
   }
 
   /**
@@ -1220,7 +1225,7 @@ export class IoContext {
     let result: T | PromiseLike<T>;
     // ← `SuppressIoContextScope previousRequest; threadLocalRequest = this;` (`io-context.c++:1208`)
     // and its restoring destructor. Scoped to the synchronous body only — see `currentSlice`.
-    const previousSlice = currentSlice;
+    const previousSlice = currentSlice();
     enterSlice(this);
     try {
       result = func(lock);
