@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.4
+
+### Patch Changes
+
+- 6616bcb: Restore actor context at the first instruction after each transformed await so delayed continuations cannot outlive their captured input lock.
+
 ## 0.3.3
 
 ### Patch Changes
