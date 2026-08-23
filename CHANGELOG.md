@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.6
+
+### Patch Changes
+
+- 059433a: Serialize transformed await publication until the owning continuation resumes so overlapping actors cannot overwrite each other's ambient identity.
+
 ## 0.3.5
 
 ### Patch Changes
