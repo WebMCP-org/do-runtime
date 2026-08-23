@@ -37,7 +37,7 @@ enumerates it. Every row is one of:
 | `scheduler.wait()` / `scheduler.yield()` | scoped `Scheduler` over the same timer path | `api/global-scope.ts` |
 | `crypto.subtle.*` | every method's promise gated; sync members pass through | `api/global-scope.ts` |
 | `WebSocket` | frames each take a fresh input lock at the `accept()` loop; `send` carries its own output-gate promise (§1.8) | `api/web-socket.ts` |
-| storage / `sql` / alarms / `blockConcurrencyWhile` / `awaitIo` / `makeReentryCallback` / entry dispatch | the runtime's own primitives | `io/io-context.ts`, `server/actor-container.ts` |
+| storage / `sql` / alarms / `blockConcurrencyWhile` / `awaitIo` / `makeReentryCallback` / entry and loopback dispatch | the runtime's own primitives | `io/io-context.ts`, `server/actor-container.ts` |
 
 ## Transform
 
@@ -46,18 +46,27 @@ Vite plugin for actor-bundled modules. It rewrites every `await value` to route
 through `@mcp-b/do-runtime/gate`, and wraps every `for await` source so
 `next()`, `return()`, and `throw()` settlements re-enter the owning actor.
 
-The gate helper fails open outside actor code. Inside an actor it publishes each
-continuation through a fresh input-gated slice, including awaits of plain values.
+The gate helper fails open outside actor code. A development transform supplies
+the module id and warns once if that path is reached; production keeps the helper
+silent. Inside an actor it publishes each continuation through a fresh
+input-gated slice, including awaits of plain values.
 The slice preserves a surrounding `blockConcurrencyWhile` critical section so
-the section can await its own continuation without deadlocking. The actor identity
-exists only for that continuation's microtask and is cleared before another
-publication. Publications are serialized across actors so two promises settling
-in the same checkpoint cannot overwrite each other's identity.
+the section can await its own continuation without deadlocking. The tokenized
+actor identity is realm-shared so separately bundled actor and host copies agree.
+It exists only while the captured context still holds its input lock, the
+synchronous current slice always wins, and the marker clears at that context's
+checkpoint boundary. Publications are serialized across actors so two promises
+settling in the same checkpoint cannot overwrite each other's identity.
 
-The transform covers every syntactic await in modules selected by the consumer's
-include policy, including top-level await and async generators. It does not cover
-bare `.then()` chains on foreign promises or code outside the filter. The runtime
-itself is excluded: its internal promise machinery must keep using raw awaits.
+At build end the plugin reads the final Rollup module graph, after later
+transforms, and compares fully wrapped awaits with total awaits per included
+module. It logs the aggregate and fails the build with each incomplete module's
+transformed/total count. `await using` is counted as uncovered rather than
+silently claimed. The transform covers ordinary syntactic awaits selected by the
+consumer's include policy, including top-level await and async generators. It
+does not cover bare `.then()` chains on foreign promises, null-byte virtual
+modules, or code outside the filter. The runtime itself is excluded: its
+internal promise machinery must keep using raw awaits.
 Every seam row above remains defense in depth for untransformed consumers and for
 promise continuations that do not pass through syntax the transform can rewrite.
 

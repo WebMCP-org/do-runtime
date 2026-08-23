@@ -15,7 +15,7 @@
  * upstream only exercises from `io-context.h`, which is Section 2.
  */
 
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 import {
   CanceledError,
   CriticalSection,
@@ -785,7 +785,9 @@ it("InputGate hooks balance across fulfilled, cancelled and broken waiters", asy
 
     const first = await gate.wait();
     const second = first.addRef();
-    const queued = gate.wait();
+    const controller = new AbortController();
+    const removeAbort = vi.spyOn(controller.signal, "removeEventListener");
+    const queued = gate.wait(controller.signal);
     expect(counts).toEqual({ locked: 1, released: 0, waiterAdded: 1, waiterRemoved: 0 });
 
     first.release();
@@ -794,6 +796,8 @@ it("InputGate hooks balance across fulfilled, cancelled and broken waiters", asy
 
     second.release();
     (await queued).release();
+    expect(removeAbort).toHaveBeenCalledWith("abort", expect.any(Function));
+    controller.abort();
     expect(counts).toEqual({ locked: 2, released: 2, waiterAdded: 1, waiterRemoved: 1 });
   }
 
@@ -979,7 +983,7 @@ it("OutputGate hooks balance on every path a lock can leave by", async () => {
   }
 
   // Settle, then abort. One AbortController covering a batch of writes, aborted during cleanup
-  // after the writes landed: the handler still fires, and must do nothing at all.
+  // after the writes landed: its settled listener is removed and the gate stays healthy.
   {
     const counts = newHookCounts();
     const gate = new OutputGate(recordingOutputGateHooks(counts));

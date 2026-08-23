@@ -53,7 +53,9 @@ Internal `_cf_` names remain reserved to the runtime.
 
 `blockConcurrencyWhile()` uses a real nested `CriticalSection`. It blocks peer
 entries, inherits through supported reentry callbacks, has the workerd
-deadline, and permanently breaks the input gate on failure.
+deadline, and permanently breaks the input gate on failure. Workerd discards
+the caller with its isolate; this same-realm runtime rejects it with the same
+typed `BrokenActorError` used to break and abort the placement.
 
 ### §1.6 Abort and breakage
 
@@ -113,10 +115,11 @@ MessagePort session.
 ### §2.1 One application-entry boundary
 
 External methods enter through `ActorContainer.entry()` and non-method events
-through `run()`. A genuine self-loopback reuses the current slice
-(`isCurrentSlice()`). Cross-actor calls pass through the callee's entry
-surface and actor-owned I/O. There is no serialized event tail, method-family
-dispatch table, or off-tail exception list.
+through `run()`. In-realm bindings use `resolveLoopback()`, which invokes the
+raw instance only when the exact caller is the target; every other actor call
+passes through the callee's entry and the exact current, transformed, or
+structurally supplied caller's `awaitIo`. There is no serialized event tail,
+method-family dispatch table, or off-tail exception list.
 
 ### §2.2 Worker placement is not actor identity
 
@@ -130,8 +133,9 @@ Timers, fetch, crypto, and host I/O are reached through the owning actor's
 scope — `container.globals`, installed ambiently only where one realm hosts
 one root (`installActorScope`). A raw host promise that application code must
 await is wrapped once at its shared owner with `awaitIo`; it is not repaired
-at every caller or by patching the realm. No mutable global or ambient field
-may select an actor across an `await`.
+at every caller or by patching the realm. The await transform's tokenized
+continuation marker is the sole exception: it republishes the context captured
+from the exact slice, and readers ignore it once that context's lock is gone.
 
 ### §2.4 Storage contract
 
@@ -176,20 +180,23 @@ owns only placement and physical storage operations.
 3. Use workerd-shaped `CriticalSection` semantics rather than a mutex or
    queue.
 4. Implement `blockConcurrencyWhile()` with that critical section and its
-   deadline.
+   deadline; reject its reachable same-realm caller with `BrokenActorError` when
+   the section breaks the actor.
 5. Use a promise-chain output gate and wait before externally observable I/O.
 6. Treat a broken gate as fatal to the current container; rebuild from
    committed storage.
 7. Bound implicit transactions by the same hand-off that releases the input
    gate.
 8. Carry explicit actor scope through application-owned code and route raw
-   host promises through `awaitIo`. Do not restore a one-slot async-context
-   shim, patch the realm with zones, or infer an actor from a realm-wide
-   global that can mean more than one.
+   host promises through `awaitIo`. Do not add a generic async-context shim or
+   patch the realm with zones. The compile-time await transform may republish
+   only the exact context it captured, tokenized for one checkpoint and valid
+   only while that context still holds an input lock.
 9. No stream pump or generic remote-facet protocol in the runtime. Facet
    placement is the host's; direct actor hops use native capabilities.
-10. Store per-connection host bridges by connection id. Do not save and
-    restore an ambient across an `await`.
+10. Store per-connection host bridges by connection id. Never use the
+    transform's actor marker to select a connection or save and restore a host
+    bridge ambient across an `await`.
 11. Run one conformance suite against real workerd, the Node backend, and the
     browser backend; assert unavailable substrate behavior rather than
     skipping it.

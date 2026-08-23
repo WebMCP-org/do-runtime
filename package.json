@@ -54,7 +54,7 @@
       "import": "./dist/backends/node-sqlite.js"
     },
     "./cloudflare-workers": {
-      "types": "./dist/src/api/cloudflare-workers.d.ts",
+      "types": "./dist/cloudflare-workers.d.ts",
       "import": "./dist/cloudflare-workers.js"
     },
     "./gate": {

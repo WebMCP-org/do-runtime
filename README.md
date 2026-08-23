@@ -181,19 +181,23 @@ The lifecycle:
 
 1. `await createActorContainer(options)`.
 2. `container.start((ctx, env) => new ActorClass(ctx, env))` once, under boot semantics (input gate held for the constructor, deletion receipts replayed first).
-3. Expose `container.entry(instance)` to callers. Its `ActorEntry<T>` type makes every method return a promise because each call is one gated event.
-4. Use `container.run(fn)` for events that are not method calls: a WebSocket frame, a host callback.
+3. Expose `container.entry(instance, signal?)` to callers. Its `ActorEntry<T>` type makes every method return a promise because each call is one gated event. The optional signal is bound to the proxy and cancels only calls still queued for admission.
+4. Use `container.run(fn, signal?)` for events that are not method calls: a WebSocket frame, a host callback. Its signal likewise stops only a queued event, not one already running.
 5. Reach the platform through `container.globals` (or install it with `installActorScope`). For a host-provided promise an actor must await, wrap it once in `container.awaitIo()`.
-6. Watch `container.onBroken`; dispose the placement; recreate it on the next event over the same storage.
+6. Watch `container.onBroken`; dispose the placement; recreate it on the next event over the same storage. A failed `blockConcurrencyWhile()` rejects its caller with `BrokenActorError` and breaks the placement with that same error.
 
 For a standard Durable Object binding, call
 `createDurableObjectNamespace(uniqueKey, channel)` and put the result in `env`
 and `ctx.exports`. The channel maps each routed id to a placed `Fetcher`; that
 binding works directly with Agents SDK `routeAgentRequest()` and
-`getAgentByName()`. When an actor uses the binding to call another actor, wrap
-the transport promise with the caller's `container.awaitIo()` so its continuation
-re-enters the owning input gate. The extension example shows both the external
-router binding and the per-container actor binding.
+`getAgentByName()`. For an in-realm binding, pass the raw and entered call
+thunks to the target's `container.resolveLoopback()`; it invokes the raw
+instance only when the exact caller is that target and otherwise owns the callee
+entry and caller `awaitIo`. Current slices and transformed continuations resolve
+automatically; pass the still-lock-holding structural caller as the third
+argument from untransformed post-await code. For an external transport, wrap
+its promise with the caller's `container.awaitIo()` so the continuation
+re-enters the owning input gate.
 
 ### Storage
 
@@ -216,6 +220,8 @@ Construct one `AlarmScheduler` per namespace over a `SqlDatabase` of its own. It
 On workerd every awaitable thing is an io-context primitive, so "resuming from an await re-enters with a fresh input lock" never needs saying. Here it does. A raw `setTimeout` resolves a promise the runtime does not own; the continuation resumes with an empty invocation stack and the next `ctx.storage` call throws `no input lock available in this context`. That is by design — the alternative is a continuation that silently writes outside the gate.
 
 `container.globals` is the complete gated set, bound to that container: `setTimeout`/`clearTimeout`/`setInterval`/`clearInterval` capture the critical section when armed and re-enter when fired; `scheduler.wait()` and `scheduler.yield()` resume under the actor; `fetch()` waits for output locks and releases the input gate while in flight; `crypto` re-enters on async completion; accepted WebSocket frames enter through the captured context. Install it as the worker's globals (`installActorScope`) when one worker hosts one root, or hand it to application code explicitly when it must not.
+
+Actor bundles can also install `doRuntimeAwaitTransform()` from `@mcp-b/do-runtime/vite`. A production build checks the final module graph and fails with transformed/total counts for any included module with an uncovered await; the development transform warns once per module if a transformed await reaches its fail-open path without an actor lock.
 
 ## What is not supported
 

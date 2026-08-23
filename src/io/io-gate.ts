@@ -63,13 +63,14 @@ function makeCanceledError(): CanceledError {
  * here, and every one of them first rejects a pre-aborted wait before touching gate state, so
  * "cancelled" always means "left the gate exactly as it found it".
  */
-function onAbort(signal: AbortSignal | undefined, run: () => void): void {
-  if (signal === undefined) return;
+function onAbort(signal: AbortSignal | undefined, run: () => void): () => void {
+  if (signal === undefined) return () => {};
   if (signal.aborted) {
     run();
-    return;
+    return () => {};
   }
   signal.addEventListener("abort", run, { once: true });
+  return () => signal.removeEventListener("abort", run);
 }
 
 /**
@@ -235,12 +236,13 @@ export class InputGate {
   newWaiterPromise(isChildWaiter: boolean, signal?: AbortSignal): Promise<Lock> {
     const { promise, resolve, reject } = Promise.withResolvers<Lock>();
     const waiter = new Waiter(this, isChildWaiter, resolve, reject);
-    onAbort(signal, () => {
+    const removeAbort = onAbort(signal, () => {
       // ← `~Waiter` on the cancellation path. A waiter that already settled is unlinked, and
       // cancelling it is the no-op that dropping a settled promise is.
       if (!waiter.linked) return;
       waiter.reject(makeCanceledError());
     });
+    void promise.then(removeAbort, removeAbort);
     return promise;
   }
 
@@ -601,7 +603,7 @@ export class CriticalSection extends InputGate {
 
 /**
  * ← the gate half of `IoContext::makeReentryCallback()` (`io-context.h:1507`), which is
- * `ctx.run(func, cs)` with the critical section captured here rather than looked up later.
+ * `ctx.run(func, { input: cs })` with the critical section captured here rather than looked up later.
  *
  * Upstream, on why the critical section travels with the callback at all:
  *
@@ -716,7 +718,7 @@ export class OutputGate {
       // ← the `kj::defer(rejectIfCanceled)` arm that runs when the coroutine is destroyed.
       // Upstream leaves the dropped promise unobservable; here the caller still holds it, and a
       // promise that never settles is a hang nobody can see, so it takes the same exception.
-      onAbort(signal, () => {
+      const removeAbort = onAbort(signal, () => {
         // The guard comes first, as it does in `Waiter`. Upstream can call the hook before its
         // own check because `kj::defer` runs once ever, on whichever path exits the scope; an
         // abort listener can fire after the lock already settled, so the invariant to preserve
@@ -731,6 +733,7 @@ export class OutputGate {
 
       void raced.then(
         (value) => {
+          removeAbort();
           // kj would have destroyed this frame on cancellation; there is nothing left to settle.
           if (!fulfiller.isWaiting()) return;
           fulfiller.fulfill();
@@ -738,6 +741,7 @@ export class OutputGate {
           resolve(value);
         },
         (exception: unknown) => {
+          removeAbort();
           if (!fulfiller.isWaiting()) return;
           this.#setBroken(exception);
           fulfiller.reject(exception);

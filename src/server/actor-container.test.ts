@@ -11,10 +11,12 @@
 
 import { describe, expect, expectTypeOf, test, vi } from "vitest";
 import { createNodeSqlProvider } from "../../backends/node-sqlite";
+import { __gateAwait, __resumeAwait } from "../gate";
 import { DurableObjectClass } from "../api/actor";
 import { FACET_TREE_MAX_DEPTH } from "../api/actor-state";
 import type { AlarmInvocationInfo } from "../api/global-scope";
 import type { Timer } from "../io/io-context";
+import { CanceledError } from "../io/io-gate";
 import type { SqlDatabase, SqlDatabaseProvider } from "../util/sqlite";
 import { FacetDeletionReceiptStore } from "./facet-deletion";
 import type { ActorClassChannel } from "../io/io-channels";
@@ -403,6 +405,37 @@ describe("the composition", () => {
     expect(await entry.increment(1)).toBe(2);
   });
 
+  test("entry and run signals cancel queued admission without breaking the actor", async () => {
+    const { container } = await counterContainer();
+    await portHop();
+
+    const started = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const holding = container.run(() =>
+      container.state.blockConcurrencyWhile(async () => {
+        started.resolve();
+        await release.promise;
+      }),
+    );
+    await started.promise;
+
+    const controller = new AbortController();
+    const runBody = vi.fn(() => "run");
+    const entryBody = vi.fn(() => "entry");
+    const queuedRun = container.run(runBody, controller.signal);
+    const queuedEntry = container.entry({ call: entryBody }, controller.signal).call();
+    controller.abort();
+
+    await expect(queuedRun).rejects.toBeInstanceOf(CanceledError);
+    await expect(queuedEntry).rejects.toBeInstanceOf(CanceledError);
+    expect(runBody).not.toHaveBeenCalled();
+    expect(entryBody).not.toHaveBeenCalled();
+
+    release.resolve();
+    await holding;
+    await expect(container.run(() => "still alive")).resolves.toBe("still alive");
+  });
+
   test("isCurrentSlice identifies this container's synchronous body only", async () => {
     const first = await counterContainer();
     const second = await counterContainer();
@@ -445,6 +478,148 @@ describe("the composition", () => {
     expect(afterAwait).toBe(true);
     await checkpointEnd();
     expect(first.container.hasCurrent()).toBe(false);
+  });
+
+  test("resolveLoopback preserves direct call return types", async () => {
+    const { container } = await counterContainer();
+
+    const syncResult = container.resolveLoopback(() => 1, () => Promise.resolve(1));
+    expectTypeOf(syncResult).toEqualTypeOf<number | Promise<number>>();
+    const asyncResult = container.resolveLoopback(
+      async () => 1,
+      () => Promise.resolve(1),
+    );
+    expectTypeOf(asyncResult).toEqualTypeOf<Promise<number>>();
+  });
+
+  test("resolveLoopback invokes direct only for an exact self-call", async () => {
+    const actor = await counterContainer();
+    await portHop();
+
+    const direct = vi.fn(() => "direct");
+    const entered = actor.container.entry({ call: () => "entered" });
+    const enter = vi.fn(() => entered.call());
+
+    await expect(
+      actor.container.run(() => actor.container.resolveLoopback(direct, enter)),
+    ).resolves.toBe("direct");
+    await portHop();
+    await expect(actor.container.resolveLoopback(direct, enter)).resolves.toBe("entered");
+
+    expect(direct).toHaveBeenCalledOnce();
+    expect(enter).toHaveBeenCalledOnce();
+  });
+
+  test("resolveLoopback resumes through a structural caller after an untransformed await", async () => {
+    const parent = await counterContainer();
+    const facet = await counterContainer();
+    await portHop();
+
+    const direct = vi.fn(() => "direct");
+    const entered = parent.container.entry({ call: () => "entered" });
+    const enter = vi.fn(() => entered.call());
+
+    await expect(
+      parent.container.run(async () => {
+        await Promise.resolve();
+        return parent.container.resolveLoopback(direct, enter, parent.container);
+      }),
+    ).resolves.toBe("direct");
+
+    const order: string[] = [];
+    const outputWait = vi.spyOn(facet.container, "waitOutputLocks").mockImplementation(() => {
+      order.push("output");
+      return Promise.resolve();
+    });
+    await expect(
+      facet.container.run(async () => {
+        await Promise.resolve();
+        const value = await parent.container.resolveLoopback(
+          direct,
+          () => {
+            order.push("entry");
+            return enter();
+          },
+          facet.container,
+        );
+        await facet.instance.ctx.storage.get("still-gated");
+        return value;
+      }),
+    ).resolves.toBe("entered");
+    outputWait.mockRestore();
+    expect(order).toEqual(["output", "entry"]);
+
+    await portHop();
+    expect(() => parent.container.resolveLoopback(direct, enter, parent.container)).toThrow(
+      "resolveLoopback() caller has no current input lock",
+    );
+    expect(direct).toHaveBeenCalledOnce();
+    expect(enter).toHaveBeenCalledOnce();
+  });
+
+  test("resolveLoopback prefers the exact current slice over another held lock", async () => {
+    const parent = await counterContainer();
+    const facet = await counterContainer();
+    await portHop();
+
+    const direct = vi.fn(() => "direct");
+    const entered = parent.container.entry({ call: () => "entered" });
+    const enter = vi.fn(() => entered.call());
+
+    await expect(
+      parent.container.run(async () => {
+        __resumeAwait(await __gateAwait(portHop()));
+        return facet.container.run(async () => {
+          expect(parent.container.hasCurrent()).toBe(true);
+          expect(facet.container.isCurrentSlice()).toBe(true);
+          const value = await parent.container.resolveLoopback(direct, enter);
+          await facet.instance.ctx.storage.get("still-gated");
+          return value;
+        });
+      }),
+    ).resolves.toBe("entered");
+    expect(direct).not.toHaveBeenCalled();
+    expect(enter).toHaveBeenCalledOnce();
+  });
+
+  test("resolveLoopback follows a transformed caller continuation", async () => {
+    const caller = await counterContainer();
+    const target = await counterContainer();
+    await portHop();
+
+    const direct = vi.fn(() => "direct");
+    const entered = target.container.entry({ call: () => "entered" });
+
+    await expect(
+      caller.container.run(async () => {
+        __resumeAwait(await __gateAwait(portHop()));
+        expect(caller.container.isCurrentSlice()).toBe(false);
+        const value = await target.container.resolveLoopback(direct, () => entered.call());
+        await caller.instance.ctx.storage.get("still-gated");
+        return value;
+      }),
+    ).resolves.toBe("entered");
+    expect(direct).not.toHaveBeenCalled();
+    await portHop();
+  });
+
+  test("resolveLoopback keeps a transformed same-actor continuation direct", async () => {
+    const actor = await counterContainer();
+    await portHop();
+
+    const direct = vi.fn(() => "direct");
+    const entered = vi.fn(() => Promise.resolve("entered"));
+
+    await expect(
+      actor.container.run(async () => {
+        __resumeAwait(await __gateAwait(portHop()));
+        expect(actor.container.isCurrentSlice()).toBe(false);
+        return await actor.container.resolveLoopback(direct, entered);
+      }),
+    ).resolves.toBe("direct");
+    expect(direct).toHaveBeenCalledOnce();
+    expect(entered).not.toHaveBeenCalled();
+    await portHop();
   });
 
   test("transformed actor code re-enters before storage after a foreign await", async () => {

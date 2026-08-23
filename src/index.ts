@@ -33,7 +33,8 @@ export type {
 } from "./util/sqlite";
 export type { ReadOptions, WriteOptions } from "./io/actor-cache";
 export type { AlarmOutlet } from "./io/actor-sqlite";
-export type { Timer } from "./io/io-context";
+export { BrokenActorError, type Timer } from "./io/io-context";
+export { CanceledError } from "./io/io-gate";
 /**
  * The Worker Loader (§1.11, decision 15). Exported where the `api/` classes are
  * not, and for the reason `AlarmScheduler` is: this one is a **binding**, so a
