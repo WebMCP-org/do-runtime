@@ -136,7 +136,7 @@ export class AcceptedWebSocket extends EventTarget {
         // so both are called, exactly as `WebSocketFacade` does for the same reason.
         const handler = this[`on${type}`] as ((event: Event) => void) | null;
         handler?.(delivered);
-      }, this.#criticalSection),
+      }, { input: this.#criticalSection }),
     );
   }
 

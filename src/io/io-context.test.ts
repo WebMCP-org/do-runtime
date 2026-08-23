@@ -22,6 +22,7 @@ import {
 } from "./io-gate";
 import {
   BLOCK_CONCURRENCY_WHILE_TIMEOUT_MESSAGE,
+  BrokenActorError,
   type Actor,
   IoContext,
   type Timer,
@@ -528,6 +529,7 @@ it("§1.5 blockConcurrencyWhile times out at 30 seconds against the Timer port",
   const never = new Promise<string>(() => {});
 
   const blocking = blockConcurrencyWhile(ctx, () => never);
+  const failure = blocking.catch((exception: unknown) => exception);
   await quiesce();
   expect(timer.pendingCount).toBe(1);
 
@@ -536,8 +538,12 @@ it("§1.5 blockConcurrencyWhile times out at 30 seconds against the Timer port",
 
   timer.advance(1);
   await expect(onBroken).rejects.toThrow(BLOCK_CONCURRENCY_WHILE_TIMEOUT_MESSAGE);
-  // The deadline is a failure like any other, so the returned promise stays unsettled.
-  expect(await poll(blocking)).toBe(false);
+  const exception = await failure;
+  expect(exception).toBeInstanceOf(BrokenActorError);
+  expect(exception).toHaveProperty(
+    "cause",
+    new Error(BLOCK_CONCURRENCY_WHILE_TIMEOUT_MESSAGE),
+  );
 });
 
 it("§1.5 the deadline timer is cancelled when the callback wins", async () => {
@@ -547,22 +553,53 @@ it("§1.5 the deadline timer is cancelled when the callback wins", async () => {
   expect(timer.pendingCount).toBe(0);
 });
 
-it("§1.5 a failed critical section breaks the gate and never settles its promise", async () => {
-  // "we don't even bother calling resolver.reject() because it's meaningless at this
-  // point" — the actor is aborted instead, which is what the caller observes.
+it("§1.5 a failed critical section breaks the gate and rejects its same-realm caller", async () => {
   const { ctx, actor } = newContext();
-  const onBroken = actor.inputGate.onBroken();
-  const onAbort = ctx.onAbort();
+  const onBroken = actor.inputGate.onBroken().catch((exception: unknown) => exception);
+  const onAbort = ctx.onAbort().catch((exception: unknown) => exception);
+  const cause = new Error("boot failed");
 
   const blocking = blockConcurrencyWhile(ctx, () => {
-    throw new Error("boot failed");
+    throw cause;
+  });
+  const failure = blocking.catch((exception: unknown) => exception);
+
+  const exception = await failure;
+  expect(exception).toBeInstanceOf(BrokenActorError);
+  expect(exception).toHaveProperty("cause", cause);
+  expect(await onBroken).toBe(exception);
+  expect(await onAbort).toBe(exception);
+  // Every future wait rejects, forever.
+  expect(await ctx.run(() => "later").catch((error: unknown) => error)).toBe(exception);
+});
+
+it("§1.5 nested critical-section failures reuse one BrokenActorError", async () => {
+  const { ctx } = newContext();
+  const cause = new Error("nested failure");
+
+  const exception = await blockConcurrencyWhile(
+    ctx,
+    async () =>
+      await ctx.blockConcurrencyWhile(() => {
+        throw cause;
+      }),
+  ).catch((error: unknown) => error);
+
+  expect(exception).toBeInstanceOf(BrokenActorError);
+  expect(exception).toHaveProperty("cause", cause);
+});
+
+it("§1.5 an ignored failed section does not create an unhandled rejection", async () => {
+  const { ctx } = newContext();
+  const onAbort = ctx.onAbort().catch((exception: unknown) => exception);
+
+  await ctx.run(() => {
+    void ctx.blockConcurrencyWhile(() => {
+      throw new Error("ignored failure");
+    });
   });
 
-  await expect(onBroken).rejects.toThrow("boot failed");
-  await expect(onAbort).rejects.toThrow("boot failed");
-  expect(await poll(blocking)).toBe(false);
-  // Every future wait rejects, forever.
-  await expect(ctx.run(() => "later")).rejects.toThrow("boot failed");
+  await expect(onAbort).resolves.toBeInstanceOf(BrokenActorError);
 });
 
 it("§1.5 a failure is annotated broken.inputGateBroken exactly once", async () => {
@@ -573,8 +610,10 @@ it("§1.5 a failure is annotated broken.inputGateBroken exactly once", async () 
     throw new Error("boom");
   });
 
-  expect(await poll(blocking)).toBe(false);
-  await expect(onBroken).rejects.toThrow("broken.inputGateBroken; boom");
+  await expect(blocking).rejects.toBeInstanceOf(BrokenActorError);
+  await expect(onBroken).rejects.toThrow(
+    "broken.inputGateBroken; The Durable Object was reset after its input gate broke: boom",
+  );
 });
 
 it("§1.5 an abandoned critical section hands its parent lock back", async () => {
@@ -588,7 +627,7 @@ it("§1.5 an abandoned critical section hands its parent lock back", async () =>
     throw new Error("boom");
   });
 
-  expect(await poll(blocking)).toBe(false);
+  await expect(blocking).rejects.toBeInstanceOf(BrokenActorError);
   await quiesce();
 
   expect(counts.locked).toBe(counts.released);
@@ -841,8 +880,7 @@ it("§1.2 a timer armed inside a critical section runs inside that section", asy
   const section = blockConcurrencyWhile(ctx, async (lock) => {
     // Read synchronously: a `Lock` is released at the end of the slice that holds it, and
     // `getCriticalSection()` on a released one throws. That throw would fail the critical
-    // section, and a failed one is never settled at all (§1.5) — so the mistake presents as a
-    // hung test rather than as an assertion, which is worth knowing before making it.
+    // section and reject with BrokenActorError (§1.5).
     const own = lock.getCriticalSection();
     ctx.setTimeoutImpl(
       false,

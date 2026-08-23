@@ -17,3 +17,8 @@ for (const name of await readdir(dist, { recursive: true })) {
 
   if (fixed !== source) await writeFile(file, fixed);
 }
+
+await writeFile(
+  new URL("cloudflare-workers.d.ts", dist),
+  'export * from "./src/api/cloudflare-workers.js";\n',
+);

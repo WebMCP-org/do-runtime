@@ -57,7 +57,7 @@ import type { AlarmOutlet } from "../io/actor-sqlite";
 import { ActorSqlite, DEFAULT_ALARM_OUTLET } from "../io/actor-sqlite";
 import type { AlarmResult } from "./alarm-scheduler";
 import type { Actor, Timer } from "../io/io-context";
-import { IoContext, captureGateStack } from "../io/io-context";
+import { IoContext, captureGateStack, tryCurrentIoContext } from "../io/io-context";
 import { InputGate, OutputGate } from "../io/io-gate";
 import type { FacetManager, FacetStartInfo } from "../io/worker";
 import { asFacetStub } from "../io/worker";
@@ -401,14 +401,27 @@ export interface ActorContainer {
    * when its synchronous body returns, but the lock it took drains the whole
    * microtask checkpoint (§1.2), so actor code chained one promise past a gated
    * resumption is lock-holding without being slice-current. That window is
-   * where a host stub still has a caller to identify: an outbound call made
-   * there must resume through the caller's `awaitIo`, or the code after it
-   * comes back with no input lock and its next storage call throws. A host
-   * that resolves callers with `isCurrentSlice()` alone routes exactly those
-   * calls ungated, which is how the loss stays invisible until three layers
-   * later.
+   * where an outbound call must resume through the caller's `awaitIo`, or the
+   * code after it comes back with no input lock and its next storage call
+   * throws. Lock state is not caller identity: a parent and its running facet
+   * can both return true. `resolveLoopback()` owns that decision.
    */
   hasCurrent(): boolean;
+
+  /**
+   * Resolve an in-realm actor call without making the host infer caller identity.
+   * A call from this exact actor context uses the raw instance; every other call
+   * uses its gated entry, routed through the caller's output gate and `awaitIo`
+   * when there is one. The runtime resolves a current slice or
+   * transformed continuation first; `caller` is the lock-holding structural
+   * fallback for untransformed post-await code. Both callbacks are lazy: only
+   * the selected invocation runs.
+   */
+  resolveLoopback<Result>(
+    invokeDirect: () => Result,
+    invokeEntry: () => Promise<Awaited<Result>>,
+    caller?: ActorContainer,
+  ): Result | Promise<Awaited<Result>>;
 
   /**
    * Construct the instance under workerd's boot semantics: the input gate is
@@ -426,19 +439,21 @@ export interface ActorContainer {
    * lock across an await. That is §1.2's whole content and the suite pins it: a
    * second event posted while a storage await holds the gate must not interleave,
    * and a door that reused the held lock could not tell that event apart from a
-   * call the actor made to itself. Telling them apart needs to know WHO is
-   * calling, which is a host's question rather than a container's — see the
-   * extension host's `loopbackStub`, where an actor reaching its own
-   * `DurableObjectNamespace` binding skips this door entirely because the lock it
-   * would take is the one it is already holding.
+   * call the actor made to itself. `resolveLoopback()` makes that distinction:
+   * an actor reaching its own `DurableObjectNamespace` binding from its exact
+   * current context skips this door because the lock it would take is the one
+   * it holds. `signal` is bound to the returned proxy and cancels invocations
+   * that are still waiting for admission; it does not interrupt an admitted
+   * method or its output-gate drain.
    */
-  entry<T extends object>(target: T): ActorEntry<T>;
+  entry<T extends object>(target: T, signal?: AbortSignal): ActorEntry<T>;
 
   /**
    * The door for events that are not method calls — one WebSocket frame, one
-   * host-originated callback. Upstream: `IoContext::run`.
+   * host-originated callback. Upstream: `IoContext::run`. `signal` cancels only
+   * while the event is queued for an input lock.
    */
-  run<T>(event: () => T | PromiseLike<T>): Promise<T>;
+  run<T>(event: () => T | PromiseLike<T>, signal?: AbortSignal): Promise<T>;
 
   /**
    * ← `IoContext::awaitIo`. The form a HOST-PROVIDED async primitive must take,
@@ -1337,6 +1352,24 @@ class ActorContainerImpl implements ActorContainer {
     return this.#ctx.hasCurrent();
   }
 
+  resolveLoopback<Result>(
+    invokeDirect: () => Result,
+    invokeEntry: () => Promise<Awaited<Result>>,
+    caller?: ActorContainer,
+  ): Result | Promise<Awaited<Result>> {
+    const context = tryCurrentIoContext();
+    if (context === this.#ctx) return invokeDirect();
+    if (context !== undefined) {
+      return context.awaitIo(context.waitForOutputLocks().then(invokeEntry));
+    }
+    if (caller === undefined) return invokeEntry();
+    if (!caller.hasCurrent()) {
+      throw new Error("resolveLoopback() caller has no current input lock");
+    }
+    if (caller === this) return invokeDirect();
+    return caller.awaitIo(caller.waitOutputLocks().then(invokeEntry));
+  }
+
   /**
    * ← `ActorContainer::start` (`server.c++:2854-2957`) as far as the class
    * instance, plus decision 4's boot semantics.
@@ -1363,7 +1396,7 @@ class ActorContainerImpl implements ActorContainer {
     }
   }
 
-  entry<T extends object>(target: T): ActorEntry<T> {
+  entry<T extends object>(target: T, signal?: AbortSignal): ActorEntry<T> {
     const bound = new Map<string | symbol, unknown>();
 
     return new Proxy(target, {
@@ -1379,10 +1412,12 @@ class ActorContainerImpl implements ActorContainer {
           // The dispatch is the one moment that knows both the method name and
           // the caller's frames — the provenance `describeLostLock` reports.
           this.#ctx.noteGateUse(`entry ${String(property)}()`, captureGateStack());
-          const result = await this.#ctx.run(() =>
-            this.#withExternalEntry(() =>
-              (value as (...rest: unknown[]) => unknown).apply(subject, args),
-            ),
+          const result = await this.#ctx.run(
+            () =>
+              this.#withExternalEntry(() =>
+                (value as (...rest: unknown[]) => unknown).apply(subject, args),
+              ),
+            { signal },
           );
           // ← the reply being piped through `waitForOutputLocks()`. This is §1.1's whole point:
           // a method that returns without awaiting its own write still must not answer before
@@ -1431,8 +1466,11 @@ class ActorContainerImpl implements ActorContainer {
     });
   }
 
-  run<T>(event: () => T | PromiseLike<T>): Promise<T> {
-    return this.#ctx.run(() => this.#withExternalEntry(event));
+  run<T>(event: () => T | PromiseLike<T>, signal?: AbortSignal): Promise<T> {
+    return this.#ctx.run(
+      () => this.#withExternalEntry(event),
+      { signal },
+    );
   }
 
   #withExternalEntry<T>(body: () => T): T {
@@ -1460,7 +1498,7 @@ class ActorContainerImpl implements ActorContainer {
    *
    * "Alarms enter with no lock and no critical section, so an alarm queues behind
    * any held lock and takes a fresh top-level lock" (§1.8) — which is exactly
-   * `ctx.run(func)` with no third argument. The retry ladder and the watchdog are
+   * `ctx.run(func)` with no input option. The retry ladder and the watchdog are
    * `server/alarm-scheduler.ts`'s; what is here is one delivery, and the
    * serialization of one delivery against the next, which is the property
    * `_cf_executingScheduleRowId` upstream depends on.

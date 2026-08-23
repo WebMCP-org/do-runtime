@@ -1,13 +1,10 @@
 /* @do-runtime-gated */
 
-import { atCheckpointEnd, tryCurrentSlice, type IoContext } from "./io/io-context";
-
-type ContinuationContext = {
-  readonly context: IoContext;
-  readonly token: object;
-};
-
-let continuationContext: ContinuationContext | undefined;
+import {
+  tryCurrentContinuation,
+  tryCurrentIoContext,
+  type IoContext,
+} from "./io/io-context";
 
 type Publication = {
   readonly publish: () => Promise<void>;
@@ -19,6 +16,7 @@ type Outcome<T> =
   | { readonly ok: false; readonly exception: unknown };
 
 const TRANSFORMED_AWAIT = Symbol("@mcp-b/do-runtime/transformed-await");
+const warnedUngatedAwaits = new Set<string>();
 
 type TransformedAwait<T> = {
   readonly [TRANSFORMED_AWAIT]: true;
@@ -35,16 +33,28 @@ function isThenable(value: unknown): value is PromiseLike<unknown> {
 
 /** Re-enter the actor that owns this transformed await; fail open outside actors. */
 export function __gate<T>(value: T): T | Promise<Awaited<T>> {
-  const context = tryCurrentSlice() ?? continuationContext?.context;
+  const context = tryCurrentIoContext();
   if (!isThenable(value) && context === undefined) return value;
   if (context === undefined) return value;
   return resumeWithContext(context, Promise.resolve(value));
 }
 
 /** Capture an actor await without publishing its context before the continuation runs. */
-export function __gateAwait<T>(value: T): T | Promise<TransformedAwait<Awaited<T>>> {
-  const context = tryCurrentSlice() ?? continuationContext?.context;
-  if (context === undefined) return value;
+export function __gateAwait<T>(
+  value: T,
+  developmentSource?: string,
+): T | Promise<TransformedAwait<Awaited<T>>> {
+  const context = tryCurrentIoContext();
+  if (context === undefined) {
+    if (developmentSource !== undefined && !warnedUngatedAwaits.has(developmentSource)) {
+      warnedUngatedAwaits.add(developmentSource);
+      console.warn(
+        `do-runtime: transformed await in ${developmentSource} ran without an actor input lock; ` +
+          "an earlier await or entry path is not gated",
+      );
+    }
+    return value;
+  }
   return resumeAwaitWithContext(context, Promise.resolve(value));
 }
 
@@ -52,21 +62,13 @@ export function __gateAwait<T>(value: T): T | Promise<TransformedAwait<Awaited<T
 export function __resumeAwait<T>(value: T | TransformedAwait<T>): T {
   if (!isTransformedAwait(value)) return value as T;
 
-  restoreContinuation(value.context);
+  value.context.restoreContinuation();
   if (value.outcome.ok) return value.outcome.value;
   throw value.outcome.exception;
 }
 
 function isTransformedAwait<T>(value: T | TransformedAwait<T>): value is TransformedAwait<T> {
   return Reflect.get(Object(value), TRANSFORMED_AWAIT) === true;
-}
-
-function restoreContinuation(context: IoContext): void {
-  const token = {};
-  continuationContext = { context, token };
-  atCheckpointEnd(() => {
-    if (continuationContext?.token === token) continuationContext = undefined;
-  });
 }
 
 function publishOutcome<T, Result>(
@@ -76,7 +78,7 @@ function publishOutcome<T, Result>(
 ): Promise<Result> {
   return new Promise<Result>((resolve, reject) => {
     const publish = context.makeTransformReentryCallback((outcome: Outcome<T>) => {
-      if (continuationContext !== undefined) {
+      if (tryCurrentContinuation() !== undefined) {
         schedulePublication({ publish: () => publish(outcome), reject });
         return;
       }
@@ -106,7 +108,7 @@ function resumeAwaitWithContext<T>(
 
 function resumeWithContext<T>(context: IoContext, promise: Promise<T>): Promise<T> {
   return publishOutcome(context, promise, (outcome) => {
-    restoreContinuation(context);
+    context.restoreContinuation();
     if (outcome.ok) return outcome.value;
     throw outcome.exception;
   });

@@ -25,6 +25,7 @@ for (const required of [
   "CHANGELOG.md",
   "dist/index.js",
   "dist/src/index.d.ts",
+  "dist/cloudflare-workers.d.ts",
   "dist/backends/node-sqlite.js",
   "dist/backends/sqlite-wasm.js",
   "dist/gate.js",
@@ -61,6 +62,9 @@ const gate = modules.get("./gate");
 const vite = modules.get("./vite");
 if (typeof runtime.createActorContainer !== "function") {
   throw new Error("packed root entry does not export createActorContainer");
+}
+if (typeof runtime.BrokenActorError !== "function" || typeof runtime.CanceledError !== "function") {
+  throw new Error("packed root entry does not export its actor lifecycle errors");
 }
 if (typeof nodeBackend.createNodeSqlProvider !== "function") {
   throw new Error("packed Node backend does not export createNodeSqlProvider");

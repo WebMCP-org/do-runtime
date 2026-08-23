@@ -26,7 +26,7 @@
  * "wrap it in awaitIo" would be wrong three ways:
  *
  *  - **Timers** capture the critical section at the ARMING call and re-enter
- *    through `ctx.run(callback, cs)` when they fire. Not `awaitIo`, deliberately
+ *    through `ctx.run(callback, { input: cs })` when they fire. Not `awaitIo`, deliberately
  *    — see `TimeoutManager` in `io/io-context.ts` for upstream's own reason.
  *  - **`fetch`** is `awaitIo` (`http.c++` has ten of them and zero
  *    `awaitIoWithInputLock`), preceded by an output-gate wait so nothing departs

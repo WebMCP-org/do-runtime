@@ -35,7 +35,7 @@
  *     Upstream is the same: `getCriticalSection()` (`io-context.c++:362`) does
  *     not touch `currentInputLock`, and `:1214` is the only place that clears
  *     it. The difference between the two forms is entirely on the far side —
- *     `awaitIo` re-enters through `run(func, criticalSection)` and queues for a
+ *     `awaitIo` re-enters through `run(func, { input: criticalSection })` and queues for a
  *     fresh lock, `awaitIoWithInputLock` re-enters holding the ref it took.
  *  4. Removal from the stack is by identity, not by popping, because entries do
  *     overlap — three deep in the unit tests. One invocation can have several
@@ -97,10 +97,10 @@
  * makes impossible; hang detection and `registerPendingEvent`, which need the
  * isolate's own idea of pending work; and the thread-local
  * `IoContext::current()` static, whose lock-resolving half the invocation stack
- * replaces — its *identity* half is `currentSlice` below, narrowed to the
- * synchronous slice, with one consumer and no resolver. `EventOutcome` and
- * `RequestObserver` are metrics types with no port, so `waitUntilStatus()`
- * returns the first exception instead.
+ * replaces — its *identity* half is `currentSlice` below for synchronous code
+ * and the await transform's captured continuation for post-await code. Neither
+ * identity resolves a lock. `EventOutcome` and `RequestObserver` are metrics
+ * types with no port, so `waitUntilStatus()` returns the first exception instead.
  */
 
 import {
@@ -162,6 +162,16 @@ export const BLOCK_CONCURRENCY_WHILE_TIMEOUT_MS = 30_000;
 export const BLOCK_CONCURRENCY_WHILE_TIMEOUT_MESSAGE =
   "A call to blockConcurrencyWhile() in a Durable Object waited for too long. " +
   "The call was canceled and the Durable Object was reset.";
+
+/** A critical-section failure reset the actor before its caller could continue. */
+export class BrokenActorError extends Error {
+  override readonly name = "BrokenActorError";
+
+  constructor(cause: unknown) {
+    const detail = cause instanceof Error ? `: ${cause.message}` : "";
+    super(`The Durable Object was reset after its input gate broke${detail}`, { cause });
+  }
+}
 
 /** ← `jsg::annotateBroken(msg, "broken.inputGateBroken")`. */
 const INPUT_GATE_BROKEN_PREFIX = "broken.inputGateBroken; ";
@@ -328,12 +338,10 @@ const pendingCheckpointEnds: (() => void)[] = [];
 /**
  * ← `static thread_local IoContext* threadLocalRequest` (`io-context.c++:25`).
  *
- * **This is NOT an async context and must not become one.** It is set on entry
- * to a slice's SYNCHRONOUS body and restored the instant that body returns —
- * which for an `async` function is its first `await`. It propagates through
- * exactly nothing. The package's "no async context is required" property
- * (README, Part 4 mechanic 1) is undisturbed: nothing resolves a lock through
- * this, and deleting it would change no gate behaviour.
+ * `CURRENT_SLICE` is NOT an async context. It is set on entry to a slice's
+ * SYNCHRONOUS body and restored the instant that body returns — which for an
+ * `async` function is its first `await`. It propagates through exactly nothing,
+ * and neither identity below resolves a lock.
  *
  * Upstream's scope is wider and cannot be matched. `runInContextScope` saves the
  * previous context, installs itself, and restores at the end of the isolate run
@@ -346,19 +354,40 @@ const pendingCheckpointEnds: (() => void)[] = [];
  * a parent against its child), and the value would be wrong with nothing to say
  * so.
  *
- * So the port keeps only the half that is exact, and the one consumer is a
- * tripwire that refuses on mismatch and stays quiet on `undefined` — never a
- * resolver. See `requireOwnSlice` in `api/global-scope.ts`.
+ * So the port keeps that exact synchronous half. The await transform separately
+ * restores the context it captured at the await's first continuation instruction;
+ * `tryCurrentIoContext()` combines the two exact windows for loopback routing.
+ * Both values are realm-shared so separately bundled host and actor copies agree.
  */
 const CURRENT_SLICE = Symbol.for("@mcp-b/do-runtime/current-slice");
+const CURRENT_CONTINUATION = Symbol.for("@mcp-b/do-runtime/current-continuation");
+
+type CurrentContinuation = {
+  readonly context: IoContext;
+};
 
 function currentSlice(): IoContext | undefined {
   return Reflect.get(globalThis, CURRENT_SLICE) as IoContext | undefined;
 }
 
+function currentContinuation(): CurrentContinuation | undefined {
+  return Reflect.get(globalThis, CURRENT_CONTINUATION) as CurrentContinuation | undefined;
+}
+
 /** ← `IoContext::tryCurrent()` (`io-context.c++:1416-1422`), over the narrowed scope above. */
 export function tryCurrentSlice(): IoContext | undefined {
   return currentSlice();
+}
+
+/** The actor continuation restored by the await transform, if one is running. */
+export function tryCurrentContinuation(): IoContext | undefined {
+  const context = currentContinuation()?.context;
+  return context?.hasCurrent() === true ? context : undefined;
+}
+
+/** The exact actor calling now, across both a synchronous slice and a transformed continuation. */
+export function tryCurrentIoContext(): IoContext | undefined {
+  return currentSlice() ?? tryCurrentContinuation();
 }
 
 /**
@@ -497,7 +526,7 @@ type TimeoutState = {
  * ugly, but using awaitIo() doesn't work here because we need the ability to
  * cancel the timer, so we don't want to addTask() it, which awaitIo() does
  * implicitly." So the shape is `cs = ctx.getCriticalSection()` captured at the
- * call, then `ctx.run(callback, cs)` when it fires. The captured section is what
+ * call, then `ctx.run(callback, { input: cs })` when it fires. The captured section is what
  * makes a timer armed inside `blockConcurrencyWhile` run INSIDE that section
  * rather than queueing on the root gate behind it.
  *
@@ -629,7 +658,7 @@ class TimeoutManager {
       } finally {
         if (state.params.repeat && !state.isCanceled) this.#arm(ctx, id, state);
       }
-    }, criticalSection);
+    }, { input: criticalSection });
   }
 }
 
@@ -770,6 +799,17 @@ export class IoContext {
    */
   isCurrentSlice(): boolean {
     return currentSlice() === this;
+  }
+
+  /** Publish this transformed continuation through the same checkpoint queue as its lock. */
+  restoreContinuation(): void {
+    const current: CurrentContinuation = { context: this };
+    Reflect.set(globalThis, CURRENT_CONTINUATION, current);
+    atCheckpointEnd(() => {
+      if (currentContinuation() === current) {
+        Reflect.deleteProperty(globalThis, CURRENT_CONTINUATION);
+      }
+    });
   }
 
   /**
@@ -988,11 +1028,15 @@ export class IoContext {
    * ← the two `IoContext::run()` overloads: given a CriticalSection it waits on that, given
    * an already-held Lock it runs under it, and given neither it takes a fresh lock from the
    * gate. The third case is what a new external event does, and it is the reason inheritance
-   * cannot be read from gate state — see `makeReentryCallback`.
+   * cannot be read from gate state — see `makeReentryCallback`. `signal` cancels only the wait
+   * for admission; once a lock is acquired the slice runs normally.
    */
   async run<T>(
     func: (lock: Lock) => T | PromiseLike<T>,
-    ilOrCs?: Lock | CriticalSection,
+    options?: {
+      readonly input?: Lock | CriticalSection | undefined;
+      readonly signal?: AbortSignal | undefined;
+    },
   ): Promise<T> {
     // Before we try running anything, let's make sure our IoContext hasn't been aborted. If it
     // has been aborted, there's likely not an active request so later operations will fail
@@ -1002,13 +1046,14 @@ export class IoContext {
       throw aborted.exception;
     }
 
+    const input = options?.input;
     let lock: Lock;
-    if (ilOrCs === undefined) {
-      lock = await this.#actor.getInputGate().wait();
-    } else if (ilOrCs instanceof CriticalSection) {
-      lock = await ilOrCs.wait();
+    if (input === undefined) {
+      lock = await this.#actor.getInputGate().wait(options?.signal);
+    } else if (input instanceof CriticalSection) {
+      lock = await input.wait(options?.signal);
     } else {
-      lock = ilOrCs;
+      lock = input;
     }
 
     return await this.#runImpl(func, lock);
@@ -1032,7 +1077,7 @@ export class IoContext {
    *
    * It does not route through `io-gate.ts`'s `makeReentryCallback`, which is the same idea
    * expressed at the gate. Upstream's `IoContext::makeReentryCallback` is literally
-   * `ctx.run(func, cs)`, and going through the gate helper instead would take a lock this
+   * `ctx.run(func, { input: cs })`, and going through the gate helper instead would take a lock this
    * file then has to make current a second time. The gate copy stays: it is the shape a
    * consumer holding only a gate needs, and Section 1's tests cover it.
    */
@@ -1049,7 +1094,7 @@ export class IoContext {
 
     return async (...args: Args): Promise<Result> => {
       this.noteGateUse("a re-entry callback registered at the site below", registrationStack);
-      const call = this.run((lock) => func(lock, ...args), criticalSection);
+      const call = this.run((lock) => func(lock, ...args), { input: criticalSection });
 
       // ← the `addTask()` + `registerPendingEvent()` pair, which keeps the context live while
       // a callback is outstanding. Upstream scopes that to the callback's lifetime via a
@@ -1074,7 +1119,7 @@ export class IoContext {
    * Waits for some background I/O to complete, then executes `func` on the result.
    *
    * The input lock is NOT held across the wait: the resumption re-enters through
-   * `run(func, criticalSection)` and takes a fresh lock, so it queues behind whatever
+   * `run(func, { input: criticalSection })` and takes a fresh lock, so it queues behind whatever
    * arrived in the meantime. This is what makes a Durable Object awaiting another Durable
    * Object fully re-entrant (§1.3).
    *
@@ -1110,7 +1155,7 @@ export class IoContext {
     };
 
     return (...args: Args): Promise<Result> => {
-      const call = this.run(() => func(...args), criticalSection);
+      const call = this.run(() => func(...args), { input: criticalSection });
       this.addTask(
         call.then(
           () => {},
@@ -1161,14 +1206,15 @@ export class IoContext {
    *
    * Three behaviours live here rather than in `io-gate.ts`, which has no timer, and rather
    * than in `api/actor-state.ts`, whose own `blockConcurrencyWhile` is a one-line forward:
-   * the 30-second deadline, the brokenness annotation, and the fact that on failure the
-   * returned promise is never settled at all.
+   * the 30-second deadline, the brokenness annotation, and the typed rejection returned to
+   * the same-realm caller after the actor is broken.
    */
   blockConcurrencyWhile<T>(callback: (lock: Lock) => T | PromiseLike<T>): Promise<T> {
     const lock = this.getInputLock();
     this.noteGateUse("blockConcurrencyWhile", captureGateStack());
     const criticalSection = lock.startCriticalSection();
-    const { promise: result, resolve } = Promise.withResolvers<T>();
+    const { promise: result, resolve, reject } = Promise.withResolvers<T>();
+    void result.catch(() => {});
 
     this.addTask(
       (async () => {
@@ -1183,15 +1229,13 @@ export class IoContext {
         } catch (exception) {
           // Annotate as broken for periodic metrics. If we already set up a brokenness reason,
           // we shouldn't override it.
-          annotateInputGateBroken(exception);
+          const broken =
+            exception instanceof BrokenActorError ? exception : new BrokenActorError(exception);
+          annotateInputGateBroken(broken);
+          criticalSection.failed(broken);
+          reject(broken);
 
-          // Note that on failure, no further InputLocks will be obtainable and the actor will
-          // shut down, so don't worry about holding a lock until we get back to application
-          // code -- we won't! In fact, we don't even bother calling resolver.reject() because
-          // it's meaningless at this point.
-          criticalSection.failed(exception);
-
-          throw exception;
+          throw broken;
         } finally {
           // ← `~CriticalSection`. A no-op after `succeeded()`; on the failure path it is what
           // hands the parent lock back, since `failed()` does not.
@@ -1265,7 +1309,8 @@ export class IoContext {
    * ← `awaitIoImpl()`.
    *
    * The KJ-side rejection is merged into the value so a single continuation handles both, the
-   * continuation re-enters through `run(func, ilOrCs)`, and the whole thing rides `addTask()`.
+   * continuation re-enters through `run(func, { input: ilOrCs })`, and the whole thing rides
+   * `addTask()`.
    * When `ilOrCs` is a Lock this is `awaitIoWithInputLock` and the gate never opened; when it
    * is a CriticalSection or nothing this is `awaitIo` and the resumption queues for a fresh
    * lock like any other event.
@@ -1291,7 +1336,7 @@ export class IoContext {
             } else {
               reject(outcome.exception);
             }
-          }, ilOrCs);
+          }, { input: ilOrCs });
         } catch (exception) {
           // `run()` refuses to re-enter an aborted context, and both of its throws happen
           // before the lock reaches the invocation stack. Upstream would destroy the whole

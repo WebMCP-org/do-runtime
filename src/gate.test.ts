@@ -1,7 +1,13 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import { __gate, __gateAsyncIterable, __gateAwait, __resumeAwait } from "./gate";
 import { InputGate, OutputGate } from "./io/io-gate";
-import { IoContext, requireInputLock, type Actor, type Timer } from "./io/io-context";
+import {
+  BrokenActorError,
+  IoContext,
+  requireInputLock,
+  type Actor,
+  type Timer,
+} from "./io/io-context";
 
 const timer: Timer = {
   now: () => Date.now(),
@@ -51,6 +57,25 @@ describe("__gate", () => {
 
     expect(__gate(value)).toBe(value);
     expect(__gate(thenable)).toBe(thenable);
+  });
+
+  test("warns once only when a development transform reaches a lockless continuation", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const value = Promise.resolve("done");
+    try {
+      expect(__gateAwait(value)).toBe(value);
+      const context = newContext();
+      await context.run(async () => {
+        __resumeAwait(await __gateAwait(value, "/actor-with-a-lock.js"));
+      });
+      await portHop();
+      expect(__gateAwait(value, "/actor-with-a-gap.js")).toBe(value);
+      expect(__gateAwait(value, "/actor-with-a-gap.js")).toBe(value);
+      expect(warn).toHaveBeenCalledOnce();
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("/actor-with-a-gap.js"));
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   test("re-enters the same actor after sequential foreign awaits", async () => {
@@ -194,6 +219,54 @@ describe("__gate", () => {
 });
 
 describe("transformed await resume", () => {
+  test("preserves BrokenActorError when a failed section cannot re-enter", async () => {
+    const context = newContext();
+    const cause = new Error("section failed");
+
+    const exception = await context.run(async () => {
+      try {
+        __resumeAwait(
+          await __gateAwait(
+            context.blockConcurrencyWhile(() => {
+              throw cause;
+            }),
+          ),
+        );
+        return undefined;
+      } catch (error) {
+        return error;
+      }
+    });
+
+    expect(exception).toBeInstanceOf(BrokenActorError);
+    expect(exception).toHaveProperty("cause", cause);
+  });
+
+  test("ignores a continuation marker after its input lock is gone", () => {
+    const context = newContext();
+    const key = Symbol.for("@mcp-b/do-runtime/current-continuation");
+    const value = Promise.resolve("outside");
+    Reflect.set(globalThis, key, { context, token: {} });
+
+    try {
+      expect(__gate(value)).toBe(value);
+    } finally {
+      Reflect.deleteProperty(globalThis, key);
+    }
+  });
+
+  test("publishes continuation identity for separately bundled runtime copies", async () => {
+    const context = newContext();
+    const key = Symbol.for("@mcp-b/do-runtime/current-continuation");
+
+    await context.run(async () => {
+      __resumeAwait(await __gateAwait(portHop()));
+      expect(Reflect.get(globalThis, key)).toMatchObject({ context });
+    });
+    await portHop();
+    expect(Reflect.has(globalThis, key)).toBe(false);
+  });
+
   test("restores context at the first instruction after fulfillment", async () => {
     const context = newContext();
 

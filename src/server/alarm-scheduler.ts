@@ -890,8 +890,5 @@ function requireRange(actorId: string, column: string, value: number, max: numbe
 /** ← `ensureInitialized` (`alarm-scheduler.c++:50-60`). */
 function ensureInitialized(db: SqliteDatabase): void {
   hasCurrentSqliteTable(db, "_cf_ALARM", STMT.createTable);
-  // TODO(sqlite): Do this automatically at a lower layer?
-  db.run("PRAGMA journal_mode=WAL");
-
   db.run(STMT.createTable);
 }
