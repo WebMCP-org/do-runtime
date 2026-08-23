@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.3
+
+### Patch Changes
+
+- 9484c98: Let transformed actor code re-enter containers created by a separately bundled copy of the runtime.
+
 ## 0.3.2
 
 ### Patch Changes
