@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.2
+
+### Patch Changes
+
+- 9b747e8: Prevent a transformed await waiting on one actor's input gate from blocking transformed continuations in other actors.
+
 ## 0.3.1
 
 ### Patch Changes
