@@ -18,9 +18,6 @@ type Outcome<T> =
   | { readonly ok: true; readonly value: T }
   | { readonly ok: false; readonly exception: unknown };
 
-// ponytail: one module-wide queue; shard by actor only if settled-await contention is measured.
-const publications: Publication[] = [];
-
 function isThenable(value: unknown): value is PromiseLike<unknown> {
   return (
     (typeof value === "object" && value !== null) ||
@@ -36,53 +33,45 @@ export function __gate<T>(value: T): T | Promise<Awaited<T>> {
   return resumeWithContext(context, Promise.resolve(value));
 }
 
-/**
- * Resolve one transformed await per task, inside a fresh actor slice. Starting
- * from a task with an empty microtask queue makes its continuation the only code
- * between publishing and clearing the actor identity. A shared queue prevents
- * two actors that settle together from overwriting each other's publication.
- */
-function enqueuePublication(publication: Publication): void {
-  publications.push(publication);
-  if (publications.length === 1) schedulePublication();
-}
-
 function resumeWithContext<T>(context: IoContext, promise: Promise<T>): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const publish = context.makeTransformReentryCallback((outcome: Outcome<T>) => {
+      if (continuationContext !== undefined) {
+        schedulePublication({ publish: () => publish(outcome), reject });
+        return;
+      }
       const token = {};
       continuationContext = { context, token };
       if (outcome.ok) resolve(outcome.value);
       else reject(outcome.exception);
       queueMicrotask(() => {
         if (continuationContext?.token === token) continuationContext = undefined;
-        publications.shift();
-        if (publications.length > 0) schedulePublication();
       });
     });
     void promise.then(
       (value) => {
-        enqueuePublication({ publish: () => publish({ ok: true, value }), reject });
+        schedulePublication({ publish: () => publish({ ok: true, value }), reject });
       },
       (exception: unknown) => {
-        enqueuePublication({ publish: () => publish({ ok: false, exception }), reject });
+        schedulePublication({ publish: () => publish({ ok: false, exception }), reject });
       },
     );
   });
 }
 
-function schedulePublication(): void {
+/**
+ * Resolve one transformed await per task, inside a fresh actor slice. Admission
+ * attempts are independent so a blocked actor cannot stall the actor that will
+ * unblock it. The task boundary keeps each continuation ambient isolated.
+ */
+function schedulePublication(publication: Publication): void {
   const channel = new MessageChannel();
   channel.port1.onmessage = () => {
     channel.port1.close();
     channel.port2.close();
-    const publication = publications[0];
-    if (publication === undefined) return;
 
     void publication.publish().catch((exception: unknown) => {
       publication.reject(exception);
-      publications.shift();
-      if (publications.length > 0) schedulePublication();
     });
   };
   channel.port2.postMessage(undefined);
