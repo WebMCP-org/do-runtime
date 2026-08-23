@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { __gate, __gateAsyncIterable } from "./gate";
+import { __gate, __gateAsyncIterable, __gateAwait, __resumeAwait } from "./gate";
 import { InputGate, OutputGate } from "./io/io-gate";
 import { IoContext, requireInputLock, type Actor, type Timer } from "./io/io-context";
 
@@ -190,6 +190,49 @@ describe("__gate", () => {
     } finally {
       context.abort(new Error("test cleanup"));
     }
+  });
+});
+
+describe("transformed await resume", () => {
+  test("restores context at the first instruction after fulfillment", async () => {
+    const context = newContext();
+
+    const held = await context.run(async () => {
+      __resumeAwait(await __gateAwait(portHop()));
+      requireInputLock(context, "explicit transformed continuation");
+      return true;
+    });
+
+    expect(held).toBe(true);
+  });
+
+  test("carries context across nested native promise continuations", async () => {
+    const context = newContext();
+
+    const held = await context.run(async () => {
+      __resumeAwait(await __gateAwait(portHop()));
+      await Promise.resolve();
+      __resumeAwait(await __gateAwait(portHop()));
+      requireInputLock(context, "nested native continuation");
+      return true;
+    });
+
+    expect(held).toBe(true);
+  });
+
+  test("restores context before throwing a rejection", async () => {
+    const context = newContext();
+
+    await context.run(async () => {
+      let caught: unknown;
+      try {
+        __resumeAwait(await __gateAwait(Promise.reject(new Error("expected"))));
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toEqual(new Error("expected"));
+      requireInputLock(context, "rejected transformed continuation");
+    });
   });
 });
 

@@ -8,7 +8,7 @@ import {
 
 const MARKER = "/* @do-runtime-gated */";
 const IMPORT =
-  'import { __gate, __gateAsyncIterable } from "@mcp-b/do-runtime/gate";';
+  'import { __gateAsyncIterable, __gateAwait, __resumeAwait } from "@mcp-b/do-runtime/gate";';
 
 export interface DoRuntimeAwaitTransformOptions {
   include?: FilterPattern;
@@ -39,8 +39,10 @@ export function doRuntimeAwaitTransform(options?: DoRuntimeAwaitTransformOptions
       const program = this.parse(code);
       new Visitor({
         AwaitExpression(node) {
-          source.prependLeft(node.argument.start, "__gate((");
+          source.prependLeft(node.start, "__resumeAwait((");
+          source.prependLeft(node.argument.start, "__gateAwait((");
           source.appendRight(node.argument.end, "))");
+          source.appendRight(node.end, "))");
           transformed = true;
         },
         ForOfStatement(node) {

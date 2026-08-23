@@ -3,7 +3,7 @@ import { describe, expect, test } from "vitest";
 import { doRuntimeAwaitTransform } from "./vite";
 
 const HEADER =
-  '/* @do-runtime-gated */\nimport { __gate, __gateAsyncIterable } from "@mcp-b/do-runtime/gate";\n';
+  '/* @do-runtime-gated */\nimport { __gateAsyncIterable, __gateAwait, __resumeAwait } from "@mcp-b/do-runtime/gate";\n';
 
 async function transform(
   code: string,
@@ -31,7 +31,7 @@ describe("doRuntimeAwaitTransform", () => {
     const source = "async function run() { return await task; }\n";
 
     await expect(transform(source)).resolves.toBe(
-      `${HEADER}async function run() { return await __gate((task)); }\n`,
+      `${HEADER}async function run() { return __resumeAwait((await __gateAwait((task)))); }\n`,
     );
   });
 
@@ -47,37 +47,38 @@ describe("doRuntimeAwaitTransform", () => {
     {
       name: "nested awaits",
       source: "const value = await outer(await inner);\n",
-      expected: "const value = await __gate((outer(await __gate((inner)))));\n",
+      expected:
+        "const value = __resumeAwait((await __gateAwait((outer(__resumeAwait((await __gateAwait((inner)))))))));\n",
     },
     {
       name: "arrow, object method, and class method bodies",
       source:
         "const arrow = async () => await one;\nconst object = { async method() { await two; } };\nclass Example { async method() { await three; } }\n",
       expected:
-        "const arrow = async () => await __gate((one));\nconst object = { async method() { await __gate((two)); } };\nclass Example { async method() { await __gate((three)); } }\n",
+        "const arrow = async () => __resumeAwait((await __gateAwait((one))));\nconst object = { async method() { __resumeAwait((await __gateAwait((two)))); } };\nclass Example { async method() { __resumeAwait((await __gateAwait((three)))); } }\n",
     },
     {
       name: "async generators",
       source: "async function* values() { yield await item; }\n",
-      expected: "async function* values() { yield await __gate((item)); }\n",
+      expected: "async function* values() { yield __resumeAwait((await __gateAwait((item)))); }\n",
     },
     {
       name: "top-level await",
       source: "const value = await task;\n",
-      expected: "const value = await __gate((task));\n",
+      expected: "const value = __resumeAwait((await __gateAwait((task))));\n",
     },
     {
       name: "await precedence",
       source: "const first = await a ?? b;\nconst second = await (a, b);\n",
       expected:
-        "const first = await __gate((a)) ?? b;\nconst second = await __gate(((a, b)));\n",
+        "const first = __resumeAwait((await __gateAwait((a)))) ?? b;\nconst second = __resumeAwait((await __gateAwait(((a, b)))));\n",
     },
   ])("preserves $name", async ({ source, expected }) => {
     await expect(transform(source)).resolves.toBe(`${HEADER}${expected}`);
   });
 
   test("is idempotent once the marker is present", async () => {
-    const source = `${HEADER}const value = await __gate((task));\n`;
+    const source = `${HEADER}const value = __resumeAwait((await __gateAwait((task))));\n`;
 
     await expect(transform(source)).resolves.toBe(source);
   });
