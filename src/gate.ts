@@ -1,6 +1,7 @@
 /* @do-runtime-gated */
 
 import {
+  atCheckpointEnd,
   tryCurrentContinuation,
   tryCurrentIoContext,
   type IoContext,
@@ -16,12 +17,24 @@ type Outcome<T> =
   | { readonly ok: false; readonly exception: unknown };
 
 const TRANSFORMED_AWAIT = Symbol("@mcp-b/do-runtime/transformed-await");
+/**
+ * Own the gap between publishing an await result and its `__resumeAwait` call.
+ * This is deliberately separate from the current-continuation ambient: a
+ * reservation serializes publishers but must never make its actor look current.
+ * See §2.3 and decision 8.
+ */
+const CURRENT_PUBLICATION = Symbol.for("@mcp-b/do-runtime/current-await-publication");
 const warnedUngatedAwaits = new Set<string>();
+
+type PublicationReservation = {
+  readonly context: IoContext;
+};
 
 type TransformedAwait<T> = {
   readonly [TRANSFORMED_AWAIT]: true;
   readonly context: IoContext;
   readonly outcome: Outcome<T>;
+  readonly reservation: PublicationReservation;
 };
 
 function isThenable(value: unknown): value is PromiseLike<unknown> {
@@ -62,6 +75,7 @@ export function __gateAwait<T>(
 export function __resumeAwait<T>(value: T | TransformedAwait<T>): T {
   if (!isTransformedAwait(value)) return value as T;
 
+  clearPublication(value.reservation);
   value.context.restoreContinuation();
   if (value.outcome.ok) return value.outcome.value;
   throw value.outcome.exception;
@@ -71,18 +85,37 @@ function isTransformedAwait<T>(value: T | TransformedAwait<T>): value is Transfo
   return Reflect.get(Object(value), TRANSFORMED_AWAIT) === true;
 }
 
+function currentPublication(): PublicationReservation | undefined {
+  return Reflect.get(globalThis, CURRENT_PUBLICATION) as PublicationReservation | undefined;
+}
+
+function reservePublication(context: IoContext): PublicationReservation | undefined {
+  if (tryCurrentContinuation() !== undefined || currentPublication() !== undefined) return undefined;
+  const reservation = { context };
+  Reflect.set(globalThis, CURRENT_PUBLICATION, reservation);
+  atCheckpointEnd(() => clearPublication(reservation));
+  return reservation;
+}
+
+function clearPublication(reservation: PublicationReservation): void {
+  if (currentPublication() === reservation) {
+    Reflect.deleteProperty(globalThis, CURRENT_PUBLICATION);
+  }
+}
+
 function publishOutcome<T, Result>(
   context: IoContext,
   promise: Promise<T>,
-  finish: (outcome: Outcome<T>) => Result,
+  finish: (outcome: Outcome<T>, reservation: PublicationReservation) => Result,
 ): Promise<Result> {
   return new Promise<Result>((resolve, reject) => {
     const publish = context.makeTransformReentryCallback((outcome: Outcome<T>) => {
-      if (tryCurrentContinuation() !== undefined) {
+      const reservation = reservePublication(context);
+      if (reservation === undefined) {
         schedulePublication({ publish: () => publish(outcome), reject });
         return;
       }
-      resolve(finish(outcome));
+      resolve(finish(outcome, reservation));
     });
     void promise.then(
       (value) => {
@@ -99,15 +132,17 @@ function resumeAwaitWithContext<T>(
   context: IoContext,
   promise: Promise<T>,
 ): Promise<TransformedAwait<T>> {
-  return publishOutcome(context, promise, (outcome) => ({
+  return publishOutcome(context, promise, (outcome, reservation) => ({
     [TRANSFORMED_AWAIT]: true,
     context,
     outcome,
+    reservation,
   }));
 }
 
 function resumeWithContext<T>(context: IoContext, promise: Promise<T>): Promise<T> {
-  return publishOutcome(context, promise, (outcome) => {
+  return publishOutcome(context, promise, (outcome, reservation) => {
+    clearPublication(reservation);
     context.restoreContinuation();
     if (outcome.ok) return outcome.value;
     throw outcome.exception;
