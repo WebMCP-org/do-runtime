@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.0
+
+### Minor Changes
+
+- 9170766: Add `/gate` runtime helpers and a `/vite` transform that makes actor continuations re-enter the input gate after every transformed await.
+
 ## 0.2.3
 
 ### Patch Changes
