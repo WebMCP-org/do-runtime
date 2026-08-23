@@ -20,6 +20,7 @@ import { FacetDeletionReceiptStore } from "./facet-deletion";
 import type { ActorClassChannel } from "../io/io-channels";
 import type { IsolateChannelFactory } from "../api/worker-loader";
 import { FacetTreeIndex } from "./facet-tree-index";
+import { readAfterForeignAwait } from "../fixtures/await-transform.actor";
 import type {
   ActorContainer,
   ActorContainerOptions,
@@ -444,6 +445,15 @@ describe("the composition", () => {
     expect(afterAwait).toBe(true);
     await checkpointEnd();
     expect(first.container.hasCurrent()).toBe(false);
+  });
+
+  test("transformed actor code re-enters before storage after a foreign await", async () => {
+    const { container, instance } = await counterContainer();
+    const entry = container.entry({
+      read: () => readAfterForeignAwait(instance.ctx.storage),
+    });
+
+    await expect(entry.read()).resolves.toBeUndefined();
   });
 
   test("a lost lock names where the gate was last engaged", async () => {

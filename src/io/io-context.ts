@@ -685,6 +685,8 @@ export class IoContext {
    * whatever continuation is running lockless now.
    */
   #lastGateUse: { readonly what: string; readonly stack: string | undefined; readonly at: number } | undefined;
+  #transformGateUses = 0;
+  #transformGateStack: string | undefined;
 
   #abortException: { readonly exception: unknown } | undefined;
   readonly #abortPromise: Promise<never>;
@@ -1084,6 +1086,24 @@ export class IoContext {
   ): Promise<R> {
     this.noteGateUse("awaitIo", captureGateStack());
     return this.#awaitIoImpl(promise, this.getCriticalSection(), func);
+  }
+
+  /**
+   * The await transform's hot path. It preserves provenance without capturing
+   * an Error stack for every await: the first call and every 64th call refresh
+   * the sampled site, while intervening calls keep that stack and say so.
+   */
+  awaitIoFromTransform<T>(promise: Promise<T>): Promise<T> {
+    const shouldSample = this.#transformGateUses++ % 64 === 0 || this.#transformGateStack === undefined;
+    if (shouldSample) this.#transformGateStack = captureGateStack();
+    this.#lastGateUse = {
+      what: shouldSample
+        ? "a transformed await sampled at the site below"
+        : "a transformed await (stack from the most recent sampled transformed await)",
+      stack: this.#transformGateStack,
+      at: this.now(),
+    };
+    return this.#awaitIoImpl(promise, this.getCriticalSection(), identity);
   }
 
   /**

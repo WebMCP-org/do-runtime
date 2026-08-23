@@ -1,5 +1,6 @@
 import { fileURLToPath } from "node:url";
 import { defineConfig } from "vitest/config";
+import { doRuntimeAwaitTransform } from "./src/vite.ts";
 
 /**
  * The unit lane: tests co-located with the module they port, named after the
@@ -13,6 +14,14 @@ import { defineConfig } from "vitest/config";
  * comes from conformance.
  */
 export default defineConfig({
+  plugins: [
+    doRuntimeAwaitTransform({ include: "**/src/fixtures/await-transform.actor.ts" }),
+  ],
+  resolve: {
+    alias: {
+      "@mcp-b/do-runtime/gate": fileURLToPath(new URL("./src/gate.ts", import.meta.url)),
+    },
+  },
   test: {
     name: "unit",
     root: fileURLToPath(new URL(".", import.meta.url)),
