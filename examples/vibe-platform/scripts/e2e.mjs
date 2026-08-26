@@ -130,11 +130,14 @@ page.on("console", (message) => {
 });
 
 const preview = () => page.frameLocator("#preview");
-const file = (path) => page.locator(`#files button[data-path="${path}"]`);
+const file = (path) => page.locator(`#files [data-path="${path}"] button`);
+const editorValue = () => page.locator("#editor").evaluate((element) => element.value);
+const fillEditor = (value) => page.locator("#editor .cm-content").fill(value);
 const builtOk = () =>
-  page.waitForFunction(() => /^built in \d+ms$/.test(document.querySelector("#status").textContent), {
-    timeout: TIMEOUT,
-  });
+  page.waitForFunction(
+    () => /^built in \d+ms$/.test(document.querySelector("#status")?.textContent ?? ""),
+    { timeout: TIMEOUT },
+  );
 
 const previewApi = (method = "GET") =>
   preview()
@@ -244,10 +247,10 @@ try {
       undefined,
       { timeout: TIMEOUT },
     );
-    const source = await page.locator("#editor").inputValue();
+    const source = await editorValue();
     agentSourceForExport = source.replace("a quiet hello", "a cheerful hello");
     if (agentSourceForExport === source) throw new Error("agent edit marker was missing");
-    await page.locator("#editor").fill(agentSourceForExport);
+    await fillEditor(agentSourceForExport);
     await page.locator("#save").click();
     await builtOk();
     await page.waitForFunction(
@@ -264,7 +267,7 @@ try {
 
   await step("a user DO syntax error reaches the log and recovers after it is fixed", async () => {
     const broken = agentSourceForExport.replace("export class", "export clss");
-    await page.locator("#editor").fill(broken);
+    await fillEditor(broken);
     await page.locator("#save").click();
     await page.waitForFunction(
       () => document.querySelector("#status").textContent === "saving failed",
@@ -276,7 +279,7 @@ try {
       throw new Error("the syntax error message did not reach the UI log");
     }
 
-    await page.locator("#editor").fill(agentSourceForExport);
+    await fillEditor(agentSourceForExport);
     await page.locator("#save").click();
     await builtOk();
     const state = await previewApi();
@@ -288,7 +291,7 @@ try {
       "export class MyAgent extends Agent {",
       'export class MyAgent extends Agent {\n  constructor(ctx, env) {\n    super(ctx, env);\n    throw new Error("e2e constructor failed");\n  }',
     );
-    await page.locator("#editor").fill(broken);
+    await fillEditor(broken);
     await page.locator("#save").click();
     await page.waitForFunction(
       () => document.querySelector("#status").textContent === "saving failed",
@@ -301,7 +304,7 @@ try {
       { timeout: TIMEOUT },
     );
 
-    await page.locator("#editor").fill(agentSourceForExport);
+    await fillEditor(agentSourceForExport);
     await page.locator("#save").click();
     await builtOk();
     const state = await previewApi();
@@ -313,14 +316,13 @@ try {
   // 5 -----------------------------------------------------------------------
   await step("editing a file in the UI, saving it, and rebuilding", async () => {
     await file("/src/App.tsx").click();
-    const editor = page.locator("#editor");
     await page.waitForFunction(
       (marker) => document.querySelector("#editor").value.includes(marker),
       TITLE_BEFORE,
       { timeout: TIMEOUT },
     );
-    const source = await editor.inputValue();
-    await editor.fill(source.replace(TITLE_BEFORE, TITLE_AFTER));
+    const source = await editorValue();
+    await fillEditor(source.replace(TITLE_BEFORE, TITLE_AFTER));
     await page.locator("#save").click();
     await builtOk();
   });
@@ -347,7 +349,7 @@ try {
       undefined,
       { timeout: TIMEOUT },
     );
-    const source = await page.locator("#editor").inputValue();
+    const source = await editorValue();
     if (!source.includes(TITLE_AFTER)) {
       throw new Error("the reloaded workspace does not contain the edit");
     }

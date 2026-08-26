@@ -44,6 +44,10 @@ SDK external to the browser host; `agent.worker.ts` blob-imports the result and 
 class through `createActorContainer`. Saving any `server/*` file drains requests, releases storage,
 and places a new instance over the same SQLite files, so code is volatile while state is durable.
 
+**The studio uses the MCP-B design system.** React 19 owns the shell and state; the shared React
+FileTree, Button, WebPreview, and Terminal components provide the product UI, while the shared Lit
+CodeMirror custom element remains the editor.
+
 **The sandbox has one narrow capability.** The preview keeps `sandbox="allow-scripts"`. Its `fetch`
 wrapper sends only `/api/*` requests to the parent over a one-request `MessageChannel`; the page
 forwards the flattened request to the authored actor and returns its real status, headers, and body.
@@ -63,7 +67,8 @@ Agents SDK's `nodejs_compat` flag; `package.json` pins the same Agents SDK versi
 
 | Path | What it is |
 | --- | --- |
-| `index.html`, `src/main.ts` | The page: supervisor, editor, two builds, preview bridge, export. Plain DOM. |
+| `index.html`, `src/main.tsx` | The React supervisor: design-system shell, two builds, preview bridge, export. |
+| `src/studio.css` | Page-grid composition around the shared design-system components. |
 | `src/wire.ts` | The page↔actor protocol, and why it is shaped for capnweb. |
 | `src/worker/host.worker.ts` | The workspace host: pool, ports, container, RPC. |
 | `src/worker/agent.worker.ts` | The authored-class host: evaluation, stable pool, container, RPC. |

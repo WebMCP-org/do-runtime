@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.7
+
+### Patch Changes
+
+- 2447315: Rebuild the browser-hosted Vibe platform example with React and the shared MCP-B design system while preserving its real actor, editor, preview, export, reload, and namespace-typing coverage.
+
 ## 0.3.6
 
 ### Patch Changes

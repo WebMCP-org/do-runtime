@@ -2,7 +2,9 @@ import { expect, test } from "vitest";
 import type { ActorChannelFactory } from "../api/actor";
 import { createDurableObjectNamespace } from "./actor-namespace";
 
-type CounterStub = Fetcher & { increment(): Promise<number> };
+interface Counter extends Rpc.DurableObjectBranded {
+  increment(): Promise<number>;
+}
 
 test("named stubs route to stable, independent actors", async () => {
   const values = new Map<string, number>();
@@ -20,12 +22,12 @@ test("named stubs route to stable, independent actors", async () => {
           values.set(name, value);
           return value;
         },
-      } as CounterStub;
+      } satisfies Fetcher & Pick<Counter, "increment">;
     },
   };
-  const namespace = createDurableObjectNamespace("counter-test", channel);
-  const alpha = namespace.getByName("alpha") as CounterStub & DurableObjectStub;
-  const beta = namespace.getByName("beta") as CounterStub & DurableObjectStub;
+  const namespace = createDurableObjectNamespace<Counter>("counter-test", channel);
+  const alpha = namespace.getByName("alpha");
+  const beta = namespace.getByName("beta");
 
   expect([alpha.name, await alpha.increment(), await alpha.increment()]).toEqual(["alpha", 1, 2]);
   expect([beta.name, await beta.increment()]).toEqual(["beta", 1]);
