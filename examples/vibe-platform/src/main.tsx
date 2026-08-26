@@ -4,7 +4,7 @@
  * It owns no storage — it cannot, because OPFS synchronous access handles exist
  * only inside a dedicated worker, which is the whole reason the actor lives in
  * one. What it owns is worker creation, the session to the actor, the bundler,
- * and the DOM.
+ * and the React shell.
  *
  * The loop is: read files from the Durable Object over HTTP, hand them to
  * `@rolldown/browser` as a virtual filesystem, inline the bundle into a
@@ -13,7 +13,38 @@
  */
 
 import { rolldown } from "@rolldown/browser";
+import {
+  detectLanguage,
+  type FileLanguage,
+  type SigveloCodeEditor,
+} from "@mcp-b/interactive-components";
+import { FileTree, FileTreeFile } from "@mcp-b/react-components/components/general-purpose/FileTree";
+import { WebPreview, WebPreviewBody } from "@mcp-b/react-components/components/general-purpose/WebPreview";
+import { Terminal } from "@mcp-b/react-components/components/general-purpose/Terminal";
+import { AppFrame } from "@mcp-b/react-components/components/general-purpose/AppFrame";
+import { Button } from "@mcp-b/react-components/components/foundations/Button";
 import { newMessagePortRpcSession, RpcTarget, type RpcStub } from "capnweb";
+import { useEffect, useRef, useSyncExternalStore } from "react";
+import type * as React from "react";
+import { createRoot } from "react-dom/client";
+import "@mcp-b/interactive-components/components/code-editor/code-editor.js";
+import "@mcp-b/react-components/styles";
+import "./studio.css";
+
+declare module "react" {
+  namespace JSX {
+    interface IntrinsicElements {
+      "sigvelo-code-editor": React.DetailedHTMLProps<
+        React.HTMLAttributes<SigveloCodeEditor>,
+        SigveloCodeEditor
+      > & {
+        value: string;
+        language: FileLanguage;
+        "editor-label": string;
+      };
+    }
+  }
+}
 import {
   browserStorageSummary,
   holdExclusiveBrowserHost,
@@ -33,38 +64,147 @@ import {
 import { storeZip, type ZipEntry } from "./zip";
 
 // ---------------------------------------------------------------------------
-// DOM
+// React shell
 
-const $ = <T extends Element>(selector: string): T => {
-  const element = document.querySelector<T>(selector);
-  if (element === null) throw new Error(`index.html has no ${selector}`);
-  return element;
+type LogLine = { text: string; isError: boolean };
+type StudioState = {
+  files: string[];
+  selectedPath: string;
+  editorValue: string;
+  previewHtml: string;
+  logs: LogLine[];
+  banner: string;
+  status: string;
+  busy: boolean;
 };
 
-const fileList = $<HTMLElement>("#files");
-const editor = $<HTMLTextAreaElement>("#editor");
-const preview = $<HTMLIFrameElement>("#preview");
-const logPane = $<HTMLElement>("#log");
-const banner = $<HTMLElement>("#banner");
-const status = $<HTMLElement>("#status");
-const saveButton = $<HTMLButtonElement>("#save");
-const buildButton = $<HTMLButtonElement>("#build");
-const exportButton = $<HTMLButtonElement>("#export");
+let studioState: StudioState = {
+  files: [],
+  selectedPath: "/src/main.tsx",
+  editorValue: "",
+  previewHtml: "",
+  logs: [],
+  banner: "",
+  status: "booting…",
+  busy: false,
+};
+const studioListeners = new Set<() => void>();
+let preview: HTMLIFrameElement | null = null;
+
+function updateStudio(patch: Partial<StudioState>): void {
+  studioState = { ...studioState, ...patch };
+  for (const listener of studioListeners) listener();
+}
+
+function subscribeStudio(listener: () => void): () => void {
+  studioListeners.add(listener);
+  return () => studioListeners.delete(listener);
+}
 
 function log(line: string, isError = false): void {
-  const row = document.createElement("div");
-  row.textContent = `${new Date().toLocaleTimeString()}  ${line}`;
-  if (isError) row.className = "err";
-  logPane.appendChild(row);
-  logPane.scrollTop = logPane.scrollHeight;
+  const text = `${new Date().toLocaleTimeString()}  ${line}`;
+  updateStudio({ logs: [...studioState.logs, { text, isError }] });
 }
 
 function fail(message: string): void {
-  banner.textContent = message;
-  banner.hidden = false;
-  status.textContent = "stopped";
+  updateStudio({ banner: message, status: "stopped" });
   log(message, true);
 }
+
+function Studio() {
+  const state = useSyncExternalStore(subscribeStudio, () => studioState);
+  const editorRef = useRef<SigveloCodeEditor>(null);
+
+  useEffect(() => {
+    const editor = editorRef.current;
+    if (editor === null) return;
+    const handleChange = () => {
+      if (editor.value === studioState.editorValue) return;
+      updateStudio({ editorValue: editor.value });
+    };
+    editor.addEventListener("sigvelo-change", handleChange);
+    return () => editor.removeEventListener("sigvelo-change", handleChange);
+  }, []);
+
+  const output = state.logs
+    .map(({ text, isError }) => (isError ? `\u001b[31m${text}\u001b[0m` : text))
+    .join("\n");
+
+  return (
+    <AppFrame.Root className="studio">
+      <header className="studio__toolbar">
+        <h1 className="studio__title">vibe platform</h1>
+        <Button id="save" size="xs" disabled={state.busy} onClick={saveNow}>
+          Save
+        </Button>
+        <Button
+          id="build"
+          size="xs"
+          variant="outline"
+          color="neutral"
+          disabled={state.busy}
+          onClick={() => void withBusy("building", rebuild)}
+        >
+          Build &amp; run
+        </Button>
+        <Button
+          id="export"
+          size="xs"
+          variant="ghost"
+          color="neutral"
+          disabled={state.busy}
+          onClick={() => void withBusy("exporting", exportProject)}
+        >
+          Export
+        </Button>
+        <output id="status" className="studio__status" aria-live="polite">
+          {state.status}
+        </output>
+      </header>
+      <p id="banner" className="studio__banner" role="alert" hidden={!state.banner}>
+        {state.banner}
+      </p>
+      <AppFrame.Body className="studio__body">
+        <nav id="files" className="studio__files" aria-label="workspace files">
+          <FileTree
+            appearance="plain"
+            selectedPath={state.selectedPath}
+            onSelect={(path) => void withBusy("opening", () => openFile(path))}
+          >
+            {state.files.map((path) => (
+              <FileTreeFile key={path} path={path} name={path} data-path={path} />
+            ))}
+          </FileTree>
+        </nav>
+        <section className="studio__editor" aria-label="Code editor">
+          <sigvelo-code-editor
+            id="editor"
+            ref={editorRef}
+            value={state.editorValue}
+            language={detectLanguage(state.selectedPath)}
+            editor-label={state.selectedPath}
+          />
+        </section>
+        <WebPreview className="studio__preview" defaultUrl="about:blank">
+          <WebPreviewBody
+            id="preview"
+            ref={(element) => {
+              preview = element;
+            }}
+            srcDoc={state.previewHtml}
+            title="Preview"
+            sandbox="allow-scripts"
+          />
+        </WebPreview>
+        <Terminal id="log" output={output} isStreaming={state.busy} />
+      </AppFrame.Body>
+    </AppFrame.Root>
+  );
+}
+
+const root = document.querySelector<HTMLElement>("#root");
+if (root === null) throw new Error("index.html has no #root");
+createRoot(root).render(<Studio />);
 
 log(await browserStorageSummary());
 const releaseHost = await holdExclusiveBrowserHost("do-runtime:vibe-platform");
@@ -329,7 +469,7 @@ const IMPORT_MAP = {
 function renderPreview(code: string): void {
   const escaped = code.replaceAll("</script", "<\\/script");
   const parentOrigin = JSON.stringify(location.origin);
-  preview.srcdoc = `<!doctype html>
+  updateStudio({ previewHtml: `<!doctype html>
 <html><head><meta charset="utf-8" />
 <script type="importmap">${JSON.stringify(IMPORT_MAP)}</script>
 <script>
@@ -387,16 +527,16 @@ function renderPreview(code: string): void {
 </script>
 </head><body><div id="root"></div>
 <script type="module">${escaped}</script>
-</body></html>`;
+</body></html>` });
 }
 
 addEventListener("message", (event: MessageEvent) => {
   // The origin is necessarily opaque; source identity plus strict payload
   // validation is the authority check for the one sandboxed frame.
-  if (event.source !== preview.contentWindow || event.origin !== "null") return;
+  if (event.source !== preview?.contentWindow || event.origin !== "null") return;
   const data: unknown = event.data;
   if (typeof data === "object" && data !== null && "preview" in data) {
-    log(`preview: ${String((data as { preview: unknown }).preview)}`, true);
+    log(`preview: ${String(data.preview)}`, true);
     return;
   }
   if (
@@ -405,7 +545,7 @@ addEventListener("message", (event: MessageEvent) => {
     "previewApi" in data &&
     event.ports[0] !== undefined
   ) {
-    void forwardPreviewApi((data as { previewApi: unknown }).previewApi, event.ports[0]);
+    void forwardPreviewApi(data.previewApi, event.ports[0]);
   }
 });
 
@@ -418,20 +558,22 @@ type PreviewApiRequest = {
 
 function isPreviewApiRequest(value: unknown): value is PreviewApiRequest {
   if (typeof value !== "object" || value === null) return false;
-  const request = value as Partial<PreviewApiRequest>;
   return (
-    typeof request.method === "string" &&
-    typeof request.path === "string" &&
-    request.path.startsWith("/api/") &&
-    Array.isArray(request.headers) &&
-    request.headers.every(
+    "method" in value &&
+    typeof value.method === "string" &&
+    "path" in value &&
+    typeof value.path === "string" &&
+    value.path.startsWith("/api/") &&
+    "headers" in value &&
+    Array.isArray(value.headers) &&
+    value.headers.every(
       (header) =>
         Array.isArray(header) &&
         header.length === 2 &&
         typeof header[0] === "string" &&
         typeof header[1] === "string",
     ) &&
-    (request.body === undefined || request.body instanceof Uint8Array)
+    (!("body" in value) || value.body === undefined || value.body instanceof Uint8Array)
   );
 }
 
@@ -462,30 +604,12 @@ async function forwardPreviewApi(value: unknown, port: MessagePort): Promise<voi
 // ---------------------------------------------------------------------------
 // UI
 
-let selectedPath = ENTRY;
-
 async function refreshFiles(): Promise<void> {
-  const paths = await listFiles();
-  fileList.replaceChildren();
-  for (const path of paths) {
-    const button = document.createElement("button");
-    button.textContent = path;
-    button.dataset.path = path;
-    button.ariaCurrent = String(path === selectedPath);
-    button.addEventListener("click", () => {
-      void withBusy("opening", () => openFile(path));
-    });
-    fileList.appendChild(button);
-  }
+  updateStudio({ files: await listFiles() });
 }
 
 async function openFile(path: string): Promise<void> {
-  selectedPath = path;
-  editor.value = await readFile(path);
-  for (const button of fileList.querySelectorAll("button")) {
-    button.ariaCurrent = String(button.dataset.path === path);
-  }
-  status.textContent = path;
+  updateStudio({ selectedPath: path, editorValue: await readFile(path), status: path });
 }
 
 /** Bundle, render, and report. The status line is what the e2e watches. */
@@ -494,7 +618,7 @@ async function rebuild(): Promise<void> {
   const code = await build();
   const elapsed = Math.round(performance.now() - started);
   renderPreview(code);
-  status.textContent = `built in ${elapsed}ms`;
+  updateStudio({ status: `built in ${elapsed}ms` });
   log(`built ${code.length} bytes in ${elapsed}ms`);
 }
 
@@ -579,36 +703,14 @@ Run \`pnpm exec wrangler deploy\` when you are ready to deploy.
   link.download = "vibe-platform.zip";
   link.click();
   setTimeout(() => URL.revokeObjectURL(url), 0);
-  status.textContent = "exported vibe-platform.zip";
+  updateStudio({ status: "exported vibe-platform.zip" });
   log(`exported ${bytes.length} bytes; server sources unchanged`);
 }
 
-let busy = false;
-
-/** One action at a time, and a failed one says so in the status line and the log. */
-async function withBusy(what: string, run: () => Promise<void>): Promise<void> {
-  if (busy) return;
-  busy = true;
-  saveButton.disabled = true;
-  buildButton.disabled = true;
-  exportButton.disabled = true;
-  status.textContent = `${what}…`;
-  try {
-    await run();
-  } catch (error) {
-    status.textContent = `${what} failed`;
-    log(`${what} failed: ${error instanceof Error ? error.message : String(error)}`, true);
-  } finally {
-    busy = false;
-    saveButton.disabled = false;
-    buildButton.disabled = false;
-    exportButton.disabled = false;
-  }
-}
-
-saveButton.addEventListener("click", () => {
+function saveNow(): void {
+  const { selectedPath, editorValue } = studioState;
   void withBusy("saving", async () => {
-    await writeFile(selectedPath, editor.value);
+    await writeFile(selectedPath, editorValue);
     // Durable before this line runs: the actor's output gate held the response
     // until the write it could reveal had committed.
     log(`saved ${selectedPath}`);
@@ -616,15 +718,21 @@ saveButton.addEventListener("click", () => {
     if (selectedPath.startsWith("/server/")) await restartAgent();
     await rebuild();
   });
-});
+}
 
-buildButton.addEventListener("click", () => {
-  void withBusy("building", rebuild);
-});
-
-exportButton.addEventListener("click", () => {
-  void withBusy("exporting", exportProject);
-});
+/** One action at a time, and a failed one says so in the status line and the log. */
+async function withBusy(what: string, run: () => Promise<void>): Promise<void> {
+  if (studioState.busy) return;
+  updateStudio({ busy: true, status: `${what}…` });
+  try {
+    await run();
+  } catch (error) {
+    updateStudio({ status: `${what} failed` });
+    log(`${what} failed: ${error instanceof Error ? error.message : String(error)}`, true);
+  } finally {
+    updateStudio({ busy: false });
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Boot
