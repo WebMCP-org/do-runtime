@@ -14,9 +14,12 @@ import type { RawWebSocket } from "./web-socket";
 const timer: Timer = {
   now: () => Date.now(),
   afterDelay: (ms, signal) =>
-    new Promise<void>((resolve) => {
+    new Promise<void>((resolve, reject) => {
       const handle = setTimeout(resolve, ms);
-      signal?.addEventListener("abort", () => clearTimeout(handle));
+      signal?.addEventListener("abort", () => {
+        clearTimeout(handle);
+        reject(signal.reason);
+      });
     }),
 };
 
@@ -97,7 +100,8 @@ function recorder(): {
   const attached = vi.fn((socket: RawWebSocket, bytes: Uint8Array | null) => {
     const entry = entries.get(socket);
     if (entry === undefined) throw new Error("attachment mirrored before acceptance");
-    entry.attachment = bytes === null ? undefined : bytes.slice();
+    if (bytes === null) delete entry.attachment;
+    else entry.attachment = bytes.slice();
   });
   const autoResponse = vi.fn();
   const closed = vi.fn((socket: RawWebSocket) => {
@@ -184,7 +188,9 @@ describe("hibernation embedder contract", () => {
       container.state.acceptWebSocket(server, ["id"]);
       client.accept();
       client.addEventListener("message", (event) => replies.push(String(event.data)));
-      container.state.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
+      container.state.setWebSocketAutoResponse(
+        new container.globals.WebSocketRequestResponsePair("ping", "pong") as WebSocketRequestResponsePair,
+      );
     });
 
     expect(mirror.autoResponse).toHaveBeenLastCalledWith({ request: "ping", response: "pong" });
@@ -267,13 +273,14 @@ test("quiescence reports eviction state and gateHooks reach both gates", async (
   });
   expect(inside).toEqual({
     armedTimers: 1,
-    pendingWaitUntil: 1,
+    pendingWaitUntil: 2,
     inputLockHeld: true,
     outputGateBroken: false,
   });
+  await quiesce(2);
   expect(container.quiescence()).toEqual({
     armedTimers: 1,
-    pendingWaitUntil: 1,
+    pendingWaitUntil: 2,
     inputLockHeld: false,
     outputGateBroken: false,
   });
@@ -281,6 +288,7 @@ test("quiescence reports eviction state and gateHooks reach both gates", async (
   pending.resolve();
   await container.run(() => container.globals.clearInterval(interval));
   await container.drainWaitUntil();
+  await quiesce(2);
   expect(container.quiescence()).toEqual({
     armedTimers: 0,
     pendingWaitUntil: 0,

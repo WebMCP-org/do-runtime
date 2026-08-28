@@ -60,7 +60,6 @@ import {
   FACET_CLASS_UNSUPPORTED_MESSAGE,
   FACET_NAME_MAX_LENGTH,
   FACET_TREE_MAX_DEPTH,
-  HIBERNATION_UNIMPLEMENTED_MESSAGE,
   type StorageCache,
 } from "./actor-state";
 
@@ -993,27 +992,6 @@ test("blockConcurrencyWhile outside a gated slice throws", async () => {
   expect(() => h.state.blockConcurrencyWhile(() => Promise.resolve(1))).toThrow(
     "no input lock available in this context",
   );
-});
-
-// =======================================================================================
-// Hibernatable WebSockets — the substrate boundary, asserted rather than skipped
-
-apiTest("every hibernatable WebSocket method throws the named message", ({ state }) => {
-  const socket = {} as WebSocket;
-  expect(() => state.acceptWebSocket(socket)).toThrow(HIBERNATION_UNIMPLEMENTED_MESSAGE);
-  expect(() => state.getWebSockets()).toThrow(HIBERNATION_UNIMPLEMENTED_MESSAGE);
-  expect(() => state.setWebSocketAutoResponse()).toThrow(HIBERNATION_UNIMPLEMENTED_MESSAGE);
-  expect(() => state.getWebSocketAutoResponse()).toThrow(HIBERNATION_UNIMPLEMENTED_MESSAGE);
-  expect(() => state.getWebSocketAutoResponseTimestamp(socket)).toThrow(
-    HIBERNATION_UNIMPLEMENTED_MESSAGE,
-  );
-  expect(() => state.setHibernatableWebSocketEventTimeout(1)).toThrow(
-    HIBERNATION_UNIMPLEMENTED_MESSAGE,
-  );
-  expect(() => state.getHibernatableWebSocketEventTimeout()).toThrow(
-    HIBERNATION_UNIMPLEMENTED_MESSAGE,
-  );
-  expect(() => state.getTags(socket)).toThrow(HIBERNATION_UNIMPLEMENTED_MESSAGE);
 });
 
 // =======================================================================================

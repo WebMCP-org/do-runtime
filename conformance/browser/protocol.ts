@@ -107,6 +107,15 @@ export interface ActorRpc {
   call(method: string, args: unknown[]): Promise<unknown>;
   /** Same identity, fresh instance: drop the container, reopen the same files. */
   respawn(): Promise<void>;
+  /** Same identity and transport: rebuild with the mirrored hibernation state. */
+  evict(): Promise<void>;
+  connect(tags: string[]): Promise<{ id: string; readyState: number }>;
+  socketSend(id: string, data: string | ArrayBuffer): Promise<void>;
+  socketClose(id: string, code?: number, reason?: string): Promise<void>;
+  nextSocketMessage(id: string): Promise<string | ArrayBuffer>;
+  nextSocketClose(
+    id: string,
+  ): Promise<{ code: number; reason: string; wasClean: boolean }>;
   /** ← `ConformanceHost.crash`: drop the container and do NOT replace it. */
   crash(): Promise<void>;
   deliverAlarm(scheduledTime: number, retryCount: number): Promise<AlarmResult>;

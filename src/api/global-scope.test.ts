@@ -396,7 +396,7 @@ describe("installActorScope", () => {
     expect(bound.currentExternalEntry).toBe(currentExternalEntry);
   });
 
-  test("writes all seven names onto a scope object, bound", async () => {
+  test("writes all actor globals onto a scope object, bound", async () => {
     // Bound, because a dynamically-loaded Worker source destructures them: `const
     // { scheduler, setTimeout } = …` would lose `this` on a method.
     const { ctx, timer, scope } = newScope({ fetch: async () => new Response("ok") });
@@ -404,6 +404,9 @@ describe("installActorScope", () => {
     installActorScope(target, () => scope);
 
     expect(Object.keys(target).sort()).toEqual([
+      "WebSocket",
+      "WebSocketPair",
+      "WebSocketRequestResponsePair",
       "clearInterval",
       "clearTimeout",
       "crypto",

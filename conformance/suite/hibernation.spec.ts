@@ -288,7 +288,7 @@ describe("handler dispatch and close state", () => {
     const actor = await host.spawn("ws-ready-state");
     expect(await actor.call("readyStateConstants")).toEqual({
       fresh: [1, 1],
-      constructor: [0, 1, 2, 3, 0, 1, 2, 3],
+      constructorValues: [0, 1, 2, 3, 0, 1, 2, 3],
       prototype: [0, 1, 2, 3, 0, 1, 2, 3],
     });
   });

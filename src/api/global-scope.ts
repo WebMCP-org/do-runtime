@@ -49,6 +49,12 @@ import {
   type IoContext,
 } from "../io/io-context";
 import { gateResponseBody } from "./http";
+import {
+  installWebSocketGlobals,
+  WebSocketRequestResponsePair,
+  type HibernatableWebSocketRegistry,
+  type RuntimeWebSocketPairConstructor,
+} from "./web-socket";
 
 /**
  * ← `AlarmInvocationInfo` (`api/global-scope.h:386-412`): "a jsg::Object used to
@@ -304,6 +310,7 @@ export type ActorGlobalScopeOptions = {
    * refuses by name rather than reaching a `fetch` this package does not own.
    */
   readonly fetch?: FetchPort | undefined;
+  readonly webSockets?: HibernatableWebSocketRegistry | undefined;
 };
 
 /** Thrown where `globalOutbound` is absent. Asserted rather than skipped, so it cannot drift. */
@@ -335,11 +342,20 @@ export class ActorGlobalScope {
   readonly #readCurrentExternalEntry: (() => object | undefined) | undefined;
   readonly scheduler: Scheduler;
   readonly crypto: GatedCrypto;
+  declare readonly WebSocket: typeof globalThis.WebSocket;
+  declare readonly WebSocketPair: RuntimeWebSocketPairConstructor;
+  declare readonly WebSocketRequestResponsePair: typeof WebSocketRequestResponsePair;
 
   constructor(ctx: IoContext, options: ActorGlobalScopeOptions = {}) {
     this.#ctx = ctx;
     this.#fetch = options.fetch;
     this.#readCurrentExternalEntry = options.currentExternalEntry;
+    const unavailablePair = new Proxy(function WebSocketPair() {}, {
+      construct(): never {
+        throw new Error("WebSocketPair is unavailable on this unbound actor scope.");
+      },
+    }) as unknown as RuntimeWebSocketPairConstructor;
+    installWebSocketGlobals(this, options.webSockets?.WebSocketPair ?? unavailablePair);
     this.scheduler = new Scheduler(this);
     this.crypto = new GatedCrypto(
       (op) => {
@@ -489,6 +505,9 @@ export type ActorScopeBindings = {
   readonly clearInterval: (id?: number | null) => void;
   readonly fetch: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
   readonly crypto: Crypto;
+  readonly WebSocket: typeof globalThis.WebSocket;
+  readonly WebSocketPair: RuntimeWebSocketPairConstructor;
+  readonly WebSocketRequestResponsePair: typeof WebSocketRequestResponsePair;
   readonly currentExternalEntry?: object | undefined;
 };
 
@@ -502,6 +521,9 @@ export type ActorScopeBindings = {
  * scope instead. A single-actor host simply writes `() => scope`.
  */
 export function actorScopeBindings(resolve: () => ActorGlobalScope): ActorScopeBindings {
+  const WebSocketPair = new Proxy(function WebSocketPair() {}, {
+    construct: () => Reflect.construct(resolve().WebSocketPair, []),
+  }) as unknown as RuntimeWebSocketPairConstructor;
   return {
     awaitIo: (promise) => resolve().awaitIo(promise),
     scheduler: {
@@ -518,6 +540,9 @@ export function actorScopeBindings(resolve: () => ActorGlobalScope): ActorScopeB
     },
     fetch: (input, init) => resolve().fetch(input, init),
     crypto: scopeCrypto(resolve),
+    WebSocket: globalThis.WebSocket,
+    WebSocketPair,
+    WebSocketRequestResponsePair,
     get currentExternalEntry(): object | undefined {
       return resolve().currentExternalEntry;
     },

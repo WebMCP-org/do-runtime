@@ -1,53 +1,79 @@
 /**
- * ← workerd `src/workerd/api/web-socket.{h,c++}` — the gating, and nothing else.
+ * ← workerd `src/workerd/api/web-socket.{h,c++}` — classic and hibernatable
+ * socket delivery over the actor's input/output gates.
  *
- * A socket is the one primitive that is neither of the other two, and §1.8 says
- * why in three lines: incoming frames "each take a fresh input lock via
- * `context.run(...)`", the read loop "captures the critical section at
- * `accept()` time", and outbound messages "each carry their own output-gate
- * promise captured at `send()` time". Upstream states the first outright, on the
- * line that does it (`web-socket.c++:1056-1059`):
- *
- * > "Re-enter the context with context.run(). This is arguably a bit unusual
- * > compared to other I/O which is delivered by return from context.awaitIo(),
- * > but the difference here is that we have a long stream of events over time.
- * > It makes sense to use context.run() each time a new event arrives."
- *
- * So a socket cannot be `awaitIo`: there is no single result to resume from.
- * `accept()` starts a loop, and the loop is the gate's caller.
- *
- * **What is ported and what is not.** The frame protocol, the hibernation
- * states, auto-response, `WebSocketPair` and the byte accounting are all
- * absent — the substrate ships a `WebSocket`, and hibernation is a recorded
- * substrate boundary with no Chrome lifecycle to be faithful to. What is here is
- * `WebSocket::Accepted`: the three gate properties above, over whatever socket
- * the host hands in. That is the same division `api/http.ts` makes and for the
- * same reason.
- *
- * **The accept contract, and the hole it leaves.** After `acceptWebSocket`, the
- * gated view owns the raw socket's events. A consumer that keeps a reference to
- * the raw socket and registers a listener on it directly gets that listener
- * called ungated, and nothing here can prevent it — upstream cannot be reached
- * that way because `accept()` moves the `kj::WebSocket` into `Accepted` and the
- * JS object never had it. The refusal below covers the case that is detectable
- * (accepting the same socket twice); the rest is the accept contract, stated.
- *
- * Spec: §1.1, §1.8 and decision 5 in
- * docs/decisions.md.
+ * The runtime owns the WebSocket object produced by `WebSocketPair`; embedders
+ * still own network transports supplied as `RawWebSocket`s. Hibernation state is
+ * per container and can be mirrored through `HibernationHost` for reconstruction.
  */
 
 import type { IoContext } from "../io/io-context";
 import type { CriticalSection } from "../io/io-gate";
+import { deserializeValue, serializeValue } from "./actor-state";
 
-/**
- * The socket beneath. Deliberately structural and minimal: a real `WebSocket`,
- * the extension's `WebSocketFacade` over capnweb, and a test double all satisfy
- * it, and none of them is a type this package should name.
- */
 export interface RawWebSocket {
   addEventListener(type: string, listener: (event: Event) => void): void;
   send(data: string | ArrayBufferLike | ArrayBufferView | Blob): void;
   close(code?: number, reason?: string): void;
+  readonly readyState?: number;
+  binaryType?: string;
+}
+
+export interface HibernationHost {
+  accepted(socket: RawWebSocket, tags: readonly string[]): void;
+  attachment(socket: RawWebSocket, bytes: Uint8Array | null): void;
+  autoResponse(pair: { request: string; response: string } | null): void;
+  closed(socket: RawWebSocket): void;
+}
+
+export type RehydratedWebSocket = {
+  socket: RawWebSocket;
+  tags?: readonly string[];
+  attachment?: Uint8Array;
+  autoResponseTimestamp?: number;
+};
+
+export interface WebSocketRequestResponsePair {
+  readonly request: string;
+  readonly response: string;
+}
+
+class WebSocketRequestResponsePairImpl implements WebSocketRequestResponsePair {
+  readonly #request: string;
+  readonly #response: string;
+
+  constructor(request: string, response: string) {
+    this.#request = String(request);
+    this.#response = String(response);
+  }
+
+  get request(): string {
+    return this.#request;
+  }
+
+  get response(): string {
+    return this.#response;
+  }
+}
+
+export const WebSocketRequestResponsePair: {
+  new (request: string, response: string): WebSocketRequestResponsePair;
+  readonly prototype: WebSocketRequestResponsePair;
+} = new Proxy(WebSocketRequestResponsePairImpl, {
+  apply(): never {
+    throw new TypeError(
+      "Failed to construct 'WebSocketRequestResponsePair': Please use the 'new' operator, this DOM object constructor cannot be called as a function.",
+    );
+  },
+});
+
+export interface RuntimeWebSocketPair {
+  0: AcceptedWebSocket;
+  1: AcceptedWebSocket;
+}
+
+export interface RuntimeWebSocketPairConstructor {
+  new (): RuntimeWebSocketPair;
 }
 
 /** ← the `JSG_REQUIRE(!native.state.is<Accepted>(), ...)` at the head of `accept()`. */
@@ -55,162 +81,675 @@ export const ALREADY_ACCEPTED_MESSAGE =
   "acceptWebSocket(): this socket has already been accepted by an actor. A socket's frames are " +
   "delivered by exactly one read loop, and a second accept would deliver them under two gates.";
 
-/** Sockets this runtime has accepted, so the refusal above is answerable. */
-const accepted = new WeakSet<RawWebSocket>();
+export const HIBERNATION_ALREADY_ACCEPTED_MESSAGE =
+  "Cannot call `acceptWebSocket()` if the WebSocket was already accepted via `accept()`";
+export const HIBERNATION_AFTER_ACCEPT_MESSAGE =
+  "Can't accept() WebSocket after enabling hibernation.";
+export const HIBERNATION_PAIR_USED_MESSAGE =
+  "Cannot call `acceptWebSocket()` on this WebSocket because its pair has already been accepted or used in a Response.";
 
-/** The four events a `WebSocket` dispatches, which `readLoop` and its `.then` cover upstream. */
+const MAX_HIBERNATABLE_SOCKETS = 32_768;
+const MAX_TAGS = 10;
+const MAX_TAG_LENGTH = 256;
+const MAX_ATTACHMENT_BYTES = 16_384;
+const MAX_AUTO_RESPONSE_BYTES = 2_048;
+const MAX_EVENT_TIMEOUT = 604_800_000;
+
 const SOCKET_EVENTS = ["open", "message", "close", "error"] as const;
 type SocketEvent = (typeof SOCKET_EVENTS)[number];
+type SocketMode = "classic" | "hibernatable";
 
-/**
- * ← `WebSocket::Accepted` (`web-socket.h:~300-360`), reached through
- * `accept()` → `internalAccept(js, IoContext::current().getCriticalSection())`
- * → `startReadLoop` (`web-socket.c++:133`, `:426`, `:429-433`, `:507`).
- *
- * An `EventTarget`, so a consumer registers listeners the way it would on a real
- * socket — but on THIS object rather than on the raw one, because this is what
- * runs them inside a gated slice.
- */
-export class AcceptedWebSocket extends EventTarget {
-  readonly #ctx: IoContext;
+type PairState = {
+  used: boolean;
+  hibernationAccepted: boolean;
+};
+
+type SocketMetadata = {
+  accepted?: { mode: SocketMode; registry?: HibernatableWebSocketRegistry };
+  attachment?: Uint8Array;
+  hasAttachment: boolean;
+};
+
+const metadata = new WeakMap<object, SocketMetadata>();
+
+function socketMetadata(socket: object): SocketMetadata {
+  let value = metadata.get(socket);
+  if (value === undefined) {
+    value = { hasAttachment: false };
+    metadata.set(socket, value);
+  }
+  return value;
+}
+
+function isRawWebSocket(value: unknown): value is RawWebSocket {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "addEventListener" in value &&
+    typeof value.addEventListener === "function" &&
+    "send" in value &&
+    typeof value.send === "function" &&
+    "close" in value &&
+    typeof value.close === "function"
+  );
+}
+
+function requireWebSocket(value: unknown, operation: string): RawWebSocket {
+  if (!isRawWebSocket(value)) {
+    throw new TypeError(
+      `Failed to execute '${operation}' on 'WebSocket': parameter 1 is not of type 'WebSocket'.`,
+    );
+  }
+  return value;
+}
+
+function serializeAttachment(socket: RawWebSocket, value: unknown): void {
+  try {
+    structuredClone(value);
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "DataCloneError") {
+      throw new DOMException(
+        error.message.replace(/^Failed to execute 'structuredClone' on '[^']+': /, ""),
+        "DataCloneError",
+      );
+    }
+    throw error;
+  }
+  const bytes = serializeValue(value);
+  // ponytail: the local codec's string envelope is seven bytes wider than V8's;
+  // replace this size adapter if the package adopts V8 wire bytes.
+  const measuredBytes =
+    typeof value === "string" ? new TextEncoder().encode(value).byteLength + 5 : bytes.byteLength;
+  if (measuredBytes > MAX_ATTACHMENT_BYTES) {
+    throw new Error(
+      `A WebSocket 'attachment' cannot be larger than 16384 bytes.'attachment' was ${measuredBytes} bytes.`,
+    );
+  }
+  const state = socketMetadata(socket);
+  state.attachment = bytes;
+  state.hasAttachment = true;
+  state.accepted?.registry?.attachmentChanged(socket, bytes);
+}
+
+function deserializeAttachment(socket: RawWebSocket): unknown {
+  const state = socketMetadata(socket);
+  if (!state.hasAttachment) return null;
+  return deserializeValue("WebSocket attachment", state.attachment!);
+}
+
+function serializeAttachmentMethod(this: unknown, value?: unknown): void {
+  if (arguments.length === 0) {
+    throw new TypeError(
+      "Failed to execute 'serializeAttachment' on 'WebSocket': parameter 1 is not of type 'Value'.",
+    );
+  }
+  serializeAttachment(requireWebSocket(this, "serializeAttachment"), value);
+}
+
+function deserializeAttachmentMethod(this: unknown): unknown {
+  return deserializeAttachment(requireWebSocket(this, "deserializeAttachment"));
+}
+
+function cloneMessageData(data: unknown): string | ArrayBuffer | Blob {
+  if (typeof data === "string" || data instanceof Blob) return data;
+  if (data instanceof ArrayBuffer) return data.slice(0);
+  if (ArrayBuffer.isView(data)) {
+    return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer;
+  }
+  return String(data);
+}
+
+class MemoryWebSocketEndpoint extends EventTarget implements RawWebSocket {
+  peer!: MemoryWebSocketEndpoint;
+  #sentClose = false;
+
+  send(data: string | ArrayBufferLike | ArrayBufferView | Blob): void {
+    this.peer.dispatchEvent(new MessageEvent("message", { data: cloneMessageData(data) }));
+  }
+
+  close(code = 1000, reason = ""): void {
+    if (this.#sentClose) return;
+    this.#sentClose = true;
+    this.peer.dispatchEvent(new CloseEvent("close", { code, reason, wasClean: true }));
+  }
+}
+
+/** One public socket identity, in classic or hibernatable mode after acceptance. */
+export class AcceptedWebSocket extends EventTarget implements RawWebSocket, WebSocket {
+  static readonly READY_STATE_CONNECTING = 0;
+  static readonly READY_STATE_OPEN = 1;
+  static readonly READY_STATE_CLOSING = 2;
+  static readonly READY_STATE_CLOSED = 3;
+  static readonly CONNECTING = 0;
+  static readonly OPEN = 1;
+  static readonly CLOSING = 2;
+  static readonly CLOSED = 3;
+
+  declare readonly READY_STATE_CONNECTING: 0;
+  declare readonly READY_STATE_OPEN: 1;
+  declare readonly READY_STATE_CLOSING: 2;
+  declare readonly READY_STATE_CLOSED: 3;
+  declare readonly CONNECTING: 0;
+  declare readonly OPEN: 1;
+  declare readonly CLOSING: 2;
+  declare readonly CLOSED: 3;
+  readonly bufferedAmount = 0;
+  readonly extensions = "";
+  readonly protocol = "";
+  readonly url = "";
+
+  #ctx: IoContext;
   readonly #socket: RawWebSocket;
-  /**
-   * ← `readLoop`'s `cs` parameter, captured at accept and replayed for every
-   * frame via `mapAddRef(cs)` (`web-socket.c++:1110`). A socket accepted inside
-   * `blockConcurrencyWhile` therefore delivers its messages inside that critical
-   * section — §1.8's second bullet, and the reason this is captured here rather
-   * than read when a frame arrives.
-   */
-  readonly #criticalSection: CriticalSection | undefined;
-
-  /**
-   * ← `OutgoingMessagesMap outgoingMessages` plus `ensurePumping`
-   * (`web-socket.h:582-590`, `web-socket.c++:948-975`), as a chain.
-   *
-   * The table is insertion-ordered and the pump awaits each entry's own
-   * `outputLock` before sending it, so messages leave in order and message N
-   * waits only for the writes outstanding when IT was enqueued. A promise chain
-   * is the same two properties with nothing to schedule.
-   */
+  readonly #pairState: PairState | undefined;
+  #mode: SocketMode | undefined;
+  #registry: HibernatableWebSocketRegistry | undefined;
+  #criticalSection: CriticalSection | undefined;
   #pump: Promise<void> = Promise.resolve();
+  #pending: { type: SocketEvent; event: Event }[] = [];
+  #readyState = AcceptedWebSocket.OPEN;
+  #ownClose = false;
+  #peerClose = false;
+  #binaryType: "blob" | "arraybuffer" = "blob";
 
   onopen: ((event: Event) => void) | null = null;
   onmessage: ((event: MessageEvent) => void) | null = null;
   onclose: ((event: CloseEvent) => void) | null = null;
   onerror: ((event: Event) => void) | null = null;
 
-  constructor(ctx: IoContext, socket: RawWebSocket) {
+  constructor(
+    ctx: IoContext,
+    socket: RawWebSocket,
+    options: { deferred?: boolean; pairState?: PairState } = {},
+  ) {
     super();
     this.#ctx = ctx;
     this.#socket = socket;
-    this.#criticalSection = ctx.getCriticalSection();
-
-    // ← `startReadLoop`. One listener per event type on the raw socket, forever; each delivery is
-    // one gated run. Upstream's loop is a coroutine over `ws.receive()`, which is the same shape
-    // an event listener already is here.
+    this.#pairState = options.pairState;
+    if (options.deferred !== true) this.#enableClassic();
     for (const type of SOCKET_EVENTS) {
       socket.addEventListener(type, (event: Event) => {
-        this.#deliver(type, event);
+        this.#receive(type, event);
       });
     }
   }
 
-  /**
-   * ← `co_await context.run([...](auto& wLock) { dispatchEventImpl(...) }, mapAddRef(cs))`
-   * (`web-socket.c++:1065-1110`).
-   *
-   * The run rides `addWaitUntil`, as upstream's read loop does ("We put the read
-   * loop in a `waitUntil`, since there would otherwise be a race condition
-   * between delivering the final close message and the request being canceled",
-   * `web-socket.c++:537-541`). That is also what stops a listener's throw
-   * becoming an unhandled rejection: it lands in `waitUntilStatus()`.
-   */
-  #deliver(type: SocketEvent, event: Event): void {
+  get readyState(): number {
+    return this.#readyState;
+  }
+
+  get binaryType(): "blob" | "arraybuffer" {
+    return this.#binaryType;
+  }
+
+  set binaryType(value: "blob" | "arraybuffer") {
+    this.#binaryType = value;
+  }
+
+  accept(): void {
+    if (this.#mode === "hibernatable") throw new TypeError(HIBERNATION_AFTER_ACCEPT_MESSAGE);
+    if (this.#mode === "classic") throw new Error(ALREADY_ACCEPTED_MESSAGE);
+    if (this.#pairState !== undefined) this.#pairState.used = true;
+    this.#enableClassic();
+  }
+
+  send(data: string | ArrayBufferLike | ArrayBufferView | Blob): void {
+    if (this.#mode === "hibernatable" && this.#ownClose) {
+      throw new TypeError("Can't call WebSocket send() after close().");
+    }
+    if (this.#peerClose || this.#readyState === AcceptedWebSocket.CLOSED) return;
+    this.#markPairUsed();
+    this.#enqueue(() => this.#socket.send(data));
+  }
+
+  close(code?: number, reason = ""): void {
+    if (this.#readyState === AcceptedWebSocket.CLOSED || this.#ownClose) return;
+    if (this.#mode === "hibernatable" || this.#pairState !== undefined) validateClose(code, reason);
+    this.#markPairUsed();
+    this.#ownClose = true;
+    this.#readyState = this.#peerClose ? AcceptedWebSocket.CLOSED : AcceptedWebSocket.CLOSING;
+    this.#enqueue(() => this.#socket.close(code, reason));
+  }
+
+  serializeAttachment(value: unknown): void {
+    if (arguments.length === 0) serializeAttachmentMethod.call(this);
+    else serializeAttachment(this, value);
+  }
+
+  deserializeAttachment(): unknown {
+    return deserializeAttachment(this);
+  }
+
+  enableHibernation(
+    registry: HibernatableWebSocketRegistry,
+    rehydrate = false,
+    ctx: IoContext = this.#ctx,
+  ): void {
+    if (!rehydrate) {
+      if (this.#mode !== undefined) throw new Error(HIBERNATION_ALREADY_ACCEPTED_MESSAGE);
+      if (this.#pairState?.used === true && !this.#pairState.hibernationAccepted) {
+        throw new Error(HIBERNATION_PAIR_USED_MESSAGE);
+      }
+      if (this.#pairState !== undefined) {
+        this.#pairState.used = true;
+        this.#pairState.hibernationAccepted = true;
+      }
+    }
+    this.#ctx = ctx;
+    this.#mode = "hibernatable";
+    this.#registry = registry;
+    this.#pending = [];
+  }
+
+  markPairUsed(): void {
+    this.#markPairUsed();
+  }
+
+  #markPairUsed(): void {
+    if (this.#pairState !== undefined) this.#pairState.used = true;
+  }
+
+  #enableClassic(): void {
+    this.#mode = "classic";
+    this.#criticalSection = this.#ctx.getCriticalSection();
+    socketMetadata(this).accepted = { mode: "classic" };
+    const pending = this.#pending;
+    this.#pending = [];
+    for (const item of pending) this.#deliverClassic(item.type, item.event);
+  }
+
+  #receive(type: SocketEvent, event: Event): void {
+    if (type === "close") {
+      this.#receiveClose(event as CloseEvent);
+      return;
+    }
+    if (this.#mode === undefined) this.#pending.push({ type, event });
+    else if (this.#mode === "classic") this.#deliverClassic(type, event);
+    else this.#registry!.receive(this, type, event);
+  }
+
+  #receiveClose(event: CloseEvent): void {
+    if (this.#ownClose) {
+      this.#readyState = AcceptedWebSocket.CLOSED;
+    } else {
+      this.#peerClose = true;
+      this.#readyState = AcceptedWebSocket.CLOSING;
+      if (this.#mode === "classic" && this.#pairState !== undefined) {
+        // Pair halves perform the WebSocket close handshake in-memory. An
+        // embedder-supplied raw socket owns its own protocol and only reports.
+        if (event.code === 1005 || event.code === 1006 || event.code === 1015) {
+          this.#readyState = AcceptedWebSocket.CLOSED;
+        } else {
+          this.close(event.code, event.reason);
+        }
+      }
+    }
+    if (this.#mode === undefined) this.#pending.push({ type: "close", event });
+    else if (this.#mode === "classic") this.#deliverClassic("close", event);
+    else this.#registry!.receive(this, "close", event);
+  }
+
+  #deliverClassic(type: SocketEvent, event: Event): void {
     this.#ctx.addWaitUntil(
       this.#ctx.run(() => {
-        // One rebuilt event for both forms: handing the handler the raw one would give it a
-        // different `target` from the listener beside it, for the same frame.
         const delivered = cloneEventFor(type, event);
         this.dispatchEvent(delivered);
-        // Consumers use both forms — a client library sets handlers, a server library listens —
-        // so both are called, exactly as `WebSocketFacade` does for the same reason.
         const handler = this[`on${type}`] as ((event: Event) => void) | null;
         handler?.(delivered);
       }, { input: this.#criticalSection }),
     );
   }
 
-  /**
-   * ← `WebSocket::send` (`web-socket.c++:~640`), which inserts a
-   * `GatedMessage{IoContext::current().waitForOutputLocksIfNecessary(), …}`.
-   *
-   * Synchronous, as upstream's is: the wait is the pump's, not the caller's. The
-   * output gate is what "blocks all outgoing messages from an actor that would
-   * allow the rest of the world to observe the actor's state" (§1.1), and a
-   * socket frame is exactly such a message.
-   *
-   * `waitForOutputLocksIfNecessary()` collapses to `waitForOutputLocks()` here
-   * for the reason the whole file collapses `kj::Maybe<Worker::Actor&>`: its
-   * body is `actor.map(…)` (`io-context.c++:383-386`) and every context in this
-   * runtime is an actor context.
-   */
-  send(data: string | ArrayBufferLike | ArrayBufferView | Blob): void {
-    this.#enqueue(() => {
-      this.#socket.send(data);
-    });
-  }
-
-  /** ← `WebSocket::close`, which enqueues a `Close` through the same gate. */
-  close(code?: number, reason?: string): void {
-    this.#enqueue(() => {
-      this.#socket.close(code, reason);
-    });
-  }
-
   #enqueue(write: () => void): void {
-    // Captured HERE, at the call, so message N waits for the writes outstanding when it was
-    // enqueued and not for whatever is outstanding when the pump reaches it.
     const outputLock = this.#ctx.waitForOutputLocks();
-    // A failed write mutes the socket, and that is upstream's semantics rather than an accident
-    // to repair. `LegacyWebSocketAdapter::pump`'s `KJ_DEFER` (`web-socket.c++:1187-1207`) clears
-    // `outgoingMessages` unconditionally and sets `native.outgoingAborted` on any unwind that is
-    // not a clean completion, and `send()` (`:816`) and `close()` (`:916`) then return silently —
-    // so a queued frame AND a queued close are both dropped, forever, after one throwing send.
-    //
-    // Here that falls out of `.then(onFulfilled)` skipping its callback on a rejected chain.
-    // Do not "fix" it into `.then(a, b)`, `.catch()`, or an awaited predecessor: each of those
-    // resumes delivery where upstream stays silent, and `web-socket.test.ts` pins the difference.
     this.#pump = this.#pump.then(async () => {
       await outputLock;
       write();
     });
-    // The chain is the actor's work, so a broken output gate reports where every other background
-    // failure reports rather than as an unhandled rejection.
     this.#ctx.addWaitUntil(this.#pump);
   }
 }
 
-/**
- * ← `accept()` / `state.acceptWebSocket()`, as the one verb.
- *
- * Named for what upstream names it, because the critical-section capture is a
- * property of accepting rather than of constructing: "a socket accepted inside a
- * `blockConcurrencyWhile` delivers its messages inside that critical section"
- * (§1.8).
- */
-export function acceptWebSocket(ctx: IoContext, socket: RawWebSocket): AcceptedWebSocket {
-  if (accepted.has(socket)) throw new Error(ALREADY_ACCEPTED_MESSAGE);
-  accepted.add(socket);
-  return new AcceptedWebSocket(ctx, socket);
+for (const [name, value] of Object.entries({
+  READY_STATE_CONNECTING: 0,
+  READY_STATE_OPEN: 1,
+  READY_STATE_CLOSING: 2,
+  READY_STATE_CLOSED: 3,
+  CONNECTING: 0,
+  OPEN: 1,
+  CLOSING: 2,
+  CLOSED: 3,
+})) {
+  Object.defineProperty(AcceptedWebSocket.prototype, name, { value, enumerable: true });
 }
 
-/**
- * An `Event` may be dispatched by exactly one target at a time, so the raw
- * socket's event object cannot be re-dispatched: `dispatchEvent` on an event
- * that is already dispatched throws `InvalidStateError`, and one that has
- * finished carries the raw socket as its `target`. Rebuilding it is what makes
- * `event.target` the accepted socket, which is what a listener expects.
- */
+type HandlerDispatch = {
+  message(socket: RawWebSocket, message: string | ArrayBuffer): unknown;
+  close(socket: RawWebSocket, code: number, reason: string, wasClean: boolean): unknown;
+  error(socket: RawWebSocket, error: unknown): unknown;
+};
+
+type RegistryEntry = {
+  socket: RawWebSocket;
+  tags: string[];
+  autoResponseTimestamp?: number;
+};
+
+export class HibernatableWebSocketRegistry {
+  readonly #ctx: IoContext;
+  readonly #dispatch: HandlerDispatch;
+  readonly #host: HibernationHost | undefined;
+  readonly #entries: RegistryEntry[] = [];
+  #autoResponse: WebSocketRequestResponsePair | null = null;
+  #eventTimeout: number | null = null;
+  #pairConstructor: RuntimeWebSocketPairConstructor | undefined;
+
+  constructor(
+    ctx: IoContext,
+    dispatch: HandlerDispatch,
+    host?: HibernationHost,
+    rehydrated: readonly RehydratedWebSocket[] = [],
+  ) {
+    this.#ctx = ctx;
+    this.#dispatch = dispatch;
+    this.#host = host;
+    for (const value of rehydrated) this.#rehydrate(value);
+  }
+
+  get WebSocketPair(): RuntimeWebSocketPairConstructor {
+    this.#pairConstructor ??= new Proxy(function WebSocketPair() {}, {
+      construct: () => this.#createPair(),
+    }) as unknown as RuntimeWebSocketPairConstructor;
+    return this.#pairConstructor;
+  }
+
+  acceptWebSocket(socket: RawWebSocket, tags?: string[]): void {
+    if (!isRawWebSocket(socket)) {
+      throw new TypeError(
+        "Failed to execute 'acceptWebSocket' on 'DurableObjectState': parameter 1 is not of type 'WebSocket'.",
+      );
+    }
+    const state = socketMetadata(socket);
+    if (state.accepted !== undefined) throw new Error(HIBERNATION_ALREADY_ACCEPTED_MESSAGE);
+    if (this.#entries.length >= MAX_HIBERNATABLE_SOCKETS) {
+      throw new Error("only 32768 websockets can be accepted on a single Durable Object instance");
+    }
+    const normalizedTags = normalizeTags(tags);
+    if (socket instanceof AcceptedWebSocket) socket.enableHibernation(this);
+    else this.#listenRaw(socket);
+    state.accepted = { mode: "hibernatable", registry: this };
+    this.#entries.push({ socket, tags: normalizedTags });
+    this.#host?.accepted(socket, normalizedTags);
+  }
+
+  getWebSockets(tag?: string): WebSocket[] {
+    if (arguments.length > 0) {
+      if (typeof tag !== "string") return [];
+      return this.#entries
+        .filter((entry) => entry.tags.includes(tag))
+        .map((entry) => entry.socket as WebSocket);
+    }
+    return this.#entries.map((entry) => entry.socket as WebSocket).reverse();
+  }
+
+  getTags(socket: RawWebSocket): string[] {
+    const state = isRawWebSocket(socket) ? metadata.get(socket) : undefined;
+    if (state?.accepted === undefined) {
+      throw new Error(
+        "you must call 'acceptWebSocket()' before attempting to access the tags of a WebSocket.",
+      );
+    }
+    if (state.accepted.mode !== "hibernatable") {
+      throw new Error("only hibernatable websockets can have tags.");
+    }
+    const entry = this.#entries.find((candidate) => candidate.socket === socket);
+    if (entry === undefined) {
+      throw new Error(
+        "you must call 'acceptWebSocket()' before attempting to access the tags of a WebSocket.",
+      );
+    }
+    return [...entry.tags];
+  }
+
+  setWebSocketAutoResponse(pair?: WebSocketRequestResponsePair): void {
+    if (pair === undefined) {
+      this.#autoResponse = null;
+      this.#host?.autoResponse(null);
+      return;
+    }
+    if (!(pair instanceof WebSocketRequestResponsePairImpl)) {
+      throw new TypeError(
+        "Failed to execute 'setWebSocketAutoResponse' on 'DurableObjectState': parameter 1 is not of type 'WebSocketRequestResponsePair'.",
+      );
+    }
+    validateAutoResponseSize("Request", pair.request);
+    validateAutoResponseSize("Response", pair.response);
+    this.#autoResponse = pair;
+    this.#host?.autoResponse({ request: pair.request, response: pair.response });
+  }
+
+  getWebSocketAutoResponse(): WebSocketRequestResponsePair | null {
+    const pair = this.#autoResponse;
+    return pair === null ? null : new WebSocketRequestResponsePair(pair.request, pair.response);
+  }
+
+  getWebSocketAutoResponseTimestamp(socket: RawWebSocket): Date | null {
+    if (!isRawWebSocket(socket)) {
+      throw new TypeError(
+        "Failed to execute 'getWebSocketAutoResponseTimestamp' on 'DurableObjectState': parameter 1 is not of type 'WebSocket'.",
+      );
+    }
+    const timestamp = this.#entries.find((entry) => entry.socket === socket)?.autoResponseTimestamp;
+    return timestamp === undefined ? null : new Date(timestamp);
+  }
+
+  setHibernatableWebSocketEventTimeout(value?: number): void {
+    if (value === undefined || Number(value) === 0) {
+      this.#eventTimeout = null;
+      return;
+    }
+    const number = Number(value);
+    if (Number.isNaN(number)) {
+      throw new TypeError("The value cannot be converted because it is not an integer.");
+    }
+    if (number < 0) {
+      throw new TypeError(
+        "The value cannot be converted because it is negative and this API expects a positive number.",
+      );
+    }
+    if (number > 0xffff_ffff) {
+      throw new TypeError("Value out of range. Must be less than or equal to 4294967295.");
+    }
+    const timeout = Math.trunc(number);
+    if (timeout > MAX_EVENT_TIMEOUT) {
+      throw new Error("Event timeout should not exceed 604800000 ms.");
+    }
+    this.#eventTimeout = timeout;
+  }
+
+  getHibernatableWebSocketEventTimeout(): number | null {
+    return this.#eventTimeout;
+  }
+
+  attachmentChanged(socket: RawWebSocket, bytes: Uint8Array): void {
+    this.#host?.attachment(socket, bytes);
+  }
+
+  receive(socket: RawWebSocket, type: SocketEvent, event: Event): void {
+    const entry = this.#entries.find((candidate) => candidate.socket === socket);
+    if (entry === undefined) return;
+    if (type === "message") {
+      const data = (event as MessageEvent).data as unknown;
+      if (typeof data === "string" && data === this.#autoResponse?.request) {
+        entry.autoResponseTimestamp = this.#ctx.now();
+        socket.send(this.#autoResponse.response);
+        return;
+      }
+      if (data instanceof Blob) {
+        this.#ctx.addWaitUntil(
+          data.arrayBuffer().then((buffer) => {
+            this.#schedule(() => this.#dispatch.message(socket, buffer));
+          }),
+        );
+        return;
+      }
+      const message =
+        typeof data === "string" ? data : (cloneMessageData(data) as ArrayBuffer);
+      this.#schedule(() => this.#dispatch.message(socket, message));
+      return;
+    }
+    if (type === "close") {
+      this.#remove(entry);
+      const close = event as CloseEvent;
+      this.#schedule(() =>
+        this.#dispatch.close(socket, close.code, close.reason, close.wasClean),
+      );
+      return;
+    }
+    if (type === "error") this.#schedule(() => this.#dispatch.error(socket, event));
+  }
+
+  #schedule(handler: () => unknown): void {
+    this.#ctx.addWaitUntil(this.#ctx.run(handler).then(() => {}));
+  }
+
+  #remove(entry: RegistryEntry): void {
+    const index = this.#entries.indexOf(entry);
+    if (index === -1) return;
+    this.#entries.splice(index, 1);
+    this.#host?.closed(entry.socket);
+  }
+
+  #listenRaw(socket: RawWebSocket): void {
+    for (const type of ["message", "close", "error"] as const) {
+      socket.addEventListener(type, (event) => this.receive(socket, type, event));
+    }
+  }
+
+  #rehydrate(value: RehydratedWebSocket): void {
+    const socket = value.socket;
+    if (!isRawWebSocket(socket)) {
+      throw new TypeError("ActorContainerOptions.webSockets contains a non-WebSocket value.");
+    }
+    const tags = normalizeTags(value.tags === undefined ? [] : [...value.tags]);
+    const state = socketMetadata(socket);
+    state.accepted = { mode: "hibernatable", registry: this };
+    if (value.attachment !== undefined) {
+      state.attachment = value.attachment.slice();
+      state.hasAttachment = true;
+    }
+    if (socket instanceof AcceptedWebSocket) socket.enableHibernation(this, true, this.#ctx);
+    else this.#listenRaw(socket);
+    this.#entries.push({
+      socket,
+      tags,
+      ...(value.autoResponseTimestamp === undefined
+        ? {}
+        : { autoResponseTimestamp: value.autoResponseTimestamp }),
+    });
+  }
+
+  #createPair(): RuntimeWebSocketPair {
+    const pairState: PairState = { used: false, hibernationAccepted: false };
+    const left = new MemoryWebSocketEndpoint();
+    const right = new MemoryWebSocketEndpoint();
+    left.peer = right;
+    right.peer = left;
+    return {
+      0: new AcceptedWebSocket(this.#ctx, left, { deferred: true, pairState }),
+      1: new AcceptedWebSocket(this.#ctx, right, { deferred: true, pairState }),
+    };
+  }
+}
+
+export function acceptWebSocket(ctx: IoContext, socket: RawWebSocket): AcceptedWebSocket {
+  const state = socketMetadata(socket);
+  if (state.accepted !== undefined) throw new Error(ALREADY_ACCEPTED_MESSAGE);
+  if (socket instanceof AcceptedWebSocket) {
+    socket.accept();
+    return socket;
+  }
+  state.accepted = { mode: "classic" };
+  const accepted = new AcceptedWebSocket(ctx, socket);
+  socketMetadata(accepted).accepted = { mode: "classic" };
+  return accepted;
+}
+
+export function markWebSocketUsed(socket: RawWebSocket): void {
+  if (socket instanceof AcceptedWebSocket) socket.markPairUsed();
+}
+
+export function installWebSocketGlobals(
+  target: object,
+  pairConstructor: RuntimeWebSocketPairConstructor,
+): void {
+  const constructor =
+    typeof globalThis.WebSocket === "function" ? globalThis.WebSocket : AcceptedWebSocket;
+  for (const [name, value] of Object.entries({
+    READY_STATE_CONNECTING: 0,
+    READY_STATE_OPEN: 1,
+    READY_STATE_CLOSING: 2,
+    READY_STATE_CLOSED: 3,
+    CONNECTING: 0,
+    OPEN: 1,
+    CLOSING: 2,
+    CLOSED: 3,
+  })) {
+    defineValue(constructor, name, value);
+    defineValue(constructor.prototype, name, value);
+  }
+  defineValue(constructor.prototype, "serializeAttachment", serializeAttachmentMethod);
+  defineValue(constructor.prototype, "deserializeAttachment", deserializeAttachmentMethod);
+  defineValue(target, "WebSocket", constructor);
+  defineValue(target, "WebSocketPair", pairConstructor);
+  defineValue(target, "WebSocketRequestResponsePair", WebSocketRequestResponsePair);
+}
+
+function defineValue(target: object, name: string, value: unknown): void {
+  const current = Object.getOwnPropertyDescriptor(target, name);
+  if (current?.configurable === false) return;
+  Object.defineProperty(target, name, { configurable: true, writable: true, value });
+}
+
+function normalizeTags(tags: string[] | readonly string[] | undefined): string[] {
+  if (tags === undefined) return [];
+  if (!Array.isArray(tags)) {
+    throw new TypeError(
+      "Failed to execute 'acceptWebSocket' on 'DurableObjectState': parameter 2 is not of type 'Array'.",
+    );
+  }
+  if (tags.length > MAX_TAGS) {
+    throw new Error("a Hibernatable WebSocket cannot have more than 10 tags");
+  }
+  const normalized = [...new Set(tags.map((tag) => String(tag)))];
+  for (const tag of normalized) {
+    if (tag.length > MAX_TAG_LENGTH) {
+      throw new Error(`"${tag}" is longer than the max tag length (256 characters).`);
+    }
+  }
+  return normalized;
+}
+
+function validateAutoResponseSize(side: "Request" | "Response", value: string): void {
+  const bytes = new TextEncoder().encode(value).byteLength;
+  if (bytes > MAX_AUTO_RESPONSE_BYTES) {
+    throw new RangeError(
+      `${side} cannot be larger than 2048 bytes. A ${side.toLowerCase()} of size ${bytes} was provided.`,
+    );
+  }
+}
+
+function validateClose(code: number | undefined, reason: string): void {
+  if (code !== undefined && code !== 1000 && (code < 3000 || code > 4999)) {
+    throw new DOMException(`Invalid WebSocket close code: ${code}.`, "InvalidAccessError");
+  }
+  if (new TextEncoder().encode(reason).byteLength > 123) {
+    throw new DOMException(
+      "WebSocket close reason must not be longer than 123 bytes when UTF-8 encoded.",
+      "SyntaxError",
+    );
+  }
+}
+
 function cloneEventFor(type: SocketEvent, event: Event): Event {
   if (type === "message") {
     const source = event as MessageEvent;

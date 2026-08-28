@@ -1379,7 +1379,7 @@ export class Probe extends DurableObject<Record<string, unknown>> {
     const proto = WebSocket.prototype as WebSocket & Record<string, number>;
     return {
       fresh: [client.readyState, server.readyState],
-      constructor: [
+      constructorValues: [
         ctor.READY_STATE_CONNECTING,
         ctor.READY_STATE_OPEN,
         ctor.READY_STATE_CLOSING,

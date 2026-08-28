@@ -688,6 +688,10 @@ class TaskSet {
     this.#tasks.add(task);
   }
 
+  size(): number {
+    return this.#tasks.size;
+  }
+
   /** ← `kj::TaskSet::onEmpty()`. Re-checks, since a task can add another. */
   async onEmpty(): Promise<void> {
     while (this.#tasks.size > 0) {
@@ -1008,6 +1012,10 @@ export class IoContext {
    */
   waitUntilStatus(): unknown {
     return this.#waitUntilStatus?.exception;
+  }
+
+  waitUntilTaskCount(): number {
+    return this.#waitUntilTasks.size();
   }
 
   /**
