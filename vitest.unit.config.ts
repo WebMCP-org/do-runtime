@@ -10,8 +10,10 @@ import { doRuntimeAwaitTransform } from "./src/vite.ts";
  * asserts observable Durable Object behaviour against three runtimes; this lane
  * ports workerd's OWN unit tests — `io-gate-test.c++` and friends — so the
  * internal structure is checked by the same assertions upstream checks it with.
- * A module here without an upstream test file gets no unit tests; its coverage
- * comes from conformance.
+ * A ported module without an upstream test file gets no unit tests; its
+ * coverage comes from conformance. Package-original machinery with no workerd
+ * counterpart to conform to — runtime storage versioning, the Drizzle
+ * migration flow — is the one exception: its contract is pinned here.
  */
 export default defineConfig({
   plugins: [

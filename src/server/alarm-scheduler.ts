@@ -38,6 +38,7 @@ import {
   type SqlDatabase,
   SqliteDatabase,
 } from "../util/sqlite";
+import { ensureRuntimeStorageVersion } from "../util/sqlite-migrations";
 
 // =======================================================================================
 // Constants
@@ -360,6 +361,7 @@ export class AlarmScheduler {
     this.#random = options.random ?? Math.random;
     this.#getActor = options.getActor;
     this.#projectWake = options.projectWake;
+    ensureRuntimeStorageVersion(options.db, "alarms");
     this.#db = new SqliteDatabase(options.db);
     ensureInitialized(this.#db);
     this.#loadAlarmsFromDb();

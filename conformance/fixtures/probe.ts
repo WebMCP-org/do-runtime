@@ -550,6 +550,128 @@ export class Probe extends DurableObject<Record<string, unknown>> {
     };
   }
 
+  /**
+   * The pragma allowlist: `ALLOWED_PRAGMAS` and the `SQLITE_PRAGMA` authorizer
+   * case (`util/sqlite.c++:539-563`, `:1194-1273`). Everything not listed —
+   * `user_version`, `writable_schema`, `journal_mode`, `max_page_count` — is
+   * denied. This is load-bearing for the runtime, not just fidelity:
+   * `user_version` is where runtime storage versioning keeps its stamp, and
+   * `writable_schema` would let application SQL rewrite `sqlite_master` out
+   * from under the `_cf_` reservation.
+   */
+  sqlPragmas(): Record<string, string> {
+    const attempt = (sql: string): string => {
+      try {
+        this.ctx.storage.sql.exec(sql);
+        return "allowed";
+      } catch (error) {
+        return error instanceof Error && /not authorized/.test(error.message)
+          ? "refused"
+          : `refused otherwise: ${String(error)}`;
+      }
+    };
+    this.ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS pragma_probe(x INTEGER)");
+    return {
+      userVersionRead: attempt("PRAGMA user_version"),
+      userVersionWrite: attempt("PRAGMA user_version = 7"),
+      userVersionSchema: attempt("PRAGMA main.user_version"),
+      userVersionFunction: attempt("SELECT * FROM pragma_user_version"),
+      writableSchema: attempt("PRAGMA writable_schema = ON"),
+      journalMode: attempt("PRAGMA journal_mode"),
+      maxPageCount: attempt("PRAGMA max_page_count = 1"),
+      schemaVersion: attempt("PRAGMA schema_version"),
+      dataVersion: attempt("PRAGMA data_version"),
+      dataVersionWithArg: attempt("PRAGMA data_version = 1"),
+      foreignKeysRead: attempt("PRAGMA foreign_keys"),
+      foreignKeysWrite: attempt("PRAGMA foreign_keys = ON"),
+      tableList: attempt("PRAGMA table_list"),
+      tableInfo: attempt("PRAGMA table_info(pragma_probe)"),
+      tableInfoQuoted: attempt("PRAGMA table_info('pragma_probe')"),
+      tableInfoFunction: attempt("SELECT name FROM pragma_table_info('pragma_probe')"),
+      indexList: attempt("PRAGMA index_list(pragma_probe)"),
+      foreignKeyCheck: attempt("PRAGMA foreign_key_check"),
+      quickCheck: attempt("PRAGMA quick_check"),
+      optimize: attempt("PRAGMA optimize"),
+    };
+  }
+
+  /**
+   * The observable shape of the cursor and its iterators. Upstream's
+   * `JSG_ITERATOR` types (`jsg/iterator.h:1036-1050`) define `next` and
+   * self-iterability on `%IteratorPrototype%` and nothing else — no `return`,
+   * no `throw` (only the async variant registers `return_`, `:1069-1085`) — so
+   * an early exit does NOT close a retained iterator, `next()` results are
+   * `JSG_STRUCT(done, value)` in that key order (`iterator.h:706-710`), and
+   * `Symbol.toStringTag` carries the resource-type name (`resource.h`).
+   * `columnNames` is a prototype accessor (`sql.h:210`), so a cursor
+   * JSON-stringifies to `{}`.
+   */
+  sqlCursorIteratorShape(): Record<string, unknown> {
+    const sql = this.ctx.storage.sql;
+    sql.exec("CREATE TABLE IF NOT EXISTS shape_probe(id INTEGER, label TEXT)");
+    sql.exec("DELETE FROM shape_probe");
+    sql.exec("INSERT INTO shape_probe VALUES (1, 'one'), (2, 'two'), (3, 'three')");
+    const query = "SELECT id, label FROM shape_probe ORDER BY id";
+
+    const abandoned = sql.exec(query).raw();
+    for (const row of abandoned) {
+      void row;
+      break;
+    }
+    const rows = sql.exec(query)[Symbol.iterator]();
+    const [first] = rows;
+    void first;
+
+    const fresh = sql.exec(query).raw();
+    const exhausted = sql.exec(query).raw();
+    for (const row of exhausted) void row;
+    const cursor = sql.exec(query);
+    const drained = sql.exec(query);
+    drained.toArray();
+    return {
+      breakThenNext: abandoned.next(),
+      destructureThenNext: rows.next(),
+      rawTag: Object.prototype.toString.call(fresh),
+      rowsTag: Object.prototype.toString.call(sql.exec(query)[Symbol.iterator]()),
+      cursorTag: Object.prototype.toString.call(cursor),
+      nextKeys: Object.keys(fresh.next()),
+      doneKeys: Object.keys(exhausted.next()),
+      cursorDoneKeys: Object.keys(drained.next()),
+      ownKeys: Object.getOwnPropertyNames(fresh),
+      hasReturn: typeof fresh.return,
+      hasThrow: typeof (fresh as { throw?: unknown }).throw,
+      selfIterable: fresh[Symbol.iterator]() === fresh,
+      cursorJson: JSON.stringify(cursor),
+    };
+  }
+
+  /**
+   * Cursor iterators inherit the ES iterator helpers, because upstream's jsg
+   * iterator objects sit on `%IteratorPrototype%`. `raw().toArray()` is what
+   * Drizzle's durable-sqlite driver calls on every `values` query, so a plain
+   * `{ next() }` object here is an SDK-visible divergence, not a style choice.
+   */
+  sqlCursorIteratorHelpers(): Record<string, unknown> {
+    const sql = this.ctx.storage.sql;
+    sql.exec("CREATE TABLE IF NOT EXISTS helper_probe(id INTEGER, label TEXT)");
+    sql.exec("DELETE FROM helper_probe");
+    sql.exec("INSERT INTO helper_probe VALUES (1, 'one'), (2, 'two')");
+    const query = "SELECT id, label FROM helper_probe ORDER BY id";
+    const raw = sql.exec(query).raw() as IterableIterator<unknown[]> & {
+      toArray?(): unknown[][];
+      map?(fn: (row: unknown[]) => unknown): IterableIterator<unknown>;
+    };
+    const rows = sql.exec(query)[Symbol.iterator]() as IterableIterator<unknown> & {
+      toArray?(): unknown[];
+    };
+    const mapped = (sql.exec(query).raw() as typeof raw).map?.((row) => row[1]);
+    return {
+      rawToArray: raw.toArray?.(),
+      rawMaps: mapped === undefined ? undefined : [...mapped],
+      rowsToArray: rows.toArray?.(),
+    };
+  }
+
   /** `sql.exec()` runs each prelude in order; bindings and rows belong to the last statement. */
   async sqlBatch(): Promise<Record<string, unknown>> {
     const cursor = this.ctx.storage.sql.exec(

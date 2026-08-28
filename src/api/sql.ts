@@ -196,6 +196,179 @@ function refuseTransactionControl(statement: string): void {
 }
 
 /**
+ * ← the message a `SQLITE_DENY` from the authorizer surfaces to JavaScript,
+ * byte-identical so a caller matching on it ports unchanged.
+ */
+export const SQL_NOT_AUTHORIZED_MESSAGE = "not authorized: SQLITE_AUTH";
+
+/** Comments are never code. String literals STAY: pragma arguments may be quoted. */
+const NOT_COMMENT = /--[^\n]*|\/\*[\s\S]*?\*\//g;
+
+/** Cheap pre-test; `PRAGMA` and the `pragma_` functions both contain it. */
+const PRAGMA_HINT = /pragma/i;
+
+/** `PRAGMA [schema.]name`, then `= value`, `(argument)`, or nothing. */
+const PRAGMA_STATEMENT =
+  /^\s*PRAGMA\s+(?:[A-Za-z_][A-Za-z0-9_$]*\s*\.\s*)?([A-Za-z_][A-Za-z0-9_$]*)(?:\s*=\s*([\s\S]+?)|\s*\(\s*([\s\S]*?)\s*\))?\s*;?\s*$/i;
+
+/**
+ * ← `ALLOWED_PRAGMAS` and `PragmaSignature` (`util/sqlite.c++:525-563`),
+ * verbatim. `table_list`, `table_info`, and `table_xinfo` are special-cased
+ * ahead of the table in the authorizer, exactly as upstream's `SQLITE_PRAGMA`
+ * case does (`util/sqlite.c++:1194-1273`).
+ */
+const ALLOWED_PRAGMAS = new Map<
+  string,
+  "NO_ARG" | "BOOLEAN" | "OBJECT_NAME" | "OPTIONAL_OBJECT_NAME" | "NULL_OR_NUMBER" | "NULL_NUMBER_OR_OBJECT_NAME"
+>([
+  ["data_version", "NO_ARG"],
+  ["case_sensitive_like", "BOOLEAN"],
+  ["foreign_keys", "BOOLEAN"],
+  ["defer_foreign_keys", "BOOLEAN"],
+  ["ignore_check_constraints", "BOOLEAN"],
+  ["legacy_alter_table", "BOOLEAN"],
+  ["recursive_triggers", "BOOLEAN"],
+  ["reverse_unordered_selects", "BOOLEAN"],
+  ["foreign_key_check", "OPTIONAL_OBJECT_NAME"],
+  ["foreign_key_list", "OBJECT_NAME"],
+  ["index_info", "OBJECT_NAME"],
+  ["index_list", "OBJECT_NAME"],
+  ["index_xinfo", "OBJECT_NAME"],
+  ["quick_check", "NULL_NUMBER_OR_OBJECT_NAME"],
+  ["optimize", "NULL_OR_NUMBER"],
+]);
+
+/** Upstream compares the eight literal forms as PREFIXES, case-insensitively. */
+const BOOLEAN_PRAGMA_VALUE = /^(?:true|false|yes|no|on|off|1|0)/i;
+
+/**
+ * The pragmas SQLite ships (https://www.sqlite.org/pragma.html), so a
+ * `pragma_X` identifier can be told apart: `X` here means the table-valued
+ * pragma function and follows the allowlist; any other `pragma_`-prefixed
+ * identifier is an ordinary application name, which upstream's authorizer
+ * distinguishes by resolution and the conformance suite pins.
+ */
+const SQLITE_PRAGMA_NAMES = new Set([
+  "analysis_limit", "application_id", "auto_vacuum", "automatic_index",
+  "busy_timeout", "cache_size", "cache_spill", "case_sensitive_like",
+  "cell_size_check", "checkpoint_fullfsync", "collation_list",
+  "compile_options", "data_version", "database_list", "defer_foreign_keys",
+  "encoding", "foreign_key_check", "foreign_key_list", "foreign_keys",
+  "freelist_count", "full_column_names", "fullfsync", "function_list",
+  "hard_heap_limit", "ignore_check_constraints", "incremental_vacuum",
+  "index_info", "index_list", "index_xinfo", "integrity_check",
+  "journal_mode", "journal_size_limit", "legacy_alter_table",
+  "legacy_file_format", "locking_mode", "max_page_count", "mmap_size",
+  "module_list", "optimize", "page_count", "page_size", "pragma_list",
+  "query_only", "quick_check", "read_uncommitted", "recursive_triggers",
+  "reverse_unordered_selects", "schema_version", "secure_delete",
+  "short_column_names", "shrink_memory", "soft_heap_limit", "synchronous",
+  "table_info", "table_list", "table_xinfo", "temp_store", "threads",
+  "trusted_schema", "user_version", "wal_autocheckpoint", "wal_checkpoint",
+  "writable_schema",
+]);
+
+/** kj's `tryParseAs` is decimal; keep the same acceptance. */
+const DECIMAL = /^[+-]?\d+$/;
+
+/** One layer of SQL quoting off a pragma argument, any of the four forms. */
+function unquoted(argument: string): string {
+  const first = argument[0];
+  const last = argument[argument.length - 1];
+  if (argument.length >= 2) {
+    if ((first === "'" || first === '"' || first === "`") && last === first) {
+      return argument.slice(1, -1);
+    }
+    if (first === "[" && last === "]") return argument.slice(1, -1);
+  }
+  return argument;
+}
+
+/** ← the `SQLITE_PRAGMA` authorizer case (`util/sqlite.c++:1194-1273`), whole. */
+function isAllowedPragma(name: string, argument: string | undefined): boolean {
+  const pragma = name.toLowerCase();
+  if (pragma === "table_list") return true;
+  if (pragma === "table_info" || pragma === "table_xinfo") {
+    // "Allow if the specific named table is not protected."
+    if (argument === undefined) return false;
+    return SqlStorageRegulator.isAllowedName(unquoted(argument));
+  }
+  const signature = ALLOWED_PRAGMAS.get(pragma);
+  if (signature === undefined) return false;
+  switch (signature) {
+    case "NO_ARG":
+      return argument === undefined;
+    case "BOOLEAN":
+      // "We allow omitting the argument in order to read back the current value."
+      return argument === undefined || BOOLEAN_PRAGMA_VALUE.test(unquoted(argument));
+    case "OBJECT_NAME":
+      return argument !== undefined && SqlStorageRegulator.isAllowedName(unquoted(argument));
+    case "OPTIONAL_OBJECT_NAME":
+      return argument === undefined || SqlStorageRegulator.isAllowedName(unquoted(argument));
+    case "NULL_OR_NUMBER":
+      return argument === undefined || DECIMAL.test(argument);
+    case "NULL_NUMBER_OR_OBJECT_NAME":
+      return (
+        argument === undefined ||
+        DECIMAL.test(argument) ||
+        SqlStorageRegulator.isAllowedName(unquoted(argument))
+      );
+  }
+}
+
+/**
+ * The text-level stand-in for the authorizer's `SQLITE_PRAGMA` case, against
+ * one SQLite-decided statement boundary. Load-bearing beyond fidelity:
+ * `user_version` is where runtime storage versioning keeps its per-file stamp
+ * (`util/sqlite-migrations.ts`), and `writable_schema` would let application
+ * SQL rewrite `sqlite_master` out from under the `_cf_` reservation.
+ *
+ * The `pragma_` table-valued functions reach the same authorizer path
+ * upstream, so they follow the same allowlist here — by pragma NAME only. An
+ * argument the text cannot see (a string literal or a binding) goes unchecked
+ * where upstream's authorizer sees the resolved value; a `_cf_` name smuggled
+ * that way reads schema whose shape is public source anyway, while identifier
+ * arguments stay covered by `requireAllowedNames`. The README divergence row
+ * records this.
+ */
+function requireAllowedPragmas(statement: string): void {
+  if (!PRAGMA_HINT.test(statement)) return;
+  const code = statement.replace(NOT_COMMENT, " ");
+  const direct = code.match(PRAGMA_STATEMENT);
+  if (direct !== null) {
+    const [, name = "", assigned, called] = direct;
+    const argument = (assigned ?? called)?.trim();
+    if (!isAllowedPragma(name, argument === "" ? undefined : argument)) {
+      throw new Error(SQL_NOT_AUTHORIZED_MESSAGE);
+    }
+    return;
+  }
+  // A statement that leads with PRAGMA but does not parse as one is refused —
+  // the deliberately stricter direction the reserved-name check already takes.
+  if (/^\s*PRAGMA\b/i.test(code)) throw new Error(SQL_NOT_AUTHORIZED_MESSAGE);
+  const literalFree = code.replace(NOT_CODE, " ");
+  for (const [token] of literalFree.matchAll(IDENTIFIER)) {
+    if (token.length <= 7 || token.slice(0, 7).toLowerCase() !== "pragma_") continue;
+    const name = token.slice(7).toLowerCase();
+    if (!SQLITE_PRAGMA_NAMES.has(name)) continue;
+    if (
+      name !== "table_list" &&
+      name !== "table_info" &&
+      name !== "table_xinfo" &&
+      !ALLOWED_PRAGMAS.has(name)
+    ) {
+      throw new Error(SQL_NOT_AUTHORIZED_MESSAGE);
+    }
+  }
+}
+
+/** Everything the untrusted path refuses at one statement boundary. */
+function regulateUntrustedStatement(statement: string): void {
+  refuseTransactionControl(statement);
+  requireAllowedPragmas(statement);
+}
+
+/**
  * ← the `jsg::Ref<DurableObjectStorage>` `SqlStorage` holds, narrowed to the one
  * member it reaches through (`SqlStorage::getDb`). `DurableObjectStorage`
  * satisfies it; narrowing is what keeps this file free of a value-level import
@@ -213,6 +386,68 @@ type CursorState = {
   readonly rowsWritten: number;
 };
 
+/** ← `JSG_INHERIT_INTRINSIC(v8::kIteratorPrototype)` (`jsg/iterator.h:1044`). */
+const IteratorPrototype: object = Object.getPrototypeOf(
+  Object.getPrototypeOf([][Symbol.iterator]()),
+) as object;
+
+/**
+ * ← the `JSG_ITERATOR` types (`jsg/iterator.h:1036-1050`): `next` and
+ * self-iterability on `%IteratorPrototype%` — which is what carries the ES
+ * iterator helpers; `raw().toArray()` is what Drizzle's durable-sqlite driver
+ * calls — and NOTHING else. No `return`, no `throw` (only the async variant
+ * registers `return_`, `:1069-1085`), so `IteratorClose` after a `break`, a
+ * partial destructuring, or a `take()` is a no-op and a retained iterator
+ * resumes. Results are `JSG_STRUCT(done, value)` in that key order
+ * (`jsg/iterator.h:706-710`).
+ */
+class RawIterator<U extends SqlStorageValue[]> implements IterableIterator<U> {
+  readonly #pull: () => readonly SqlStorageValue[] | undefined;
+
+  constructor(pull: () => readonly SqlStorageValue[] | undefined) {
+    this.#pull = pull;
+  }
+
+  next(): { done: false; value: U } | { done: true; value: undefined } {
+    const raw = this.#pull();
+    if (raw === undefined) return { done: true, value: undefined };
+    return { done: false, value: asRawRow<U>([...raw]) };
+  }
+
+  [Symbol.iterator](): IterableIterator<U> {
+    return this;
+  }
+}
+Object.setPrototypeOf(RawIterator.prototype, IteratorPrototype);
+Object.defineProperty(RawIterator.prototype, Symbol.toStringTag, {
+  value: "RawIterator",
+  configurable: true,
+});
+
+/** ← `RowIterator`, shaped exactly as `RawIterator` above. */
+class RowIterator<T extends SqlRow> implements IterableIterator<T> {
+  readonly #pull: () => T | undefined;
+
+  constructor(pull: () => T | undefined) {
+    this.#pull = pull;
+  }
+
+  next(): { done: false; value: T } | { done: true; value: undefined } {
+    const row = this.#pull();
+    if (row === undefined) return { done: true, value: undefined };
+    return { done: false, value: row };
+  }
+
+  [Symbol.iterator](): IterableIterator<T> {
+    return this;
+  }
+}
+Object.setPrototypeOf(RowIterator.prototype, IteratorPrototype);
+Object.defineProperty(RowIterator.prototype, Symbol.toStringTag, {
+  value: "RowIterator",
+  configurable: true,
+});
+
 /**
  * ← `SqlStorage::Cursor`.
  *
@@ -225,22 +460,35 @@ type CursorState = {
  * undercounts any query that scans more rows than it returns.
  */
 export class Cursor<T extends SqlRow = SqlRow> implements SqlStorageCursor<T> {
-  readonly columnNames: string[];
+  readonly #columnNames: string[];
   readonly #rawRows: readonly (readonly SqlStorageValue[])[];
   readonly #rowsWritten: number;
   #position = 0;
 
   constructor(state?: CursorState) {
     if (state === undefined) throw new Error(CURSOR_NOT_CONSTRUCTIBLE_MESSAGE);
-    this.columnNames = state.columnNames;
+    this.#columnNames = state.columnNames;
     this.#rawRows = state.rawRows;
     this.#rowsWritten = state.rowsWritten;
+  }
+
+  /**
+   * ← `JSG_READONLY_PROTOTYPE_PROPERTY(columnNames)` (`sql.h:210`): a
+   * prototype accessor, not an own field, so a cursor JSON-stringifies to `{}`.
+   */
+  get columnNames(): string[] {
+    return this.#columnNames;
   }
 
   /** ← `Cursor::next`, whose `RowIterator::Next` is this exact shape. */
   next(): { done?: false; value: T } | { done: true; value?: never } {
     const row = this.#nextRow();
-    if (row === undefined) return { done: true };
+    if (row === undefined) {
+      // ← `JSG_STRUCT(done, value)` serializes an OWN `value: undefined` on
+      // the done result; the published type says the key is absent. Callers
+      // observe the runtime shape, so it wins — on workerd exactly the same.
+      return { done: true, value: undefined } as unknown as { done: true; value?: never };
+    }
     return { done: false, value: row };
   }
 
@@ -268,35 +516,17 @@ export class Cursor<T extends SqlRow = SqlRow> implements SqlStorageCursor<T> {
     return row;
   }
 
-  /** ← `Cursor::raw`, which shares this cursor's position rather than restarting. */
+  /**
+   * ← `Cursor::raw`, which shares this cursor's position rather than
+   * restarting. The iterator's shape is `RawIterator`'s whole doc comment.
+   */
   raw<U extends SqlStorageValue[]>(): IterableIterator<U> {
-    const iterator: IterableIterator<U> = {
-      [Symbol.iterator](): IterableIterator<U> {
-        return iterator;
-      },
-      next: (): IteratorResult<U> => {
-        const raw = this.#nextRaw();
-        if (raw === undefined) return { done: true, value: undefined };
-        const values: SqlStorageValue[] = [...raw];
-        return { done: false, value: asRawRow<U>(values) };
-      },
-    };
-    return iterator;
+    return new RawIterator<U>(() => this.#nextRaw());
   }
 
-  /** ← `JSG_ITERABLE(rows)`. */
+  /** ← `JSG_ITERABLE(rows)`, yielding through the same shared position. */
   [Symbol.iterator](): IterableIterator<T> {
-    const iterator: IterableIterator<T> = {
-      [Symbol.iterator](): IterableIterator<T> {
-        return iterator;
-      },
-      next: (): IteratorResult<T> => {
-        const row = this.#nextRow();
-        if (row === undefined) return { done: true, value: undefined };
-        return { done: false, value: row };
-      },
-    };
-    return iterator;
+    return new RowIterator<T>(() => this.#nextRow());
   }
 
   get rowsRead(): number {
@@ -320,12 +550,17 @@ export class Cursor<T extends SqlRow = SqlRow> implements SqlStorageCursor<T> {
     const raw = this.#nextRaw();
     if (raw === undefined) return undefined;
     const row: SqlRow = {};
-    this.columnNames.forEach((name, index) => {
+    this.#columnNames.forEach((name, index) => {
       row[name] = raw[index] ?? null;
     });
     return asRow<T>(row);
   }
 }
+/** ← the jsg resource-type tag every workerd API object carries (`resource.h`). */
+Object.defineProperty(Cursor.prototype, Symbol.toStringTag, {
+  value: "Cursor",
+  configurable: true,
+});
 
 /**
  * ← `SqlStorage::Statement`, which upstream describes as "supported only for
@@ -372,7 +607,7 @@ export class SqlStorage implements globalThis.SqlStorage {
 
     // The backend supplies the same statement boundary SQLite compiled. That is
     // load-bearing for CREATE TRIGGER, whose body legitimately contains semicolons.
-    const result = db.run({ regulate: refuseTransactionControl }, query, ...sqlBindings);
+    const result = db.run({ regulate: regulateUntrustedStatement }, query, ...sqlBindings);
     return new Cursor<T>({
       columnNames: [...result.columnNames],
       rawRows: result.rawRows.map((row) => row.map(toSqlStorageValue)),
@@ -412,7 +647,7 @@ export class SqlStorage implements globalThis.SqlStorage {
   ingest(query: string): SqlStorageIngestResult {
     requireInputLock(this.#ctx, "sql.ingest()");
     requireAllowedNames(query);
-    return this.#owner.getSqliteDb().ingest(query, refuseTransactionControl);
+    return this.#owner.getSqliteDb().ingest(query, regulateUntrustedStatement);
   }
 
   /** ← `SqlStorage::setMaxPageCountForTest`, which is what its name says. */

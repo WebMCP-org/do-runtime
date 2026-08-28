@@ -33,6 +33,7 @@ import {
   type SqlResult,
   type SqlValue,
 } from "../src/util/sqlite";
+import { requireImportableRuntimeStorage } from "../src/util/sqlite-migrations";
 
 export type NodeSqlProviderOptions = {
   /**
@@ -86,6 +87,7 @@ export function createNodeSqlProvider(
       const path = requireSnapshotDirectory(directory);
       requireClosed(openDatabases);
       requireValidSqlDatabaseSnapshot(snapshot);
+      requireImportableRuntimeStorage(snapshot);
 
       const databases = snapshot.databases.map(({ name, image }) => ({
         name,

@@ -102,6 +102,185 @@ sqlTest("raw() yields arrays in column order and shares the cursor's position", 
   expect([...cursor.raw()]).toEqual([[2, "two"]]);
 });
 
+/**
+ * Both cursor iterators are generators, so they inherit `%IteratorPrototype%`
+ * exactly as upstream's `JSG_ITERABLE` objects do. `raw().toArray()` is what
+ * Drizzle's `durable-sqlite` driver calls on every `values` query, so the
+ * helpers are SDK-visible surface rather than a style choice. The static types
+ * are Cloudflare's own (`raw(): IterableIterator<U>`, no helpers), which is why
+ * the helper calls go through a cast here and in the conformance probe.
+ */
+type HelpedIterator<T> = IterableIterator<T> & {
+  toArray(): T[];
+  map<U>(fn: (value: T) => U): HelpedIterator<U>;
+  take(limit: number): HelpedIterator<T>;
+};
+const helpers = <T>(iterator: IterableIterator<T>): HelpedIterator<T> =>
+  iterator as HelpedIterator<T>;
+
+sqlTest("both cursor iterators inherit the ES iterator helpers", ({ sql }) => {
+  sql.exec("CREATE TABLE things (id INTEGER, label TEXT)");
+  sql.exec("INSERT INTO things VALUES (1, 'one'), (2, 'two')");
+  const query = "SELECT id, label FROM things ORDER BY id";
+
+  const iteratorPrototype = Object.getPrototypeOf(Object.getPrototypeOf([][Symbol.iterator]()));
+  expect(iteratorPrototype.isPrototypeOf(sql.exec(query).raw())).toBe(true);
+  expect(iteratorPrototype.isPrototypeOf(sql.exec(query)[Symbol.iterator]())).toBe(true);
+
+  expect(helpers(sql.exec(query).raw()).toArray()).toEqual([
+    [1, "one"],
+    [2, "two"],
+  ]);
+  expect(helpers(sql.exec(query)[Symbol.iterator]()).toArray()).toEqual([
+    { id: 1, label: "one" },
+    { id: 2, label: "two" },
+  ]);
+});
+
+sqlTest("a helper chain pulls only the rows it consumes", ({ sql }) => {
+  sql.exec("CREATE TABLE things (id INTEGER, label TEXT)");
+  sql.exec("INSERT INTO things VALUES (1, 'one'), (2, 'two'), (3, 'three')");
+
+  // `map` and `take` are lazy, and a generator suspends at each `yield`, so the
+  // cursor is asked for exactly the one row the chain yields. `rowsRead` is the
+  // only window onto that, being the position `#nextRaw` has advanced to.
+  const cursor = sql.exec("SELECT id, label FROM things ORDER BY id");
+  expect([
+    ...helpers(cursor.raw())
+      .map((row) => row[1])
+      .take(1),
+  ]).toEqual(["one"]);
+  expect(cursor.rowsRead).toBe(1);
+
+  // Same for `break`. The iterator has no `return()` to close it (see the
+  // shape test below), but the position lives on the cursor either way.
+  const partial = sql.exec("SELECT id FROM things ORDER BY id");
+  for (const _row of partial) break;
+  expect(partial.rowsRead).toBe(1);
+  // Closing one iterator does not close the cursor: the next one resumes where
+  // this one stopped, because the position lives on the cursor.
+  expect([...partial]).toEqual([{ id: 2 }, { id: 3 }]);
+});
+
+sqlTest("raw() and the row iterator share the cursor's one position", ({ sql }) => {
+  sql.exec("CREATE TABLE things (id INTEGER, label TEXT)");
+  sql.exec("INSERT INTO things VALUES (1, 'one'), (2, 'two'), (3, 'three')");
+
+  const cursor = sql.exec("SELECT id, label FROM things ORDER BY id");
+  const raw = cursor.raw();
+  expect(raw.next()).toEqual({ done: false, value: [1, "one"] });
+  expect(cursor.next()).toEqual({ done: false, value: { id: 2, label: "two" } });
+  expect(raw.next()).toEqual({ done: false, value: [3, "three"] });
+  expect(cursor.rowsRead).toBe(3);
+
+  // Exhausted stays exhausted, for this iterator and for the cursor.
+  expect(raw.next()).toEqual({ done: true, value: undefined });
+  expect(raw.next()).toEqual({ done: true, value: undefined });
+  expect(cursor.next()).toEqual({ done: true });
+});
+
+sqlTest("an early exit leaves a retained iterator open, as upstream's do", ({ sql }) => {
+  sql.exec("CREATE TABLE things (id INTEGER, label TEXT)");
+  sql.exec("INSERT INTO things VALUES (1, 'one'), (2, 'two'), (3, 'three')");
+  const query = "SELECT id, label FROM things ORDER BY id";
+
+  // `JSG_ITERATOR` registers `next` and self-iterability only — no `return`,
+  // no `throw` (jsg/iterator.h:1036-1050; only the async variant has
+  // `return_`, :1069-1085) — so `IteratorClose` after a `break`, a partial
+  // destructuring, or a `take()` is a no-op and the iterator resumes.
+  const abandoned = sql.exec(query).raw();
+  for (const row of abandoned) {
+    void row;
+    break;
+  }
+  expect(abandoned.next()).toEqual({ done: false, value: [2, "two"] });
+
+  const rows = sql.exec(query)[Symbol.iterator]();
+  const [first] = rows;
+  expect(first).toEqual({ id: 1, label: "one" });
+  expect(rows.next()).toEqual({ done: false, value: { id: 2, label: "two" } });
+
+  const taken = sql.exec(query).raw();
+  expect([...helpers(taken).take(1)]).toEqual([[1, "one"]]);
+  expect(taken.next()).toEqual({ done: false, value: [2, "two"] });
+});
+
+sqlTest("cursor and iterator surfaces carry workerd's shape", ({ sql }) => {
+  sql.exec("CREATE TABLE things (id INTEGER, label TEXT)");
+  sql.exec("INSERT INTO things VALUES (1, 'one')");
+  const query = "SELECT id, label FROM things ORDER BY id";
+
+  // ← jsg resource-type names and `JSG_STRUCT(done, value)` key order
+  // (resource.h toStringTag; iterator.h:706-710); `columnNames` is a prototype
+  // accessor (sql.h:210), so a cursor JSON-stringifies to `{}`.
+  const cursor = sql.exec(query);
+  const raw = cursor.raw();
+  expect(Object.prototype.toString.call(raw)).toBe("[object RawIterator]");
+  expect(Object.prototype.toString.call(sql.exec(query)[Symbol.iterator]())).toBe(
+    "[object RowIterator]",
+  );
+  expect(Object.prototype.toString.call(cursor)).toBe("[object Cursor]");
+  expect(typeof raw.return).toBe("undefined");
+  expect(typeof (raw as { throw?: unknown }).throw).toBe("undefined");
+  expect(Object.getOwnPropertyNames(raw)).toEqual([]);
+  expect(raw[Symbol.iterator]()).toBe(raw);
+  expect(Object.keys(raw.next())).toEqual(["done", "value"]);
+  expect(Object.keys(raw.next())).toEqual(["done", "value"]);
+  expect(JSON.stringify(cursor)).toBe("{}");
+
+  const drained = sql.exec(query);
+  drained.toArray();
+  expect(Object.keys(drained.next())).toEqual(["done", "value"]);
+});
+
+sqlTest("PRAGMA outside workerd's allowlist is refused, with workerd's message", ({ sql, db }) => {
+  const stamp = () => Number(db.run("PRAGMA user_version").rawRows[0]?.[0]);
+  const before = stamp();
+  expect(() => sql.exec("PRAGMA user_version = 7")).toThrowError("not authorized: SQLITE_AUTH");
+  expect(() => sql.exec("PRAGMA user_version")).toThrowError("not authorized: SQLITE_AUTH");
+  expect(() => sql.exec("PRAGMA main.user_version")).toThrowError("not authorized: SQLITE_AUTH");
+  expect(() => sql.exec("PRAGMA writable_schema = ON")).toThrowError("not authorized: SQLITE_AUTH");
+  expect(() => sql.exec("SELECT * FROM pragma_user_version")).toThrowError(
+    "not authorized: SQLITE_AUTH",
+  );
+  // A batch is regulated per statement, exactly like transaction control.
+  expect(() => sql.exec("SELECT 1; PRAGMA user_version = 7")).toThrowError(
+    "not authorized: SQLITE_AUTH",
+  );
+  // The refused statement never reached the database.
+  expect(stamp()).toBe(before);
+});
+
+sqlTest("allowed pragmas run, and name arguments pass the reserved-name rule", ({ sql }) => {
+  sql.exec("CREATE TABLE things (id INTEGER)");
+  expect(sql.exec("PRAGMA table_info(things)").toArray()).toEqual([
+    { cid: 0, name: "id", type: "INTEGER", notnull: 0, dflt_value: null, pk: 0 },
+  ]);
+  // A quoted argument is the same name; `_cf_` stays refused through either
+  // rule (the identifier scan catches the bare form first).
+  expect(sql.exec("PRAGMA table_info('things')").toArray().length).toBe(1);
+  expect(() => sql.exec("PRAGMA table_info(_cf_KV)")).toThrowError(SQL_RESERVED_PREFIX_MESSAGE);
+  expect(() => sql.exec("PRAGMA table_info('_cf_KV')")).toThrowError(
+    "not authorized: SQLITE_AUTH",
+  );
+  expect(() => sql.exec("PRAGMA index_list(_cf_KV)")).toThrowError(SQL_RESERVED_PREFIX_MESSAGE);
+  // The boolean set reads back and takes workerd's eight literal forms.
+  sql.exec("PRAGMA foreign_keys = ON");
+  expect(sql.exec("PRAGMA foreign_keys").one()).toEqual({ foreign_keys: 1 });
+  expect(() => sql.exec("PRAGMA foreign_keys = MAYBE")).toThrowError(
+    "not authorized: SQLITE_AUTH",
+  );
+  // The pragma table-valued functions follow the same allowlist; a bound
+  // argument is data, exactly as it is for any other statement.
+  expect(
+    sql.exec("SELECT name FROM pragma_table_info(?)", "things").toArray(),
+  ).toEqual([{ name: "id" }]);
+  expect(sql.exec("PRAGMA data_version").toArray().length).toBe(1);
+  expect(() => sql.exec("PRAGMA data_version = 1")).toThrowError("not authorized: SQLITE_AUTH");
+  sql.exec("PRAGMA optimize");
+  expect(() => sql.exec("PRAGMA optimize = wrench")).toThrowError("not authorized: SQLITE_AUTH");
+});
+
 sqlTest("one() returns the single row", ({ sql }) => {
   sql.exec("CREATE TABLE things (id INTEGER)");
   sql.exec("INSERT INTO things VALUES (42)");

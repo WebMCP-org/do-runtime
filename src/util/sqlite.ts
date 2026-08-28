@@ -702,7 +702,10 @@ export function hasCurrentSqliteTable(
   ) {
     throw new Error(
       `Incompatible @mcp-b/do-runtime storage schema for table "${name}". ` +
-        "This release accepts only the current schema and does not migrate stored runtime data.",
+        "Runtime storage migrations already brought this database to the " +
+        "current version, so this is a shape no release produced — the " +
+        "database is foreign or corrupt. Restore it from a snapshot or " +
+        "delete it to start over.",
     );
   }
   return true;
