@@ -149,7 +149,6 @@ const STARTER: Record<string, string> = {
   "/server/agent.ts": `import { Agent } from "agents";
 
 export class MyAgent extends Agent {
-  static options = { hibernate: false };
   initialState = { visits: 0, recent: [] };
 
   async onRequest(request) {

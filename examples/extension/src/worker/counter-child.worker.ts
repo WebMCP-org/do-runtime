@@ -20,7 +20,6 @@ class Counter extends Agent<CounterEnv, CounterState> {
 }
 
 export class CounterChild extends Agent<CounterEnv, CounterState> {
-  static override options = { hibernate: false };
   override initialState: CounterState = { value: 0 };
 
   async bump(): Promise<SubAgentSnapshot> {
@@ -56,7 +55,6 @@ export class CounterChild extends Agent<CounterEnv, CounterState> {
 }
 
 export class CounterLeaf extends Agent<CounterEnv, CounterState> {
-  static override options = { hibernate: false };
   override initialState: CounterState = { value: 0 };
 
   async bump(): Promise<NestedSubAgentSnapshot> {

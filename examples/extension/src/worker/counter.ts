@@ -45,7 +45,6 @@ export type CounterEnv = { Counter: DurableObjectNamespace<Counter> };
 type CounterState = { value: number };
 
 export class Counter extends Agent<CounterEnv, CounterState> {
-  static override options = { hibernate: false };
   override initialState: CounterState = { value: 0 };
 
   /**

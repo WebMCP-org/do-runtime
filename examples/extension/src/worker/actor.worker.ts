@@ -51,7 +51,7 @@ import sqlite3InitModule from "@sqlite.org/sqlite-wasm";
 import { getAgentByName, routeAgentEmail, routeAgentRequest } from "agents";
 import { RpcTarget } from "cloudflare:workers";
 import {
-  installMemoryWebSocketPair,
+  installWebSocketUpgradeResponse,
   upgradeWebSocket,
   withWebSocketUpgrade,
   type UpgradeWebSocket,
@@ -380,10 +380,7 @@ function counterNamespace(gate?: FacetModule["gate"]) {
 
 const rootNamespace = counterNamespace();
 
-installMemoryWebSocketPair(() => {
-  if (live === undefined) throw new Error("WebSocket upgrade reached an unplaced actor");
-  return live.container;
-});
+installWebSocketUpgradeResponse();
 
 /**
  * What the installed globals resolve to, and it REFUSES rather than falling

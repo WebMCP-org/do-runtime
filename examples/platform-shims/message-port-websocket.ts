@@ -9,6 +9,7 @@ type PortSocket = {
   accept(): void;
   send(data: unknown): void;
   close(code?: number, reason?: string): void;
+  readonly readyState: number;
 };
 
 /** A browser WebSocket constructor backed by one multiplexed MessagePort. */
@@ -90,7 +91,13 @@ export function serveMessagePortWebSockets(
       void connect(message.url).then(
         (socket) => {
           sockets.set(message.id, socket);
-          socket.addEventListener("open", () => post(message));
+          let opened = false;
+          const open = () => {
+            if (opened) return;
+            opened = true;
+            post(message);
+          };
+          socket.addEventListener("open", open);
           socket.addEventListener("message", (incoming: Event) => {
             post({
               type: "message",
@@ -107,6 +114,7 @@ export function serveMessagePortWebSockets(
             post({ type: "error", id: message.id, message: "agent socket failed" });
           });
           socket.accept();
+          if (socket.readyState === WebSocket.OPEN) open();
         },
         (error: unknown) => {
           post({ type: "error", id: message.id, message: String(error) });
