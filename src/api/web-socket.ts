@@ -171,6 +171,15 @@ export class AcceptedWebSocket extends EventTarget {
     // Captured HERE, at the call, so message N waits for the writes outstanding when it was
     // enqueued and not for whatever is outstanding when the pump reaches it.
     const outputLock = this.#ctx.waitForOutputLocks();
+    // A failed write mutes the socket, and that is upstream's semantics rather than an accident
+    // to repair. `LegacyWebSocketAdapter::pump`'s `KJ_DEFER` (`web-socket.c++:1187-1207`) clears
+    // `outgoingMessages` unconditionally and sets `native.outgoingAborted` on any unwind that is
+    // not a clean completion, and `send()` (`:816`) and `close()` (`:916`) then return silently —
+    // so a queued frame AND a queued close are both dropped, forever, after one throwing send.
+    //
+    // Here that falls out of `.then(onFulfilled)` skipping its callback on a rejected chain.
+    // Do not "fix" it into `.then(a, b)`, `.catch()`, or an awaited predecessor: each of those
+    // resumes delivery where upstream stays silent, and `web-socket.test.ts` pins the difference.
     this.#pump = this.#pump.then(async () => {
       await outputLock;
       write();

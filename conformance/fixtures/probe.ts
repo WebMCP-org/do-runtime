@@ -856,6 +856,75 @@ export class Probe extends DurableObject<Record<string, unknown>> {
     };
   }
 
+  /**
+   * The authorizer forms that consult no `SqlStorageRegulator` callback, so porting the regulator
+   * did not carry them — this row is what makes every lane assert the refusal.
+   *
+   * ATTACH is also the isolation boundary: a backend that allows it reads another actor's file.
+   * The two file paths name a directory that does not exist, so a regression fails loudly on the
+   * refusal instead of quietly leaving a database in the working directory.
+   */
+  sqlAuthorizerRefusals(): Record<string, string> {
+    const sql = this.ctx.storage.sql;
+    // A trigger needs a real table: SQLite refuses one on a system table before the authorizer
+    // is consulted, which would measure SQLite's own message rather than the refusal under test.
+    sql.exec("CREATE TABLE base (x)");
+    const attempt = (query: string): string => {
+      try {
+        sql.exec(query).toArray();
+        return "allowed";
+      } catch (error) {
+        return error instanceof Error ? error.message : String(error);
+      }
+    };
+    return {
+      attach: attempt("ATTACH DATABASE '/nonexistent-dir/other.sqlite' AS other"),
+      detach: attempt("DETACH DATABASE other"),
+      tempTable: attempt("CREATE TEMP TABLE t(x)"),
+      tempTemporary: attempt("CREATE TEMPORARY TABLE t2(x)"),
+      tempView: attempt("CREATE TEMP VIEW v AS SELECT 1"),
+      tempTrigger: attempt("CREATE TEMP TRIGGER tg AFTER INSERT ON base BEGIN SELECT 1; END"),
+      // The schema qualifier reaches upstream's `dbName == temp` rule rather than the
+      // `SQLITE_CREATE_TEMP_*` action codes — the same refusal by its own path — and it takes
+      // every quoting SQLite does, whitespace or none, single-quoted string included.
+      tempQualifiedTable: attempt("CREATE TABLE temp.tq(x)"),
+      tempQualifiedView: attempt("CREATE VIEW temp.vq AS SELECT 1"),
+      noSpaceTempQualified: attempt('CREATE TABLE"temp".tq2(x)'),
+      misquotedSchemaTemp: attempt("CREATE TABLE 'temp'.mq1(x)"),
+      // A leading `;` is trivia: an empty first statement must not shift the leading keyword.
+      // Classified rather than quoted, as `sqlPragmas` does, because this is the one form whose
+      // MESSAGE legitimately differs by backend — workerd and `node:sqlite` compile the span and
+      // reach the refusal, while sqlite-wasm cuts the input at the first `;` and rejects the
+      // empty statement first. What has to hold on every lane is that it is refused at all.
+      semicolonAttach:
+        attempt(";ATTACH DATABASE '/nonexistent-dir/other.sqlite' AS other") === "allowed"
+          ? "allowed"
+          : "refused",
+      batchAttach: attempt("SELECT 1; ATTACH DATABASE '/nonexistent-dir/o.sqlite' AS other"),
+      vacuum: attempt("VACUUM"),
+      vacuumInto: attempt("VACUUM INTO '/nonexistent-dir/exfil.sqlite'"),
+      // Upstream allows exactly four virtual-table modules; `dbstat` would enumerate the
+      // runtime's own `_cf_` tables without the statement naming them. All four are pinned on
+      // the allowed side — `fts5vocab` reads the `ft` table the `fts5` entry created.
+      rtree: attempt("CREATE VIRTUAL TABLE rt USING rtree(id, minX, maxX)"),
+      rtreeI32: attempt("CREATE VIRTUAL TABLE rt32 USING rtree_i32(id, x1, x2)"),
+      fts5: attempt("CREATE VIRTUAL TABLE ft USING fts5(body)"),
+      fts5vocab: attempt("CREATE VIRTUAL TABLE ftv USING fts5vocab('ft', 'row')"),
+      dbstat: attempt("CREATE VIRTUAL TABLE d USING dbstat"),
+      // The name and the module take every quoting SQLite does — a guessed name boundary is a
+      // bypass in both directions, so the quoted forms are pinned on every lane.
+      spaceyNameDbstat: attempt('CREATE VIRTUAL TABLE "my table" USING dbstat'),
+      usingInsideName: attempt('CREATE VIRTUAL TABLE "a USING fts5 b" USING dbstat'),
+      quotedModuleDbstat: attempt('CREATE VIRTUAL TABLE qd USING "dbstat"'),
+      quotedNameFts5: attempt('CREATE VIRTUAL TABLE "my docs" USING fts5(body)'),
+      // The refusals are leading-keyword only; an application name is not a keyword.
+      applicationName: attempt("CREATE TABLE t_ok (attach TEXT, vacuum TEXT)"),
+      // `page_size` is on upstream's allowlist for the R*Tree module's own internal read.
+      pageSizeRead: attempt("PRAGMA page_size"),
+      pageSizeAssign: attempt("PRAGMA page_size = 8192"),
+    };
+  }
+
   /** The synchronous and asynchronous KV surfaces share one ordered store and codec. */
   async syncKvInterop(): Promise<Record<string, unknown>> {
     const kv = this.ctx.storage.kv;
@@ -901,6 +970,41 @@ export class Probe extends DurableObject<Record<string, unknown>> {
       re: read.re instanceof RegExp ? "RegExp" : typeof read.re,
       err: read.err instanceof Error ? "Error" : typeof read.err,
     };
+  }
+
+  /**
+   * Which argument `put()` reads as a key and which as an entries object — the
+   * `kj::OneOf<kj::String, jsg::Dict<...>>` unwrap. Anything `jsg::Dict` refuses is a coerced
+   * KEY, not an empty entries object, and the difference is a silently dropped write. Once the
+   * key HAS unwrapped as a Dict, the second argument is the options STRUCT: `null`, arrays and
+   * functions all unwrap to default options — only a non-null primitive is the overload error.
+   */
+  async putKeyCoercion(): Promise<{ keys: string[]; symbol: string; overload: string }> {
+    const storage = this.ctx.storage;
+    await storage.put(123 as never, "number");
+    await storage.put(null as never, "null");
+    await storage.put(true as never, "boolean");
+    await storage.put(10n as never, "bigint");
+    await storage.put([["a", 1]] as never, "array");
+    // A Map reaches the Dict alternative and has no own enumerable keys, so it writes nothing.
+    await storage.put(new Map([["m", 1]]) as never);
+    await storage.put(undefined as never, "undefined");
+    // The struct wrapper reads `null` as default options, so this WRITES — measured upstream.
+    await storage.put({ nulled: 9 } as never, null as never);
+    let symbol = "allowed";
+    try {
+      await storage.put(Symbol.iterator as never, "v");
+    } catch (error) {
+      symbol = error instanceof Error ? error.message : String(error);
+    }
+    // A non-null primitive where the options bag belongs is the caller mixing the overloads.
+    let overload = "allowed";
+    try {
+      await storage.put({ mixed: 1 } as never, "not-options" as never);
+    } catch (error) {
+      overload = error instanceof Error ? error.message : String(error);
+    }
+    return { keys: [...(await storage.list()).keys()].sort(), symbol, overload };
   }
 
   // -- §1.8 alarms never overlap ---------------------------------------------
@@ -960,6 +1064,8 @@ export class Probe extends DurableObject<Record<string, unknown>> {
     }
     await push(`exit:${depth}`);
   }
+
+
 }
 
 export default {

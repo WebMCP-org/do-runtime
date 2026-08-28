@@ -126,6 +126,36 @@ const OP_DELETE = "delete()";
 const OP_DELETE_ALARM = "deleteAlarm()";
 const OP_ROLLBACK = "rollback()";
 
+/** ← `actor-state.c++:455`, verbatim: the one message both overloads' misuse produces. */
+const PUT_OVERLOAD_MESSAGE =
+  "put() may only be called with a single key-value pair and optional options as " +
+  "put(key, value, options) or with multiple key-value pairs and optional options as " +
+  "put(entries, options)";
+
+/**
+ * ← the `kj::OneOf<kj::String, jsg::Dict<…>>` unwrap on put()'s first parameter: `jsg::Dict`
+ * takes any JS object except an Array — functions and Maps included — and `kj::String` takes
+ * everything else by coercion. A type predicate, so the overload split narrows without a cast.
+ */
+function isEntriesArgument<T>(value: string | Record<string, T>): value is Record<string, T> {
+  return (
+    (typeof value === "object" || typeof value === "function") &&
+    value !== null &&
+    !Array.isArray(value)
+  );
+}
+
+/**
+ * ← the struct wrapper (`jsg/struct.h:246-258`), which is NOT the Dict wrapper: `PutOptions` is
+ * all-optional fields, so `null` unwraps to default options, and any object does — arrays and
+ * functions included, because the wrapper checks `IsObject()` with no Array exclusion. Only a
+ * non-null primitive fails to unwrap. Measured on real workerd: `put({k: 1}, null)`, `…, [])`
+ * and `…, function () {})` all write, and `put({k: 1}, "v")` alone is the overload error.
+ */
+function isPutOptions(value: unknown): boolean {
+  return value === null || typeof value === "object" || typeof value === "function";
+}
+
 /** The key immediately after `k` in byte order is `k` plus this. */
 const NULL_CHARACTER = "\u0000";
 /** ← the `0xff` upstream strips from the tail of a prefix, in UTF-16 code units. */
@@ -444,19 +474,43 @@ abstract class DurableObjectStorageOperations {
   ): Promise<void> {
     requireInputLock(this.ctx, OP_PUT);
     // The second parameter carries a value in one overload and the options bag in the other, and
-    // which it is follows from the first — so the two narrowings below are the discrimination
-    // upstream does with `optionsTypeHandler.tryUnwrap`, made by testing the parameter that
-    // actually decides rather than the one that is ambiguous.
-    if (typeof keyOrEntries === "string") {
+    // which it is follows from the first — so `isEntriesArgument` below is the parameter-1
+    // unwrap, and the guard after it is `optionsTypeHandler.tryUnwrap` on parameter 2. Two
+    // upstream steps, in that order: which overload, then whether the rest of the call agrees
+    // with it.
+    //
+    // ← the `kj::OneOf<kj::String, jsg::Dict<...>>` unwrap, which picks the overload by which
+    // alternative accepts the argument. `jsg::Dict` takes a plain object and refuses an Array;
+    // `kj::String` takes everything else by stringifying it — so a non-string key is NOT a
+    // mistake upstream, it is the single-key overload with a coerced key. Reading one as entries
+    // instead is a silently dropped write, because `Object.entries` on a primitive is `[]`: the
+    // call resolves having written nothing.
+    //
+    // Measured on real workerd: `put(123, "v")` writes `"123"`, `put(null, "v")` writes `"null"`,
+    // `put(10n, "v")` writes `"10"`, `put([["a", 1]], "v")` writes `"a,1"`, and a symbol key
+    // throws V8's own conversion error. That last one is why the coercion below is a template
+    // literal: `String(symbol)` is the one form that returns a description instead of throwing,
+    // so it would swallow the case upstream refuses. `put(new Map(...))` reaches the Dict
+    // alternative and writes nothing, which the entries branch already reproduces.
+    //
+    // A function reaches the `Dict` alternative too, so it is entries here rather than a key
+    // stringified to its own source text.
+    if (!isEntriesArgument(keyOrEntries)) {
       if (valueOrOptions === undefined) {
         throw new TypeError("put() called with undefined value.");
       }
-      return this.#putOne(keyOrEntries, valueOrOptions as T, { ...maybeOptions });
+      return this.#putOne(`${keyOrEntries}`, valueOrOptions as T, { ...maybeOptions });
     }
-    return this.#putMultiple(
-      keyOrEntries,
-      { ...(valueOrOptions as DurableObjectPutOptions | undefined) },
-    );
+    // ← the `else` of `optionsTypeHandler.tryUnwrap` (`actor-state.c++:449-456`): once the key
+    // unwrapped as a `Dict`, a second argument can only be the options bag, and a non-null
+    // primitive there is the caller mixing the two overloads. Without this the value spreads
+    // into the options — `put({a: 1}, "v")` wrote key `a` with `{0: "v"}` for options.
+    if (valueOrOptions !== undefined && !isPutOptions(valueOrOptions)) {
+      throw new TypeError(PUT_OVERLOAD_MESSAGE);
+    }
+    return this.#putMultiple(keyOrEntries, {
+      ...(valueOrOptions as DurableObjectPutOptions | undefined),
+    });
   }
 
   delete(key: string, options?: DurableObjectPutOptions): Promise<boolean>;

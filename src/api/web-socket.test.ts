@@ -203,6 +203,41 @@ describe("outgoing messages", () => {
     expect(socket.sent).toEqual(["a", "b", "c"]);
   });
 
+  test("a send that throws mutes the socket, as upstream's pump does", async () => {
+    // ← `LegacyWebSocketAdapter::pump`'s `KJ_DEFER` (`web-socket.c++:1187-1207`): an unwind
+    // that is not a clean completion clears `outgoingMessages` and sets
+    // `native.outgoingAborted`, after which `send()` (`:816`) and `close()` (`:916`) return
+    // silently. So the frame after a failed send is dropped and so is a queued close —
+    // permanently, on one failure. Here that falls out of `.then(onFulfilled)` skipping its
+    // callback on a rejected chain, which is why this test exists: it pins the
+    // upstream-matching outcome against a refactor that would "repair" the chain into resuming.
+    const { ctx, socket } = newFixture();
+    const accepted = await ctx.run(() => acceptWebSocket(ctx, socket));
+    const realSend = socket.send.bind(socket);
+    // Only the FIRST send throws: a chain wrongly repaired into resuming delivery would then
+    // surface as a delivered "after" rather than as another throw.
+    let failNext = true;
+    socket.send = (data) => {
+      if (failNext) {
+        failNext = false;
+        throw new Error("peer already closed");
+      }
+      realSend(data);
+    };
+
+    await ctx.run(() => {
+      accepted.send("throws");
+      accepted.send("after");
+      accepted.close(1000);
+    });
+    await quiesce();
+
+    expect(socket.sent).toEqual([]);
+    expect(socket.closed).toEqual([]);
+    // Upstream surfaces the abort as an error event; here it reaches the actor's failure channel.
+    expect((ctx.waitUntilStatus() as Error | undefined)?.message).toBe("peer already closed");
+  });
+
   test("close is queued through the same gate as a send", async () => {
     const { ctx, socket } = newFixture();
     const write = Promise.withResolvers<void>();

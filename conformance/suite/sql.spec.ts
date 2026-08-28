@@ -170,3 +170,50 @@ it("§1.4 SQLite R*Tree virtual tables are available", async () => {
   const probe = await host.spawn("sql-rtree");
   expect(await probe.call("sqliteRtree")).toEqual({ ids: [{ id: 1 }], check: "ok" });
 });
+
+it("§1.4 the authorizer-only forms are refused, with workerd's own messages", async () => {
+  // ATTACH, DETACH, the temp-schema creations and the virtual-table modules reach action codes
+  // or the authorizer's `dbName == temp` rule, not regulator callbacks, so porting
+  // `SqlStorageRegulator` whole did not carry them. ATTACH is the isolation boundary as well as
+  // a fidelity row: a backend that allows it reads another actor's database. VACUUM carries
+  // SQLite's message instead, because upstream refuses it by the transaction a Durable Object
+  // always has open.
+  //
+  // The allowed side is pinned too. These are leading-keyword refusals, so the row has to show
+  // where the keyword stops mattering — an application column named `attach`, and all four
+  // virtual-table modules upstream keeps. The quoted spellings are pinned in both directions
+  // because the module is read from past the table name, and both take every quoting SQLite
+  // does, whitespace or none.
+  const probe = await host.spawn("sql-authorizer");
+  expect(await probe.call("sqlAuthorizerRefusals")).toEqual({
+    attach: "not authorized: SQLITE_AUTH",
+    detach: "not authorized: SQLITE_AUTH",
+    tempTable: "not authorized: SQLITE_AUTH",
+    tempTemporary: "not authorized: SQLITE_AUTH",
+    tempView: "not authorized: SQLITE_AUTH",
+    tempTrigger: "not authorized: SQLITE_AUTH",
+    tempQualifiedTable: "not authorized: SQLITE_AUTH",
+    tempQualifiedView: "not authorized: SQLITE_AUTH",
+    noSpaceTempQualified: "not authorized: SQLITE_AUTH",
+    misquotedSchemaTemp: "not authorized: SQLITE_AUTH",
+    // Classified, not quoted: every lane must refuse a leading-`;` ATTACH, but the message is
+    // the backend's own — workerd and `node:sqlite` compile the span and reach the authorizer
+    // refusal, sqlite-wasm cuts at the first `;` and rejects the empty statement before that.
+    semicolonAttach: "refused",
+    batchAttach: "not authorized: SQLITE_AUTH",
+    vacuum: "cannot VACUUM from within a transaction: SQLITE_ERROR",
+    vacuumInto: "cannot VACUUM from within a transaction: SQLITE_ERROR",
+    rtree: "allowed",
+    rtreeI32: "allowed",
+    fts5: "allowed",
+    fts5vocab: "allowed",
+    dbstat: "not authorized: SQLITE_AUTH",
+    spaceyNameDbstat: "not authorized: SQLITE_AUTH",
+    usingInsideName: "not authorized: SQLITE_AUTH",
+    quotedModuleDbstat: "not authorized: SQLITE_AUTH",
+    quotedNameFts5: "allowed",
+    applicationName: "allowed",
+    pageSizeRead: "allowed",
+    pageSizeAssign: "not authorized: SQLITE_AUTH",
+  });
+});

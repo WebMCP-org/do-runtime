@@ -37,3 +37,21 @@ it("§2.4 rich values round-trip with their workerd types", async () => {
     err: "Error",
   });
 });
+
+it("§2.4 put() reads what jsg::Dict refuses as a coerced key, not as empty entries", async () => {
+  // The overloads are `kj::OneOf<kj::String, jsg::Dict<...>>`: a plain object is entries, an
+  // Array is refused by Dict and falls to the string alternative, and every primitive is a key
+  // that JSG stringifies. Reading a primitive as entries instead makes `Object.entries` return
+  // `[]`, so the call resolves having written nothing — a silently dropped write. The second
+  // argument after an entries object is the all-optional options STRUCT, which `null` unwraps
+  // to; only a non-null primitive there is the overload error.
+  const probe = await host.spawn("put-key-coercion");
+  expect(await probe.call("putKeyCoercion")).toEqual({
+    keys: ["10", "123", "a,1", "null", "nulled", "true", "undefined"],
+    symbol: "Cannot convert a Symbol value to a string",
+    overload:
+      "put() may only be called with a single key-value pair and optional options as " +
+      "put(key, value, options) or with multiple key-value pairs and optional options as " +
+      "put(entries, options)",
+  });
+});
