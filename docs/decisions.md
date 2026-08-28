@@ -215,6 +215,19 @@ owns only placement and physical storage operations.
     authorizer input is unavailable.
 18. Reconcile Workers and Cap'n Web `RpcTarget` identity inside
     `newRpcSession()` before every session.
+19. Version runtime storage per database file in `PRAGMA user_version`,
+    brought forward at open by `src/util/sqlite-migrations.ts` before anything
+    reads the file. Pending steps and the stamp commit as one transaction, and
+    a step that issues transaction control of its own is refused by name; a
+    stamp from a newer release refuses by name with the one remedy (upgrade
+    the package), at open and again at snapshot import, where the operation
+    that brought the file in is the one that fails; `hasCurrentSqliteTable`
+    stays as the post-migration invariant check. The stamp is unreachable
+    from application SQL because `SqlStorage` enforces workerd's pragma
+    allowlist (`util/sqlite.c++:539-563`), which never included
+    `user_version`. Application schemas are the application's own, migrated
+    in constructors exactly as on Cloudflare — the Agents SDK's versioned
+    `_ensureSchema` and Drizzle's `durable-sqlite` migrator run unchanged.
 
 ## Deliberate divergences
 
@@ -224,6 +237,7 @@ owns only placement and physical storage operations.
 | JavaScript cannot terminate the currently executing slice | `abort()` breaks later storage and entry, but the calling method can still return |
 | No common V8 byte serializer across Node and the browser | A versioned browser-safe structured-clone encoding preserves the public value types and reads legacy JSON rows |
 | The SQLite backends expose no authorizer callbacks | Reserved `_cf_` identifiers are detected from tokenized statement text and may reject more than workerd |
+| The pragma authorizer sees resolved arguments; the text-level port does not | Workerd's pragma allowlist is enforced per statement from tokenized text. A `pragma_*` table-valued function with a string or bound argument is authorized by pragma name only; identifier arguments stay covered by the reserved-name scan |
 | `node:sqlite` exposes no `sqlite3_limit()` | Bound and returned strings and blobs enforce workerd's 4 MiB limit; SQL-computed values that are never returned may exceed it. The browser backend sets the native limit. |
 | A response BYOB reader cannot be re-gated after `read(view)` | BYOB readers throw; callers use a default reader or `arrayBuffer()` |
 | A workerd facet alarm appears to schedule and then breaks asynchronously ([workerd#6810](https://github.com/cloudflare/workerd/issues/6810)) | This runtime refuses facet `setAlarm()` synchronously |

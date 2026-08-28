@@ -38,6 +38,7 @@ import {
   type SqlResult,
   type SqlValue,
 } from "../src/util/sqlite";
+import { requireImportableRuntimeStorage } from "../src/util/sqlite-migrations";
 
 /** ← `PreparedStatement`, the members used here. */
 export interface SqliteWasmStatement {
@@ -229,6 +230,7 @@ export function createSqliteWasmProvider(
     async importSnapshot(snapshot: SqlDatabaseSnapshot): Promise<void> {
       requireClosed(openDatabases);
       requireValidSqlDatabaseSnapshot(snapshot);
+      requireImportableRuntimeStorage(snapshot);
       for (const file of ownedFiles()) host.pool.unlink(file);
       for (const { name, image } of snapshot.databases) {
         await host.pool.importDb(`${prefix}.${name}.sqlite`, new Uint8Array(image));

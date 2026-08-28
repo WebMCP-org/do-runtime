@@ -30,6 +30,67 @@ it("§1.4 a SQL batch executes in order and returns the bound final statement", 
   });
 });
 
+it("§1.4 PRAGMA follows workerd's allowlist", async () => {
+  const probe = await host.spawn("sql-pragmas");
+  expect(await probe.call("sqlPragmas")).toEqual({
+    userVersionRead: "refused",
+    userVersionWrite: "refused",
+    userVersionSchema: "refused",
+    userVersionFunction: "refused",
+    writableSchema: "refused",
+    journalMode: "refused",
+    maxPageCount: "refused",
+    schemaVersion: "refused",
+    dataVersion: "allowed",
+    dataVersionWithArg: "refused",
+    foreignKeysRead: "allowed",
+    foreignKeysWrite: "allowed",
+    tableList: "allowed",
+    tableInfo: "allowed",
+    tableInfoQuoted: "allowed",
+    tableInfoFunction: "allowed",
+    indexList: "allowed",
+    foreignKeyCheck: "allowed",
+    quickCheck: "allowed",
+    optimize: "allowed",
+  });
+});
+
+it("§1.4 cursor iterators match workerd's observable shape", async () => {
+  const probe = await host.spawn("sql-cursor-iterator-shape");
+  expect(await probe.call("sqlCursorIteratorShape")).toEqual({
+    // No `return()` means an early exit does not close a retained iterator.
+    breakThenNext: { done: false, value: [2, "two"] },
+    destructureThenNext: { done: false, value: { id: 2, label: "two" } },
+    rawTag: "[object RawIterator]",
+    rowsTag: "[object RowIterator]",
+    cursorTag: "[object Cursor]",
+    nextKeys: ["done", "value"],
+    doneKeys: ["done", "value"],
+    cursorDoneKeys: ["done", "value"],
+    ownKeys: [],
+    hasReturn: "undefined",
+    hasThrow: "undefined",
+    selfIterable: true,
+    cursorJson: "{}",
+  });
+});
+
+it("§1.4 cursor iterators carry the ES iterator helpers", async () => {
+  const probe = await host.spawn("sql-cursor-iterator-helpers");
+  expect(await probe.call("sqlCursorIteratorHelpers")).toEqual({
+    rawToArray: [
+      [1, "one"],
+      [2, "two"],
+    ],
+    rawMaps: ["one", "two"],
+    rowsToArray: [
+      { id: 1, label: "one" },
+      { id: 2, label: "two" },
+    ],
+  });
+});
+
 it("§1.4 a prepared SQL statement is callable and reusable", async () => {
   const probe = await host.spawn("sql-prepare");
   expect(await probe.call("sqlPrepare")).toEqual({

@@ -63,6 +63,7 @@ import type { FacetManager, FacetStartInfo } from "../io/worker";
 import { asFacetStub } from "../io/worker";
 import type { SqlDatabase, SqlDatabaseProvider } from "../util/sqlite";
 import { hasCurrentSqliteTable, SqliteDatabase } from "../util/sqlite";
+import { ensureRuntimeStorageVersion } from "../util/sqlite-migrations";
 import { ActorIdFactoryImpl } from "./actor-id-impl";
 import type { IndexFile } from "./facet-tree-index";
 import { FacetTreeIndex } from "./facet-tree-index";
@@ -1658,7 +1659,9 @@ class ActorContainerImpl implements ActorContainer {
 export async function createActorContainer(
   options: ActorContainerOptions,
 ): Promise<ActorContainer> {
-  const db = new SqliteDatabase(await options.ports.sql.open(ACTOR_DATABASE_NAME));
+  const actorDb = await options.ports.sql.open(ACTOR_DATABASE_NAME);
+  ensureRuntimeStorageVersion(actorDb, ACTOR_DATABASE_NAME);
+  const db = new SqliteDatabase(actorDb);
 
   // ← `ensureFacetTreeIndex()`'s `KJ_REQUIRE(parent == kj::none, "only 'root' may
   // ensureFacetTreeIndex()")` (`server.c++:2704`). A facet is handed the root's rather than
@@ -1666,9 +1669,8 @@ export async function createActorContainer(
   if (options.facet !== undefined) {
     return new ActorContainerImpl(options, db, undefined, options.facet.tree);
   }
-  const tree = new ActorTree(
-    await options.ports.sql.open(FACET_DATABASE_NAME),
-    options.ports.facets,
-  );
+  const facetDb = await options.ports.sql.open(FACET_DATABASE_NAME);
+  ensureRuntimeStorageVersion(facetDb, FACET_DATABASE_NAME);
+  const tree = new ActorTree(facetDb, options.ports.facets);
   return new ActorContainerImpl(options, db, tree, tree);
 }

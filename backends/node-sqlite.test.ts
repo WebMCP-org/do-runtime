@@ -229,6 +229,29 @@ describe("node-sqlite backend", () => {
     reopened.close();
   });
 
+  test("snapshot import refuses an image stamped by a newer release", async () => {
+    const provider = createNodeSqlProvider({ directory: temporaryDirectory() });
+    const db = await provider.open("root");
+    db.exec("CREATE TABLE state (value TEXT)", []);
+    db.exec("INSERT INTO state VALUES ('safe')", []);
+    provider.close();
+
+    const snapshot = await provider.exportSnapshot();
+    const image = snapshot.databases.find(({ name }) => name === "root")?.image;
+    if (image === undefined) throw new Error("exported snapshot holds the root image");
+    // `user_version` lives at header offset 60, big-endian — forge a stamp
+    // from a future release. Refusing at import names the operation that
+    // brought the file in, instead of bricking the next placement.
+    new DataView(image.buffer, image.byteOffset, image.byteLength).setInt32(60, 99);
+
+    await expect(provider.importSnapshot(snapshot)).rejects.toThrow(
+      /storage version 99.*supports up to \d+.*Upgrade the package to import it/su,
+    );
+    const reopened = await provider.open("root");
+    expect(reopened.exec("SELECT value FROM state", []).rawRows).toEqual([["safe"]]);
+    provider.close();
+  });
+
   test("a name that is not a safe file name is refused", async () => {
     const provider = createNodeSqlProvider({ directory: temporaryDirectory() });
     await expect(provider.open("../escape")).rejects.toThrow("not a safe file name");
