@@ -52,6 +52,52 @@ type SocketLike = WebSocket & {
   deserializeAttachment(): unknown;
 };
 
+class RawEndpoint extends EventTarget implements RawWebSocket, WebSocket {
+  readonly READY_STATE_CONNECTING = 0;
+  readonly READY_STATE_OPEN = 1;
+  readonly READY_STATE_CLOSING = 2;
+  readonly READY_STATE_CLOSED = 3;
+  readonly CONNECTING = 0;
+  readonly OPEN = 1;
+  readonly CLOSING = 2;
+  readonly CLOSED = 3;
+  readonly bufferedAmount = 0;
+  readonly extensions = "";
+  readonly protocol = "";
+  readonly readyState = 1;
+  readonly url = "";
+  binaryType: "blob" | "arraybuffer" = "blob";
+  onopen: WebSocket["onopen"] = null;
+  onmessage: WebSocket["onmessage"] = null;
+  onclose: WebSocket["onclose"] = null;
+  onerror: WebSocket["onerror"] = null;
+  peer!: RawEndpoint;
+
+  accept(): void {}
+
+  send(data: string | ArrayBufferLike | ArrayBufferView | Blob): void {
+    this.peer.dispatchEvent(new MessageEvent("message", { data }));
+  }
+
+  close(code = 1000, reason = ""): void {
+    this.peer.dispatchEvent(new CloseEvent("close", { code, reason, wasClean: true }));
+  }
+
+  serializeAttachment(): void {}
+
+  deserializeAttachment(): null {
+    return null;
+  }
+}
+
+function rawPair(): [client: RawEndpoint, server: RawEndpoint] {
+  const client = new RawEndpoint();
+  const server = new RawEndpoint();
+  client.peer = server;
+  server.peer = client;
+  return [client, server];
+}
+
 class SocketActor {
   readonly messages: Record<string, unknown>[] = [];
   readonly constructorSockets: Record<string, unknown>[];
@@ -75,6 +121,16 @@ class SocketActor {
 
   webSocketClose(socket: WebSocket, code: number, reason: string): void {
     socket.close(code, reason);
+  }
+}
+
+class RawSocketActor {
+  readonly messages: (string | ArrayBuffer)[] = [];
+
+  constructor(readonly ctx: DurableObjectState) {}
+
+  webSocketMessage(_socket: WebSocket, message: string | ArrayBuffer): void {
+    this.messages.push(message);
   }
 }
 
@@ -147,11 +203,12 @@ describe("hibernation embedder contract", () => {
     expect(mirror.attached.mock.calls[0]?.[0]).toBe(server);
     const persisted = mirror.entries.get(server);
     expect(persisted?.attachment).toBeInstanceOf(Uint8Array);
+    if (persisted === undefined) throw new Error("accepted socket was not mirrored");
 
     const secondMirror = recorder();
     const second = await started({
       ports: { ...options().ports, hibernation: secondMirror.host },
-      webSockets: [persisted!],
+      webSockets: [persisted],
     });
     expect(second.actor.constructorSockets).toEqual([
       {
@@ -203,6 +260,38 @@ describe("hibernation embedder contract", () => {
     client.close(4001, "bye");
     await quiesce();
     expect(mirror.closed).toHaveBeenCalledWith(server);
+
+    expect(() => server.serializeAttachment({ after: "close" })).not.toThrow();
+    expect(server.deserializeAttachment()).toEqual({ after: "close" });
+    expect(mirror.entries.has(server)).toBe(false);
+  });
+
+  test("moves a rehydrated raw socket's listener to the replacement registry", async () => {
+    const mirror = recorder();
+    const firstContainer = await createActorContainer(
+      options({ ports: { ...options().ports, hibernation: mirror.host } }),
+    );
+    const firstActor = await firstContainer.start((ctx) => new RawSocketActor(ctx));
+    const [client, server] = rawPair();
+
+    await firstContainer.run(() => {
+      firstContainer.state.acceptWebSocket(server, ["raw"]);
+    });
+    const persisted = mirror.entries.get(server);
+    if (persisted === undefined) throw new Error("accepted raw socket was not mirrored");
+
+    const secondContainer = await createActorContainer(
+      options({
+        ports: { ...options().ports, hibernation: mirror.host },
+        webSockets: [persisted],
+      }),
+    );
+    const secondActor = await secondContainer.start((ctx) => new RawSocketActor(ctx));
+
+    client.send("after-rebuild");
+    await quiesce();
+    expect(firstActor.messages).toEqual([]);
+    expect(secondActor.messages).toEqual(["after-rebuild"]);
   });
 
   test("pins cross-accept, attachment, and synchronous close errors", async () => {

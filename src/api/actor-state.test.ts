@@ -62,6 +62,7 @@ import {
   FACET_TREE_MAX_DEPTH,
   type StorageCache,
 } from "./actor-state";
+import { HibernatableWebSocketRegistry } from "./web-socket";
 
 /** The `ctx.exports` value a facet start-up callback hands back, once per call site. */
 function testClass(): DurableObjectClass {
@@ -181,6 +182,7 @@ class Harness {
   readonly ctx: IoContext;
   readonly facets = new FakeFacetManager();
   readonly storage: DurableObjectStorage;
+  readonly webSockets: HibernatableWebSocketRegistry;
   readonly globals: ActorGlobalScope;
   readonly state: DurableObjectState;
   readonly scheduled: Array<number | null> = [];
@@ -207,7 +209,12 @@ class Harness {
       this.ctx,
       wrapCache === undefined ? this.cache : wrapCache(this.cache),
     );
-    this.globals = new ActorGlobalScope(this.ctx);
+    this.webSockets = new HibernatableWebSocketRegistry(this.ctx, {
+      message(): void {},
+      close(): void {},
+      error(): void {},
+    });
+    this.globals = new ActorGlobalScope(this.ctx, { webSockets: this.webSockets });
     this.state = new DurableObjectState(this.ctx, {
       id: new TestId("test-actor"),
       exports: { Thing: class {} },
@@ -215,6 +222,7 @@ class Harness {
       storage: this.storage,
       facets: this.facets,
       globals: actorScopeBindings(() => this.globals),
+      webSockets: this.webSockets,
     });
     // Nothing else takes it, and an unobserved break would surface as an unhandled rejection.
     void this.gate.onBroken().catch(() => {});
@@ -804,6 +812,7 @@ test("an actor with no facet manager says so", async () => {
     props: undefined,
     storage: h.storage,
     globals: actorScopeBindings(() => h.globals),
+    webSockets: h.webSockets,
   });
   await h.run(() => {
     expect(() => state.facets.get("child", () => ({ class: testClass() }))).toThrow(

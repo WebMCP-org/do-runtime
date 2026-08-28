@@ -64,9 +64,6 @@ import {
   type FacetTree,
   type IsolateChannelFactory,
   type LoadIsolateRequest,
-  type HibernationHost,
-  type RawWebSocket,
-  type RehydratedWebSocket,
   type WorkerSource,
   type WorkerStubChannel,
 } from "../../src/index";
@@ -80,14 +77,15 @@ import {
   type SqliteWasmHost,
 } from "../../backends/sqlite-wasm";
 import { Probe } from "../fixtures/probe";
-import type { ActorBoot, ActorRpc, SupervisorRpc } from "./protocol";
-import { installPool, timer, UNIQUE_KEY } from "./substrate";
+import { HibernationMirror } from "../hibernation-host";
 import {
   installWebSocketUpgradeGlobals,
   upgradeWebSocket,
   webSocketUpgradeRequest,
   type UpgradeWebSocket,
 } from "../websocket-upgrade";
+import type { ActorBoot, ActorRpc, SupervisorRpc } from "./protocol";
+import { installPool, timer, UNIQUE_KEY } from "./substrate";
 
 type Session<T> = ReturnType<typeof newRpcSession<T>>;
 
@@ -116,42 +114,6 @@ let placing: Promise<Live> | undefined;
 /** The page. */
 let peer: Session<SupervisorRpc> | undefined;
 
-class BrowserHibernationHost implements HibernationHost {
-  readonly #entries = new Map<RawWebSocket, RehydratedWebSocket>();
-  autoResponsePair: { request: string; response: string } | null = null;
-
-  accepted(socket: RawWebSocket, tags: readonly string[]): void {
-    this.#entries.set(socket, { socket, tags: [...tags] });
-  }
-
-  attachment(socket: RawWebSocket, bytes: Uint8Array | null): void {
-    const entry = this.#entries.get(socket);
-    if (entry === undefined) {
-      throw new Error("Browser lane: attachment preceded socket acceptance.");
-    }
-    this.#entries.set(socket, {
-      socket,
-      tags: entry.tags,
-      ...(bytes === null ? {} : { attachment: bytes.slice() }),
-      ...(entry.autoResponseTimestamp === undefined
-        ? {}
-        : { autoResponseTimestamp: entry.autoResponseTimestamp }),
-    });
-  }
-
-  autoResponse(pair: { request: string; response: string } | null): void {
-    this.autoResponsePair = pair === null ? null : { ...pair };
-  }
-
-  closed(socket: RawWebSocket): void {
-    this.#entries.delete(socket);
-  }
-
-  snapshot(): RehydratedWebSocket[] {
-    return [...this.#entries.values()];
-  }
-}
-
 type SocketClose = { code: number; reason: string; wasClean: boolean };
 type ClientRecord = {
   socket: UpgradeWebSocket;
@@ -161,7 +123,7 @@ type ClientRecord = {
   closeWaiters: ((close: SocketClose) => void)[];
 };
 
-const hibernation = new BrowserHibernationHost();
+const hibernation = new HibernationMirror();
 const clients = new Map<string, ClientRecord>();
 let clientCounter = 0;
 

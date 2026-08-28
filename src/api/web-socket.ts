@@ -33,10 +33,7 @@ export type RehydratedWebSocket = {
   autoResponseTimestamp?: number;
 };
 
-export interface WebSocketRequestResponsePair {
-  readonly request: string;
-  readonly response: string;
-}
+type WebSocketPairConstructor = typeof WebSocketPair;
 
 class WebSocketRequestResponsePairImpl implements WebSocketRequestResponsePair {
   readonly #request: string;
@@ -56,25 +53,21 @@ class WebSocketRequestResponsePairImpl implements WebSocketRequestResponsePair {
   }
 }
 
-export const WebSocketRequestResponsePair: {
-  new (request: string, response: string): WebSocketRequestResponsePair;
-  readonly prototype: WebSocketRequestResponsePair;
-} = new Proxy(WebSocketRequestResponsePairImpl, {
-  apply(): never {
-    throw new TypeError(
-      "Failed to construct 'WebSocketRequestResponsePair': Please use the 'new' operator, this DOM object constructor cannot be called as a function.",
-    );
-  },
-});
+const RuntimeWebSocketRequestResponsePair: typeof WebSocketRequestResponsePair =
+  new Proxy(WebSocketRequestResponsePairImpl, {
+    apply(): never {
+      throw new TypeError(
+        "Failed to construct 'WebSocketRequestResponsePair': Please use the 'new' operator, this DOM object constructor cannot be called as a function.",
+      );
+    },
+  });
 
-export interface RuntimeWebSocketPair {
+export { RuntimeWebSocketRequestResponsePair as WebSocketRequestResponsePair };
+
+type RuntimeWebSocketPair = {
   0: AcceptedWebSocket;
   1: AcceptedWebSocket;
-}
-
-export interface RuntimeWebSocketPairConstructor {
-  new (): RuntimeWebSocketPair;
-}
+};
 
 /** ← the `JSG_REQUIRE(!native.state.is<Accepted>(), ...)` at the head of `accept()`. */
 export const ALREADY_ACCEPTED_MESSAGE =
@@ -94,20 +87,42 @@ const MAX_TAG_LENGTH = 256;
 const MAX_ATTACHMENT_BYTES = 16_384;
 const MAX_AUTO_RESPONSE_BYTES = 2_048;
 const MAX_EVENT_TIMEOUT = 604_800_000;
+const MAX_CLOSE_REASON_BYTES = 123;
+
+const WEB_SOCKET_READY_STATES = {
+  READY_STATE_CONNECTING: 0,
+  READY_STATE_OPEN: 1,
+  READY_STATE_CLOSING: 2,
+  READY_STATE_CLOSED: 3,
+  CONNECTING: 0,
+  OPEN: 1,
+  CLOSING: 2,
+  CLOSED: 3,
+} as const;
+
+const textEncoder = new TextEncoder();
 
 const SOCKET_EVENTS = ["open", "message", "close", "error"] as const;
 type SocketEvent = (typeof SOCKET_EVENTS)[number];
-type SocketMode = "classic" | "hibernatable";
 
 type PairState = {
   used: boolean;
   hibernationAccepted: boolean;
 };
 
+type SocketAcceptance =
+  | { mode: "classic" }
+  | { mode: "hibernatable"; registry: HibernatableWebSocketRegistry };
+
+type SocketDelivery =
+  | { mode: "pending" }
+  | { mode: "classic"; criticalSection: CriticalSection | undefined }
+  | { mode: "hibernatable"; registry: HibernatableWebSocketRegistry };
+
 type SocketMetadata = {
-  accepted?: { mode: SocketMode; registry?: HibernatableWebSocketRegistry };
+  accepted?: SocketAcceptance;
   attachment?: Uint8Array;
-  hasAttachment: boolean;
+  rawListenersInstalled?: true;
 };
 
 const metadata = new WeakMap<object, SocketMetadata>();
@@ -115,7 +130,7 @@ const metadata = new WeakMap<object, SocketMetadata>();
 function socketMetadata(socket: object): SocketMetadata {
   let value = metadata.get(socket);
   if (value === undefined) {
-    value = { hasAttachment: false };
+    value = {};
     metadata.set(socket, value);
   }
   return value;
@@ -159,22 +174,23 @@ function serializeAttachment(socket: RawWebSocket, value: unknown): void {
   // ponytail: the local codec's string envelope is seven bytes wider than V8's;
   // replace this size adapter if the package adopts V8 wire bytes.
   const measuredBytes =
-    typeof value === "string" ? new TextEncoder().encode(value).byteLength + 5 : bytes.byteLength;
+    typeof value === "string" ? textEncoder.encode(value).byteLength + 5 : bytes.byteLength;
   if (measuredBytes > MAX_ATTACHMENT_BYTES) {
     throw new Error(
-      `A WebSocket 'attachment' cannot be larger than 16384 bytes.'attachment' was ${measuredBytes} bytes.`,
+      `A WebSocket 'attachment' cannot be larger than ${MAX_ATTACHMENT_BYTES} bytes.'attachment' was ${measuredBytes} bytes.`,
     );
   }
   const state = socketMetadata(socket);
   state.attachment = bytes;
-  state.hasAttachment = true;
-  state.accepted?.registry?.attachmentChanged(socket, bytes);
+  if (state.accepted?.mode === "hibernatable") {
+    state.accepted.registry.attachmentChanged(socket, bytes);
+  }
 }
 
 function deserializeAttachment(socket: RawWebSocket): unknown {
-  const state = socketMetadata(socket);
-  if (!state.hasAttachment) return null;
-  return deserializeValue("WebSocket attachment", state.attachment!);
+  const attachment = socketMetadata(socket).attachment;
+  if (attachment === undefined) return null;
+  return deserializeValue("WebSocket attachment", attachment);
 }
 
 function serializeAttachmentMethod(this: unknown, value?: unknown): void {
@@ -194,7 +210,7 @@ function cloneMessageData(data: unknown): string | ArrayBuffer | Blob {
   if (typeof data === "string" || data instanceof Blob) return data;
   if (data instanceof ArrayBuffer) return data.slice(0);
   if (ArrayBuffer.isView(data)) {
-    return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer;
+    return new Uint8Array(data.buffer, data.byteOffset, data.byteLength).slice().buffer;
   }
   return String(data);
 }
@@ -216,14 +232,14 @@ class MemoryWebSocketEndpoint extends EventTarget implements RawWebSocket {
 
 /** One public socket identity, in classic or hibernatable mode after acceptance. */
 export class AcceptedWebSocket extends EventTarget implements RawWebSocket, WebSocket {
-  static readonly READY_STATE_CONNECTING = 0;
-  static readonly READY_STATE_OPEN = 1;
-  static readonly READY_STATE_CLOSING = 2;
-  static readonly READY_STATE_CLOSED = 3;
-  static readonly CONNECTING = 0;
-  static readonly OPEN = 1;
-  static readonly CLOSING = 2;
-  static readonly CLOSED = 3;
+  static readonly READY_STATE_CONNECTING = WEB_SOCKET_READY_STATES.READY_STATE_CONNECTING;
+  static readonly READY_STATE_OPEN = WEB_SOCKET_READY_STATES.READY_STATE_OPEN;
+  static readonly READY_STATE_CLOSING = WEB_SOCKET_READY_STATES.READY_STATE_CLOSING;
+  static readonly READY_STATE_CLOSED = WEB_SOCKET_READY_STATES.READY_STATE_CLOSED;
+  static readonly CONNECTING = WEB_SOCKET_READY_STATES.CONNECTING;
+  static readonly OPEN = WEB_SOCKET_READY_STATES.OPEN;
+  static readonly CLOSING = WEB_SOCKET_READY_STATES.CLOSING;
+  static readonly CLOSED = WEB_SOCKET_READY_STATES.CLOSED;
 
   declare readonly READY_STATE_CONNECTING: 0;
   declare readonly READY_STATE_OPEN: 1;
@@ -241,12 +257,10 @@ export class AcceptedWebSocket extends EventTarget implements RawWebSocket, WebS
   #ctx: IoContext;
   readonly #socket: RawWebSocket;
   readonly #pairState: PairState | undefined;
-  #mode: SocketMode | undefined;
-  #registry: HibernatableWebSocketRegistry | undefined;
-  #criticalSection: CriticalSection | undefined;
+  #delivery: SocketDelivery = { mode: "pending" };
   #pump: Promise<void> = Promise.resolve();
   #pending: { type: SocketEvent; event: Event }[] = [];
-  #readyState = AcceptedWebSocket.OPEN;
+  #readyState: number = AcceptedWebSocket.OPEN;
   #ownClose = false;
   #peerClose = false;
   #binaryType: "blob" | "arraybuffer" = "blob";
@@ -256,16 +270,12 @@ export class AcceptedWebSocket extends EventTarget implements RawWebSocket, WebS
   onclose: ((event: CloseEvent) => void) | null = null;
   onerror: ((event: Event) => void) | null = null;
 
-  constructor(
-    ctx: IoContext,
-    socket: RawWebSocket,
-    options: { deferred?: boolean; pairState?: PairState } = {},
-  ) {
+  constructor(ctx: IoContext, socket: RawWebSocket, pairState?: PairState) {
     super();
     this.#ctx = ctx;
     this.#socket = socket;
-    this.#pairState = options.pairState;
-    if (options.deferred !== true) this.#enableClassic();
+    this.#pairState = pairState;
+    if (pairState === undefined) this.#enableClassic();
     for (const type of SOCKET_EVENTS) {
       socket.addEventListener(type, (event: Event) => {
         this.#receive(type, event);
@@ -286,14 +296,16 @@ export class AcceptedWebSocket extends EventTarget implements RawWebSocket, WebS
   }
 
   accept(): void {
-    if (this.#mode === "hibernatable") throw new TypeError(HIBERNATION_AFTER_ACCEPT_MESSAGE);
-    if (this.#mode === "classic") throw new Error(ALREADY_ACCEPTED_MESSAGE);
+    if (this.#delivery.mode === "hibernatable") {
+      throw new TypeError(HIBERNATION_AFTER_ACCEPT_MESSAGE);
+    }
+    if (this.#delivery.mode === "classic") throw new Error(ALREADY_ACCEPTED_MESSAGE);
     if (this.#pairState !== undefined) this.#pairState.used = true;
     this.#enableClassic();
   }
 
   send(data: string | ArrayBufferLike | ArrayBufferView | Blob): void {
-    if (this.#mode === "hibernatable" && this.#ownClose) {
+    if (this.#delivery.mode === "hibernatable" && this.#ownClose) {
       throw new TypeError("Can't call WebSocket send() after close().");
     }
     if (this.#peerClose || this.#readyState === AcceptedWebSocket.CLOSED) return;
@@ -303,7 +315,9 @@ export class AcceptedWebSocket extends EventTarget implements RawWebSocket, WebS
 
   close(code?: number, reason = ""): void {
     if (this.#readyState === AcceptedWebSocket.CLOSED || this.#ownClose) return;
-    if (this.#mode === "hibernatable" || this.#pairState !== undefined) validateClose(code, reason);
+    if (this.#delivery.mode === "hibernatable" || this.#pairState !== undefined) {
+      validateClose(code, reason);
+    }
     this.#markPairUsed();
     this.#ownClose = true;
     this.#readyState = this.#peerClose ? AcceptedWebSocket.CLOSED : AcceptedWebSocket.CLOSING;
@@ -319,24 +333,27 @@ export class AcceptedWebSocket extends EventTarget implements RawWebSocket, WebS
     return deserializeAttachment(this);
   }
 
-  enableHibernation(
-    registry: HibernatableWebSocketRegistry,
-    rehydrate = false,
-    ctx: IoContext = this.#ctx,
-  ): void {
-    if (!rehydrate) {
-      if (this.#mode !== undefined) throw new Error(HIBERNATION_ALREADY_ACCEPTED_MESSAGE);
-      if (this.#pairState?.used === true && !this.#pairState.hibernationAccepted) {
-        throw new Error(HIBERNATION_PAIR_USED_MESSAGE);
-      }
-      if (this.#pairState !== undefined) {
-        this.#pairState.used = true;
-        this.#pairState.hibernationAccepted = true;
-      }
+  acceptHibernation(registry: HibernatableWebSocketRegistry): void {
+    if (this.#delivery.mode !== "pending") {
+      throw new Error(HIBERNATION_ALREADY_ACCEPTED_MESSAGE);
     }
+    if (this.#pairState?.used === true && !this.#pairState.hibernationAccepted) {
+      throw new Error(HIBERNATION_PAIR_USED_MESSAGE);
+    }
+    if (this.#pairState !== undefined) {
+      this.#pairState.used = true;
+      this.#pairState.hibernationAccepted = true;
+    }
+    this.#activateHibernation(registry, this.#ctx);
+  }
+
+  rehydrateHibernation(registry: HibernatableWebSocketRegistry, ctx: IoContext): void {
+    this.#activateHibernation(registry, ctx);
+  }
+
+  #activateHibernation(registry: HibernatableWebSocketRegistry, ctx: IoContext): void {
     this.#ctx = ctx;
-    this.#mode = "hibernatable";
-    this.#registry = registry;
+    this.#delivery = { mode: "hibernatable", registry };
     this.#pending = [];
   }
 
@@ -349,12 +366,17 @@ export class AcceptedWebSocket extends EventTarget implements RawWebSocket, WebS
   }
 
   #enableClassic(): void {
-    this.#mode = "classic";
-    this.#criticalSection = this.#ctx.getCriticalSection();
+    const delivery: SocketDelivery = {
+      mode: "classic",
+      criticalSection: this.#ctx.getCriticalSection(),
+    };
+    this.#delivery = delivery;
     socketMetadata(this).accepted = { mode: "classic" };
     const pending = this.#pending;
     this.#pending = [];
-    for (const item of pending) this.#deliverClassic(item.type, item.event);
+    for (const item of pending) {
+      this.#deliverClassic(item.type, item.event, delivery.criticalSection);
+    }
   }
 
   #receive(type: SocketEvent, event: Event): void {
@@ -362,9 +384,11 @@ export class AcceptedWebSocket extends EventTarget implements RawWebSocket, WebS
       this.#receiveClose(event as CloseEvent);
       return;
     }
-    if (this.#mode === undefined) this.#pending.push({ type, event });
-    else if (this.#mode === "classic") this.#deliverClassic(type, event);
-    else this.#registry!.receive(this, type, event);
+    const delivery = this.#delivery;
+    if (delivery.mode === "pending") this.#pending.push({ type, event });
+    else if (delivery.mode === "classic") {
+      this.#deliverClassic(type, event, delivery.criticalSection);
+    } else delivery.registry.receive(this, type, event);
   }
 
   #receiveClose(event: CloseEvent): void {
@@ -373,7 +397,7 @@ export class AcceptedWebSocket extends EventTarget implements RawWebSocket, WebS
     } else {
       this.#peerClose = true;
       this.#readyState = AcceptedWebSocket.CLOSING;
-      if (this.#mode === "classic" && this.#pairState !== undefined) {
+      if (this.#delivery.mode === "classic" && this.#pairState !== undefined) {
         // Pair halves perform the WebSocket close handshake in-memory. An
         // embedder-supplied raw socket owns its own protocol and only reports.
         if (event.code === 1005 || event.code === 1006 || event.code === 1015) {
@@ -383,19 +407,25 @@ export class AcceptedWebSocket extends EventTarget implements RawWebSocket, WebS
         }
       }
     }
-    if (this.#mode === undefined) this.#pending.push({ type: "close", event });
-    else if (this.#mode === "classic") this.#deliverClassic("close", event);
-    else this.#registry!.receive(this, "close", event);
+    const delivery = this.#delivery;
+    if (delivery.mode === "pending") this.#pending.push({ type: "close", event });
+    else if (delivery.mode === "classic") {
+      this.#deliverClassic("close", event, delivery.criticalSection);
+    } else delivery.registry.receive(this, "close", event);
   }
 
-  #deliverClassic(type: SocketEvent, event: Event): void {
+  #deliverClassic(
+    type: SocketEvent,
+    event: Event,
+    criticalSection: CriticalSection | undefined,
+  ): void {
     this.#ctx.addWaitUntil(
       this.#ctx.run(() => {
         const delivered = cloneEventFor(type, event);
         this.dispatchEvent(delivered);
         const handler = this[`on${type}`] as ((event: Event) => void) | null;
         handler?.(delivered);
-      }, { input: this.#criticalSection }),
+      }, { input: criticalSection }),
     );
   }
 
@@ -409,16 +439,7 @@ export class AcceptedWebSocket extends EventTarget implements RawWebSocket, WebS
   }
 }
 
-for (const [name, value] of Object.entries({
-  READY_STATE_CONNECTING: 0,
-  READY_STATE_OPEN: 1,
-  READY_STATE_CLOSING: 2,
-  READY_STATE_CLOSED: 3,
-  CONNECTING: 0,
-  OPEN: 1,
-  CLOSING: 2,
-  CLOSED: 3,
-})) {
+for (const [name, value] of Object.entries(WEB_SOCKET_READY_STATES)) {
   Object.defineProperty(AcceptedWebSocket.prototype, name, { value, enumerable: true });
 }
 
@@ -429,8 +450,8 @@ type HandlerDispatch = {
 };
 
 type RegistryEntry = {
-  socket: RawWebSocket;
-  tags: string[];
+  readonly socket: RawWebSocket;
+  readonly tags: string[];
   autoResponseTimestamp?: number;
 };
 
@@ -441,7 +462,7 @@ export class HibernatableWebSocketRegistry {
   readonly #entries: RegistryEntry[] = [];
   #autoResponse: WebSocketRequestResponsePair | null = null;
   #eventTimeout: number | null = null;
-  #pairConstructor: RuntimeWebSocketPairConstructor | undefined;
+  #pairConstructor: WebSocketPairConstructor | undefined;
 
   constructor(
     ctx: IoContext,
@@ -455,10 +476,15 @@ export class HibernatableWebSocketRegistry {
     for (const value of rehydrated) this.#rehydrate(value);
   }
 
-  get WebSocketPair(): RuntimeWebSocketPairConstructor {
-    this.#pairConstructor ??= new Proxy(function WebSocketPair() {}, {
-      construct: () => this.#createPair(),
-    }) as unknown as RuntimeWebSocketPairConstructor;
+  get WebSocketPair(): WebSocketPairConstructor {
+    const registry = this;
+    this.#pairConstructor ??= new Proxy(
+      class WebSocketPair {
+        declare readonly 0: WebSocket;
+        declare readonly 1: WebSocket;
+      },
+      { construct: () => registry.#createPair() },
+    );
     return this.#pairConstructor;
   }
 
@@ -471,10 +497,12 @@ export class HibernatableWebSocketRegistry {
     const state = socketMetadata(socket);
     if (state.accepted !== undefined) throw new Error(HIBERNATION_ALREADY_ACCEPTED_MESSAGE);
     if (this.#entries.length >= MAX_HIBERNATABLE_SOCKETS) {
-      throw new Error("only 32768 websockets can be accepted on a single Durable Object instance");
+      throw new Error(
+        `only ${MAX_HIBERNATABLE_SOCKETS} websockets can be accepted on a single Durable Object instance`,
+      );
     }
     const normalizedTags = normalizeTags(tags);
-    if (socket instanceof AcceptedWebSocket) socket.enableHibernation(this);
+    if (socket instanceof AcceptedWebSocket) socket.acceptHibernation(this);
     else this.#listenRaw(socket);
     state.accepted = { mode: "hibernatable", registry: this };
     this.#entries.push({ socket, tags: normalizedTags });
@@ -529,7 +557,9 @@ export class HibernatableWebSocketRegistry {
 
   getWebSocketAutoResponse(): WebSocketRequestResponsePair | null {
     const pair = this.#autoResponse;
-    return pair === null ? null : new WebSocketRequestResponsePair(pair.request, pair.response);
+    return pair === null
+      ? null
+      : new RuntimeWebSocketRequestResponsePair(pair.request, pair.response);
   }
 
   getWebSocketAutoResponseTimestamp(socket: RawWebSocket): Date | null {
@@ -561,7 +591,7 @@ export class HibernatableWebSocketRegistry {
     }
     const timeout = Math.trunc(number);
     if (timeout > MAX_EVENT_TIMEOUT) {
-      throw new Error("Event timeout should not exceed 604800000 ms.");
+      throw new Error(`Event timeout should not exceed ${MAX_EVENT_TIMEOUT} ms.`);
     }
     this.#eventTimeout = timeout;
   }
@@ -571,7 +601,9 @@ export class HibernatableWebSocketRegistry {
   }
 
   attachmentChanged(socket: RawWebSocket, bytes: Uint8Array): void {
-    this.#host?.attachment(socket, bytes);
+    if (this.#entries.some((entry) => entry.socket === socket)) {
+      this.#host?.attachment(socket, bytes);
+    }
   }
 
   receive(socket: RawWebSocket, type: SocketEvent, event: Event): void {
@@ -584,16 +616,15 @@ export class HibernatableWebSocketRegistry {
         socket.send(this.#autoResponse.response);
         return;
       }
-      if (data instanceof Blob) {
+      const message = cloneMessageData(data);
+      if (message instanceof Blob) {
         this.#ctx.addWaitUntil(
-          data.arrayBuffer().then((buffer) => {
+          message.arrayBuffer().then((buffer) => {
             this.#schedule(() => this.#dispatch.message(socket, buffer));
           }),
         );
         return;
       }
-      const message =
-        typeof data === "string" ? data : (cloneMessageData(data) as ArrayBuffer);
       this.#schedule(() => this.#dispatch.message(socket, message));
       return;
     }
@@ -620,8 +651,16 @@ export class HibernatableWebSocketRegistry {
   }
 
   #listenRaw(socket: RawWebSocket): void {
+    const state = socketMetadata(socket);
+    if (state.rawListenersInstalled === true) return;
+    state.rawListenersInstalled = true;
     for (const type of ["message", "close", "error"] as const) {
-      socket.addEventListener(type, (event) => this.receive(socket, type, event));
+      socket.addEventListener(type, (event) => {
+        const accepted = socketMetadata(socket).accepted;
+        if (accepted?.mode === "hibernatable") {
+          accepted.registry.receive(socket, type, event);
+        }
+      });
     }
   }
 
@@ -630,22 +669,19 @@ export class HibernatableWebSocketRegistry {
     if (!isRawWebSocket(socket)) {
       throw new TypeError("ActorContainerOptions.webSockets contains a non-WebSocket value.");
     }
-    const tags = normalizeTags(value.tags === undefined ? [] : [...value.tags]);
+    const tags = normalizeTags(value.tags);
     const state = socketMetadata(socket);
     state.accepted = { mode: "hibernatable", registry: this };
     if (value.attachment !== undefined) {
       state.attachment = value.attachment.slice();
-      state.hasAttachment = true;
     }
-    if (socket instanceof AcceptedWebSocket) socket.enableHibernation(this, true, this.#ctx);
+    if (socket instanceof AcceptedWebSocket) socket.rehydrateHibernation(this, this.#ctx);
     else this.#listenRaw(socket);
-    this.#entries.push({
-      socket,
-      tags,
-      ...(value.autoResponseTimestamp === undefined
-        ? {}
-        : { autoResponseTimestamp: value.autoResponseTimestamp }),
-    });
+    const entry: RegistryEntry = { socket, tags };
+    if (value.autoResponseTimestamp !== undefined) {
+      entry.autoResponseTimestamp = value.autoResponseTimestamp;
+    }
+    this.#entries.push(entry);
   }
 
   #createPair(): RuntimeWebSocketPair {
@@ -655,8 +691,8 @@ export class HibernatableWebSocketRegistry {
     left.peer = right;
     right.peer = left;
     return {
-      0: new AcceptedWebSocket(this.#ctx, left, { deferred: true, pairState }),
-      1: new AcceptedWebSocket(this.#ctx, right, { deferred: true, pairState }),
+      0: new AcceptedWebSocket(this.#ctx, left, pairState),
+      1: new AcceptedWebSocket(this.#ctx, right, pairState),
     };
   }
 }
@@ -670,7 +706,6 @@ export function acceptWebSocket(ctx: IoContext, socket: RawWebSocket): AcceptedW
   }
   state.accepted = { mode: "classic" };
   const accepted = new AcceptedWebSocket(ctx, socket);
-  socketMetadata(accepted).accepted = { mode: "classic" };
   return accepted;
 }
 
@@ -680,20 +715,10 @@ export function markWebSocketUsed(socket: RawWebSocket): void {
 
 export function installWebSocketGlobals(
   target: object,
-  pairConstructor: RuntimeWebSocketPairConstructor,
+  pairConstructor: WebSocketPairConstructor,
 ): void {
-  const constructor =
-    typeof globalThis.WebSocket === "function" ? globalThis.WebSocket : AcceptedWebSocket;
-  for (const [name, value] of Object.entries({
-    READY_STATE_CONNECTING: 0,
-    READY_STATE_OPEN: 1,
-    READY_STATE_CLOSING: 2,
-    READY_STATE_CLOSED: 3,
-    CONNECTING: 0,
-    OPEN: 1,
-    CLOSING: 2,
-    CLOSED: 3,
-  })) {
+  const constructor = globalThis.WebSocket;
+  for (const [name, value] of Object.entries(WEB_SOCKET_READY_STATES)) {
     defineValue(constructor, name, value);
     defineValue(constructor.prototype, name, value);
   }
@@ -701,7 +726,7 @@ export function installWebSocketGlobals(
   defineValue(constructor.prototype, "deserializeAttachment", deserializeAttachmentMethod);
   defineValue(target, "WebSocket", constructor);
   defineValue(target, "WebSocketPair", pairConstructor);
-  defineValue(target, "WebSocketRequestResponsePair", WebSocketRequestResponsePair);
+  defineValue(target, "WebSocketRequestResponsePair", RuntimeWebSocketRequestResponsePair);
 }
 
 function defineValue(target: object, name: string, value: unknown): void {
@@ -710,7 +735,7 @@ function defineValue(target: object, name: string, value: unknown): void {
   Object.defineProperty(target, name, { configurable: true, writable: true, value });
 }
 
-function normalizeTags(tags: string[] | readonly string[] | undefined): string[] {
+function normalizeTags(tags: unknown): string[] {
   if (tags === undefined) return [];
   if (!Array.isArray(tags)) {
     throw new TypeError(
@@ -718,22 +743,24 @@ function normalizeTags(tags: string[] | readonly string[] | undefined): string[]
     );
   }
   if (tags.length > MAX_TAGS) {
-    throw new Error("a Hibernatable WebSocket cannot have more than 10 tags");
+    throw new Error(`a Hibernatable WebSocket cannot have more than ${MAX_TAGS} tags`);
   }
-  const normalized = [...new Set(tags.map((tag) => String(tag)))];
+  const normalized = [...new Set(tags.map(String))];
   for (const tag of normalized) {
     if (tag.length > MAX_TAG_LENGTH) {
-      throw new Error(`"${tag}" is longer than the max tag length (256 characters).`);
+      throw new Error(
+        `"${tag}" is longer than the max tag length (${MAX_TAG_LENGTH} characters).`,
+      );
     }
   }
   return normalized;
 }
 
 function validateAutoResponseSize(side: "Request" | "Response", value: string): void {
-  const bytes = new TextEncoder().encode(value).byteLength;
+  const bytes = textEncoder.encode(value).byteLength;
   if (bytes > MAX_AUTO_RESPONSE_BYTES) {
     throw new RangeError(
-      `${side} cannot be larger than 2048 bytes. A ${side.toLowerCase()} of size ${bytes} was provided.`,
+      `${side} cannot be larger than ${MAX_AUTO_RESPONSE_BYTES} bytes. A ${side.toLowerCase()} of size ${bytes} was provided.`,
     );
   }
 }
@@ -742,9 +769,9 @@ function validateClose(code: number | undefined, reason: string): void {
   if (code !== undefined && code !== 1000 && (code < 3000 || code > 4999)) {
     throw new DOMException(`Invalid WebSocket close code: ${code}.`, "InvalidAccessError");
   }
-  if (new TextEncoder().encode(reason).byteLength > 123) {
+  if (textEncoder.encode(reason).byteLength > MAX_CLOSE_REASON_BYTES) {
     throw new DOMException(
-      "WebSocket close reason must not be longer than 123 bytes when UTF-8 encoded.",
+      `WebSocket close reason must not be longer than ${MAX_CLOSE_REASON_BYTES} bytes when UTF-8 encoded.`,
       "SyntaxError",
     );
   }

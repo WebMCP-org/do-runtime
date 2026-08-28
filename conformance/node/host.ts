@@ -32,21 +32,18 @@ import { cpSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createNodeSqlProvider } from "../../backends/node-sqlite";
-import type { RawWebSocket, RehydratedWebSocket, Timer } from "../../src/index";
 import {
   AlarmScheduler,
   createActorContainer,
   installWebSocketGlobals,
-} from "../../src/index";
-import type {
-  ActorContainer,
-  ActorEntry,
-  FacetHandle,
-  FacetHost,
-  FacetId,
-  FacetStartRequest,
-  FacetTree,
-  HibernationHost,
+  type ActorContainer,
+  type ActorEntry,
+  type FacetHandle,
+  type FacetHost,
+  type FacetId,
+  type FacetStartRequest,
+  type FacetTree,
+  type Timer,
 } from "../../src/index";
 import type {
   ActorClassChannel,
@@ -55,7 +52,6 @@ import type {
 } from "../../src/io/io-channels";
 import type { WorkerSource } from "../../src/io/worker-source";
 import type { IsolateChannelFactory, LoadIsolateRequest } from "../../src/api/worker-loader";
-import type { RuntimeWebSocketPairConstructor } from "../../src/api/web-socket";
 import {
   asLoopbackDurableObjectClass,
   LoopbackDurableObjectClass,
@@ -68,6 +64,7 @@ import type {
   ProbeActor,
 } from "../host";
 import { Probe } from "../fixtures/probe";
+import { HibernationMirror } from "../hibernation-host";
 import {
   installWebSocketUpgradeGlobals,
   upgradeWebSocket,
@@ -181,19 +178,22 @@ globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
   return container.globals.fetch(input, init);
 }) as typeof globalThis.fetch;
 
-const actorWebSocketPair = new Proxy(class WebSocketPair {}, {
-  construct(): object {
-    const pair = current.getStore()?.globals.WebSocketPair;
-    if (pair === undefined) {
-      throw new Error("Node lane: WebSocketPair was constructed outside an actor event.");
-    }
-    return Reflect.construct(pair, []);
+const ActorWebSocketPair: typeof WebSocketPair = new Proxy(
+  class WebSocketPair {
+    declare readonly 0: WebSocket;
+    declare readonly 1: WebSocket;
   },
-});
-installWebSocketGlobals(
-  globalThis,
-  actorWebSocketPair as unknown as RuntimeWebSocketPairConstructor,
+  {
+    construct() {
+      const Pair = current.getStore()?.globals.WebSocketPair;
+      if (Pair === undefined) {
+        throw new Error("Node lane: WebSocketPair was constructed outside an actor event.");
+      }
+      return new Pair();
+    },
+  },
 );
+installWebSocketGlobals(globalThis, ActorWebSocketPair);
 installWebSocketUpgradeGlobals();
 
 /**
@@ -509,40 +509,6 @@ type Placement = {
   readonly stub: object;
 };
 
-class NodeHibernationHost implements HibernationHost {
-  readonly #entries = new Map<RawWebSocket, RehydratedWebSocket>();
-  autoResponsePair: { request: string; response: string } | null = null;
-
-  accepted(socket: RawWebSocket, tags: readonly string[]): void {
-    this.#entries.set(socket, { socket, tags: [...tags] });
-  }
-
-  attachment(socket: RawWebSocket, bytes: Uint8Array | null): void {
-    const entry = this.#entries.get(socket);
-    if (entry === undefined) throw new Error("Node lane: attachment preceded socket acceptance.");
-    this.#entries.set(socket, {
-      socket,
-      tags: entry.tags,
-      ...(bytes === null ? {} : { attachment: bytes.slice() }),
-      ...(entry.autoResponseTimestamp === undefined
-        ? {}
-        : { autoResponseTimestamp: entry.autoResponseTimestamp }),
-    });
-  }
-
-  autoResponse(pair: { request: string; response: string } | null): void {
-    this.autoResponsePair = pair === null ? null : { ...pair };
-  }
-
-  closed(socket: RawWebSocket): void {
-    this.#entries.delete(socket);
-  }
-
-  snapshot(): RehydratedWebSocket[] {
-    return [...this.#entries.values()];
-  }
-}
-
 class NodeClientSocket implements LaneClientSocket {
   readonly #messages: LaneSocketMessage[] = [];
   readonly #messageWaiters: ((message: LaneSocketMessage) => void)[] = [];
@@ -760,12 +726,12 @@ function alarmScheduler(): Promise<AlarmScheduler> {
 }
 
 const live = new Map<string, Record_>();
-const socketHosts = new Map<string, NodeHibernationHost>();
+const socketHosts = new Map<string, HibernationMirror>();
 
-function socketHost(name: string): NodeHibernationHost {
+function socketHost(name: string): HibernationMirror {
   const existing = socketHosts.get(name);
   if (existing !== undefined) return existing;
-  const host = new NodeHibernationHost();
+  const host = new HibernationMirror();
   socketHosts.set(name, host);
   return host;
 }

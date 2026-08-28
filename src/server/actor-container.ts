@@ -237,7 +237,7 @@ export const noFacets: FacetHost = {
 };
 
 /**
- * The four ports. Each one is a seam workerd itself takes as a constructor
+ * The five ports. Each one is a seam workerd itself takes as a constructor
  * input; a port that would exist only because our code is currently shaped
  * badly is an invented seam and was rejected. Rejected, for the record:
  * a transport port (one implementation per substrate, forever), a logger port
@@ -851,7 +851,7 @@ class ActorImpl implements Actor {
 
   constructor(
     isFacet: boolean,
-    hooks: { input?: InputGateHooks; output?: OutputGateHooks } = {},
+    hooks: ActorContainerOptions["gateHooks"] = {},
   ) {
     this.#isFacet = isFacet;
     this.#inputGate = new InputGate(hooks.input);
@@ -1368,7 +1368,7 @@ class ActorContainerImpl implements ActorContainer {
       storage: this.#durableStorage,
       facets: this.#facets,
       // The same object `container.globals` is, so a class that reaches through
-      // `ctx` and a dynamically-loaded source that destructured the seven names
+      // `ctx` and a dynamically-loaded source that destructured the actor globals
       // are gated by one scope rather than two that could drift.
       globals: actorScopeBindings(() => this.globals),
       webSockets: this.#webSockets,
@@ -1562,12 +1562,7 @@ class ActorContainerImpl implements ActorContainer {
     return this.#ctx.drainWaitUntil();
   }
 
-  quiescence(): {
-    armedTimers: number;
-    pendingWaitUntil: number;
-    inputLockHeld: boolean;
-    outputGateBroken: boolean;
-  } {
+  quiescence() {
     return {
       armedTimers: this.#ctx.getTimeoutCount(),
       pendingWaitUntil: this.#ctx.waitUntilTaskCount(),
@@ -1694,10 +1689,14 @@ class ActorContainerImpl implements ActorContainer {
     );
   }
 
-  #runWebSocketHandler(name: string, socket: RawWebSocket, ...args: unknown[]): unknown {
+  #runWebSocketHandler(
+    name: "webSocketMessage" | "webSocketClose" | "webSocketError",
+    socket: RawWebSocket,
+    ...args: unknown[]
+  ): unknown {
     const instance = this.#actor.classInstance;
     if (instance.kind !== "running") return undefined;
-    const handler = (instance.instance as Record<string, unknown>)[name];
+    const handler: unknown = Reflect.get(instance.instance, name);
     if (typeof handler !== "function") return undefined;
     return Reflect.apply(handler, instance.instance, [socket, ...args]);
   }

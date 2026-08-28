@@ -114,7 +114,7 @@ class BrowserClientSocket implements LaneClientSocket {
 
   async send(data: string | ArrayBuffer | ArrayBufferView): Promise<void> {
     const message = ArrayBuffer.isView(data)
-      ? (data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer)
+      ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength).slice().buffer
       : data;
     await this.rpc.socketSend(this.id, message);
   }

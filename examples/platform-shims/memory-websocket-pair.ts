@@ -5,7 +5,7 @@ export type UpgradeWebSocket = EventTarget & RawWebSocket & {
   readonly readyState: number;
 };
 
-type UpgradeResponseInit = Omit<ResponseInit, "webSocket"> & { webSocket?: UpgradeWebSocket };
+type UpgradeResponseInit = ResponseInit & { webSocket?: UpgradeWebSocket };
 
 /** Install the Response-101 half; `installActorScope` supplies the runtime's WebSocketPair. */
 export function installWebSocketUpgradeResponse(): void {
@@ -26,7 +26,7 @@ export function installWebSocketUpgradeResponse(): void {
 }
 
 export function upgradeWebSocket(response: Response): UpgradeWebSocket | undefined {
-  return (response as unknown as { webSocket?: UpgradeWebSocket }).webSocket;
+  return (response as Response & { webSocket?: UpgradeWebSocket }).webSocket;
 }
 
 /** Preserve workerd's WebSocket upgrade signal across browser `Request.clone()` calls. */

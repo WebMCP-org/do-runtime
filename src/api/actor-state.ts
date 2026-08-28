@@ -36,11 +36,9 @@
  * `transformMaybeBackpressure` keeps the branch because
  * `DeleteAllResults.backpressure` is still a promise in `io/actor-cache.ts`.
  *
- * Not ported, because the substrate has no equivalent: Hibernatable WebSockets,
- * which is the whole reason `DurableObjectState`'s eight WebSocket methods are
- * named throwing stubs; V8's private wire bytes, replaced by a browser-safe
- * structured-clone encoding with the same public value semantics; the billing
- * counters
+ * Not ported, because the substrate has no equivalent: V8's private wire bytes,
+ * replaced by a browser-safe structured-clone encoding with the same public
+ * value semantics; the billing counters
  * (`billingUnits`, `ActorObserver`, `updateStorageWriteUnit`) and the trace
  * spans, both already absent throughout; `enableSql`, a workerd namespace option
  * that exists to simulate a non-SQLite Durable Object; and `ReplicaActorOutgoingFactory`,
@@ -998,7 +996,7 @@ export type DurableObjectStateOptions = {
    * `DurableObjectState.globals`.
    */
   globals: ActorScopeBindings;
-  webSockets?: HibernatableWebSocketRegistry;
+  webSockets: HibernatableWebSocketRegistry;
 };
 
 /** The type passed as the first parameter to a Durable Object class's constructor. */
@@ -1138,42 +1136,36 @@ export class DurableObjectState implements globalThis.DurableObjectState {
   }
 
   acceptWebSocket(ws: WebSocket, tags?: string[]): void {
-    this.#webSockets().acceptWebSocket(ws, tags);
+    this.#options.webSockets.acceptWebSocket(ws, tags);
   }
 
   getWebSockets(tag?: string): WebSocket[] {
     return tag === undefined
-      ? this.#webSockets().getWebSockets()
-      : this.#webSockets().getWebSockets(tag);
+      ? this.#options.webSockets.getWebSockets()
+      : this.#options.webSockets.getWebSockets(tag);
   }
 
   setWebSocketAutoResponse(maybeReqResp?: WebSocketRequestResponsePair): void {
-    this.#webSockets().setWebSocketAutoResponse(maybeReqResp);
+    this.#options.webSockets.setWebSocketAutoResponse(maybeReqResp);
   }
 
   getWebSocketAutoResponse(): WebSocketRequestResponsePair | null {
-    return this.#webSockets().getWebSocketAutoResponse();
+    return this.#options.webSockets.getWebSocketAutoResponse();
   }
 
   getWebSocketAutoResponseTimestamp(ws: WebSocket): Date | null {
-    return this.#webSockets().getWebSocketAutoResponseTimestamp(ws);
+    return this.#options.webSockets.getWebSocketAutoResponseTimestamp(ws);
   }
 
   setHibernatableWebSocketEventTimeout(timeoutMs?: number): void {
-    this.#webSockets().setHibernatableWebSocketEventTimeout(timeoutMs);
+    this.#options.webSockets.setHibernatableWebSocketEventTimeout(timeoutMs);
   }
 
   getHibernatableWebSocketEventTimeout(): number | null {
-    return this.#webSockets().getHibernatableWebSocketEventTimeout();
+    return this.#options.webSockets.getHibernatableWebSocketEventTimeout();
   }
 
   getTags(ws: WebSocket): string[] {
-    return this.#webSockets().getTags(ws);
-  }
-
-  #webSockets(): HibernatableWebSocketRegistry {
-    const webSockets = this.#options.webSockets;
-    if (webSockets === undefined) throw new Error("This Durable Object has no WebSocket runtime.");
-    return webSockets;
+    return this.#options.webSockets.getTags(ws);
   }
 }

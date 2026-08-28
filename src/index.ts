@@ -203,9 +203,8 @@ export {
   installActorScope,
   NO_GLOBAL_OUTBOUND_MESSAGE,
 } from "./api/global-scope";
-export type { RawWebSocket, RehydratedWebSocket } from "./api/web-socket";
+export type { AcceptedWebSocket, RawWebSocket, RehydratedWebSocket } from "./api/web-socket";
 export {
-  AcceptedWebSocket,
   ALREADY_ACCEPTED_MESSAGE,
   WebSocketRequestResponsePair,
   installWebSocketGlobals,
