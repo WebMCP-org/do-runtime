@@ -381,6 +381,77 @@ apiTest("put with an undefined value is refused", ({ storage }) => {
   expect(() => storage.put("key", undefined)).toThrow("put() called with undefined value.");
 });
 
+apiTest("put stringifies a key that is not a string, as JSG does", async ({ storage }) => {
+  // Measured on real workerd (conformance oracle run): the non-string forms are NOT refused —
+  // `kj::String` accepts them by coercion. Before this, each one fell into the entries branch,
+  // where `Object.entries` on a primitive is `[]`, so the call resolved and wrote nothing.
+  await storage.put(123 as never, "number");
+  await storage.put(null as never, "null");
+  await storage.put(true as never, "boolean");
+  await storage.put(10n as never, "bigint");
+  await storage.put([["a", 1]] as never, "array");
+
+  expect(await storage.get("123")).toBe("number");
+  expect(await storage.get("null")).toBe("null");
+  expect(await storage.get("true")).toBe("boolean");
+  expect(await storage.get("10")).toBe("bigint");
+  expect(await storage.get("a,1")).toBe("array");
+
+  // `undefined` is the likeliest accidental key in real code — `put(row.id, v)` with no `id`.
+  // Upstream coerces it like any other, so this is a real write under the literal key, not the
+  // silent no-op it used to be. Measured, and pinned here because it is the one nobody expects.
+  await storage.put(undefined as never, "undefined");
+  await storage.put(NaN as never, "nan");
+  await storage.put([] as never, "empty");
+  expect(await storage.get("undefined")).toBe("undefined");
+  expect(await storage.get("NaN")).toBe("nan");
+  expect(await storage.get("")).toBe("empty");
+
+  // `String(symbol)` throws, and upstream surfaces V8's own message.
+  expect(() => storage.put(Symbol.iterator as never, "v")).toThrow(
+    "Cannot convert a Symbol value to a string",
+  );
+  // A Map reaches the Dict alternative and has no own enumerable keys, so it writes nothing.
+  await storage.put(new Map([["m", 1]]) as never);
+  expect(await storage.get("m")).toBeUndefined();
+});
+
+apiTest("mixing the two put overloads is refused, as the Dict branch does", async ({ storage }) => {
+  // Measured on real workerd: once the key unwraps as a `Dict`, a second argument that is not the
+  // options bag is the caller mixing `put(key, value)` with `put(entries)`. Unguarded, the value
+  // spread into the options instead — `put({a: 1}, "v")` wrote key `a` with options `{0: "v"}`.
+  for (const value of ["v", 0, true]) {
+    expect(() => storage.put({ a: 1 } as never, value as never), `${value}`).toThrow(
+      "put() may only be called with a single key-value pair and optional options",
+    );
+  }
+  expect(await storage.get("a")).toBeUndefined();
+
+  // A function reaches the `Dict` alternative too. Reading it as a key instead wrote a row under
+  // the function's own source text.
+  expect(() => storage.put(function named() {} as never, "v" as never)).toThrow(
+    "put() may only be called with a single key-value pair and optional options",
+  );
+  expect(await storage.get("function named() {}")).toBeUndefined();
+
+  // The guard models the struct wrapper, not the Dict wrapper: `PutOptions` is all-optional
+  // fields, so `null` unwraps to default options, and arrays and functions are objects to
+  // `IsObject()` — measured on real workerd, all three of these WRITE.
+  await storage.put({ o1: 1 } as never, null as never);
+  await storage.put({ o2: 2 } as never, [] as never);
+  await storage.put({ o3: 3 } as never, function opts() {} as never);
+  expect(await storage.get("o1")).toBe(1);
+  expect(await storage.get("o2")).toBe(2);
+  expect(await storage.get("o3")).toBe(3);
+
+  // The real `put(entries, options)` call still works, and so does the value overload's own
+  // options — the narrowing's other job is routing the second parameter, so both need a case.
+  await storage.put({ kept: 7 } as never, { allowConcurrency: true } as never);
+  expect(await storage.get("kept")).toBe(7);
+  await storage.put("single", 8, { allowUnconfirmed: true });
+  expect(await storage.get("single")).toBe(8);
+});
+
 apiTest("putting an entries object silently drops undefined fields", async ({ storage }) => {
   await storage.put({ kept: 1, dropped: undefined });
   expect(await storage.get("kept")).toBe(1);

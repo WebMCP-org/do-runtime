@@ -18,8 +18,10 @@ import { InputGate, OutputGate } from "../io/io-gate";
 import { type Actor, IoContext, requireInputLock, type Timer } from "../io/io-context";
 import {
   CURSOR_NOT_CONSTRUCTIBLE_MESSAGE,
+  SQL_NOT_AUTHORIZED_MESSAGE,
   SQL_RESERVED_PREFIX_MESSAGE,
   SQL_TRANSACTION_REFUSED_MESSAGE,
+  SQL_VACUUM_REFUSED_MESSAGE,
   SqlStorage,
   SqlStorageRegulator,
 } from "./sql";
@@ -231,6 +233,146 @@ sqlTest("cursor and iterator surfaces carry workerd's shape", ({ sql }) => {
   const drained = sql.exec(query);
   drained.toArray();
   expect(Object.keys(drained.next())).toEqual(["done", "value"]);
+});
+
+sqlTest("the authorizer-only refusals, with workerd's own messages", ({ sql }) => {
+  // The two messages were measured on real workerd; `conformance/suite/sql.spec.ts` pins the
+  // forms the oracle was actually asked. The case, whitespace, `TEMPORARY` and batch variants
+  // below assert this port's own matching against those measured messages.
+  //
+  // Spelled as literals rather than as the exported constants ON PURPOSE: importing the constant
+  // would assert only that it equals itself, and byte-exactness is the contract here — a caller
+  // matching on the message ports unchanged. `new Error(...)` makes it exact; `toThrowError` on
+  // a bare string is substring containment, which a suffix survives.
+  //
+  // ATTACH and DETACH are also the isolation boundary: `node:sqlite` allows both, so before
+  // this an actor could read another actor's database, and `VACUUM INTO` could write any file
+  // the process can.
+  for (const query of [
+    "ATTACH DATABASE 'other.sqlite' AS other",
+    "attach 'other.sqlite' as other",
+    "  ATTACH 'other.sqlite' AS other",
+    "DETACH DATABASE other",
+    "CREATE TEMP TABLE t(x)",
+    "CREATE TEMPORARY TABLE t(x)",
+    "CREATE TEMP VIEW v AS SELECT 1",
+    // A batch is regulated per statement as it executes, exactly like transaction control and
+    // PRAGMA — the statements before the refused one have already run.
+    "SELECT 1; ATTACH 'other.sqlite' AS other",
+    // A leading `;` is trivia, not a keyword: `node:sqlite` hands the whole span to the
+    // regulator, so an empty first statement must not shift what the refusal reads.
+    ";ATTACH 'other.sqlite' AS other",
+    ";;  /* c */ ATTACH 'other.sqlite' AS other",
+    ";CREATE TEMP TABLE t(x)",
+    // The schema qualifier reaches upstream's `dbName == temp` rule rather than the action
+    // codes, and it was the live gap: workerd refuses it, and here the table was created,
+    // written and read back.
+    "CREATE TABLE temp.t(x)",
+    'CREATE TABLE "temp".t(x)',
+    // SQLite's misquoting feature reads a single-quoted string as an identifier where one is
+    // expected, so this creates a real temp-schema table too — and workerd refuses it the same.
+    "CREATE TABLE 'temp'.t(x)",
+    // SQLite needs no whitespace between a keyword and a quoted identifier.
+    'CREATE TABLE"temp".t(x)',
+    "CREATE TABLE[temp].t2(x)",
+    "CREATE VIEW temp.v AS SELECT 1",
+    "CREATE VIRTUAL TABLE temp.vt USING rtree(id, minX, maxX)",
+  ]) {
+    expect(() => sql.exec(query), query).toThrowError(new Error("not authorized: SQLITE_AUTH"));
+  }
+
+  // VACUUM carries SQLite's message rather than the authorizer's, because upstream refuses it by
+  // the transaction a Durable Object always has open.
+  for (const query of ["VACUUM", "VACUUM INTO 'exfil.sqlite'"]) {
+    expect(() => sql.exec(query), query).toThrowError(
+      new Error("cannot VACUUM from within a transaction: SQLITE_ERROR"),
+    );
+  }
+
+  // Refused only as the LEADING keyword. The `\b` boundary and the `^` anchor are separate
+  // claims, and a false refusal here would break consumer SQL that real workerd runs, so both
+  // directions are pinned: a name that contains the keyword, and the bare keyword off the front.
+  sql.exec("CREATE TABLE t_ok (attach TEXT, vacuum TEXT, temp TEXT)");
+  expect(sql.exec("SELECT 1 AS attach, 2 AS vacuum").one().attach).toBe(1);
+  expect(sql.exec("SELECT count(*) AS n FROM t_ok WHERE attach IS NULL").one().n).toBe(0);
+  // An application name that merely contains one stays usable, and so does the data.
+  // `CREATE TABLE` without TEMP is untouched.
+  sql.exec("CREATE TABLE attachments (vacuum_state TEXT)");
+  sql.exec("INSERT INTO attachments VALUES ('ATTACH ''x'' AS y')");
+  expect(sql.exec("SELECT vacuum_state FROM attachments").one().vacuum_state).toBe(
+    "ATTACH 'x' AS y",
+  );
+  // `CREATE INDEX temp.i ON …` is covered by the same regex but has no assertion: SQLite refuses
+  // a TEMP index on a non-TEMP table itself, and a TEMP table can no longer be created.
+  // A table merely NAMED for the temp schema is not the temp schema.
+  sql.exec("CREATE TABLE temporary_log (x)");
+  sql.exec("CREATE TABLE tempest (x)");
+  // A virtual table stays allowed for upstream's modules — the dedicated test below exercises
+  // all four; `rtree` and `fts5` are what the §1.4 conformance row measures.
+  sql.exec("CREATE VIRTUAL TABLE rt USING rtree(id, minX, maxX)");
+  sql.exec("CREATE VIRTUAL TABLE ft USING fts5(body)");
+});
+
+sqlTest("a virtual table outside upstream's four modules is refused", ({ sql }) => {
+  // ← `sqlite.c++:1298-1316`. `dbstat` is the one with teeth: it reports a row per table, so it
+  // enumerates the runtime's own `_cf_` tables and their sizes without the statement ever naming
+  // them — the reserved-name scan reads the submitted text and cannot see this.
+  for (const query of [
+    "CREATE VIRTUAL TABLE d USING dbstat",
+    "CREATE VIRTUAL TABLE g USING geopoly(a)",
+    "CREATE VIRTUAL TABLE f3 USING fts3(a)",
+    "CREATE VIRTUAL TABLE f4 USING fts4(a)",
+    "CREATE VIRTUAL TABLE IF NOT EXISTS d2 USING dbstat",
+    // The module is read from PAST the table name, so the name takes every quoting SQLite does.
+    // A guessed name boundary failed in both directions: an unparseable name skipped the check,
+    // and the third form here read `fts5` out of the QUOTED NAME as its module.
+    'CREATE VIRTUAL TABLE "my table" USING dbstat',
+    "CREATE VIRTUAL TABLE 'my vt' USING dbstat",
+    'CREATE VIRTUAL TABLE "a USING fts5 b" USING dbstat',
+    // The module takes the same quotings, resolved before the allowlist — as workerd does.
+    'CREATE VIRTUAL TABLE t3 USING "dbstat"',
+    // No whitespace before a quoted name; measured refused on workerd.
+    'CREATE VIRTUAL TABLE"t5"USING dbstat',
+  ]) {
+    expect(() => sql.exec(query), query).toThrowError(new Error("not authorized: SQLITE_AUTH"));
+  }
+  // A fragment with no readable module never reaches the check: regulation runs per statement
+  // the backend COMPILED, and SQLite refuses this at prepare — the same `incomplete input`
+  // workerd reports. The unparseable-module refusal in `refuseUnauthorizedForms` sits behind
+  // SQLite's own parser as fail-closed defense in depth.
+  expect(() => sql.exec("CREATE VIRTUAL TABLE t4 USING")).toThrowError("incomplete input");
+  // The allowed side, exercised for ALL FOUR of upstream's modules: the module name matched
+  // case-insensitively as `strcasecmp` does, the quoted and unspaced spellings of module and
+  // name, and a non-ASCII bare name — every one measured allowed on workerd.
+  sql.exec("CREATE VIRTUAL TABLE rt2 USING RTree(id, minX, maxX)");
+  expect(sql.exec("SELECT count(*) AS n FROM rt2").one().n).toBe(0);
+  sql.exec("CREATE VIRTUAL TABLE rt32 USING rtree_i32(id, x1, x2)");
+  sql.exec(`CREATE VIRTUAL TABLE "my docs" USING fts5(body)`);
+  sql.exec("CREATE VIRTUAL TABLE mmf USING 'fts5'(body)");
+  sql.exec('CREATE VIRTUAL TABLE"nsv"USING fts5(body)');
+  sql.exec("CREATE VIRTUAL TABLE résumé USING fts5(body)");
+  sql.exec("CREATE VIRTUAL TABLE vocab USING fts5vocab('mmf', 'row')");
+  expect(sql.exec(`SELECT count(*) AS n FROM "my docs"`).one().n).toBe(0);
+  expect(sql.exec("SELECT count(*) AS n FROM vocab").one().n).toBe(0);
+});
+
+sqlTest("PRAGMA page_size reads but does not assign, as upstream allowlists it", ({ sql }) => {
+  // ← `ALLOWED_PRAGMAS` carries `{page_size, NO_ARG}` for the R*Tree module's own internal read.
+  // Omitting it refused a pragma real workerd answers, which is a false refusal: code written
+  // for Cloudflare would break here and nowhere else.
+  expect(sql.exec("PRAGMA page_size").one().page_size).toBeGreaterThan(0);
+  expect(sql.exec("SELECT * FROM pragma_page_size").one().page_size).toBeGreaterThan(0);
+  // `NO_ARG` is what still rejects the assignment.
+  expect(() => sql.exec("PRAGMA page_size = 8192")).toThrowError(SQL_NOT_AUTHORIZED_MESSAGE);
+});
+
+sqlTest("a leading semicolon does not shift any leading-keyword refusal", ({ sql }) => {
+  // Every refusal in this file reads the leading keyword, so they share one way to be evaded.
+  // `;VACUUM` reached SQLite unregulated before this was trivia, and so did the two below it,
+  // which predate the authorizer forms.
+  expect(() => sql.exec(";VACUUM")).toThrowError(SQL_VACUUM_REFUSED_MESSAGE);
+  expect(() => sql.exec(";BEGIN")).toThrowError(SQL_TRANSACTION_REFUSED_MESSAGE);
+  expect(() => sql.exec(";PRAGMA writable_schema = 1")).toThrowError(SQL_NOT_AUTHORIZED_MESSAGE);
 });
 
 sqlTest("PRAGMA outside workerd's allowlist is refused, with workerd's message", ({ sql, db }) => {

@@ -26,14 +26,24 @@
  *     `abstract` in the types — JSG nested types have no JS constructor — so the
  *     faithful shape is a constructor that refuses. `sql.Cursor` exists for
  *     `instanceof`, which is all upstream exposes it for.
- *  3. **The regulator is ported whole; what is missing is the authorizer that
- *     calls it.** All three callbacks are here and none of them needed the
+ *  3. **The regulator is ported whole, and that is not the whole authorizer.**
+ *     Four of its five members are here as callbacks, and none needed the
  *     authorizer to compute anything — `isAllowedName` is a prefix test,
- *     `isAllowedTrigger` is `return true`, `allowTransactions` throws. What the
- *     authorizer supplied was the *identifiers*, not the decisions. With no
- *     authorizer the statement text is the only source, so `exec` tokenizes it
+ *     `isAllowedTrigger` is `return true`, `allowTransactions` throws,
+ *     `shouldAddQueryStats` is a constant. The fifth, `onError`, is not a
+ *     callback at all in this port: it is every `throw new Error(message)`
+ *     below, which is all its upstream body does with a refusal message.
+ *     For those, what the authorizer supplied was the *identifiers*:
+ *     with none, the statement text is the only source, so `exec` tokenizes it
  *     and runs `isAllowedName` over every identifier-shaped token. That is
  *     deliberately STRICTER than upstream — see `SQL_RESERVED_PREFIX_MESSAGE`.
+ *
+ *     But the authorizer also makes decisions no callback ever sees, and those
+ *     do NOT arrive with the regulator: `SQLITE_ATTACH` / `SQLITE_DETACH`, the
+ *     `SQLITE_CREATE_TEMP_*` family and the `temp` schema, `SQLITE_PRAGMA`, and
+ *     the `SQLITE_CREATE_VTABLE` module list. Each is refused from the text in
+ *     `refuseUnauthorizedForms` and `requireAllowedPragmas`. `SQLITE_FUNCTION`
+ *     is the one still unported — see the README divergence row.
  *  4. **`ingest` stays at upstream's SQLite seam.** `SqliteDatabase.ingest()`
  *     executes every complete statement and returns the partial tail, using the
  *     same compiled boundaries and regulator as `exec`.
@@ -104,8 +114,15 @@ export const SQL_RESERVED_PREFIX_MESSAGE =
  * `SQLITE_SAVEPOINT`. The same set `util/sqlite.ts` classifies, read here from
  * the leading keyword because the untrusted path has to refuse them before the
  * trusted one applies them.
+ *
+ * `;` counts as leading trivia here and in every other leading-keyword refusal
+ * below. A statement boundary comes from the backend, and `node:sqlite` reports
+ * an empty leading statement as part of the span it compiled: the `sourceSQL`
+ * for `;ATTACH ...` is the whole string, so an anchor of `^\s*` would read the
+ * keyword as `;` and let the compiled ATTACH through. The browser backend cuts
+ * the same input at the first `;` and refuses the empty statement instead.
  */
-const TRANSACTION_CONTROL = /^\s*(?:BEGIN|COMMIT|END|ROLLBACK|SAVEPOINT|RELEASE)\b/i;
+const TRANSACTION_CONTROL = /^[\s;]*(?:BEGIN|COMMIT|END|ROLLBACK|SAVEPOINT|RELEASE)\b/i;
 
 /** Cheap pre-test, so the tokenizer below runs only on a statement that could fail it. */
 const RESERVED_PREFIX_HINT = /_cf_/i;
@@ -126,7 +143,16 @@ const IDENTIFIER = /[A-Za-z_][A-Za-z0-9_$]*/g;
 const NOT_CODE = /'(?:[^']|'')*'|--[^\n]*|\/\*[\s\S]*?\*\//g;
 
 /**
- * ← `SqlStorageRegulator` (`sql.h:15-22`, `sql.c++:143-173`), whole.
+ * Comments are never code. String literals STAY, for both of this regex's callers: pragma
+ * arguments may be quoted, and SQLite's misquoting feature reads a single-quoted string as an
+ * identifier — `CREATE TABLE 'temp'.t(x)` really creates a temp-schema table — so the checks
+ * that read identifier positions must still see it. `NOT_CODE` blanks literals, which is right
+ * for the token scans and would be a bypass for these callers.
+ */
+const NOT_COMMENT = /--[^\n]*|\/\*[\s\S]*?\*\//g;
+
+/**
+ * ← `SqlStorageRegulator` (`sql.h:15-22`, `sql.c++:141-165`), whole.
  *
  * Upstream reaches these through the SQLite authorizer while a statement is
  * being compiled. `exec` calls them from the statement text instead, which is
@@ -201,18 +227,119 @@ function refuseTransactionControl(statement: string): void {
  */
 export const SQL_NOT_AUTHORIZED_MESSAGE = "not authorized: SQLITE_AUTH";
 
-/** Comments are never code. String literals STAY: pragma arguments may be quoted. */
-const NOT_COMMENT = /--[^\n]*|\/\*[\s\S]*?\*\//g;
+/**
+ * The forms neither the regulator nor any callback sees: the authorizer's own
+ * action codes, plus `VACUUM`, which SQLite itself refuses by precondition.
+ *
+ * Porting `SqlStorageRegulator` whole (point 3 in the file header) carried over its members, but
+ * not the authorizer's own action codes: `SQLITE_ATTACH`, `SQLITE_DETACH`, `SQLITE_CREATE_TEMP_*`
+ * and `SQLITE_CREATE_VTABLE` consult no callback, so nothing here refused them. Every form below
+ * was measured on real workerd through the conformance oracle, not inferred.
+ *
+ * `ATTACH` and `DETACH` are also the isolation boundary rather than a fidelity detail: both
+ * backends open a real file, so on `node:sqlite` an `ATTACH` reads another actor's database and
+ * a `VACUUM INTO` writes anywhere the process can. The reserved-name scan does not cover it,
+ * because that scan tokenizes the SUBMITTED statement — `other._cf_KV` is caught, and every
+ * application table in the same attached database is not.
+ */
+const DATABASE_ATTACHMENT = /^[\s;]*(?:ATTACH|DETACH)\b/i;
+
+/**
+ * ← the `SQLITE_CREATE_TEMP_*` denials (`sqlite.c++:1323`) and the `dbName == temp` rule
+ * (`sqlite.c++:1073`), which permits a temp-schema database name only `READ` and `UPDATE`.
+ * Upstream's own reason to deny them applies here unchanged: a temporary table makes SQLite
+ * open a separate temporary file that the storage engine knows nothing about.
+ *
+ * Two spellings, one refusal each by its own upstream path: `CREATE TEMP TABLE t(x)` is the
+ * keyword and hits the action codes; `CREATE TABLE temp.t(x)` is the schema qualifier and hits
+ * the `dbName` rule — and the qualifier was the live gap, where the table was created, written
+ * and read back here while workerd refused it outright. The qualifier accepts every quoting
+ * SQLite does, single quotes included, with or without whitespace after the keyword (measured:
+ * workerd refuses `CREATE TABLE 'temp'.t(x)` and `CREATE TABLE"temp".t(x)` the same way), and
+ * is matched only in the object-name position, so an application table merely NAMED `tempest`
+ * or `temporary_log` is untouched. The keyword spelling needs no qualifier arm of its own here:
+ * `TEMP_SCHEMA` already refuses every `CREATE TEMP…` before this pattern is consulted.
+ *
+ * The rest of the `dbName` rule goes unported on purpose: with no way to create a temp-schema
+ * object, `INSERT`/`DELETE`/`DROP` against one die in SQLite as `no such table`, and the one
+ * silent form measures identically — workerd allows `DROP TABLE IF EXISTS temp.ghost` too.
+ */
+const TEMP_SCHEMA = /^[\s;]*CREATE\s+(?:TEMP|TEMPORARY)\b/i;
+const TEMP_QUALIFIED =
+  /^[\s;]*CREATE\s+(?:UNIQUE\s+|VIRTUAL\s+)?(?:TABLE|VIEW|TRIGGER|INDEX)\s*(?:IF\s+NOT\s+EXISTS\s*)?(?:"temp"|'temp'|`temp`|\[temp\]|temp)\s*\./i;
+
+/**
+ * ← `SQLITE_CREATE_VTABLE` (`sqlite.c++:1298-1316`): a virtual table is native-code callbacks, so
+ * upstream allows exactly four modules — FTS5 and its `fts5vocab` companion, R*Tree and its
+ * `rtree_i32` variant — and denies every other module SQLite was compiled with.
+ *
+ * `dbstat` is why this is not only fidelity: it reports a row per table with page counts and
+ * byte sizes, so `SELECT name FROM d` enumerates `_cf_KV` and the rest of the runtime's own
+ * tables without the statement ever naming them — around `requireAllowedNames`, which can only
+ * see the text it was given.
+ *
+ * The table name and the module accept every quoting SQLite does — double quotes, backticks,
+ * brackets, and the misquoting feature's single-quoted string, with or without whitespace
+ * before them — because the module has to be read from PAST the name, and a guessed name
+ * boundary is a bypass in both directions: an unparseable name skipped the check, and
+ * `"a USING fts5 b" USING dbstat` read its module out of the quoted name. Measured: workerd
+ * refuses both, refuses `CREATE VIRTUAL TABLE"d"USING dbstat`, resolves `USING "dbstat"` to
+ * the same denial, and allows `USING 'fts5'`. A `CREATE VIRTUAL TABLE` whose module the
+ * pattern cannot read is refused outright — the deliberately stricter direction the
+ * unparseable-PRAGMA fallback below already takes.
+ */
+// The bare arm takes what SQLite's tokenizer does: alphanumerics, `_`, `$`, and any
+// character past ASCII — a table named `résumé` is legal and workerd allows it.
+const SQL_IDENTIFIER_SOURCE =
+  /"(?:[^"]|"")*"|'(?:[^']|'')*'|`(?:[^`]|``)*`|\[[^\]]*\]|[A-Za-z_\u0080-\uffff][A-Za-z0-9_$\u0080-\uffff]*/
+    .source;
+const VIRTUAL_TABLE = /^[\s;]*CREATE\s+VIRTUAL\s+TABLE\b/i;
+const VIRTUAL_TABLE_MODULE = new RegExp(
+  String.raw`^[\s;]*CREATE\s+VIRTUAL\s+TABLE\s*(?:IF\s+NOT\s+EXISTS\s*)?(?:${SQL_IDENTIFIER_SOURCE})\s*(?:\.\s*(?:${SQL_IDENTIFIER_SOURCE})\s*)?USING\s*(${SQL_IDENTIFIER_SOURCE})`,
+  "i",
+);
+const ALLOWED_VIRTUAL_TABLE_MODULES = new Set(["fts5", "fts5vocab", "rtree", "rtree_i32"]);
+
+/**
+ * `VACUUM` has no action code of its own, so the authorizer never sees it. What refuses it
+ * upstream is SQLite's own `cannot VACUUM from within a transaction` precondition, against the
+ * transaction a Durable Object always has open — and that message is what the oracle returned,
+ * for `VACUUM`, `VACUUM main` and `VACUUM INTO` alike. Byte-identical for the same reason
+ * `SQL_NOT_AUTHORIZED_MESSAGE` is: a caller matching on it ports unchanged.
+ *
+ * Refused here unconditionally rather than by transaction state, which is a divergence only in
+ * mechanism: this runtime never runs a statement where upstream would have allowed it.
+ */
+const VACUUM_STATEMENT = /^[\s;]*VACUUM\b/i;
+export const SQL_VACUUM_REFUSED_MESSAGE = "cannot VACUUM from within a transaction: SQLITE_ERROR";
+
+/** Refuse the authorizer-only forms against one SQLite-decided statement boundary. */
+function refuseUnauthorizedForms(statement: string): void {
+  const code = statement.replace(NOT_COMMENT, " ");
+  if (VACUUM_STATEMENT.test(code)) throw new Error(SQL_VACUUM_REFUSED_MESSAGE);
+  if (DATABASE_ATTACHMENT.test(code) || TEMP_SCHEMA.test(code) || TEMP_QUALIFIED.test(code)) {
+    throw new Error(SQL_NOT_AUTHORIZED_MESSAGE);
+  }
+  if (VIRTUAL_TABLE.test(code)) {
+    const moduleName = VIRTUAL_TABLE_MODULE.exec(code)?.[1];
+    if (
+      moduleName === undefined ||
+      !ALLOWED_VIRTUAL_TABLE_MODULES.has(unquoted(moduleName).toLowerCase())
+    ) {
+      throw new Error(SQL_NOT_AUTHORIZED_MESSAGE);
+    }
+  }
+}
 
 /** Cheap pre-test; `PRAGMA` and the `pragma_` functions both contain it. */
 const PRAGMA_HINT = /pragma/i;
 
 /** `PRAGMA [schema.]name`, then `= value`, `(argument)`, or nothing. */
 const PRAGMA_STATEMENT =
-  /^\s*PRAGMA\s+(?:[A-Za-z_][A-Za-z0-9_$]*\s*\.\s*)?([A-Za-z_][A-Za-z0-9_$]*)(?:\s*=\s*([\s\S]+?)|\s*\(\s*([\s\S]*?)\s*\))?\s*;?\s*$/i;
+  /^[\s;]*PRAGMA\s+(?:[A-Za-z_][A-Za-z0-9_$]*\s*\.\s*)?([A-Za-z_][A-Za-z0-9_$]*)(?:\s*=\s*([\s\S]+?)|\s*\(\s*([\s\S]*?)\s*\))?\s*;?\s*$/i;
 
 /**
- * ← `ALLOWED_PRAGMAS` and `PragmaSignature` (`util/sqlite.c++:525-563`),
+ * ← `ALLOWED_PRAGMAS` (`util/sqlite.c++:543-571`) and `PragmaSignature` (`:528-535`),
  * verbatim. `table_list`, `table_info`, and `table_xinfo` are special-cased
  * ahead of the table in the authorizer, exactly as upstream's `SQLITE_PRAGMA`
  * case does (`util/sqlite.c++:1194-1273`).
@@ -222,6 +349,10 @@ const ALLOWED_PRAGMAS = new Map<
   "NO_ARG" | "BOOLEAN" | "OBJECT_NAME" | "OPTIONAL_OBJECT_NAME" | "NULL_OR_NUMBER" | "NULL_NUMBER_OR_OBJECT_NAME"
 >([
   ["data_version", "NO_ARG"],
+  // Upstream's own comment: "The R*Tree module issues `PRAGMA page_size` (with no argument)
+  // internally to read the current page size. `PRAGMA page_size=N`, which would attempt to
+  // change the page size, is still rejected." `NO_ARG` is what rejects the assignment.
+  ["page_size", "NO_ARG"],
   ["case_sensitive_like", "BOOLEAN"],
   ["foreign_keys", "BOOLEAN"],
   ["defer_foreign_keys", "BOOLEAN"],
@@ -271,7 +402,11 @@ const SQLITE_PRAGMA_NAMES = new Set([
 /** kj's `tryParseAs` is decimal; keep the same acceptance. */
 const DECIMAL = /^[+-]?\d+$/;
 
-/** One layer of SQL quoting off a pragma argument, any of the four forms. */
+/**
+ * One layer of SQL quoting, any of the four forms — a pragma argument, or the module token
+ * `VIRTUAL_TABLE_MODULE` captured. Doubled inner quotes stay doubled, which cannot change a
+ * verdict here: no allowlisted comparison target contains a quote character.
+ */
 function unquoted(argument: string): string {
   const first = argument[0];
   const last = argument[argument.length - 1];
@@ -345,7 +480,7 @@ function requireAllowedPragmas(statement: string): void {
   }
   // A statement that leads with PRAGMA but does not parse as one is refused —
   // the deliberately stricter direction the reserved-name check already takes.
-  if (/^\s*PRAGMA\b/i.test(code)) throw new Error(SQL_NOT_AUTHORIZED_MESSAGE);
+  if (/^[\s;]*PRAGMA\b/i.test(code)) throw new Error(SQL_NOT_AUTHORIZED_MESSAGE);
   const literalFree = code.replace(NOT_CODE, " ");
   for (const [token] of literalFree.matchAll(IDENTIFIER)) {
     if (token.length <= 7 || token.slice(0, 7).toLowerCase() !== "pragma_") continue;
@@ -365,6 +500,7 @@ function requireAllowedPragmas(statement: string): void {
 /** Everything the untrusted path refuses at one statement boundary. */
 function regulateUntrustedStatement(statement: string): void {
   refuseTransactionControl(statement);
+  refuseUnauthorizedForms(statement);
   requireAllowedPragmas(statement);
 }
 
