@@ -77,7 +77,7 @@ import {
   type SqliteWasmHost,
 } from "../../backends/sqlite-wasm";
 import { Probe } from "../fixtures/probe";
-import { HibernationMirror } from "../hibernation-host";
+import { HibernationMirror } from "../../examples/platform-shims/hibernation-mirror";
 import {
   installWebSocketUpgradeGlobals,
   upgradeWebSocket,

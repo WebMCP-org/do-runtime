@@ -600,21 +600,29 @@ class TimeoutManager {
     const wake = new AbortController();
     state.armed = wake;
 
-    const fired = this.#timer.afterDelay(state.params.msDelay, wake.signal).then(
-      async () => {
-        if (state.isCanceled) return;
-        state.armed = undefined;
-        await this.#fire(ctx, id, state, criticalSection);
-      },
-      (exception: unknown) => {
-        // kj cancels by dropping the promise, which cannot report anything; Section 1 records
-        // that the substitution turns every cancel-by-drop into an `AbortSignal` whose waiter
-        // rejects with `CanceledError`. A wake THIS manager aborted is that cancellation and not
-        // a failure. Anything else is the timer port's and is reported, so a substrate that
-        // fails to keep time cannot look like a timer nobody armed.
-        if (!state.isCanceled) throw exception;
-      },
-    );
+    // A Timer may model kj's cancel-by-drop by leaving its delay promise unsettled.
+    // The manager still has to finish its own waitUntil bookkeeping when it drops
+    // that wait, or a cleared timer would keep the actor permanently non-idle.
+    const canceled = new Promise<void>((resolve) => {
+      wake.signal.addEventListener("abort", () => resolve(), { once: true });
+    });
+
+    const fired = Promise.race([
+      this.#timer.afterDelay(state.params.msDelay, wake.signal).then(
+        async () => {
+          if (state.isCanceled) return;
+          state.armed = undefined;
+          await this.#fire(ctx, id, state, criticalSection);
+        },
+        (exception: unknown) => {
+          // A timer port may reject its waiter when this manager aborts it. That is cancellation,
+          // not a clock failure. Anything else is reported, so a substrate that fails to keep
+          // time cannot look like a timer nobody armed.
+          if (!state.isCanceled) throw exception;
+        },
+      ),
+      canceled,
+    ]);
 
     // ← `context.addWaitUntil(kj::mv(paf.promise))` (`io-context.c++:845-851`): "Add a wait-until
     // task which resolves when this timer completes. This ensures that `IncomingRequest::drain()`

@@ -81,6 +81,7 @@ export type HostStatus = {
 export interface HostRpc {
   directStubIncrement(): Promise<number>;
   email(subject: string, body: string): Promise<void>;
+  evict(): Promise<void>;
   increment(): Promise<number>;
   enqueueIncrement(amount: number): Promise<string>;
   mcp(method: string, params: Record<string, unknown>): Promise<unknown>;

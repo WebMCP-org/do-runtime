@@ -145,6 +145,7 @@ const ops = {
     host.directStubIncrement() as unknown as Promise<number>,
   email: (subject: string, body: string): Promise<void> =>
     host.email(subject, body) as unknown as Promise<void>,
+  evict: (): Promise<void> => host.evict() as unknown as Promise<void>,
   increment: (): Promise<number> => host.increment() as unknown as Promise<number>,
   enqueueIncrement: (amount: number): Promise<string> =>
     host.enqueueIncrement(amount) as unknown as Promise<string>,
@@ -194,6 +195,8 @@ async function runOp(op: HostOp, args: readonly unknown[]): Promise<unknown> {
       return await ops.directStubIncrement();
     case "email":
       return await ops.email(String(args[0]), String(args[1]));
+    case "evict":
+      return await ops.evict();
     case "increment":
       return await ops.increment();
     case "enqueueIncrement":

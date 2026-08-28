@@ -2,11 +2,11 @@ import type {
   HibernationHost,
   RawWebSocket,
   RehydratedWebSocket,
-} from "../src/index";
+} from "@mcp-b/do-runtime";
 
 type MirroredWebSocket = RehydratedWebSocket & { tags: readonly string[] };
 
-/** In-memory socket state shared by the Node and browser reference embedders. */
+/** In-memory socket state shared by the reference embedders and browser example. */
 export class HibernationMirror implements HibernationHost {
   readonly #entries = new Map<RawWebSocket, MirroredWebSocket>();
   autoResponsePair: { request: string; response: string } | null = null;

@@ -56,6 +56,7 @@ import {
   withWebSocketUpgrade,
   type UpgradeWebSocket,
 } from "../../../platform-shims/memory-websocket-pair";
+import { HibernationMirror } from "../../../platform-shims/hibernation-mirror";
 import { serveMessagePortWebSockets } from "../../../platform-shims/message-port-websocket";
 import type {
   CounterSnapshot,
@@ -162,6 +163,8 @@ const ALARM_DATABASE = "scheduler";
  * `SQLITE_CANTOPEN: sqlite3 result code 14`. This line is the knob.
  */
 const POOL_CAPACITY = 64;
+const EVICTION_POLL_MS = 10;
+const EVICTION_TIMEOUT_MS = 5_000;
 
 // =======================================================================================
 // Facet placement: bundled Agent classes, one database and gate set per child
@@ -328,6 +331,8 @@ class ExtensionFacetHost implements FacetHost {
 }
 
 const facets = new ExtensionFacetHost();
+// Worker-owned, not placement-owned: accepted raw sockets survive a root replacement.
+const hibernation = new HibernationMirror();
 
 // =======================================================================================
 // The container this worker hosts
@@ -339,6 +344,7 @@ type Live = {
    * gated event, so this is the only handle anything outside the actor gets.
    */
   readonly entry: ActorEntry<Counter>;
+  readonly storage: SqliteWasmActorStorage;
 };
 
 let live: Live | undefined;
@@ -543,10 +549,12 @@ async function place(): Promise<Live> {
       alarms: scheduler.hooks(ACTOR_ID),
       facets,
       timer,
+      hibernation,
       // `ports.fetch` is deliberately omitted, which is upstream's
       // `globalOutbound: null` posture: `fetch` inside the actor refuses BY NAME
       // rather than reaching an ungated one that would appear to work.
     },
+    webSockets: hibernation.snapshot(),
   });
   rootGate.container = container;
 
@@ -581,7 +589,7 @@ async function place(): Promise<Live> {
     storage.close();
     throw error;
   }
-  live = { container, entry: container.entry(instance) };
+  live = { container, entry: container.entry(instance), storage };
   return live;
 }
 
@@ -599,6 +607,28 @@ async function placed(): Promise<Live> {
     placing = undefined;
   });
   return await placing;
+}
+
+/** Poll on the raw host timer; an actor-scoped delay would itself keep the actor busy. */
+async function waitUntilEvictable(container: ActorContainer): Promise<void> {
+  const deadline = Date.now() + EVICTION_TIMEOUT_MS;
+  for (;;) {
+    const state = container.quiescence();
+    if (state.outputGateBroken) {
+      throw new Error(`The actor output gate is broken: ${JSON.stringify(state)}`);
+    }
+    if (
+      state.armedTimers === 0 &&
+      state.pendingWaitUntil === 0 &&
+      !state.inputLockHeld
+    ) {
+      return;
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(`The actor did not become idle: ${JSON.stringify(state)}`);
+    }
+    await timer.afterDelay(EVICTION_POLL_MS);
+  }
 }
 
 // =======================================================================================
@@ -660,6 +690,14 @@ class HostTarget extends RpcTarget implements HostRpc {
     await routeAgentEmail(message, { Counter: rootNamespace }, {
       resolver: async () => ({ agentName: "Counter", agentId: ACTOR_ID }),
     });
+  }
+
+  async evict(): Promise<void> {
+    const current = await placed();
+    await waitUntilEvictable(current.container);
+    live = undefined;
+    current.storage.close();
+    await placed();
   }
 
   async increment(): Promise<number> {
