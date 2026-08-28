@@ -98,6 +98,7 @@ export type {
   ActorContainerOptions,
   ActorEntry,
   ActorPorts,
+  HibernationHost,
   FacetHandle,
   FacetHost,
   FacetId,
@@ -137,7 +138,6 @@ export { asLoopbackDurableObjectClass, LoopbackDurableObjectClass } from "./api/
 export {
   FACET_NAME_MAX_LENGTH,
   FACET_TREE_MAX_DEPTH,
-  HIBERNATION_UNIMPLEMENTED_MESSAGE,
 } from "./api/actor-state";
 export { PITR_UNIMPLEMENTED_MESSAGE, REPLICATION_UNIMPLEMENTED_MESSAGE } from "./io/actor-cache";
 /**
@@ -203,8 +203,13 @@ export {
   installActorScope,
   NO_GLOBAL_OUTBOUND_MESSAGE,
 } from "./api/global-scope";
-export type { AcceptedWebSocket, RawWebSocket } from "./api/web-socket";
-export { ALREADY_ACCEPTED_MESSAGE } from "./api/web-socket";
+export type { AcceptedWebSocket, RawWebSocket, RehydratedWebSocket } from "./api/web-socket";
+export {
+  ALREADY_ACCEPTED_MESSAGE,
+  WebSocketRequestResponsePair,
+  installWebSocketGlobals,
+  markWebSocketUsed,
+} from "./api/web-socket";
 export { BYOB_READER_UNGATABLE_MESSAGE, gateRequestBody } from "./api/http";
 /**
  * The transport, for the same reason the loader binding and the scheduler are

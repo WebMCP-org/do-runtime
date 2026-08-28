@@ -24,6 +24,7 @@ import {
   isAlarmFailureUserError,
   NO_GLOBAL_OUTBOUND_MESSAGE,
 } from "./global-scope";
+import { HibernatableWebSocketRegistry } from "./web-socket";
 
 describe("AlarmInvocationInfo", () => {
   test("carries the scheduled time and the retry count", () => {
@@ -145,14 +146,23 @@ async function quiesce(turns = 8): Promise<void> {
   }
 }
 
-function newScope(options?: ActorGlobalScopeOptions): {
+function newScope(options: Omit<ActorGlobalScopeOptions, "webSockets"> = {}): {
   ctx: IoContext;
   timer: TestTimer;
   scope: ActorGlobalScope;
 } {
   const timer = new TestTimer();
   const ctx = new IoContext(new TestActor(), timer);
-  return { ctx, timer, scope: new ActorGlobalScope(ctx, options) };
+  const webSockets = new HibernatableWebSocketRegistry(ctx, {
+    message(): void {},
+    close(): void {},
+    error(): void {},
+  });
+  return {
+    ctx,
+    timer,
+    scope: new ActorGlobalScope(ctx, { ...options, webSockets }),
+  };
 }
 
 describe("Scheduler", () => {
@@ -396,7 +406,7 @@ describe("installActorScope", () => {
     expect(bound.currentExternalEntry).toBe(currentExternalEntry);
   });
 
-  test("writes all seven names onto a scope object, bound", async () => {
+  test("writes all actor globals onto a scope object, bound", async () => {
     // Bound, because a dynamically-loaded Worker source destructures them: `const
     // { scheduler, setTimeout } = …` would lose `this` on a method.
     const { ctx, timer, scope } = newScope({ fetch: async () => new Response("ok") });
@@ -404,6 +414,9 @@ describe("installActorScope", () => {
     installActorScope(target, () => scope);
 
     expect(Object.keys(target).sort()).toEqual([
+      "WebSocket",
+      "WebSocketPair",
+      "WebSocketRequestResponsePair",
       "clearInterval",
       "clearTimeout",
       "crypto",

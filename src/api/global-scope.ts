@@ -49,6 +49,13 @@ import {
   type IoContext,
 } from "../io/io-context";
 import { gateResponseBody } from "./http";
+import {
+  installWebSocketGlobals,
+  WebSocketRequestResponsePair,
+  type HibernatableWebSocketRegistry,
+} from "./web-socket";
+
+type WebSocketPairConstructor = typeof WebSocketPair;
 
 /**
  * ← `AlarmInvocationInfo` (`api/global-scope.h:386-412`): "a jsg::Object used to
@@ -288,6 +295,7 @@ function abortReasonOf(signal: AbortSignal | undefined): unknown {
 export type FetchPort = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 
 export type ActorGlobalScopeOptions = {
+  readonly webSockets: HibernatableWebSocketRegistry;
   /** Opaque identity of the external entry whose synchronous body is running. */
   readonly currentExternalEntry?: (() => object | undefined) | undefined;
   /**
@@ -335,11 +343,15 @@ export class ActorGlobalScope {
   readonly #readCurrentExternalEntry: (() => object | undefined) | undefined;
   readonly scheduler: Scheduler;
   readonly crypto: GatedCrypto;
+  declare readonly WebSocket: typeof globalThis.WebSocket;
+  declare readonly WebSocketPair: WebSocketPairConstructor;
+  declare readonly WebSocketRequestResponsePair: typeof WebSocketRequestResponsePair;
 
-  constructor(ctx: IoContext, options: ActorGlobalScopeOptions = {}) {
+  constructor(ctx: IoContext, options: ActorGlobalScopeOptions) {
     this.#ctx = ctx;
     this.#fetch = options.fetch;
     this.#readCurrentExternalEntry = options.currentExternalEntry;
+    installWebSocketGlobals(this, options.webSockets.WebSocketPair);
     this.scheduler = new Scheduler(this);
     this.crypto = new GatedCrypto(
       (op) => {
@@ -489,6 +501,9 @@ export type ActorScopeBindings = {
   readonly clearInterval: (id?: number | null) => void;
   readonly fetch: (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
   readonly crypto: Crypto;
+  readonly WebSocket: typeof globalThis.WebSocket;
+  readonly WebSocketPair: WebSocketPairConstructor;
+  readonly WebSocketRequestResponsePair: typeof WebSocketRequestResponsePair;
   readonly currentExternalEntry?: object | undefined;
 };
 
@@ -502,6 +517,13 @@ export type ActorScopeBindings = {
  * scope instead. A single-actor host simply writes `() => scope`.
  */
 export function actorScopeBindings(resolve: () => ActorGlobalScope): ActorScopeBindings {
+  const BoundWebSocketPair: WebSocketPairConstructor = new Proxy(
+    class WebSocketPair {
+      declare readonly 0: WebSocket;
+      declare readonly 1: WebSocket;
+    },
+    { construct: () => new (resolve().WebSocketPair)() },
+  );
   return {
     awaitIo: (promise) => resolve().awaitIo(promise),
     scheduler: {
@@ -518,6 +540,9 @@ export function actorScopeBindings(resolve: () => ActorGlobalScope): ActorScopeB
     },
     fetch: (input, init) => resolve().fetch(input, init),
     crypto: scopeCrypto(resolve),
+    WebSocket: globalThis.WebSocket,
+    WebSocketPair: BoundWebSocketPair,
+    WebSocketRequestResponsePair,
     get currentExternalEntry(): object | undefined {
       return resolve().currentExternalEntry;
     },
@@ -529,7 +554,7 @@ export function actorScopeBindings(resolve: () => ActorGlobalScope): ActorScopeB
  * an operation actually runs.
  *
  * That laziness is required rather than tidy, and both lanes proved it. A facet's
- * module destructures its seven names at module scope, which is BEFORE its container
+ * module destructures its actor globals at module scope, which is BEFORE its container
  * exists — so a `crypto` that resolved on read threw at import. And on the root
  * path `globalThis.crypto` is read by things that are not the actor at all: capnweb,
  * the sqlite driver, the test runner. So the binding is a pair of plain objects
@@ -581,8 +606,8 @@ const ASYNC_SUBTLE_METHODS = [
  * one that is not.
  *
  * **A host should call this rather than assigning the names itself**, and the
- * reason is the failure it prevents: a host that installs five of the six leaves
- * one primitive ungated, and an ungated primitive that WORKS is invisible until
+ * reason is the failure it prevents: a host that installs only a subset leaves a
+ * primitive ungated, and an ungated primitive that WORKS is invisible until
  * a continuation after it touches storage — possibly never, on the path that
  * matters. The set is the package's, so it can grow without every host growing
  * with it.

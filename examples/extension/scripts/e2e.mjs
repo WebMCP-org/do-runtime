@@ -261,7 +261,42 @@ async function main() {
     );
 
     // ---------------------------------------------------------------------
-    // 2. A real alarm: armed in the actor's storage, delivered by the
+    // 2. Root-container eviction keeps the existing hibernatable socket. The
+    //    offscreen document, Worker, MessagePort and AgentClient all stay put;
+    //    only the root actor container and its SQLite handle are replaced.
+    await op(popup, "evict");
+    check("the replacement actor continues durable state", await op(popup, "increment"), 13);
+
+    let stateAfterEviction = await op(popup, "sdkState");
+    for (let attempts = 0; attempts < 20 && stateAfterEviction.value !== 13; attempts += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      stateAfterEviction = await op(popup, "sdkState");
+    }
+    check(
+      "the connected Agents client receives state after container eviction",
+      stateAfterEviction.value,
+      13,
+    );
+
+    const clientStateAfterEviction = await op(popup, "sdkSetState", [20]);
+    check(
+      "the connected Agents client remains writable after container eviction",
+      clientStateAfterEviction.value,
+      20,
+    );
+    for (let attempts = 0; attempts < 20; attempts += 1) {
+      snapshot = await op(popup, "snapshot");
+      if (snapshot.value === 20) break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    check(
+      "the replacement actor receives state over the rehydrated socket",
+      snapshot.value,
+      20,
+    );
+
+    // ---------------------------------------------------------------------
+    // 3. A real alarm: armed in the actor's storage, delivered by the
     //    AlarmScheduler's own database in the same worker.
     const childArmedFor = await op(popup, "armSubAgentWake", [5000]);
     if (typeof childArmedFor !== "number") {
@@ -300,7 +335,7 @@ async function main() {
       await new Promise((resolve) => setTimeout(resolve, 250));
     }
     check("chrome.alarms recreated the host and delivered the alarm", alarms, 1);
-    check("the alarm handler's write landed", snapshot.value, 13);
+    check("the alarm handler's write landed", snapshot.value, 21);
     check(
       "the recreated host delivered durable work to the sub-agent",
       await op(popup, "scheduledSubAgentValue"),
@@ -308,12 +343,12 @@ async function main() {
     );
 
     // ---------------------------------------------------------------------
-    // 3. Persistence across offscreen recreation: a new document, a new worker, a new
+    // 4. Persistence across offscreen recreation: a new document, a new worker, a new
     //    container, the same OPFS files.
     await worker.evaluate(async () => chrome.offscreen.closeDocument());
     await ensureHost(popup);
     snapshot = await op(popup, "snapshot");
-    check("the Agent state survived offscreen recreation", snapshot.value, 13);
+    check("the Agent state survived offscreen recreation", snapshot.value, 21);
     check(
       "the alarm event survived offscreen recreation",
       snapshot.events.filter((event) => event.kind === "sdk-schedule").length,
@@ -321,17 +356,17 @@ async function main() {
     );
 
     const reconnectedState = await op(popup, "sdkState");
-    check("a recreated Agents client resynced durable state", reconnectedState.value, 13);
+    check("a recreated Agents client resynced durable state", reconnectedState.value, 21);
     const afterReload = await op(popup, "sdkIncrement");
-    check("a recreated Agents client called a decorated method", afterReload, 14);
+    check("a recreated Agents client called a decorated method", afterReload, 22);
 
     const restartedSubAgents = await op(popup, "subAgents");
     check(
       "sub-agent state survived offscreen recreation",
       JSON.stringify(restartedSubAgents),
       JSON.stringify([
-        { name: "alpha", value: 3, parentValue: 14 },
-        { name: "beta", value: 3, parentValue: 14 },
+        { name: "alpha", value: 3, parentValue: 22 },
+        { name: "beta", value: 3, parentValue: 22 },
       ]),
     );
     check(
@@ -346,17 +381,17 @@ async function main() {
     );
 
     // ---------------------------------------------------------------------
-    // 4. Nothing broke in the background.
+    // 5. Nothing broke in the background.
     const status = await op(popup, "status");
     check("the container never broke", status.broken, null);
     check("the alarm scheduler had no background failure", status.alarmTaskFailure, null);
 
     // ---------------------------------------------------------------------
-    // 5. The popup reaches that same real offscreen host.
+    // 6. The popup reaches that same real offscreen host.
     await popup.click("#increment");
     const printed = await waitForOutput(popup, /^[^\n]+  increment\n/, BOOT_TIMEOUT_MS);
     const viaOffscreen = Number(printed.split("\n")[1]);
-    check("the offscreen document continues the same storage", viaOffscreen, 15);
+    check("the offscreen document continues the same storage", viaOffscreen, 23);
 
     const offscreenContexts = await worker.evaluate(async () =>
       (await chrome.runtime.getContexts({ contextTypes: ["OFFSCREEN_DOCUMENT"] })).length,

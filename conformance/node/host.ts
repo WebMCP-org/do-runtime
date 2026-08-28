@@ -32,16 +32,18 @@ import { cpSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createNodeSqlProvider } from "../../backends/node-sqlite";
-import type { Timer } from "../../src/index";
-import { AlarmScheduler, createActorContainer } from "../../src/index";
-import type {
-  ActorContainer,
-  ActorEntry,
-  FacetHandle,
-  FacetHost,
-  FacetId,
-  FacetStartRequest,
-  FacetTree,
+import {
+  AlarmScheduler,
+  createActorContainer,
+  installWebSocketGlobals,
+  type ActorContainer,
+  type ActorEntry,
+  type FacetHandle,
+  type FacetHost,
+  type FacetId,
+  type FacetStartRequest,
+  type FacetTree,
+  type Timer,
 } from "../../src/index";
 import type {
   ActorClassChannel,
@@ -54,8 +56,21 @@ import {
   asLoopbackDurableObjectClass,
   LoopbackDurableObjectClass,
 } from "../../src/api/export-loopback";
-import type { Capability, ConformanceHost, ProbeActor } from "../host";
+import type {
+  Capability,
+  ConformanceHost,
+  LaneClientSocket,
+  LaneSocketMessage,
+  ProbeActor,
+} from "../host";
 import { Probe } from "../fixtures/probe";
+import { HibernationMirror } from "../../examples/platform-shims/hibernation-mirror";
+import {
+  installWebSocketUpgradeGlobals,
+  upgradeWebSocket,
+  webSocketUpgradeRequest,
+  type UpgradeWebSocket,
+} from "../websocket-upgrade";
 
 // =======================================================================================
 // The platform globals workerd has natively
@@ -162,6 +177,24 @@ globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
   if (container === undefined) return nodeFetch(input, init);
   return container.globals.fetch(input, init);
 }) as typeof globalThis.fetch;
+
+const ActorWebSocketPair: typeof WebSocketPair = new Proxy(
+  class WebSocketPair {
+    declare readonly 0: WebSocket;
+    declare readonly 1: WebSocket;
+  },
+  {
+    construct() {
+      const Pair = current.getStore()?.globals.WebSocketPair;
+      if (Pair === undefined) {
+        throw new Error("Node lane: WebSocketPair was constructed outside an actor event.");
+      }
+      return new Pair();
+    },
+  },
+);
+installWebSocketGlobals(globalThis, ActorWebSocketPair);
+installWebSocketUpgradeGlobals();
 
 /**
  * `crypto`, on the same ambient as the timers above.
@@ -476,6 +509,62 @@ type Placement = {
   readonly stub: object;
 };
 
+class NodeClientSocket implements LaneClientSocket {
+  readonly #messages: LaneSocketMessage[] = [];
+  readonly #messageWaiters: ((message: LaneSocketMessage) => void)[] = [];
+  readonly #closes: { code: number; reason: string; wasClean: boolean }[] = [];
+  readonly #closeWaiters: ((close: { code: number; reason: string; wasClean: boolean }) => void)[] = [];
+
+  constructor(readonly socket: UpgradeWebSocket) {
+    socket.addEventListener("message", (event) => {
+      const message = (event as MessageEvent).data as LaneSocketMessage;
+      const waiter = this.#messageWaiters.shift();
+      if (waiter === undefined) this.#messages.push(message);
+      else waiter(message);
+    });
+    socket.addEventListener("close", (event) => {
+      const closeEvent = event as CloseEvent;
+      const close = {
+        code: closeEvent.code,
+        reason: closeEvent.reason,
+        wasClean: closeEvent.wasClean,
+      };
+      const waiter = this.#closeWaiters.shift();
+      if (waiter === undefined) this.#closes.push(close);
+      else waiter(close);
+    });
+    socket.accept();
+  }
+
+  get readyState(): number {
+    return this.socket.readyState;
+  }
+
+  send(data: string | ArrayBuffer | ArrayBufferView): Promise<void> {
+    this.socket.send(data);
+    return Promise.resolve();
+  }
+
+  close(code?: number, reason?: string): Promise<void> {
+    this.socket.close(code, reason);
+    return Promise.resolve();
+  }
+
+  nextMessage(): Promise<LaneSocketMessage> {
+    const message = this.#messages.shift();
+    return message === undefined
+      ? new Promise((resolve) => this.#messageWaiters.push(resolve))
+      : Promise.resolve(message);
+  }
+
+  nextClose(): Promise<{ code: number; reason: string; wasClean: boolean }> {
+    const close = this.#closes.shift();
+    return close === undefined
+      ? new Promise((resolve) => this.#closeWaiters.push(resolve))
+      : Promise.resolve(close);
+  }
+}
+
 /**
  * One host for the whole run, as `FacetHost`'s contract requires: every id it is
  * handed is an id in some root's tree index, so it has to be able to place and
@@ -637,6 +726,15 @@ function alarmScheduler(): Promise<AlarmScheduler> {
 }
 
 const live = new Map<string, Record_>();
+const socketHosts = new Map<string, HibernationMirror>();
+
+function socketHost(name: string): HibernationMirror {
+  const existing = socketHosts.get(name);
+  if (existing !== undefined) return existing;
+  const host = new HibernationMirror();
+  socketHosts.set(name, host);
+  return host;
+}
 
 async function placed(name: string): Promise<Record_> {
   return live.get(name) ?? (await place(name));
@@ -651,6 +749,7 @@ async function place(name: string): Promise<Record_> {
   mkdirSync(directory, { recursive: true });
 
   const host = new NodeFacetHost();
+  const hibernation = socketHost(name);
   const scheduler = await alarmScheduler();
   // `LOADER` is filled in below: the binding needs the container's IoContext, exactly as
   // upstream's binding compilation runs after the Worker exists. `env` is the same object the
@@ -674,11 +773,13 @@ async function place(name: string): Promise<Record_> {
       alarms: scheduler.hooks(name),
       facets: host,
       timer,
+      hibernation,
       fetch: async () => {
         await timer.afterDelay(60);
         return new Response("fetched");
       },
     },
+    webSockets: hibernation.snapshot(),
   });
   // ← `WorkerdApi::compileGlobals`'s `Global::WorkerLoader` arm — the real binding over the
   // lane's own namespace. `CODE_VERSION` is what workerd itself passes
@@ -771,6 +872,21 @@ export const host: ConformanceHost = {
     teardown(previous.name);
     await place(previous.name);
     return actor(previous.name);
+  },
+
+  connect: async (target, tags = []) => {
+    const record = await placed(target.name);
+    const response = await record.stub.fetch(
+      webSocketUpgradeRequest("https://probe.invalid/socket", tags),
+    );
+    const socket = upgradeWebSocket(response);
+    if (socket === undefined) throw new Error("Node lane: probe fetch did not upgrade.");
+    return new NodeClientSocket(socket);
+  },
+
+  evict: async (target) => {
+    teardown(target.name);
+    await place(target.name);
   },
 
   /** Drop the container without letting it flush: the files are all that survives. */

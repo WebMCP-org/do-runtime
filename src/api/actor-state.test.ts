@@ -60,9 +60,9 @@ import {
   FACET_CLASS_UNSUPPORTED_MESSAGE,
   FACET_NAME_MAX_LENGTH,
   FACET_TREE_MAX_DEPTH,
-  HIBERNATION_UNIMPLEMENTED_MESSAGE,
   type StorageCache,
 } from "./actor-state";
+import { HibernatableWebSocketRegistry } from "./web-socket";
 
 /** The `ctx.exports` value a facet start-up callback hands back, once per call site. */
 function testClass(): DurableObjectClass {
@@ -182,6 +182,7 @@ class Harness {
   readonly ctx: IoContext;
   readonly facets = new FakeFacetManager();
   readonly storage: DurableObjectStorage;
+  readonly webSockets: HibernatableWebSocketRegistry;
   readonly globals: ActorGlobalScope;
   readonly state: DurableObjectState;
   readonly scheduled: Array<number | null> = [];
@@ -208,7 +209,12 @@ class Harness {
       this.ctx,
       wrapCache === undefined ? this.cache : wrapCache(this.cache),
     );
-    this.globals = new ActorGlobalScope(this.ctx);
+    this.webSockets = new HibernatableWebSocketRegistry(this.ctx, {
+      message(): void {},
+      close(): void {},
+      error(): void {},
+    });
+    this.globals = new ActorGlobalScope(this.ctx, { webSockets: this.webSockets });
     this.state = new DurableObjectState(this.ctx, {
       id: new TestId("test-actor"),
       exports: { Thing: class {} },
@@ -216,6 +222,7 @@ class Harness {
       storage: this.storage,
       facets: this.facets,
       globals: actorScopeBindings(() => this.globals),
+      webSockets: this.webSockets,
     });
     // Nothing else takes it, and an unobserved break would surface as an unhandled rejection.
     void this.gate.onBroken().catch(() => {});
@@ -805,6 +812,7 @@ test("an actor with no facet manager says so", async () => {
     props: undefined,
     storage: h.storage,
     globals: actorScopeBindings(() => h.globals),
+    webSockets: h.webSockets,
   });
   await h.run(() => {
     expect(() => state.facets.get("child", () => ({ class: testClass() }))).toThrow(
@@ -993,27 +1001,6 @@ test("blockConcurrencyWhile outside a gated slice throws", async () => {
   expect(() => h.state.blockConcurrencyWhile(() => Promise.resolve(1))).toThrow(
     "no input lock available in this context",
   );
-});
-
-// =======================================================================================
-// Hibernatable WebSockets — the substrate boundary, asserted rather than skipped
-
-apiTest("every hibernatable WebSocket method throws the named message", ({ state }) => {
-  const socket = {} as WebSocket;
-  expect(() => state.acceptWebSocket(socket)).toThrow(HIBERNATION_UNIMPLEMENTED_MESSAGE);
-  expect(() => state.getWebSockets()).toThrow(HIBERNATION_UNIMPLEMENTED_MESSAGE);
-  expect(() => state.setWebSocketAutoResponse()).toThrow(HIBERNATION_UNIMPLEMENTED_MESSAGE);
-  expect(() => state.getWebSocketAutoResponse()).toThrow(HIBERNATION_UNIMPLEMENTED_MESSAGE);
-  expect(() => state.getWebSocketAutoResponseTimestamp(socket)).toThrow(
-    HIBERNATION_UNIMPLEMENTED_MESSAGE,
-  );
-  expect(() => state.setHibernatableWebSocketEventTimeout(1)).toThrow(
-    HIBERNATION_UNIMPLEMENTED_MESSAGE,
-  );
-  expect(() => state.getHibernatableWebSocketEventTimeout()).toThrow(
-    HIBERNATION_UNIMPLEMENTED_MESSAGE,
-  );
-  expect(() => state.getTags(socket)).toThrow(HIBERNATION_UNIMPLEMENTED_MESSAGE);
 });
 
 // =======================================================================================

@@ -1,14 +1,18 @@
-import { markWebSocketUsed, type RawWebSocket } from "@mcp-b/do-runtime";
+import { markWebSocketUsed, type RawWebSocket } from "../src/index";
 
-export type UpgradeWebSocket = EventTarget & RawWebSocket & {
+export type UpgradeWebSocket = RawWebSocket & {
   accept(): void;
   readonly readyState: number;
 };
 
 type UpgradeResponseInit = ResponseInit & { webSocket?: UpgradeWebSocket };
 
-/** Install the Response-101 half; `installActorScope` supplies the runtime's WebSocketPair. */
-export function installWebSocketUpgradeResponse(): void {
+let installed = false;
+
+/** The Request/Response half of WebSocket upgrades supplied by workerd in the oracle lane. */
+export function installWebSocketUpgradeGlobals(): void {
+  if (installed) return;
+  installed = true;
   const NativeResponse = globalThis.Response;
   class WorkersResponse extends NativeResponse {
     constructor(body?: BodyInit | null, init: UpgradeResponseInit = {}) {
@@ -29,16 +33,13 @@ export function upgradeWebSocket(response: Response): UpgradeWebSocket | undefin
   return (response as Response & { webSocket?: UpgradeWebSocket }).webSocket;
 }
 
-/** Preserve workerd's WebSocket upgrade signal across browser `Request.clone()` calls. */
-export function withWebSocketUpgrade<T extends { headers: Headers; clone(): T }>(request: T): T {
+/** Preserve workerd's upgrade signal when browser Request.clone() drops forbidden headers. */
+export function webSocketUpgradeRequest(url: string, tags: readonly string[]): Request {
+  const request = new Request(`${url}?${tags.map((tag) => `tag=${encodeURIComponent(tag)}`).join("&")}`);
   const get = request.headers.get.bind(request.headers);
   Object.defineProperty(request.headers, "get", {
     value: (name: string): string | null =>
       name.toLowerCase() === "upgrade" ? "websocket" : get(name),
-  });
-  const clone = request.clone.bind(request);
-  Object.defineProperty(request, "clone", {
-    value: (): T => withWebSocketUpgrade(clone()),
   });
   return request;
 }

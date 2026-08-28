@@ -36,11 +36,9 @@
  * `transformMaybeBackpressure` keeps the branch because
  * `DeleteAllResults.backpressure` is still a promise in `io/actor-cache.ts`.
  *
- * Not ported, because the substrate has no equivalent: Hibernatable WebSockets,
- * which is the whole reason `DurableObjectState`'s eight WebSocket methods are
- * named throwing stubs; V8's private wire bytes, replaced by a browser-safe
- * structured-clone encoding with the same public value semantics; the billing
- * counters
+ * Not ported, because the substrate has no equivalent: V8's private wire bytes,
+ * replaced by a browser-safe structured-clone encoding with the same public
+ * value semantics; the billing counters
  * (`billingUnits`, `ActorObserver`, `updateStorageWriteUnit`) and the trace
  * spans, both already absent throughout; `enableSql`, a workerd namespace option
  * that exists to simulate a non-SQLite Durable Object; and `ReplicaActorOutgoingFactory`,
@@ -71,6 +69,7 @@ import { DurableObjectClass } from "./actor";
 import { LoopbackColoLocalActorNamespace, LoopbackDurableObjectNamespace } from "./export-loopback";
 import type { ActorScopeBindings } from "./global-scope";
 import { SqlStorage } from "./sql";
+import type { HibernatableWebSocketRegistry } from "./web-socket";
 
 // =======================================================================================
 // Constants
@@ -84,18 +83,6 @@ import { SqlStorage } from "./sql";
 export const FACET_NAME_MAX_LENGTH = 256;
 /** Root is at depth 0, so the deepest allowed facet is at depth 3. */
 export const FACET_TREE_MAX_DEPTH = 4;
-
-/**
- * The substrate boundary named in the package README: Hibernatable WebSockets
- * exist so the platform can evict an actor while keeping its sockets open, and
- * Chrome exposes no equivalent lifecycle. Under this repo's fail-closed tenet
- * the throw IS the specified behaviour, which is why §2.5 orders the four
- * silent no-op stubs beside it replaced.
- */
-export const HIBERNATION_UNIMPLEMENTED_MESSAGE =
-  "Hibernatable WebSockets are not available in this runtime: they exist so the platform can " +
-  "evict a Durable Object while keeping its sockets open, and there is no equivalent lifecycle " +
-  "to be faithful to.";
 
 /**
  * ← what falls off the end of `DurableObjectFacets::get`'s class switch
@@ -175,7 +162,7 @@ const VALUE_CODEC_HEADER = new Uint8Array([0, 0x44, 0x4f, 1]);
  * The short header keeps the new representation unambiguous while old JSON rows
  * remain readable.
  */
-function serializeValue(value: unknown): Uint8Array {
+export function serializeValue(value: unknown): Uint8Array {
   const body = textEncoder.encode(JSON.stringify(serializeStructuredClone(value)));
   const encoded = new Uint8Array(VALUE_CODEC_HEADER.byteLength + body.byteLength);
   encoded.set(VALUE_CODEC_HEADER);
@@ -192,7 +179,7 @@ function serializeValue(value: unknown): Uint8Array {
  * type of the value, but not its contents)". Our four-byte header carries only
  * a marker and version for the same reason.
  */
-function deserializeValue<T = unknown>(key: string, buffer: Uint8Array): T {
+export function deserializeValue<T = unknown>(key: string, buffer: Uint8Array): T {
   if (buffer.byteLength === 0) {
     throw new Error(`unexpectedly empty value buffer; key = ${key}`);
   }
@@ -1009,6 +996,7 @@ export type DurableObjectStateOptions = {
    * `DurableObjectState.globals`.
    */
   globals: ActorScopeBindings;
+  webSockets: HibernatableWebSocketRegistry;
 };
 
 /** The type passed as the first parameter to a Durable Object class's constructor. */
@@ -1147,39 +1135,37 @@ export class DurableObjectState implements globalThis.DurableObjectState {
     );
   }
 
-  // -----------------------------------------------------------------
-  // Hibernatable WebSockets — the substrate boundary. §2.5 orders the silent
-  // no-op stubs replaced with throws, so all eight throw the same named message.
-
-  acceptWebSocket(_ws: WebSocket, _tags?: string[]): never {
-    throw new Error(HIBERNATION_UNIMPLEMENTED_MESSAGE);
+  acceptWebSocket(ws: WebSocket, tags?: string[]): void {
+    this.#options.webSockets.acceptWebSocket(ws, tags);
   }
 
-  getWebSockets(_tag?: string): never {
-    throw new Error(HIBERNATION_UNIMPLEMENTED_MESSAGE);
+  getWebSockets(tag?: string): WebSocket[] {
+    return tag === undefined
+      ? this.#options.webSockets.getWebSockets()
+      : this.#options.webSockets.getWebSockets(tag);
   }
 
-  setWebSocketAutoResponse(_maybeReqResp?: WebSocketRequestResponsePair): never {
-    throw new Error(HIBERNATION_UNIMPLEMENTED_MESSAGE);
+  setWebSocketAutoResponse(maybeReqResp?: WebSocketRequestResponsePair): void {
+    this.#options.webSockets.setWebSocketAutoResponse(maybeReqResp);
   }
 
-  getWebSocketAutoResponse(): never {
-    throw new Error(HIBERNATION_UNIMPLEMENTED_MESSAGE);
+  getWebSocketAutoResponse(): WebSocketRequestResponsePair | null {
+    return this.#options.webSockets.getWebSocketAutoResponse();
   }
 
-  getWebSocketAutoResponseTimestamp(_ws: WebSocket): never {
-    throw new Error(HIBERNATION_UNIMPLEMENTED_MESSAGE);
+  getWebSocketAutoResponseTimestamp(ws: WebSocket): Date | null {
+    return this.#options.webSockets.getWebSocketAutoResponseTimestamp(ws);
   }
 
-  setHibernatableWebSocketEventTimeout(_timeoutMs?: number): never {
-    throw new Error(HIBERNATION_UNIMPLEMENTED_MESSAGE);
+  setHibernatableWebSocketEventTimeout(timeoutMs?: number): void {
+    this.#options.webSockets.setHibernatableWebSocketEventTimeout(timeoutMs);
   }
 
-  getHibernatableWebSocketEventTimeout(): never {
-    throw new Error(HIBERNATION_UNIMPLEMENTED_MESSAGE);
+  getHibernatableWebSocketEventTimeout(): number | null {
+    return this.#options.webSockets.getHibernatableWebSocketEventTimeout();
   }
 
-  getTags(_ws: WebSocket): never {
-    throw new Error(HIBERNATION_UNIMPLEMENTED_MESSAGE);
+  getTags(ws: WebSocket): string[] {
+    return this.#options.webSockets.getTags(ws);
   }
 }

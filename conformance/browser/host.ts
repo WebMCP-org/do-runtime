@@ -71,7 +71,13 @@ import type { AlarmResult } from "../../src/index";
 import { RpcTarget } from "../../src/api/cloudflare-workers";
 import type { ActorBoot, ActorRpc, AlarmsBoot, AlarmsRpc, SupervisorRpc } from "./protocol";
 import { poolName, reportWorkerErrors } from "./protocol";
-import type { Capability, ConformanceHost, ProbeActor } from "../host";
+import type {
+  Capability,
+  ConformanceHost,
+  LaneClientSocket,
+  LaneSocketMessage,
+  ProbeActor,
+} from "../host";
 
 type Session<T> = ReturnType<typeof newRpcSession<T>>;
 
@@ -90,6 +96,44 @@ type Placed = {
   readonly worker: Worker;
   readonly rpc: Session<ActorRpc>;
 };
+
+class BrowserClientSocket implements LaneClientSocket {
+  #readyState: number;
+
+  constructor(
+    readonly rpc: Session<ActorRpc>,
+    readonly id: string,
+    readyState: number,
+  ) {
+    this.#readyState = readyState;
+  }
+
+  get readyState(): number {
+    return this.#readyState;
+  }
+
+  async send(data: string | ArrayBuffer | ArrayBufferView): Promise<void> {
+    const message = ArrayBuffer.isView(data)
+      ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength).slice().buffer
+      : data;
+    await this.rpc.socketSend(this.id, message);
+  }
+
+  async close(code?: number, reason?: string): Promise<void> {
+    this.#readyState = WebSocket.CLOSING;
+    await this.rpc.socketClose(this.id, code, reason);
+  }
+
+  nextMessage(): Promise<LaneSocketMessage> {
+    return this.rpc.nextSocketMessage(this.id);
+  }
+
+  async nextClose(): Promise<{ code: number; reason: string; wasClean: boolean }> {
+    const close = await this.rpc.nextSocketClose(this.id);
+    this.#readyState = WebSocket.CLOSED;
+    return close;
+  }
+}
 
 const live = new Map<string, Placed>();
 
@@ -211,6 +255,16 @@ export const host: ConformanceHost = {
   respawn: async (previous) => {
     await place(previous.name).rpc.respawn();
     return actor(previous.name);
+  },
+
+  connect: async (target, tags = []) => {
+    const rpc = place(target.name).rpc;
+    const socket = await rpc.connect([...tags]);
+    return new BrowserClientSocket(rpc, socket.id, socket.readyState);
+  },
+
+  evict: async (target) => {
+    await place(target.name).rpc.evict();
   },
 
   /**

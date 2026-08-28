@@ -17,8 +17,6 @@ export type Capability =
   | "fake-time"
   /** Kill without cleanup: worker.terminate() or dropping the container. */
   | "real-crash"
-  /** Substrate boundary: no Chrome equivalent lifecycle. */
-  | "hibernation"
   /** Substrate boundary: sqlite-wasm lacks the storage capability. */
   | "bookmarks";
 
@@ -32,12 +30,26 @@ export interface ProbeActor {
   post(method: string, ...args: readonly unknown[]): { settled: Promise<unknown> };
 }
 
+export type LaneSocketMessage = string | ArrayBuffer;
+
+export interface LaneClientSocket {
+  readonly readyState: number;
+  send(data: string | ArrayBuffer | ArrayBufferView): Promise<void>;
+  close(code?: number, reason?: string): Promise<void>;
+  nextMessage(): Promise<LaneSocketMessage>;
+  nextClose(): Promise<{ code: number; reason: string; wasClean: boolean }>;
+}
+
 export interface ConformanceHost {
   readonly lane: LaneName;
   readonly capabilities: ReadonlySet<Capability>;
   spawn(name?: string): Promise<ProbeActor>;
   /** Same identity, fresh instance. Durable state must survive. */
   respawn(actor: ProbeActor): Promise<ProbeActor>;
+  /** Open a WebSocket through the actor's fetch handler. */
+  connect(actor: ProbeActor, tags?: readonly string[]): Promise<LaneClientSocket>;
+  /** Rebuild the actor while preserving its hibernatable sockets. */
+  evict(actor: ProbeActor): Promise<void>;
   /** Only where "real-crash". */
   crash?(actor: ProbeActor): Promise<void>;
   /** Only where "fake-time". */

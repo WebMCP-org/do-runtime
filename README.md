@@ -157,7 +157,7 @@ Open a second container over the same directory and `increment()` answers `3`: t
 
 Two runnable browser hosts live in [`examples/`](examples/), each with its own README and Playwright e2e (`pnpm test:examples`):
 
-- [`examples/extension/`](examples/extension/) — a Chrome MV3 compatibility harness: service worker → offscreen document (with corpse recovery) → worker hosting an Agents SDK `Counter` and local sub-agents. Proves persistent state, sibling and nested facet isolation, overlapping async work, abort/delete lifecycle, sub-agent scheduling across host recreation, exclusive host ownership, non-hibernating `AgentClient` WebSockets, state sync, callable and streaming RPC, SDK queues, stateless MCP, inbound email routing, the MV3 CSP story (`'wasm-unsafe-eval'`), and `chrome.alarms` recreation of an evicted host before durable alarm delivery.
+- [`examples/extension/`](examples/extension/) — a Chrome MV3 compatibility harness: service worker → offscreen document (with corpse recovery) → worker hosting an Agents SDK `Counter` and local sub-agents. Proves persistent state, sibling and nested facet isolation, overlapping async work, abort/delete lifecycle, sub-agent scheduling across host recreation, exclusive host ownership, hibernating `AgentClient` WebSockets, state sync, callable and streaming RPC, SDK queues, stateless MCP, inbound email routing, the MV3 CSP story (`'wasm-unsafe-eval'`), and `chrome.alarms` recreation of an evicted host before durable alarm delivery.
 - [`examples/vibe-platform/`](examples/vibe-platform/) — a self-contained vibe-coding page that authors both a front-end and an Agents SDK `Agent`, runs them in-tab with durable SQLite-backed state, and exports the unchanged sources as a Wrangler project that passes `wrangler deploy --dry-run`.
 
 ## Hosting an actor
@@ -175,6 +175,9 @@ The runtime owns semantics; the host owns placement and substrate. `createActorC
 | `ports.facets` | A `FacetHost`: place a child container, abort it, copy or delete its storage. |
 | `ports.timer` | `now()` and `afterDelay()`, captured below any installed actor scope. |
 | `ports.fetch` | Optional global outbound. Absent means `fetch` refuses by name, as a Worker with `globalOutbound: null` does. |
+| `ports.hibernation` | Optional mirror callbacks for accepted sockets, attachment bytes, auto-response changes, and closure. Omit it when the host never rebuilds a live socket placement. |
+| `webSockets` | Socket references and mirrored tags/attachments to register before the new instance constructor runs. |
+| `gateHooks` | Optional input/output gate instrumentation for an embedding host. |
 | `facet` | Present when constructing a local child: its id, depth, and the root-owned `FacetTree`. |
 
 The lifecycle:
@@ -185,6 +188,7 @@ The lifecycle:
 4. Use `container.run(fn, signal?)` for events that are not method calls: a WebSocket frame, a host callback. Its signal likewise stops only a queued event, not one already running.
 5. Reach the platform through `container.globals` (or install it with `installActorScope`). For a host-provided promise an actor must await, wrap it once in `container.awaitIo()`.
 6. Watch `container.onBroken`; dispose the placement; recreate it on the next event over the same storage. A failed `blockConcurrencyWhile()` rejects its caller with `BrokenActorError` and breaks the placement with that same error.
+7. Before evicting, inspect `container.quiescence()`. Mirror live sockets through `ports.hibernation`, then build the replacement with `webSockets`; do not reconnect or call `acceptWebSocket()` again.
 
 For a standard Durable Object binding, call
 `createDurableObjectNamespace(uniqueKey, channel)` and put the result in `env`
@@ -221,7 +225,25 @@ Construct one `AlarmScheduler` per namespace over a `SqlDatabase` of its own. It
 
 On workerd every awaitable thing is an io-context primitive, so "resuming from an await re-enters with a fresh input lock" never needs saying. Here it does. A raw `setTimeout` resolves a promise the runtime does not own; the continuation resumes with an empty invocation stack and the next `ctx.storage` call throws `no input lock available in this context`. That is by design — the alternative is a continuation that silently writes outside the gate.
 
-`container.globals` is the complete gated set, bound to that container: `setTimeout`/`clearTimeout`/`setInterval`/`clearInterval` capture the critical section when armed and re-enter when fired; `scheduler.wait()` and `scheduler.yield()` resume under the actor; `fetch()` waits for output locks and releases the input gate while in flight; `crypto` re-enters on async completion; accepted WebSocket frames enter through the captured context. Install it as the worker's globals (`installActorScope`) when one worker hosts one root, or hand it to application code explicitly when it must not.
+`container.globals` is the complete gated set, bound to that container: `setTimeout`/`clearTimeout`/`setInterval`/`clearInterval` capture the critical section when armed and re-enter when fired; `scheduler.wait()` and `scheduler.yield()` resume under the actor; `fetch()` waits for output locks and releases the input gate while in flight; `crypto` re-enters on async completion; and `WebSocketPair` creates runtime-owned socket halves. Install it as the worker's globals (`installActorScope`) when one worker hosts one root, or hand it to application code explicitly when it must not.
+
+### Hibernatable WebSockets
+
+`ctx.acceptWebSocket(socket, tags)` enables class-method dispatch and the full
+Workers state API: `getWebSockets`, `getTags`, attachments, auto-response pairs
+and timestamps, and the hibernatable event timeout. The runtime works without a
+hibernation port for hosts that keep a container alive.
+
+An evicting host implements `ports.hibernation` as a mirror. It retains the same
+raw socket reference plus copied tags and attachment bytes, drops the old
+placement, and supplies that snapshot as `webSockets` on the replacement. The
+registry is populated before the constructor, so SDKs can lazily rebuild their
+connection wrappers without another upgrade or connect hook. Closed sockets are
+removed before `webSocketClose` runs.
+
+`container.quiescence()` reports armed timers, pending `waitUntil` work, input
+lock state, and output-gate breakage without waiting. `drainWaitUntil()` is for
+shutdown and intentionally never settles while a live interval remains armed.
 
 Actor bundles can also install `doRuntimeAwaitTransform()` from `@mcp-b/do-runtime/vite`. A production build checks the final module graph and fails with transformed/total counts for any included module with an uncovered await; the development transform warns once per module if a transformed await reaches its fail-open path without an actor lock.
 
@@ -231,7 +253,6 @@ The browser cannot reproduce every workerd facility. Where it cannot, the runtim
 
 | Area | Contract here |
 | --- | --- |
-| Hibernatable WebSockets | Unsupported; named methods throw. Use memory-only sockets and reconnect. |
 | Cloudflare point-in-time recovery and read replication | Unsupported by local SQLite; named methods throw. Bookmarks are development counters, not recovery points. |
 | Actor-class stub serialization | Throws; needs workerd's serializer and channel tokens. |
 | Module-scope `waitUntil`, `cache`, `abortIsolate`, Workers RPC stub constructors | Named `cloudflare:workers` boundaries throw. |

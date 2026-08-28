@@ -14,11 +14,30 @@
 
 import { DurableObject } from "cloudflare:workers";
 
+type CapturedError = { name: string; message: string };
+
+function captureError(action: () => unknown): CapturedError | null {
+  try {
+    action();
+    return null;
+  } catch (error) {
+    return error instanceof Error
+      ? { name: error.name, message: error.message }
+      : { name: typeof error, message: String(error) };
+  }
+}
+
+function socketPair(): [WebSocket, WebSocket] {
+  const pair = new WebSocketPair();
+  return [pair[0], pair[1]];
+}
+
 /** The facet implementation, loaded through the Worker Loader binding. */
 const CHILD_SOURCE = `
 import { DurableObject } from "cloudflare:workers";
 export class Child extends DurableObject {
   local = 0;
+  clients = [];
   async bump() {
     const n = ((await this.ctx.storage.get("n")) ?? 0) + 1;
     await this.ctx.storage.put("n", n);
@@ -36,6 +55,14 @@ export class Child extends DurableObject {
     return await g.localBump();
   }
   async localBump() { return ++this.local; }
+  openSocket() {
+    const pair = new WebSocketPair();
+    this.ctx.acceptWebSocket(pair[1], ["facet"]);
+    pair[0].accept();
+    this.clients.push(pair[0]);
+    return this.ctx.getWebSockets().length;
+  }
+  socketCount() { return this.ctx.getWebSockets().length; }
   /**
    * The facet breaks ITSELF — the one way a running facet becomes broken without
    * its parent asking for it, and therefore the only shape in which "does a
@@ -85,6 +112,20 @@ export default { fetch() { return new Response("child"); } };
 export class Probe extends DurableObject<Record<string, unknown>> {
   marker = "init";
   trace: string[] = [];
+  #clients = new Map<string, WebSocket>();
+  #servers = new Map<string, WebSocket>();
+  #clientMessages = new Map<string, (string | ArrayBuffer)[]>();
+  #clientCloses = new Map<
+    string,
+    { code: number; reason: string; wasClean: boolean }[]
+  >();
+  #handlerEvents: Record<string, unknown>[] = [];
+  #handlerTrace: string[] = [];
+  #handlerTimes: { event: string; at: number }[] = [];
+  #listenerMessages = 0;
+  #latePair: [WebSocket, WebSocket] | undefined;
+  #capacityClients: WebSocket[] = [];
+  #throwNextMessage = false;
 
   #child(slot = "c", className = "Child"): Record<string, (...args: never[]) => Promise<unknown>> {
     const loader = (this.env as { LOADER: WorkerLoader }).LOADER;
@@ -1037,6 +1078,555 @@ export class Probe extends DurableObject<Record<string, unknown>> {
   /** `getAlarm()` as an ordinary caller sees it, for the row that reads it mid-ladder. */
   async readAlarm(): Promise<number | null> {
     return await this.ctx.storage.getAlarm();
+  }
+
+  // -- hibernatable WebSockets ------------------------------------------------
+
+  async fetch(request: Request): Promise<Response> {
+    if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
+      return new Response("probe");
+    }
+
+    const [client, server] = socketPair();
+    const tags = new URL(request.url).searchParams.getAll("tag");
+    this.ctx.acceptWebSocket(server, tags);
+    WebSocket.prototype.serializeAttachment.call(server, {
+      id: tags[0] ?? "external",
+      tags,
+      marker: "attachment-survived",
+    });
+    const connects = (((await this.ctx.storage.get("wsConnects")) as number | undefined) ?? 0) + 1;
+    await this.ctx.storage.put("wsConnects", connects);
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  acceptanceSemantics(): Record<string, unknown> {
+    const [, twice] = socketPair();
+    this.ctx.acceptWebSocket(twice);
+    const doubleHibernation = captureError(() => this.ctx.acceptWebSocket(twice));
+
+    const [, classicFirst] = socketPair();
+    classicFirst.accept();
+    const classicThenHibernation = captureError(() => this.ctx.acceptWebSocket(classicFirst));
+
+    const [, hibernationFirst] = socketPair();
+    this.ctx.acceptWebSocket(hibernationFirst);
+    const hibernationThenClassic = captureError(() => hibernationFirst.accept());
+
+    const [client, server] = socketPair();
+    this.ctx.acceptWebSocket(client, ["client-half"]);
+    server.accept();
+
+    const [usedPeer, usedServer] = socketPair();
+    usedPeer.accept();
+    const usedPair = captureError(() => this.ctx.acceptWebSocket(usedServer));
+
+    return {
+      doubleHibernation,
+      classicThenHibernation,
+      hibernationThenClassic,
+      clientHalfAccepted: this.ctx.getTags(client),
+      usedPair,
+    };
+  }
+
+  async acceptAfterAwait(): Promise<string[]> {
+    const [client, server] = socketPair();
+    await Promise.resolve();
+    this.ctx.acceptWebSocket(server, ["after-await"]);
+    client.accept();
+    this.#clients.set("after-await", client);
+    return this.ctx.getTags(server);
+  }
+
+  stashSocketForLaterEvent(): void {
+    this.#latePair = socketPair();
+  }
+
+  acceptSocketFromLaterEvent(): CapturedError | null {
+    const pair = this.#latePair;
+    if (pair === undefined) throw new Error("No late pair was stashed.");
+    const error = captureError(() => this.ctx.acceptWebSocket(pair[1]));
+    if (error === null) pair[0].accept();
+    return error;
+  }
+
+  tagSemantics(): Record<string, unknown> {
+    const make = (tags: unknown): WebSocket => {
+      const [client, server] = socketPair();
+      this.ctx.acceptWebSocket(server, tags as string[]);
+      client.accept();
+      this.#clients.set(`tags-${this.#clients.size}`, client);
+      return server;
+    };
+    const normalized = make(["", 123, null, { a: 1 }, "dup", "dup"]);
+    const tooMany = captureError(() => make(Array.from({ length: 11 }, (_, i) => `${i}`)));
+    const longTag = "x".repeat(257);
+    const tooLong = captureError(() => make([longTag]));
+    const nonArray = captureError(() => make("tag"));
+    return {
+      normalized: this.ctx.getTags(normalized),
+      tooMany,
+      tooLong,
+      nonArray,
+    };
+  }
+
+  orderingSemantics(): Record<string, unknown> {
+    const accept = (id: string, tags: string[]) => {
+      const [client, server] = socketPair();
+      Object.assign(server, { probeId: id });
+      this.ctx.acceptWebSocket(server, tags);
+      client.accept();
+      this.#clients.set(`order-${id}`, client);
+      return server;
+    };
+    const first = accept("first", ["shared", "ALPHA"]);
+    const second = accept("second", ["shared"]);
+    const third = accept("third", []);
+    const ids = (sockets: WebSocket[]) =>
+      sockets.map((socket) => (socket as WebSocket & { probeId: string }).probeId);
+    const a = this.ctx.getWebSockets();
+    const b = this.ctx.getWebSockets();
+    return {
+      all: ids(a),
+      shared: ids(this.ctx.getWebSockets("shared")),
+      alpha: ids(this.ctx.getWebSockets("ALPHA")),
+      lower: ids(this.ctx.getWebSockets("alpha")),
+      empty: ids(this.ctx.getWebSockets("")),
+      nonString: ids(this.ctx.getWebSockets(1 as never)),
+      freshArray: a !== b,
+      sameObjects: a.includes(first) && a.includes(second) && a.includes(third),
+    };
+  }
+
+  socketCapacity(): CapturedError | null {
+    for (let i = 0; i < 32_768; i++) {
+      const [client, server] = socketPair();
+      this.ctx.acceptWebSocket(server);
+      client.accept();
+      this.#capacityClients.push(client);
+    }
+    const [, overflow] = socketPair();
+    return captureError(() => this.ctx.acceptWebSocket(overflow));
+  }
+
+  attachmentSemantics(): Record<string, unknown> {
+    const [client, socket] = socketPair();
+    const attachment = { nested: { value: 1 } };
+    socket.serializeAttachment(attachment);
+    attachment.nested.value = 2;
+    const first = socket.deserializeAttachment() as { nested: { value: number } };
+    first.nested.value = 3;
+    const second = socket.deserializeAttachment() as { nested: { value: number } };
+
+    const [, neverSerialized] = socketPair();
+    socket.serializeAttachment(undefined);
+    const explicitUndefined = socket.deserializeAttachment();
+    const zeroArgument = captureError(() =>
+      Reflect.apply(WebSocket.prototype.serializeAttachment, socket, []),
+    );
+
+    const [, rich] = socketPair();
+    const cyclic: { self?: unknown } = {};
+    cyclic.self = cyclic;
+    rich.serializeAttachment({
+      map: new Map([["k", 1]]),
+      date: new Date(0),
+      bigint: 1n,
+      bytes: new Uint8Array([1, 2]),
+      cyclic,
+    });
+    const richResult = rich.deserializeAttachment() as Record<string, unknown>;
+
+    const [, invalid] = socketPair();
+    const functionError = captureError(() => invalid.serializeAttachment(function foo() {}));
+    const symbolError = captureError(() => invalid.serializeAttachment(Symbol("s")));
+
+    const [, size] = socketPair();
+    const pass = captureError(() => size.serializeAttachment("x".repeat(16_379)));
+    const fail = captureError(() => size.serializeAttachment("x".repeat(16_380)));
+
+    const [classicClient, classic] = socketPair();
+    classic.accept();
+    classic.serializeAttachment("classic");
+    classicClient.serializeAttachment("client");
+    classicClient.accept();
+    classicClient.close(1000, "done");
+    classicClient.serializeAttachment("closed");
+
+    client.accept();
+    return {
+      snapshot: second.nested.value,
+      freshClone: first !== second && first.nested !== second.nested,
+      neverSerialized: neverSerialized.deserializeAttachment(),
+      explicitUndefined: typeof explicitUndefined,
+      zeroArgument,
+      rich: {
+        map: richResult.map instanceof Map,
+        date: richResult.date instanceof Date,
+        bigint: typeof richResult.bigint,
+        bytes: richResult.bytes instanceof Uint8Array,
+        cyclic:
+          (richResult.cyclic as { self?: unknown }).self === (richResult.cyclic as { self?: unknown }),
+      },
+      functionError,
+      symbolError,
+      sizePass: pass,
+      sizeFail: fail,
+      classic: classic.deserializeAttachment(),
+      client: classicClient.deserializeAttachment(),
+    };
+  }
+
+  openSelfSocket(id: string, tags: string[] = []): void {
+    const [client, server] = socketPair();
+    server.addEventListener("message", () => {
+      this.#listenerMessages += 1;
+    });
+    this.ctx.acceptWebSocket(server, tags);
+    WebSocket.prototype.serializeAttachment.call(server, { id, tags });
+    client.accept();
+    const messages: (string | ArrayBuffer)[] = [];
+    const closes: { code: number; reason: string; wasClean: boolean }[] = [];
+    client.addEventListener("message", (event) => {
+      messages.push(event.data as string | ArrayBuffer);
+    });
+    client.addEventListener("close", (event) => {
+      closes.push({ code: event.code, reason: event.reason, wasClean: event.wasClean });
+    });
+    this.#clients.set(id, client);
+    this.#servers.set(id, server);
+    this.#clientMessages.set(id, messages);
+    this.#clientCloses.set(id, closes);
+  }
+
+  sendSelf(id: string, message: string): void {
+    this.#requireClient(id).send(message);
+  }
+
+  sendSelfBinary(id: string, bytes: number[]): void {
+    this.#requireClient(id).send(new Uint8Array(bytes));
+  }
+
+  closeSelfClient(id: string, code: number, reason: string): void {
+    this.#requireClient(id).close(code, reason);
+  }
+
+  closeSelfServer(id: string, code: number, reason: string): void {
+    this.#requireServer(id).close(code, reason);
+  }
+
+  throwOnNextSocketMessage(): void {
+    this.#throwNextMessage = true;
+  }
+
+  removeSocketMessageHandler(): void {
+    Object.defineProperty(this, "webSocketMessage", { configurable: true, value: undefined });
+  }
+
+  restoreSocketMessageHandler(): void {
+    Reflect.deleteProperty(this, "webSocketMessage");
+  }
+
+  socketJournal(): Record<string, unknown> {
+    return {
+      events: this.#handlerEvents,
+      trace: this.#handlerTrace,
+      times: this.#handlerTimes,
+      listenerMessages: this.#listenerMessages,
+      clients: Object.fromEntries(
+        [...this.#clientMessages].map(([id, messages]) => [
+          id,
+          messages.map((message) =>
+            message instanceof ArrayBuffer ? [...new Uint8Array(message)] : message,
+          ),
+        ]),
+      ),
+      closes: Object.fromEntries(this.#clientCloses),
+      listed: this.ctx.getWebSockets().map((socket) => this.#socketId(socket)),
+    };
+  }
+
+  sendAfterOwnClose(id: string): CapturedError | null {
+    const socket = this.#requireServer(id);
+    socket.close(4002, "server out");
+    return captureError(() => socket.send("too late"));
+  }
+
+  closeValidation(): Record<string, CapturedError | null> {
+    const attempt = (code: number, reason?: string): CapturedError | null => {
+      const [client, server] = socketPair();
+      this.ctx.acceptWebSocket(server);
+      client.accept();
+      return captureError(() => server.close(code, reason));
+    };
+    return {
+      code999: attempt(999),
+      code1005: attempt(1005),
+      code1006: attempt(1006),
+      code5000: attempt(5000),
+      longReason: attempt(1000, "é".repeat(62)),
+      code1000: attempt(1000),
+      code3000: attempt(3000),
+      code4999: attempt(4999),
+    };
+  }
+
+  readyStateConstants(): Record<string, unknown> {
+    const [client, server] = socketPair();
+    const ctor = WebSocket as typeof WebSocket & Record<string, number>;
+    const proto = WebSocket.prototype as WebSocket & Record<string, number>;
+    return {
+      fresh: [client.readyState, server.readyState],
+      constructorValues: [
+        ctor.READY_STATE_CONNECTING,
+        ctor.READY_STATE_OPEN,
+        ctor.READY_STATE_CLOSING,
+        ctor.READY_STATE_CLOSED,
+        ctor.CONNECTING,
+        ctor.OPEN,
+        ctor.CLOSING,
+        ctor.CLOSED,
+      ],
+      prototype: [
+        proto.READY_STATE_CONNECTING,
+        proto.READY_STATE_OPEN,
+        proto.READY_STATE_CLOSING,
+        proto.READY_STATE_CLOSED,
+        proto.CONNECTING,
+        proto.OPEN,
+        proto.CLOSING,
+        proto.CLOSED,
+      ],
+    };
+  }
+
+  setAutoResponse(request: string, response: string): void {
+    this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair(request, response));
+  }
+
+  clearAutoResponse(): void {
+    this.ctx.setWebSocketAutoResponse();
+  }
+
+  autoResponseSemantics(id: string): Record<string, unknown> {
+    const first = this.ctx.getWebSocketAutoResponse();
+    const second = this.ctx.getWebSocketAutoResponse();
+    return {
+      value: first === null ? null : { request: first.request, response: first.response },
+      fresh: first !== second,
+      timestamp: this.ctx.getWebSocketAutoResponseTimestamp(this.#requireServer(id))?.getTime() ?? null,
+      unacceptedTimestamp: this.ctx.getWebSocketAutoResponseTimestamp(socketPair()[1]),
+      badTimestamp: captureError(() =>
+        this.ctx.getWebSocketAutoResponseTimestamp({} as WebSocket),
+      ),
+      nullSetter: captureError(() => this.ctx.setWebSocketAutoResponse(null as never)),
+    };
+  }
+
+  autoResponseLimits(): Record<string, CapturedError | null> {
+    return {
+      request: captureError(() => {
+        this.ctx.setWebSocketAutoResponse(
+          new WebSocketRequestResponsePair("x".repeat(2_049), "response"),
+        );
+      }),
+      response: captureError(() => {
+        this.ctx.setWebSocketAutoResponse(
+          new WebSocketRequestResponsePair("request", "x".repeat(2_049)),
+        );
+      }),
+    };
+  }
+
+  timeoutSemantics(): Record<string, unknown> {
+    const initial = this.ctx.getHibernatableWebSocketEventTimeout();
+    this.ctx.setHibernatableWebSocketEventTimeout(1_000);
+    const thousand = this.ctx.getHibernatableWebSocketEventTimeout();
+    this.ctx.setHibernatableWebSocketEventTimeout(1.9);
+    const truncated = this.ctx.getHibernatableWebSocketEventTimeout();
+    this.ctx.setHibernatableWebSocketEventTimeout("42" as never);
+    const coerced = this.ctx.getHibernatableWebSocketEventTimeout();
+    const negative = captureError(() => this.ctx.setHibernatableWebSocketEventTimeout(-1));
+    const outOfRange = captureError(() =>
+      this.ctx.setHibernatableWebSocketEventTimeout(2 ** 32),
+    );
+    const sevenDays = captureError(() =>
+      this.ctx.setHibernatableWebSocketEventTimeout(604_800_001),
+    );
+    const nan = captureError(() => this.ctx.setHibernatableWebSocketEventTimeout(Number.NaN));
+    this.ctx.setHibernatableWebSocketEventTimeout(0);
+    return {
+      initial,
+      thousand,
+      truncated,
+      coerced,
+      negative,
+      outOfRange,
+      sevenDays,
+      nan,
+      cleared: this.ctx.getHibernatableWebSocketEventTimeout(),
+    };
+  }
+
+  pairClassSemantics(): Record<string, unknown> {
+    const pair = new WebSocketRequestResponsePair(123 as never, null as never);
+    const requestDescriptor = Object.getOwnPropertyDescriptor(
+      WebSocketRequestResponsePair.prototype,
+      "request",
+    );
+    return {
+      values: [pair.request, pair.response],
+      json: JSON.stringify(pair),
+      hasSetter: requestDescriptor?.set !== undefined,
+      withoutNew: captureError(() =>
+        Reflect.apply(WebSocketRequestResponsePair as unknown as () => unknown, undefined, ["a", "b"]),
+      ),
+      badCoercion: captureError(() =>
+        new WebSocketRequestResponsePair(
+          {
+            toString(): never {
+              throw new Error("coercion failed");
+            },
+          } as never,
+          "b",
+        ),
+      ),
+    };
+  }
+
+  getTagsSemantics(): Record<string, unknown> {
+    const [, unaccepted] = socketPair();
+    const [, classic] = socketPair();
+    classic.accept();
+    const [client, hibernatable] = socketPair();
+    this.ctx.acceptWebSocket(hibernatable);
+    client.accept();
+    const first = this.ctx.getTags(hibernatable);
+    const second = this.ctx.getTags(hibernatable);
+    return {
+      unaccepted: captureError(() => this.ctx.getTags(unaccepted)),
+      classic: captureError(() => this.ctx.getTags(classic)),
+      tags: first,
+      fresh: first !== second,
+    };
+  }
+
+  async facetSocketIsolation(): Promise<number[]> {
+    const [client, server] = socketPair();
+    this.ctx.acceptWebSocket(server, ["root"]);
+    client.accept();
+    this.#clients.set("root-facet-check", client);
+    const child = this.#child("socket-isolation");
+    const before = (await child.socketCount()) as number;
+    const childCount = (await child.openSocket()) as number;
+    return [this.ctx.getWebSockets().length, before, childCount];
+  }
+
+  setHibernationMarker(value: string): void {
+    this.marker = value;
+  }
+
+  async readExternalObservation(): Promise<Record<string, unknown> | null> {
+    return (
+      ((await this.ctx.storage.get("externalObservation")) as Record<string, unknown> | undefined) ??
+      null
+    );
+  }
+
+  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
+    if (this.#throwNextMessage) {
+      this.#throwNextMessage = false;
+      throw new Error("conformance: socket handler threw");
+    }
+
+    const id = this.#socketId(ws);
+    const description =
+      typeof message === "string"
+        ? { kind: "string", value: message }
+        : { kind: "ArrayBuffer", value: [...new Uint8Array(message)] };
+    this.#handlerEvents.push({ id, message: description });
+
+    if (typeof message === "string" && message.startsWith("slow:")) {
+      this.#handlerTrace.push(`start:${message}`);
+      this.#handlerTimes.push({ event: `start:${message}`, at: Date.now() });
+      await scheduler.wait(200);
+      this.#handlerTrace.push(`end:${message}`);
+      this.#handlerTimes.push({ event: `end:${message}`, at: Date.now() });
+      return;
+    }
+    if (typeof message === "string" && message.startsWith("block:")) {
+      this.#handlerTrace.push(`start:${message}`);
+      this.#handlerTimes.push({ event: `start:${message}`, at: Date.now() });
+      await this.ctx.blockConcurrencyWhile(async () => {
+        await scheduler.wait(200);
+      });
+      this.#handlerTrace.push(`end:${message}`);
+      this.#handlerTimes.push({ event: `end:${message}`, at: Date.now() });
+      return;
+    }
+    if (message === "echo") ws.send("echoed");
+
+    this.ctx.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS websocket_probe (id TEXT PRIMARY KEY, seen INTEGER)",
+    );
+    this.ctx.storage.sql.exec(
+      "INSERT OR REPLACE INTO websocket_probe (id, seen) VALUES (?, ?)",
+      id,
+      1,
+    );
+    await this.ctx.storage.put("externalObservation", {
+      id,
+      message: description,
+      attachment: WebSocket.prototype.deserializeAttachment.call(ws),
+      tags: this.ctx.getTags(ws),
+      listed: this.ctx.getWebSockets().includes(ws),
+      actorName: this.ctx.id.name,
+      marker: this.marker,
+      connects: ((await this.ctx.storage.get("wsConnects")) as number | undefined) ?? 0,
+    });
+  }
+
+  webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean): void {
+    const event: Record<string, unknown> = {
+      id: this.#socketId(ws),
+      close: { code, reason, wasClean },
+      readyState: ws.readyState,
+      listedDuringHandler: this.ctx.getWebSockets().includes(ws),
+    };
+    event.sendAfterPeerClose = captureError(() => ws.send("after-peer-close"));
+    event.reciprocalClose = captureError(() => ws.close(code, reason));
+    this.#handlerEvents.push(event);
+  }
+
+  webSocketError(ws: WebSocket, error: unknown): void {
+    this.#handlerEvents.push({
+      id: this.#socketId(ws),
+      error: error instanceof Error ? error.message : String(error),
+      readyState: ws.readyState,
+    });
+  }
+
+  #socketId(socket: WebSocket): string {
+    const attachment = WebSocket.prototype.deserializeAttachment.call(socket) as
+      | { id?: unknown }
+      | null;
+    return typeof attachment?.id === "string"
+      ? attachment.id
+      : ([...this.#servers].find(([, candidate]) => candidate === socket)?.[0] ?? "unknown");
+  }
+
+  #requireClient(id: string): WebSocket {
+    const socket = this.#clients.get(id);
+    if (socket === undefined) throw new Error(`No client socket ${id}.`);
+    return socket;
+  }
+
+  #requireServer(id: string): WebSocket {
+    const socket = this.#servers.get(id);
+    if (socket === undefined) throw new Error(`No server socket ${id}.`);
+    return socket;
   }
 
   override async alarm(info?: AlarmInvocationInfo): Promise<void> {

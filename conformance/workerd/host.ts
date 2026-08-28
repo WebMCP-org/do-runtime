@@ -3,12 +3,18 @@
  * every assertion is measuring Cloudflare's runtime.
  */
 
-import { env } from "cloudflare:test";
-import type { Capability, ConformanceHost, ProbeActor } from "../host";
+import { env, evictDurableObject } from "cloudflare:test";
+import type {
+  Capability,
+  ConformanceHost,
+  LaneClientSocket,
+  LaneSocketMessage,
+  ProbeActor,
+} from "../host";
 
 type ProbeNamespace = {
   idFromName(name: string): unknown;
-  get(id: unknown): Record<string, (...args: unknown[]) => Promise<unknown>>;
+  get(id: unknown): DurableObjectStub & Record<string, (...args: unknown[]) => Promise<unknown>>;
 };
 
 const probes = () => (env as unknown as { PROBE: ProbeNamespace }).PROBE;
@@ -37,13 +43,69 @@ function actor(name: string): ProbeActor {
   };
 }
 
+function stubFor(actor: ProbeActor): DurableObjectStub {
+  const namespace = probes();
+  return namespace.get(namespace.idFromName(actor.name));
+}
+
+function clientSocket(socket: WebSocket): LaneClientSocket {
+  const messages: LaneSocketMessage[] = [];
+  const messageWaiters: ((message: LaneSocketMessage) => void)[] = [];
+  const closes: { code: number; reason: string; wasClean: boolean }[] = [];
+  const closeWaiters: ((event: { code: number; reason: string; wasClean: boolean }) => void)[] = [];
+
+  socket.accept();
+  socket.addEventListener("message", (event) => {
+    const message = event.data as LaneSocketMessage;
+    const waiter = messageWaiters.shift();
+    if (waiter === undefined) messages.push(message);
+    else waiter(message);
+  });
+  socket.addEventListener("close", (event) => {
+    const closed = { code: event.code, reason: event.reason, wasClean: event.wasClean };
+    const waiter = closeWaiters.shift();
+    if (waiter === undefined) closes.push(closed);
+    else waiter(closed);
+  });
+
+  return {
+    get readyState() {
+      return socket.readyState;
+    },
+    send: async (data) => {
+      socket.send(data);
+    },
+    close: async (code, reason) => {
+      socket.close(code, reason);
+    },
+    nextMessage: async () =>
+      messages.shift() ??
+      (await new Promise<LaneSocketMessage>((resolve) => {
+        messageWaiters.push(resolve);
+      })),
+    nextClose: async () =>
+      closes.shift() ??
+      (await new Promise<{ code: number; reason: string; wasClean: boolean }>((resolve) => {
+        closeWaiters.push(resolve);
+      })),
+  };
+}
+
 export const host: ConformanceHost = {
   lane: "workerd",
-  // Native here, throwing stubs in ours — `substrate()` asserts both sides.
-  capabilities: new Set<Capability>([
-    "hibernation",
-    "bookmarks",
-  ]),
+  capabilities: new Set<Capability>(["bookmarks"]),
   spawn: async (name = `probe-${probeCounter++}`) => actor(name),
   respawn: async (a) => actor(a.name),
+  connect: async (target, tags = []) => {
+    const url = new URL("http://probe/hibernation");
+    for (const tag of tags) url.searchParams.append("tag", tag);
+    const response = await stubFor(target).fetch(url, { headers: { Upgrade: "websocket" } });
+    if (response.status !== 101 || response.webSocket === null) {
+      throw new Error(`Probe upgrade failed with status ${response.status}.`);
+    }
+    return clientSocket(response.webSocket);
+  },
+  evict: async (target) => {
+    await evictDurableObject(stubFor(target), { webSockets: "hibernate" });
+  },
 };

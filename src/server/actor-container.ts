@@ -49,8 +49,13 @@ import {
   actorScopeBindings,
   isAlarmFailureUserError,
 } from "../api/global-scope";
-import type { AcceptedWebSocket, RawWebSocket } from "../api/web-socket";
-import { acceptWebSocket } from "../api/web-socket";
+import type {
+  AcceptedWebSocket,
+  HibernationHost,
+  RawWebSocket,
+  RehydratedWebSocket,
+} from "../api/web-socket";
+import { acceptWebSocket, HibernatableWebSocketRegistry } from "../api/web-socket";
 import type { IsolateChannelFactory, WorkerLoaderOptions } from "../api/worker-loader";
 import { WorkerLoader } from "../api/worker-loader";
 import type { AlarmOutlet } from "../io/actor-sqlite";
@@ -58,6 +63,7 @@ import { ActorSqlite, DEFAULT_ALARM_OUTLET } from "../io/actor-sqlite";
 import type { AlarmResult } from "./alarm-scheduler";
 import type { Actor, Timer } from "../io/io-context";
 import { IoContext, captureGateStack, tryCurrentIoContext } from "../io/io-context";
+import type { InputGateHooks, OutputGateHooks } from "../io/io-gate";
 import { InputGate, OutputGate } from "../io/io-gate";
 import type { FacetManager, FacetStartInfo } from "../io/worker";
 import { asFacetStub } from "../io/worker";
@@ -231,7 +237,7 @@ export const noFacets: FacetHost = {
 };
 
 /**
- * The four ports. Each one is a seam workerd itself takes as a constructor
+ * The five ports. Each one is a seam workerd itself takes as a constructor
  * input; a port that would exist only because our code is currently shaped
  * badly is an invented seam and was rejected. Rejected, for the record:
  * a transport port (one implementation per substrate, forever), a logger port
@@ -273,7 +279,10 @@ export type ActorPorts = {
    * prevent.
    */
   fetch?: FetchPort;
+  hibernation?: HibernationHost;
 };
+
+export type { HibernationHost } from "../api/web-socket";
 
 /**
  * The whole-tree facet state, which belongs to the root container and is shared
@@ -351,6 +360,8 @@ export type ActorContainerOptions = {
   exports: Record<string, unknown>;
   env: unknown;
   ports: ActorPorts;
+  webSockets?: readonly RehydratedWebSocket[];
+  gateHooks?: { input?: InputGateHooks; output?: OutputGateHooks };
   /** Present when this container hosts a facet rather than a root. */
   facet?: {
     /** Root is 0, a direct child of the root is 1. `getDepth()` answers with it. */
@@ -545,6 +556,13 @@ export interface ActorContainer {
 
   /** For the host's idle check — today's `drainWaitUntil`. */
   drainWaitUntil(): Promise<void>;
+
+  quiescence(): {
+    armedTimers: number;
+    pendingWaitUntil: number;
+    inputLockHeld: boolean;
+    outputGateBroken: boolean;
+  };
 
   /**
    * ← `WorkerdApi::compileGlobals`'s `Global::WorkerLoader` arm
@@ -822,8 +840,8 @@ type ClassInstance =
  * which is the whole mechanism behind §1.10's parent↔child re-entrancy.
  */
 class ActorImpl implements Actor {
-  readonly #inputGate = new InputGate();
-  readonly #outputGate = new OutputGate();
+  readonly #inputGate: InputGate;
+  readonly #outputGate: OutputGate;
   readonly #isFacet: boolean;
 
   /** Assigned after construction; `storage` is a WXT auto-import in extension bundles. */
@@ -831,8 +849,13 @@ class ActorImpl implements Actor {
 
   classInstance: ClassInstance = { kind: "before-ctor" };
 
-  constructor(isFacet: boolean) {
+  constructor(
+    isFacet: boolean,
+    hooks: ActorContainerOptions["gateHooks"] = {},
+  ) {
     this.#isFacet = isFacet;
+    this.#inputGate = new InputGate(hooks.input);
+    this.#outputGate = new OutputGate(hooks.output);
   }
 
   getInputGate(): InputGate {
@@ -1263,6 +1286,7 @@ class ActorContainerImpl implements ActorContainer {
   readonly #facets: FacetManagerImpl;
   readonly #tree: ActorTree | undefined;
   readonly #env: unknown;
+  readonly #webSockets: HibernatableWebSocketRegistry;
   readonly state: DurableObjectState;
   readonly facetTree: FacetTree;
   readonly globals: ActorGlobalScope;
@@ -1277,7 +1301,7 @@ class ActorContainerImpl implements ActorContainer {
     facetTree: FacetTree,
   ) {
     const facet = options.facet;
-    this.#actor = new ActorImpl(facet !== undefined);
+    this.#actor = new ActorImpl(facet !== undefined, options.gateHooks);
     this.#ctx = new IoContext(this.#actor, options.ports.timer);
     this.#env = options.env;
     this.#tree = tree;
@@ -1301,9 +1325,21 @@ class ActorContainerImpl implements ActorContainer {
     this.#actor.actorStorage = this.#cache;
 
     this.#durableStorage = new DurableObjectStorage(this.#ctx, this.#cache);
+    this.#webSockets = new HibernatableWebSocketRegistry(
+      this.#ctx,
+      {
+        message: (socket, message) => this.#runWebSocketHandler("webSocketMessage", socket, message),
+        close: (socket, code, reason, wasClean) =>
+          this.#runWebSocketHandler("webSocketClose", socket, code, reason, wasClean),
+        error: (socket, error) => this.#runWebSocketHandler("webSocketError", socket, error),
+      },
+      options.ports.hibernation,
+      options.webSockets,
+    );
     this.globals = new ActorGlobalScope(this.#ctx, {
       fetch: options.ports.fetch,
       currentExternalEntry: () => this.#currentExternalEntry,
+      webSockets: this.#webSockets,
     });
     this.facetTree = facetTree;
     this.#facets = new FacetManagerImpl(
@@ -1332,9 +1368,10 @@ class ActorContainerImpl implements ActorContainer {
       storage: this.#durableStorage,
       facets: this.#facets,
       // The same object `container.globals` is, so a class that reaches through
-      // `ctx` and a dynamically-loaded source that destructured the seven names
+      // `ctx` and a dynamically-loaded source that destructured the actor globals
       // are gated by one scope rather than two that could drift.
       globals: actorScopeBindings(() => this.globals),
+      webSockets: this.#webSockets,
     });
   }
 
@@ -1525,6 +1562,15 @@ class ActorContainerImpl implements ActorContainer {
     return this.#ctx.drainWaitUntil();
   }
 
+  quiescence() {
+    return {
+      armedTimers: this.#ctx.getTimeoutCount(),
+      pendingWaitUntil: this.#ctx.waitUntilTaskCount(),
+      inputLockHeld: this.#ctx.hasCurrent(),
+      outputGateBroken: this.#ctx.isOutputGateBroken(),
+    };
+  }
+
   /** ← `WorkerdApi::compileGlobals`'s `Global::WorkerLoader` arm. */
   workerLoader(channel: IsolateChannelFactory, options: WorkerLoaderOptions): WorkerLoader {
     return new WorkerLoader(this.#ctx, channel, options);
@@ -1641,6 +1687,18 @@ class ActorContainerImpl implements ActorContainer {
     return (instance.instance as { alarm: (info: AlarmInvocationInfo) => unknown }).alarm(
       new AlarmInvocationInfo(scheduledTime, retryCount),
     );
+  }
+
+  #runWebSocketHandler(
+    name: "webSocketMessage" | "webSocketClose" | "webSocketError",
+    socket: RawWebSocket,
+    ...args: unknown[]
+  ): unknown {
+    const instance = this.#actor.classInstance;
+    if (instance.kind !== "running") return undefined;
+    const handler: unknown = Reflect.get(instance.instance, name);
+    if (typeof handler !== "function") return undefined;
+    return Reflect.apply(handler, instance.instance, [socket, ...args]);
   }
 }
 

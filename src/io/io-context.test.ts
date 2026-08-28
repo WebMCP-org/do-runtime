@@ -922,6 +922,24 @@ it("clearTimeout before the deadline stops the callback and frees the entry", as
   expect(ctx.waitUntilStatus()).toBeUndefined();
 });
 
+it("clearing a timer drains waitUntil when the timer port cancels by dropping its promise", async () => {
+  const timer: Timer = {
+    now: () => 0,
+    afterDelay: () => new Promise<void>(() => {}),
+  };
+  const ctx = new IoContext(new TestActor(), timer);
+  let id = 0;
+
+  await ctx.run(() => {
+    id = ctx.setTimeoutImpl(false, () => {}, 50);
+  });
+  expect(ctx.waitUntilTaskCount()).toBe(1);
+
+  ctx.clearTimeoutImpl(id);
+  expect(await poll(ctx.drainWaitUntil())).toBe(true);
+  expect(ctx.waitUntilTaskCount()).toBe(0);
+});
+
 it("clearTimeout for an unknown id is a no-op", async () => {
   // "We can't find this timeout, thus we act as if it was already canceled."
   const { ctx } = newContext();

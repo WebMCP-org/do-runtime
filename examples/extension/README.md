@@ -65,13 +65,14 @@ popup.html ──sendMessage──▶ service worker ──chrome.offscreen.crea
   sibling isolation, overlapping awaits, nested children, restart persistence,
   abort-versus-delete storage semantics, and a child schedule delivered after
   Chrome recreates an evicted host.
-- **A real non-hibernating `AgentClient` connection.** The offscreen page opens
-  the SDK client over a `MessagePort`-backed WebSocket, while the actor receives
-  the server half through `routeAgentRequest()` and
-  `container.acceptWebSocket()`. The e2e proves standard named routing,
-  `getAgentByName()` direct stubs, server-to-client state broadcasts,
-  client-to-server `setState()`, a decorated `@callable()` method, and a
-  streaming callable's chunks and final value.
+- **A hibernatable `AgentClient` connection across container eviction.** The
+  offscreen page opens the SDK client over a `MessagePort`-backed WebSocket,
+  while the actor receives the server half through `routeAgentRequest()` and
+  `ctx.acceptWebSocket()`. The e2e replaces only the root actor container and
+  proves that the same client receives a new state broadcast and writes state
+  back to the replacement without reconnecting. It also covers standard named
+  routing, `getAgentByName()` direct stubs, a decorated `@callable()` method,
+  and a streaming callable's chunks and final value.
 - **The SDK's stateless MCP handler.** The actor serves `createMcpHandler()` and
   exposes a real `McpServer` tool that reads its current state. The e2e performs
   MCP `tools/list` and `tools/call` requests through the gated actor fetch path.
@@ -112,7 +113,7 @@ cd examples/extension && node scripts/e2e.mjs
 
 It builds first, launches a headless Chromium with a throwaway profile in
 `.e2e-profile/`, loads `dist/` as an unpacked extension, and prints a `PASS`/`FAIL`
-line per assertion. It exits non-zero on the first failure.
+line per assertion. It exits non-zero if any assertion fails.
 
 `playwright` resolves from the repository root's `node_modules`, which is why the
 script is plain `.mjs` with a dynamic import rather than a dependency of this
@@ -133,7 +134,8 @@ only as a competing supervisor and asserts that Web Locks refuse it before OPFS.
 | `src/background.ts` | The service worker: offscreen lifecycle and `chrome.alarms` projection. |
 | `src/popup/popup.ts` | Four buttons and an output pane. |
 | `src/protocol.ts` | The types both TypeScript projects compile. It imports nothing. |
-| `../platform-shims/memory-websocket-pair.ts` | A local WebSocket pair for the Agents server path. |
+| `../platform-shims/memory-websocket-pair.ts` | The browser `Response`-101 shim; the runtime supplies `WebSocketPair`. |
+| `../platform-shims/hibernation-mirror.ts` | The process-local `HibernationHost` record used by this example and the conformance embedders. |
 | `../platform-shims/message-port-websocket.ts` | The client-side WebSocket adapter carried over a `MessagePort`. |
 | `public/manifest.json` | Copied verbatim into `dist/` by Vite's `publicDir`. |
 
@@ -167,9 +169,13 @@ Every step is where it is because moving it was measured to fail.
    worker hosts one root, so "no container" cannot mean "outside any actor" — it
    can only mean the container was torn down mid-flight, and handing that
    continuation a raw timer would resume it ungated.
-5. **Consume `container.onBroken`.** A host that ignores it gets an actor that
+5. **Keep the hibernation mirror outside `place()`.** Each container writes its
+   accepted sockets, tags, and attachments through `ports.hibernation`; its
+   replacement receives `hibernation.snapshot()` as `webSockets` before the
+   actor constructor runs.
+6. **Consume `container.onBroken`.** A host that ignores it gets an actor that
    answers nothing and logs nothing.
-6. **Boot the worker with one raw `postMessage` carrying the `MessagePort` in the
+7. **Boot the worker with one raw `postMessage` carrying the `MessagePort` in the
    transfer list.** A port is not a value capnweb can serialise. The DOM side
    opens capnweb directly; the actor side uses the runtime's `newRpcSession` so
    Workers `RpcTarget` values get the required prototype graft.
@@ -179,6 +185,25 @@ Two values here are permanent:
 - `UNIQUE_KEY` — every `DurableObjectId` is derived from it and the id names the
   storage. Changing it silently orphans everything the extension has stored.
 - `POOL_NAME` — it becomes an OPFS directory name, so it may not contain `/`.
+
+## The hibernation boundary
+
+`evict()` waits until `container.quiescence()` reports no armed timers,
+`waitUntil` work, current input lock, or broken output gate. It then drops the
+placement, closes that container's SQLite handle, and constructs a replacement
+from the mirror. The offscreen document, actor Worker, `MessagePort`, raw socket,
+and `AgentClient` stay alive, so there is no reconnect.
+
+The mirror is intentionally in memory. Destroying the offscreen document also
+destroys its Worker and both ends of the local transport; socket metadata cannot
+resurrect a transport that no longer exists. That path creates a new Worker and
+lets a new `AgentClient` connect, while OPFS preserves the durable state. A host
+whose platform owns sockets outside the actor process can keep the same mirror
+records at that outer boundary.
+
+If such a host buffers frames during wake-up, it must construct and start the
+replacement before flushing them. A container has no class instance to dispatch
+to before `start()` completes.
 
 ## One holder per pool
 
@@ -213,7 +238,7 @@ substrate. Cloudflare-managed products remain explicit integration boundaries:
 | Runs in this host | Needs a Cloudflare service or separate integration |
 | --- | --- |
 | HTTP and durable state | Workflows: a real Workflow binding and Workflow runtime |
-| Non-hibernating WebSockets and bidirectional state sync | WebSocket hibernation: platform-owned socket survival across eviction |
+| Hibernatable WebSockets and bidirectional state sync across same-Worker container eviction | Socket survival across Worker/offscreen destruction: a platform-owned transport |
 | Decorated callable and streaming RPC | AI chat and tool approval: `@cloudflare/ai-chat` plus a model provider |
 | SQLite-backed queue and root/sub-agent `Agent.schedule()` | Outbound email: an Email Routing send binding |
 | Local sub-agents, nesting, restart, abort, and delete | |
@@ -228,8 +253,10 @@ Written down because this example exists partly to find them.
   Vite maps the Node imports through `unenv`; `cloudflare:email` remains a
   fail-closed shim. The inbound test supplies a host-created
   `ForwardableEmailMessage`; its forwarding and reply methods refuse because the
-  demo has no outbound Email Routing binding. Both demos disable Agent WebSocket
-  hibernation because this runtime deliberately refuses hibernatable sockets.
+  demo has no outbound Email Routing binding.
+- **The hibernation mirror is not process durability.** It survives a container
+  replacement inside this Worker. It cannot survive destruction of the Worker
+  that owns the raw `MessagePort` socket; that lifecycle reconnects instead.
 - **The facet entry repeats the Agents SDK bundle.** The root worker and
   `counter-child.js` each carry their own copy (about 1.3 MB unminified for the
   child in this readable demo build). The separate entry is intentional: its

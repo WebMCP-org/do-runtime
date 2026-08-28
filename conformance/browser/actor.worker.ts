@@ -77,6 +77,13 @@ import {
   type SqliteWasmHost,
 } from "../../backends/sqlite-wasm";
 import { Probe } from "../fixtures/probe";
+import { HibernationMirror } from "../../examples/platform-shims/hibernation-mirror";
+import {
+  installWebSocketUpgradeGlobals,
+  upgradeWebSocket,
+  webSocketUpgradeRequest,
+  type UpgradeWebSocket,
+} from "../websocket-upgrade";
 import type { ActorBoot, ActorRpc, SupervisorRpc } from "./protocol";
 import { installPool, timer, UNIQUE_KEY } from "./substrate";
 
@@ -106,6 +113,56 @@ let live: Live | undefined;
 let placing: Promise<Live> | undefined;
 /** The page. */
 let peer: Session<SupervisorRpc> | undefined;
+
+type SocketClose = { code: number; reason: string; wasClean: boolean };
+type ClientRecord = {
+  socket: UpgradeWebSocket;
+  messages: (string | ArrayBuffer)[];
+  messageWaiters: ((message: string | ArrayBuffer) => void)[];
+  closes: SocketClose[];
+  closeWaiters: ((close: SocketClose) => void)[];
+};
+
+const hibernation = new HibernationMirror();
+const clients = new Map<string, ClientRecord>();
+let clientCounter = 0;
+
+function registerClient(socket: UpgradeWebSocket): string {
+  const id = `socket-${clientCounter++}`;
+  const record: ClientRecord = {
+    socket,
+    messages: [],
+    messageWaiters: [],
+    closes: [],
+    closeWaiters: [],
+  };
+  socket.addEventListener("message", (event) => {
+    const data = (event as MessageEvent).data as string | ArrayBuffer;
+    const waiter = record.messageWaiters.shift();
+    if (waiter === undefined) record.messages.push(data);
+    else waiter(data);
+  });
+  socket.addEventListener("close", (event) => {
+    const closeEvent = event as CloseEvent;
+    const close = {
+      code: closeEvent.code,
+      reason: closeEvent.reason,
+      wasClean: closeEvent.wasClean,
+    };
+    const waiter = record.closeWaiters.shift();
+    if (waiter === undefined) record.closes.push(close);
+    else waiter(close);
+  });
+  clients.set(id, record);
+  socket.accept();
+  return id;
+}
+
+function client(id: string): ClientRecord {
+  const record = clients.get(id);
+  if (record === undefined) throw new Error(`Browser lane: no client socket ${id}.`);
+  return record;
+}
 
 // =======================================================================================
 // The platform globals workerd has natively
@@ -173,6 +230,7 @@ function rootScope(op: string): ActorGlobalScope {
  */
 function installRootScope(): void {
   installActorScope(globalThis, () => rootScope("a root global"));
+  installWebSocketUpgradeGlobals();
 }
 
 // =======================================================================================
@@ -487,7 +545,7 @@ const facetScopes: Record<string, ActorScopeBindings> = {};
 (globalThis as Record<string, unknown>)[FACET_SCOPE_GLOBAL] = facetScopes;
 let facetScopeCounter = 0;
 
-/** The seven names `installActorScope` writes, in the order the prologue destructures them. */
+/** The actor globals the dynamic facet module binds to its own container. */
 const FACET_SCOPE_NAMES = [
   "scheduler",
   "setTimeout",
@@ -496,6 +554,9 @@ const FACET_SCOPE_NAMES = [
   "clearInterval",
   "fetch",
   "crypto",
+  "WebSocket",
+  "WebSocketPair",
+  "WebSocketRequestResponsePair",
 ] as const;
 
 async function facetModule(className: string, gate: FacetGate): Promise<FacetClass> {
@@ -671,11 +732,13 @@ async function place(): Promise<Live> {
       alarms: alarmOutlet(current.actorName),
       facets,
       timer,
+      hibernation,
       fetch: async () => {
         await timer.afterDelay(60);
         return new Response("fetched");
       },
     },
+    webSockets: hibernation.snapshot(),
   });
 
   // ← `WorkerdApi::compileGlobals`'s `Global::WorkerLoader` arm. Filled in after construction
@@ -752,6 +815,47 @@ class RootTarget extends RpcTarget implements ActorRpc {
   async respawn(): Promise<void> {
     teardown();
     await placed();
+  }
+
+  async evict(): Promise<void> {
+    teardown();
+    await placed();
+  }
+
+  async connect(tags: string[]): Promise<{ id: string; readyState: number }> {
+    const response = (await (await placed()).entry.fetch(
+      webSocketUpgradeRequest("https://probe.invalid/socket", tags),
+    )) as Response;
+    const socket = upgradeWebSocket(response);
+    if (socket === undefined) throw new Error("Browser lane: probe fetch did not upgrade.");
+    const id = registerClient(socket);
+    return { id, readyState: socket.readyState };
+  }
+
+  socketSend(id: string, data: string | ArrayBuffer): Promise<void> {
+    client(id).socket.send(data);
+    return Promise.resolve();
+  }
+
+  socketClose(id: string, code?: number, reason?: string): Promise<void> {
+    client(id).socket.close(code, reason);
+    return Promise.resolve();
+  }
+
+  nextSocketMessage(id: string): Promise<string | ArrayBuffer> {
+    const record = client(id);
+    const message = record.messages.shift();
+    return message === undefined
+      ? new Promise((resolve) => record.messageWaiters.push(resolve))
+      : Promise.resolve(message);
+  }
+
+  nextSocketClose(id: string): Promise<SocketClose> {
+    const record = client(id);
+    const close = record.closes.shift();
+    return close === undefined
+      ? new Promise((resolve) => record.closeWaiters.push(resolve))
+      : Promise.resolve(close);
   }
 
   crash(): Promise<void> {

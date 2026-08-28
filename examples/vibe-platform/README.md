@@ -110,10 +110,12 @@ failing; `VIBE_E2E_OFFLINE=1 node scripts/e2e.mjs` takes that path on purpose.
 
 **This is the Agents SDK's HTTP state path, not its whole platform.** The SDK eagerly imports Node
 and email modules, so Vite maps the Node imports through `unenv` and a fail-closed email shim. The
-starter disables Agent WebSocket hibernation because this runtime refuses hibernatable sockets. The
-[MV3 extension example](../extension/README.md) is the broader compatibility harness: it runs the
-SDK client and non-hibernating socket server, bidirectional state sync, callable and streaming RPC,
-the SDK queue and scheduler, stateless MCP, and inbound email routing.
+starter disables Agent WebSocket hibernation because every source edit deliberately terminates the
+Worker and its local transport; an in-Worker mirror would disappear with both. The [MV3 extension
+example](../extension/README.md) is the broader compatibility harness: it keeps the transport alive
+across container eviction and runs the SDK client, hibernatable socket server, bidirectional state
+sync, callable and streaming RPC, the SDK queue and scheduler, stateless MCP, and inbound email
+routing.
 
 ## Deploying an export
 
@@ -137,8 +139,8 @@ later real deployment will succeed.
 - **Broader Agents SDK surfaces in authored code.** This lane intentionally proves the smallest
   useful exportable slice: `initialState`, `state`, `setState()`, and `onRequest()` through an actor
   restart, page reload, and deploy dry-run. The extension example covers the locally executable SDK
-  surfaces. Workflows, outbound email, AI chat/model calls, and WebSocket hibernation need real
-  platform bindings or a separate provider, so neither browser demo simulates them.
+  surfaces. Workflows, outbound email, and AI chat/model calls need real platform bindings or a
+  separate provider, so neither browser demo simulates them.
 - **Facets.** `ports.facets` refuses too. Facets are child actors with their own gates and their own
   database inside the parent's pool — the mechanism you would reach for to give each *project* in a
   platform its own storage under one root.
