@@ -79,9 +79,19 @@ resumption.
 
 ### §1.8 Alarms and WebSockets
 
-Alarm delivery and accepted WebSocket frames are actor events. They enter the
-owning container and do not overlap another event admitted by its gate.
-Hibernatable WebSockets are not available on this substrate.
+Alarm delivery and accepted WebSocket frames are actor events. Classic sockets
+dispatch listeners through the context captured by `accept()`; hibernatable
+sockets dispatch `webSocketMessage`, `webSocketClose`, and `webSocketError`
+through fresh entries on the owning container. Handler promises may overlap;
+`blockConcurrencyWhile()` is the explicit serialization boundary.
+
+The runtime owns `WebSocketPair`, tags, attachments, auto-responses, timeouts,
+and the live per-container registry. A host that may evict a container mirrors
+accepted sockets through `ports.hibernation` and passes them back through
+`options.webSockets`; they are registered before the next constructor runs.
+Pair construction is not tied to one event—using either half via `accept()` or
+a 101 Response is the boundary. A closed socket leaves `getWebSockets()` before
+its close handler runs.
 
 ### §1.9 `waitUntil`
 
@@ -153,9 +163,9 @@ but it is not the time-indexed or continuously replicated Cloudflare service.
 
 ### §2.5 Fail-closed substrate boundaries
 
-Hibernation, point-in-time recovery, replication, actor-class stub
-serialization, and unsupported module-scope Workers features throw named
-errors. They do not return empty values or silently downgrade behavior.
+Point-in-time recovery, replication, actor-class stub serialization, and
+unsupported module-scope Workers features throw named errors. They do not
+return empty values or silently downgrade behavior.
 
 ### §2.6 Alarm ownership
 
@@ -233,7 +243,7 @@ owns only placement and physical storage operations.
 
 | Difference from production workerd | Contract here |
 | --- | --- |
-| No hibernation while retaining sockets | Hibernatable WebSocket APIs throw; applications use memory-only sockets and reconnect |
+| Workerd owns socket transport retention across eviction internally | A local embedder mirrors socket references, tags, and attachment bytes through `ports.hibernation`, then rehydrates the next container through `options.webSockets` |
 | JavaScript cannot terminate the currently executing slice | `abort()` breaks later storage and entry, but the calling method can still return |
 | No common V8 byte serializer across Node and the browser | A versioned browser-safe structured-clone encoding preserves the public value types and reads legacy JSON rows |
 | The SQLite backends expose no authorizer callbacks | Reserved `_cf_` identifiers are detected from tokenized statement text and may reject more than workerd |

@@ -36,7 +36,7 @@ enumerates it. Every row is one of:
 | `setTimeout` / `setInterval` | arming captures the critical section; firing re-enters via `ctx.run` | `api/global-scope.ts` |
 | `scheduler.wait()` / `scheduler.yield()` | scoped `Scheduler` over the same timer path | `api/global-scope.ts` |
 | `crypto.subtle.*` | every method's promise gated; sync members pass through | `api/global-scope.ts` |
-| `WebSocket` | frames each take a fresh input lock at the `accept()` loop; `send` carries its own output-gate promise (§1.8) | `api/web-socket.ts` |
+| `WebSocket` | classic listener delivery re-enters its captured context; hibernatable frames take fresh input locks and dispatch class methods; `send` carries its own output-gate promise (§1.8) | `api/web-socket.ts` |
 | storage / `sql` / alarms / `blockConcurrencyWhile` / `awaitIo` / `makeReentryCallback` / entry and loopback dispatch | the runtime's own primitives | `io/io-context.ts`, `server/actor-container.ts` |
 
 ## Transform
