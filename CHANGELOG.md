@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.0
+
+### Minor Changes
+
+- 053b995: `sql.exec()` and `sql.ingest()` now enforce workerd's pragma allowlist. Every pragma outside `util/sqlite.c++`'s `ALLOWED_PRAGMAS` — `user_version`, `writable_schema`, `journal_mode`, `max_page_count`, and the rest — refuses with workerd's message, `not authorized: SQLITE_AUTH`, and the `pragma_*` table-valued functions follow the same list. Previously every pragma passed straight through, which no code written for Cloudflare could have relied on, and which let application SQL overwrite the runtime's storage version stamp or rewrite `sqlite_master` via `writable_schema`. The allowlist, including argument-signature rules, is pinned by a conformance row that runs against real workerd.
+
+### Patch Changes
+
+- 053b995: SQL cursor iterators now match workerd's observable shape, not just its helpers. `sql.exec(...).raw()` and the cursor's own iterator sit on `%IteratorPrototype%` — so `raw().toArray()`, which Drizzle's `durable-sqlite` migrator and driver call, works as it does on Cloudflare — and, like upstream's jsg iterators, they expose `next` and nothing else: no `return`/`throw`, so an early exit (`break`, partial destructuring, `take()`) does not close a retained iterator; results are `{done, value}` in that key order with an own `value: undefined` when done; `Symbol.toStringTag` reads `RawIterator`/`RowIterator`/`Cursor`; and `columnNames` is a prototype accessor, so a cursor JSON-stringifies to `{}`. Pinned by two conformance rows on all three lanes and an end-to-end Drizzle migration test.
+- 053b995: Version runtime storage per database file. Every database the runtime opens — an actor's, the facet tree's, an alarm scheduler's — is stamped with `PRAGMA user_version` and brought forward through forward-only migration steps at open, before any event can enter (the Agents SDK's `_ensureSchema` pattern, one layer down). Pending steps and the stamp commit as one transaction, and a step that issues transaction control of its own is refused by name. A file stamped by a newer release refuses with the database and the remedy named, at open and again at `importSnapshot()`, so the operation that brought a too-new image in is the one that fails. The stamp itself is unreachable from application SQL (see the pragma allowlist change). Note for embedders constructing `AlarmScheduler` directly: the database you pass is now stamped too; host tables sharing that file are untouched — migration steps confine themselves to runtime-owned tables, and a test pins that.
+
 ## 0.3.6
 
 ### Patch Changes
