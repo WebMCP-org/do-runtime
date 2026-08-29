@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.1
+
+### Patch Changes
+
+- 55bae81: Export the shared in-memory hibernation mirror and browser WebSocket-upgrade adapter so embedders can reuse the reference host behavior instead of copying example shims.
+
 ## 0.6.0
 
 ### Minor Changes
