@@ -1,7 +1,7 @@
 {
   "extends": "../tsconfig.base.json",
   "compilerOptions": { "outDir": "../.tsbuild/index" },
-  "files": ["index.ts", "gate.ts", "vite.ts"],
+  "files": ["browser.ts", "index.ts", "gate.ts", "vite.ts"],
   "references": [
     { "path": "./util" },
     { "path": "./io" },

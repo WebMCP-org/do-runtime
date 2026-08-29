@@ -241,6 +241,12 @@ registry is populated before the constructor, so SDKs can lazily rebuild their
 connection wrappers without another upgrade or connect hook. Closed sockets are
 removed before `webSocketClose` runs.
 
+`HibernationMirror` is the package's in-memory reference implementation. Seed a
+replacement mirror with the prior socket snapshot and auto-response pair, then
+pass that mirror to `ports.hibernation` and its `snapshot()` to `webSockets`.
+Browser hosts can install the remaining Request/Response upgrade accommodation
+from `@mcp-b/do-runtime/browser`; the runtime itself supplies `WebSocketPair`.
+
 `container.quiescence()` reports armed timers, pending `waitUntil` work, input
 lock state, and output-gate breakage without waiting. `drainWaitUntil()` is for
 shutdown and intentionally never settles while a live interval remains armed.

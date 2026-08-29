@@ -35,6 +35,7 @@ import { createNodeSqlProvider } from "../../backends/node-sqlite";
 import {
   AlarmScheduler,
   createActorContainer,
+  HibernationMirror,
   installWebSocketGlobals,
   type ActorContainer,
   type ActorEntry,
@@ -64,12 +65,13 @@ import type {
   ProbeActor,
 } from "../host";
 import { Probe } from "../fixtures/probe";
-import { HibernationMirror } from "../../examples/platform-shims/hibernation-mirror";
 import {
   installWebSocketUpgradeGlobals,
   upgradeWebSocket,
-  webSocketUpgradeRequest,
   type UpgradeWebSocket,
+} from "../../src/browser";
+import {
+  webSocketUpgradeRequest,
 } from "../websocket-upgrade";
 
 // =======================================================================================

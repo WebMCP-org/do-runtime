@@ -110,6 +110,8 @@ export {
   FACET_ALARM_UNIMPLEMENTED_MESSAGE,
   noFacets,
 } from "./server/actor-container";
+export type { HibernationAutoResponse } from "./server/hibernation-mirror";
+export { HibernationMirror } from "./server/hibernation-mirror";
 export type { ActorChannelFactory, GlobalActorRequest } from "./api/actor";
 export { createDurableObjectNamespace } from "./server/actor-namespace";
 export { ACTOR_CLASS_SERIALIZATION_UNIMPLEMENTED_MESSAGE } from "./api/actor";

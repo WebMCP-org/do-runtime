@@ -134,8 +134,8 @@ only as a competing supervisor and asserts that Web Locks refuse it before OPFS.
 | `src/background.ts` | The service worker: offscreen lifecycle and `chrome.alarms` projection. |
 | `src/popup/popup.ts` | Four buttons and an output pane. |
 | `src/protocol.ts` | The types both TypeScript projects compile. It imports nothing. |
-| `../platform-shims/memory-websocket-pair.ts` | The browser `Response`-101 shim; the runtime supplies `WebSocketPair`. |
-| `../platform-shims/hibernation-mirror.ts` | The process-local `HibernationHost` record used by this example and the conformance embedders. |
+| `@mcp-b/do-runtime/browser` | The browser Request/`Response`-101 upgrade adapter; the runtime supplies `WebSocketPair`. |
+| `@mcp-b/do-runtime` `HibernationMirror` | The process-local `HibernationHost` record shared by this example and the conformance embedders. |
 | `../platform-shims/message-port-websocket.ts` | The client-side WebSocket adapter carried over a `MessagePort`. |
 | `public/manifest.json` | Copied verbatim into `dist/` by Vite's `publicDir`. |
 
