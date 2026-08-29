@@ -28,6 +28,7 @@ import {
   createActorContainer,
   createDurableObjectNamespace,
   gateRequestBody,
+  HibernationMirror,
   installActorScope,
   newRpcSession,
   type ActorContainer,
@@ -51,12 +52,11 @@ import sqlite3InitModule from "@sqlite.org/sqlite-wasm";
 import { getAgentByName, routeAgentEmail, routeAgentRequest } from "agents";
 import { RpcTarget } from "cloudflare:workers";
 import {
-  installWebSocketUpgradeResponse,
+  installWebSocketUpgradeGlobals,
   upgradeWebSocket,
   withWebSocketUpgrade,
   type UpgradeWebSocket,
-} from "../../../platform-shims/memory-websocket-pair";
-import { HibernationMirror } from "../../../platform-shims/hibernation-mirror";
+} from "@mcp-b/do-runtime/browser";
 import { serveMessagePortWebSockets } from "../../../platform-shims/message-port-websocket";
 import type {
   CounterSnapshot,
@@ -386,7 +386,7 @@ function counterNamespace(gate?: FacetModule["gate"]) {
 
 const rootNamespace = counterNamespace();
 
-installWebSocketUpgradeResponse();
+installWebSocketUpgradeGlobals();
 
 /**
  * What the installed globals resolve to, and it REFUSES rather than falling

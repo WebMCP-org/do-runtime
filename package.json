@@ -41,6 +41,10 @@
       "types": "./dist/src/index.d.ts",
       "import": "./dist/index.js"
     },
+    "./browser": {
+      "types": "./dist/src/browser.d.ts",
+      "import": "./dist/browser.js"
+    },
     "./server/alarm-scheduler": {
       "types": "./dist/src/server/alarm-scheduler.d.ts",
       "import": "./dist/server/alarm-scheduler.js"

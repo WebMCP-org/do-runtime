@@ -16,6 +16,7 @@ await build({
     lib: {
       entry: {
         index: new URL("src/index.ts", root).pathname,
+        browser: new URL("src/browser.ts", root).pathname,
         "server/alarm-scheduler": new URL("src/server/alarm-scheduler.ts", root).pathname,
         "backends/sqlite-wasm": new URL("backends/sqlite-wasm.ts", root).pathname,
         "backends/node-sqlite": new URL("backends/node-sqlite.ts", root).pathname,

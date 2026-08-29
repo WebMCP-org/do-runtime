@@ -49,6 +49,7 @@
 import {
   actorScopeBindings,
   createActorContainer,
+  HibernationMirror,
   installActorScope,
   newRpcSession,
   type ActorContainer,
@@ -77,12 +78,13 @@ import {
   type SqliteWasmHost,
 } from "../../backends/sqlite-wasm";
 import { Probe } from "../fixtures/probe";
-import { HibernationMirror } from "../../examples/platform-shims/hibernation-mirror";
 import {
   installWebSocketUpgradeGlobals,
   upgradeWebSocket,
-  webSocketUpgradeRequest,
   type UpgradeWebSocket,
+} from "../../src/browser";
+import {
+  webSocketUpgradeRequest,
 } from "../websocket-upgrade";
 import type { ActorBoot, ActorRpc, SupervisorRpc } from "./protocol";
 import { installPool, timer, UNIQUE_KEY } from "./substrate";
