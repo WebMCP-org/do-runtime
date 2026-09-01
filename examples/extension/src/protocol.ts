@@ -18,6 +18,9 @@ export type WorkerBoot = {
 /** The one Chrome watchdog mirroring the scheduler's earliest durable wake. */
 export const WAKE_ALARM = "do-runtime-wake";
 
+/** The authless relay fixture tells its host when an Agents client is paired. */
+export const RELAY_CLIENT_READY = "do-runtime:relay-client-ready";
+
 /** What the actor worker can ask its offscreen supervisor to project. */
 export interface SupervisorRpc {
   projectWake(scheduledTime: number | null): Promise<void>;
@@ -66,6 +69,15 @@ export type ThinkProbeStatus = {
   readonly recoveryPartial: string;
   readonly submissions: readonly Omit<ThinkProbeSubmission, "accepted">[];
   readonly userMessages: number;
+};
+
+/** What the authless Cloudflare relay proof observes through a remote AgentClient. */
+export type RelayRoundTrip = {
+  readonly initialValue: number;
+  readonly incrementedValue: number;
+  readonly synchronizedValue: number;
+  readonly streamChunks: readonly unknown[];
+  readonly streamFinal: unknown;
 };
 
 /**
@@ -127,6 +139,7 @@ export type HostOp =
   | "sdkSetState"
   | "sdkState"
   | "sdkStream"
+  | "relayRoundTrip"
   | "storageStatus";
 
 /**

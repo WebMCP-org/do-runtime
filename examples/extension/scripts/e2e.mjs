@@ -11,8 +11,9 @@
  * file is `.mjs` with a dynamic import rather than a dependency of the example.
  */
 
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { rmSync } from "node:fs";
+import { createServer } from "node:net";
 import { fileURLToPath } from "node:url";
 
 const example = fileURLToPath(new URL("../", import.meta.url));
@@ -58,6 +59,85 @@ function build() {
       process.exit(1);
     }
   }
+}
+
+async function unusedPort() {
+  const server = createServer();
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  if (address === null || typeof address === "string") {
+    server.close();
+    throw new Error("could not allocate a relay port");
+  }
+  await new Promise((resolve, reject) => {
+    server.close((error) => (error === undefined ? resolve() : reject(error)));
+  });
+  return address.port;
+}
+
+async function startRelay() {
+  const port = await unusedPort();
+  const origin = `http://127.0.0.1:${port}`;
+  let output = "";
+  const relay = spawn(
+    process.execPath,
+    [
+      `${repoRoot}node_modules/wrangler/bin/wrangler.js`,
+      "dev",
+      "--config",
+      "wrangler.relay.jsonc",
+      "--ip",
+      "127.0.0.1",
+      "--port",
+      String(port),
+      "--persist-to",
+      `${profile}/relay-state`,
+      "--log-level",
+      "warn",
+    ],
+    {
+      cwd: example,
+      env: { ...process.env, CI: "1", NO_COLOR: "1" },
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  const remember = (chunk) => {
+    output = `${output}${chunk}`.slice(-8_000);
+  };
+  relay.stdout.on("data", remember);
+  relay.stderr.on("data", remember);
+
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    if (relay.exitCode !== null) {
+      throw new Error(`relay exited with ${relay.exitCode}\n${output}`);
+    }
+    try {
+      const response = await fetch(`${origin}/health`, { signal: AbortSignal.timeout(500) });
+      if (response.ok) return { origin, process: relay };
+    } catch {
+      // Wrangler is still starting.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  await stopRelay(relay);
+  throw new Error(`relay did not start\n${output}`);
+}
+
+async function stopRelay(relay) {
+  if (relay.exitCode !== null) return;
+  relay.kill("SIGTERM");
+  await new Promise((resolve) => {
+    const timeout = setTimeout(resolve, 5_000);
+    relay.once("exit", () => {
+      clearTimeout(timeout);
+      resolve();
+    });
+  });
+  if (relay.exitCode === null) relay.kill("SIGKILL");
 }
 
 /** One operation sent from the service worker to the real offscreen host. */
@@ -416,6 +496,25 @@ async function main() {
     const printed = await waitForOutput(popup, /^[^\n]+  increment\n/, BOOT_TIMEOUT_MS);
     const viaOffscreen = Number(printed.split("\n")[1]);
     check("the offscreen document continues the same storage", viaOffscreen, 23);
+
+    // ---------------------------------------------------------------------
+    // 7. A native Cloudflare Durable Object carries the unmodified Agents
+    //    protocol between a network client and this browser-hosted Agent.
+    const relay = await startRelay();
+    try {
+      const relayed = await op(popup, "relayRoundTrip", [relay.origin]);
+      check("a remote AgentClient synchronized through the relay DO", relayed.initialValue, 23);
+      check("relayed callable RPC reached the browser Agent", relayed.incrementedValue, 24);
+      check("relayed Agent state returned to the remote client", relayed.synchronizedValue, 24);
+      check(
+        "relayed streaming RPC preserved every chunk",
+        JSON.stringify(relayed.streamChunks),
+        JSON.stringify([24, 25]),
+      );
+      check("relayed streaming RPC preserved its final value", relayed.streamFinal, "done");
+    } finally {
+      await stopRelay(relay.process);
+    }
 
     const completedThink = await op(popup, "submitThink", [
       "completed",

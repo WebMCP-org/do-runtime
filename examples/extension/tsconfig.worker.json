@@ -20,5 +20,5 @@
     "skipLibCheck": true,
     "noEmit": true
   },
-  "include": ["src/worker/**/*.ts", "src/protocol.ts"]
+  "include": ["src/worker/**/*.ts", "relay/**/*.ts", "src/protocol.ts"]
 }

@@ -73,6 +73,13 @@ popup.html ──sendMessage──▶ service worker ──chrome.offscreen.crea
   back to the replacement without reconnecting. It also covers standard named
   routing, `getAgentByName()` direct stubs, a decorated `@callable()` method,
   and a streaming callable's chunks and final value.
+- **A real network relay boundary.** The e2e boots an authless, hibernatable
+  Durable Object on local workerd, connects another real `AgentClient` through
+  it, and proves state synchronization plus callable and streaming RPC reach the
+  browser-hosted Agent without the relay interpreting an Agents frame. The
+  fixture deliberately uses Cloudflare's native Durable Object runtime; this
+  package remains on the browser-host side, while authentication and product
+  routing remain consumer concerns.
 - **The SDK's stateless MCP handler.** The actor serves `createMcpHandler()` and
   exposes a real `McpServer` tool that reads its current state. The e2e performs
   MCP `tools/list` and `tools/call` requests through the gated actor fetch path.
@@ -134,6 +141,7 @@ only as a competing supervisor and asserts that Web Locks refuse it before OPFS.
 | `src/worker/think-probe.ts` | A deterministic Think facet used only by the browser composition test. |
 | `src/worker/actor.worker.ts` | The host: raw timers, sqlite boot order, root/facet placement, and alarm scheduler. |
 | `src/offscreen/offscreen.ts` | The supervisor: spawns the worker, holds the session, forwards extension messages. |
+| `relay/worker.ts` | The authless native Durable Object used only to prove the external relay seam. |
 | `src/background.ts` | The service worker: offscreen lifecycle and `chrome.alarms` projection. |
 | `src/popup/popup.ts` | Four buttons and an output pane. |
 | `src/protocol.ts` | The types both TypeScript projects compile. It imports nothing. |
@@ -141,6 +149,7 @@ only as a competing supervisor and asserts that Web Locks refuse it before OPFS.
 | `@mcp-b/do-runtime` `HibernationMirror` | The process-local `HibernationHost` record shared by this example and the conformance embedders. |
 | `../platform-shims/message-port-websocket.ts` | The client-side WebSocket adapter carried over a `MessagePort`. |
 | `public/manifest.json` | Copied verbatim into `dist/` by Vite's `publicDir`. |
+| `wrangler.relay.jsonc` | Local-workerd configuration for the relay proof. |
 
 Two `tsconfig`s, because `"DOM"` and `"WebWorker"` declare incompatible versions of
 the same globals and no one project can check both halves:

@@ -28,20 +28,22 @@ import {
   holdExclusiveBrowserHost,
 } from "../../../platform-shims/browser-storage";
 import { createMessagePortWebSocketConstructor } from "@mcp-b/do-runtime/browser/message-port-websocket";
-import type {
-  CounterState,
-  CounterSnapshot,
-  ExtensionMessage,
-  ExtensionResponse,
-  HostRpc,
-  HostOp,
-  HostStatus,
-  NestedSubAgentSnapshot,
-  SubAgentSnapshot,
-  SupervisorRpc,
-  ThinkProbeStatus,
-  ThinkProbeSubmission,
-  WorkerBoot,
+import {
+  RELAY_CLIENT_READY,
+  type CounterState,
+  type CounterSnapshot,
+  type ExtensionMessage,
+  type ExtensionResponse,
+  type HostRpc,
+  type HostOp,
+  type HostStatus,
+  type NestedSubAgentSnapshot,
+  type RelayRoundTrip,
+  type SubAgentSnapshot,
+  type SupervisorRpc,
+  type ThinkProbeStatus,
+  type ThinkProbeSubmission,
+  type WorkerBoot,
 } from "../protocol";
 
 const storageStatus = browserStorageSummary();
@@ -134,6 +136,177 @@ async function connectedAgent(): Promise<AgentClient<unknown, CounterState>> {
   return agent;
 }
 
+type CloseableSocket = EventTarget & {
+  readonly CLOSING: number;
+  readonly OPEN: number;
+  readonly readyState: number;
+  close(code?: number, reason?: string): void;
+};
+
+function waitForOpen(socket: CloseableSocket): Promise<void> {
+  if (socket.readyState === socket.OPEN) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const opened = (): void => {
+      cleanup();
+      resolve();
+    };
+    const failed = (): void => {
+      cleanup();
+      reject(new Error("WebSocket closed before opening"));
+    };
+    const cleanup = (): void => {
+      socket.removeEventListener("open", opened);
+      socket.removeEventListener("close", failed);
+      socket.removeEventListener("error", failed);
+    };
+    socket.addEventListener("open", opened, { once: true });
+    socket.addEventListener("close", failed, { once: true });
+    socket.addEventListener("error", failed, { once: true });
+  });
+}
+
+async function beforeTimeout<T>(promise: Promise<T>, label: string): Promise<T> {
+  const timeout = AbortSignal.timeout(15_000);
+  return await Promise.race([
+    promise,
+    new Promise<never>((_resolve, reject) => {
+      timeout.addEventListener("abort", () => reject(new Error(`${label} timed out`)), {
+        once: true,
+      });
+    }),
+  ]);
+}
+
+function relayAddress(origin: string): {
+  readonly host: string;
+  readonly hostSocket: string;
+  readonly protocol: "ws" | "wss";
+} {
+  const url = new URL(origin);
+  if (
+    (url.protocol !== "http:" && url.protocol !== "https:") ||
+    url.username !== "" ||
+    url.password !== "" ||
+    url.pathname !== "/" ||
+    url.search !== "" ||
+    url.hash !== ""
+  ) {
+    throw new TypeError("relay origin must be a bare HTTP(S) origin");
+  }
+  const protocol = url.protocol === "https:" ? "wss" : "ws";
+  url.protocol = `${protocol}:`;
+  url.pathname = "/host";
+  return { host: url.host, hostSocket: url.href, protocol };
+}
+
+function isRelayFrame(value: unknown): value is string | ArrayBuffer {
+  return typeof value === "string" || value instanceof ArrayBuffer;
+}
+
+/** A real network AgentClient reaches the local Agent through a native relay DO. */
+async function runRelayRoundTrip(origin: string): Promise<RelayRoundTrip> {
+  const address = relayAddress(origin);
+  const relayHost = new WebSocket(address.hostSocket);
+  relayHost.binaryType = "arraybuffer";
+
+  let local: InstanceType<typeof AgentWebSocket> | undefined;
+  let resolveLocal!: () => void;
+  let rejectLocal!: (error: Error) => void;
+  const localReady = new Promise<void>((resolve, reject) => {
+    resolveLocal = resolve;
+    rejectLocal = reject;
+  });
+
+  relayHost.addEventListener("message", (event: MessageEvent<unknown>) => {
+    if (local === undefined) {
+      if (event.data !== RELAY_CLIENT_READY) {
+        rejectLocal(new Error("relay sent a frame before pairing its client"));
+        return;
+      }
+      local = new AgentWebSocket("ws://actor.invalid/agents/counter/counter");
+      local.binaryType = "arraybuffer";
+      local.addEventListener("message", (localEvent) => {
+        if (relayHost.readyState === relayHost.OPEN) relayHost.send(localEvent.data);
+      });
+      local.addEventListener("close", (close) => {
+        if (relayHost.readyState < relayHost.CLOSING) {
+          relayHost.close(close.code, close.reason);
+        }
+      });
+      void waitForOpen(local).then(resolveLocal, rejectLocal);
+      return;
+    }
+    if (!isRelayFrame(event.data)) {
+      local.close(1003, "unsupported relay frame");
+      return;
+    }
+    if (local.readyState === local.OPEN) local.send(event.data);
+  });
+  relayHost.addEventListener("close", () => {
+    if (local !== undefined && local.readyState < local.CLOSING) {
+      local.close(1000, "relay closed");
+    }
+  });
+  relayHost.addEventListener("error", () => rejectLocal(new Error("relay host socket failed")));
+
+  let client: AgentClient<unknown, CounterState> | undefined;
+  try {
+    await beforeTimeout(waitForOpen(relayHost), "relay host connection");
+
+    let resolveInitial!: (state: CounterState) => void;
+    let resolveSynchronized!: (state: CounterState) => void;
+    const initialState = new Promise<CounterState>((resolve) => {
+      resolveInitial = resolve;
+    });
+    const synchronizedState = new Promise<CounterState>((resolve) => {
+      resolveSynchronized = resolve;
+    });
+    let receivedInitial = false;
+    client = new AgentClient<unknown, CounterState>({
+      agent: "Counter",
+      name: "counter",
+      host: address.host,
+      protocol: address.protocol,
+      WebSocket,
+      defaultCallTimeout: 10_000,
+      onStateUpdate: (state) => {
+        if (!receivedInitial) {
+          receivedInitial = true;
+          resolveInitial(state);
+        } else {
+          resolveSynchronized(state);
+        }
+      },
+    });
+
+    const [initial] = await beforeTimeout(
+      Promise.all([initialState, client.ready, localReady]),
+      "relayed Agent handshake",
+    );
+    const incrementedValue = await client.call<number>("increment");
+    const synchronized = await beforeTimeout(synchronizedState, "relayed state update");
+    const streamChunks: unknown[] = [];
+    const streamFinal = await client.call("streamValues", [], {
+      stream: { onChunk: (chunk) => streamChunks.push(chunk) },
+    });
+    return {
+      initialValue: initial.value,
+      incrementedValue,
+      synchronizedValue: synchronized.value,
+      streamChunks,
+      streamFinal,
+    };
+  } finally {
+    client?.close(1000, "relay proof complete");
+    if (local !== undefined && local.readyState < local.CLOSING) {
+      local.close(1000, "relay proof complete");
+    }
+    if (relayHost.readyState < relayHost.CLOSING) {
+      relayHost.close(1000, "relay proof complete");
+    }
+  }
+}
+
 /**
  * The operations, in one place, so the extension-message path and the
  * `window.__host` path cannot drift apart.
@@ -181,6 +354,8 @@ const ops = {
     if (client.state === undefined) throw new Error("Agents client connected without state");
     return client.state;
   },
+  relayRoundTrip: async (origin: string): Promise<RelayRoundTrip> =>
+    await runRelayRoundTrip(origin),
   storageStatus: async (): Promise<string> => await storageStatus,
   sdkStream: async (): Promise<{ chunks: unknown[]; final: unknown }> => {
     const chunks: unknown[] = [];
@@ -242,6 +417,8 @@ async function runOp(op: HostOp, args: readonly unknown[]): Promise<unknown> {
       return await ops.sdkSetState(Number(args[0]));
     case "sdkState":
       return await ops.sdkState();
+    case "relayRoundTrip":
+      return await ops.relayRoundTrip(String(args[0]));
     case "storageStatus":
       return await ops.storageStatus();
     case "sdkStream":
