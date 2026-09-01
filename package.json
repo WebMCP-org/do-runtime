@@ -45,6 +45,18 @@
       "types": "./dist/src/browser.d.ts",
       "import": "./dist/browser.js"
     },
+    "./browser/alarm-coordinator": {
+      "types": "./dist/src/browser/alarm-coordinator.d.ts",
+      "import": "./dist/browser/alarm-coordinator.js"
+    },
+    "./browser/message-port-websocket": {
+      "types": "./dist/src/browser/message-port-websocket.d.ts",
+      "import": "./dist/browser/message-port-websocket.js"
+    },
+    "./browser/offscreen-document": {
+      "types": "./dist/src/browser/offscreen-document.d.ts",
+      "import": "./dist/browser/offscreen-document.js"
+    },
     "./server/alarm-scheduler": {
       "types": "./dist/src/server/alarm-scheduler.d.ts",
       "import": "./dist/server/alarm-scheduler.js"

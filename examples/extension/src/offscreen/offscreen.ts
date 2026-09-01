@@ -27,7 +27,7 @@ import {
   browserStorageSummary,
   holdExclusiveBrowserHost,
 } from "../../../platform-shims/browser-storage";
-import { createMessagePortWebSocket } from "../../../platform-shims/message-port-websocket";
+import { createMessagePortWebSocket } from "@mcp-b/do-runtime/browser/message-port-websocket";
 import type {
   CounterState,
   CounterSnapshot,

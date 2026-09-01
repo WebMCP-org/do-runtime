@@ -215,7 +215,9 @@ Both concrete providers also implement `SqlDatabaseSnapshotProvider`. After the 
 
 ### Alarms
 
-Construct one `AlarmScheduler` per namespace over a `SqlDatabase` of its own. It owns `_cf_ALARM`, delivery, retry counts (`ALARM_RETRY_MAX_TRIES`), exponential backoff with jitter, and abandonment. Pass `scheduler.hooks(id)` as a root actor's `ports.alarms`, and give the scheduler a `getActor(id)` that places the actor if it is not running — an alarm is a reason to wake a Durable Object, not something that needs one awake already. A browser host may project the scheduler's current one-shot wait onto a physical timer (`chrome.alarms`, say) but must not duplicate delivery policy.
+Construct one `AlarmScheduler` per namespace over a `SqlDatabase` of its own. It owns `_cf_ALARM`, delivery, retry counts (`ALARM_RETRY_MAX_TRIES`), exponential backoff with jitter, and abandonment. Pass `scheduler.hooks(id)` as a root actor's `ports.alarms`, and give the scheduler a `getActor(id)` that places the actor if it is not running — an alarm is a reason to wake a Durable Object, not something that needs one awake already.
+
+A suspending browser host can project the scheduler's next wake through `BrowserAlarmCoordinator` from `@mcp-b/do-runtime/browser/alarm-coordinator`. The coordinator journals the physical hop, rejects stale projections, rearms a consumed watchdog, and reconciles after background-worker restart. The host supplies durable journal storage, the physical alarm calls, and delivery back into its scheduler; logical delivery policy remains in `AlarmScheduler`.
 
 ### Facets
 
@@ -246,6 +248,10 @@ replacement mirror with the prior socket snapshot and auto-response pair, then
 pass that mirror to `ports.hibernation` and its `snapshot()` to `webSockets`.
 Browser hosts can install the remaining Request/Response upgrade accommodation
 from `@mcp-b/do-runtime/browser`; the runtime itself supplies `WebSocketPair`.
+Hosts whose actor lives in another Worker can use `MessagePortWebSocket`,
+`createMessagePortWebSocket`, and `serveMessagePortWebSockets` from
+`@mcp-b/do-runtime/browser/message-port-websocket`; binary frames stay in
+structured clone and each socket gets one dedicated `MessagePort`.
 
 `container.quiescence()` reports armed timers, pending `waitUntil` work, input
 lock state, and output-gate breakage without waiting. `drainWaitUntil()` is for
@@ -286,6 +292,7 @@ This is `0.x`. The public surface is what [`src/index.ts`](src/index.ts) and the
 | `src/io/` | Gates, invocation context, actor storage engine, ids, Worker channels |
 | `src/api/` | Workers-facing APIs: `DurableObjectState`, SQL, WebSocket, Worker Loader, `cloudflare:workers` |
 | `src/server/` | Actor containers, facet lifecycle, deletion recovery, alarm scheduling |
+| `src/browser/` | Physical alarm projection, offscreen-document recovery, and MessagePort-backed WebSockets for browser hosts |
 | `src/transport/` | The one `MessagePort` Cap'n Web session adapter |
 | `backends/` | `node:sqlite` and sqlite-wasm/OPFS `SqlDatabaseProvider`s |
 | `conformance/` | One suite, three hosts: workerd, Node, browser; plus the probe fixture and benchmarks |

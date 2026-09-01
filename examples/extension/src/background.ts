@@ -10,6 +10,7 @@
  * for alarm identity, retry policy, and delivery.
  */
 
+import { OffscreenDocumentCoordinator } from "@mcp-b/do-runtime/browser/offscreen-document";
 import { WAKE_ALARM, type ExtensionMessage, type ExtensionResponse } from "./protocol";
 
 const OFFSCREEN_URL = "offscreen.html";
@@ -56,20 +57,6 @@ function createOffscreen(): Promise<void> {
 }
 
 /**
- * In flight, so two callers never both try to create the document.
- *
- * **This is not defensive tidiness, it is the fix for a measured failure.**
- * `onInstalled` and the popup's first `ensure-host` arrive within milliseconds
- * of each other. Unserialised, both see no document, both call
- * `createDocument`, the loser gets "single offscreen document", and the recovery
- * below then CLOSES the winner's perfectly healthy document — taking its worker,
- * its container and its OPFS handles with it — and builds a third. Measured, the
- * symptom was a popup whose first operation came back "no extension context
- * answered" while a later one succeeded.
- */
-let ensuring: Promise<void> | undefined;
-
-/**
  * Create the offscreen document if it is not there, and recover if it is there
  * in a way `getContexts` cannot see.
  *
@@ -83,24 +70,21 @@ let ensuring: Promise<void> | undefined;
  * Retried ONCE rather than in a loop: the second failure is a real failure and
  * belongs at the caller, not in a spin.
  */
+const offscreenDocument = new OffscreenDocumentCoordinator({
+  exists: offscreenExists,
+  create: createOffscreen,
+  async close() {
+    console.warn(
+      "[do-runtime example] an offscreen document held the slot but was not listed; " +
+        "closing it and retrying once.",
+    );
+    await chrome.offscreen.closeDocument();
+  },
+  isOccupiedError: (error) => String(error).includes(SINGLE_DOCUMENT_ERROR),
+});
+
 export function ensureOffscreen(): Promise<void> {
-  ensuring ??= (async (): Promise<void> => {
-    if (await offscreenExists()) return;
-    try {
-      await createOffscreen();
-    } catch (error: unknown) {
-      if (!String(error).includes(SINGLE_DOCUMENT_ERROR)) throw error;
-      console.warn(
-        "[do-runtime example] an offscreen document held the slot but was not listed; " +
-          "closing it and retrying once.",
-      );
-      await chrome.offscreen.closeDocument();
-      await createOffscreen();
-    }
-  })().finally(() => {
-    ensuring = undefined;
-  });
-  return ensuring;
+  return offscreenDocument.ensure();
 }
 
 async function projectWake(scheduledTime: number | null): Promise<void> {

@@ -1,7 +1,15 @@
 {
   "extends": "../tsconfig.base.json",
   "compilerOptions": { "outDir": "../.tsbuild/index" },
-  "files": ["browser.ts", "index.ts", "gate.ts", "vite.ts"],
+  "files": [
+    "browser.ts",
+    "browser/alarm-coordinator.ts",
+    "browser/message-port-websocket.ts",
+    "browser/offscreen-document.ts",
+    "index.ts",
+    "gate.ts",
+    "vite.ts"
+  ],
   "references": [
     { "path": "./util" },
     { "path": "./io" },

@@ -17,6 +17,18 @@ await build({
       entry: {
         index: new URL("src/index.ts", root).pathname,
         browser: new URL("src/browser.ts", root).pathname,
+        "browser/alarm-coordinator": new URL(
+          "src/browser/alarm-coordinator.ts",
+          root,
+        ).pathname,
+        "browser/message-port-websocket": new URL(
+          "src/browser/message-port-websocket.ts",
+          root,
+        ).pathname,
+        "browser/offscreen-document": new URL(
+          "src/browser/offscreen-document.ts",
+          root,
+        ).pathname,
         "server/alarm-scheduler": new URL("src/server/alarm-scheduler.ts", root).pathname,
         "backends/sqlite-wasm": new URL("backends/sqlite-wasm.ts", root).pathname,
         "backends/node-sqlite": new URL("backends/node-sqlite.ts", root).pathname,

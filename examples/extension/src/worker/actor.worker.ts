@@ -57,7 +57,7 @@ import {
   withWebSocketUpgrade,
   type UpgradeWebSocket,
 } from "@mcp-b/do-runtime/browser";
-import { serveMessagePortWebSockets } from "../../../platform-shims/message-port-websocket";
+import { serveMessagePortWebSockets } from "@mcp-b/do-runtime/browser/message-port-websocket";
 import type {
   CounterSnapshot,
   HostRpc,
