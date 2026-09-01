@@ -1,15 +1,15 @@
 import { describe, expect, it, vi } from "vitest";
+import type { UpgradeWebSocket } from "../browser";
 import {
   MessagePortWebSocket,
   bridgeWebSocket,
-  createMessagePortWebSocket,
+  createMessagePortWebSocketConstructor,
   serveMessagePortWebSockets,
-  type AcceptingWebSocket,
   type MessagePortWebSocketData,
   type MessagePortWebSocketWireMessage,
 } from "./message-port-websocket";
 
-class MemorySocket extends EventTarget implements AcceptingWebSocket {
+class MemorySocket extends EventTarget implements UpgradeWebSocket {
   readonly sent: MessagePortWebSocketData[] = [];
   readyState = MessagePortWebSocket.CONNECTING;
 
@@ -51,9 +51,29 @@ describe("MessagePortWebSocket", () => {
 
     socket.accept();
     await vi.waitFor(() => expect(messages).toHaveLength(1));
-    expect([...new Uint8Array(messages[0] as ArrayBuffer)]).toEqual([7, 8, 9]);
+    const [message] = messages;
+    expect(message).toBeInstanceOf(ArrayBuffer);
+    if (!(message instanceof ArrayBuffer)) throw new TypeError("expected an ArrayBuffer frame");
+    expect([...new Uint8Array(message)]).toEqual([7, 8, 9]);
 
     socket.close();
+    channel.port2.close();
+  });
+
+  it("closes on a malformed wire message", async () => {
+    const channel = new MessageChannel();
+    const socket = new MessagePortWebSocket("ws://actor.test", channel.port1);
+    const closed = new Promise<CloseEvent>((resolve) => {
+      socket.addEventListener("close", resolve, { once: true });
+    });
+
+    channel.port2.postMessage({ type: "message", data: { unsupported: true } });
+
+    await expect(closed).resolves.toMatchObject({
+      code: 1002,
+      reason: "Invalid MessagePort WebSocket message",
+      wasClean: true,
+    });
     channel.port2.close();
   });
 
@@ -110,14 +130,15 @@ describe("MessagePortWebSocket", () => {
   it("serves WebSocket constructors over a broker MessagePort", async () => {
     const broker = new MessageChannel();
     const runtime = new MemorySocket();
-    const connection = Promise.withResolvers<AcceptingWebSocket>();
-    const stop = serveMessagePortWebSockets(broker.port2, () => connection.promise);
-    const BrokeredWebSocket = createMessagePortWebSocket(broker.port1);
+    const connection = Promise.withResolvers<UpgradeWebSocket>();
+    const connect = vi.fn(() => connection.promise);
+    const stop = serveMessagePortWebSockets(broker.port2, connect);
+    const BrokeredWebSocket = createMessagePortWebSocketConstructor(broker.port1);
     const client = new BrokeredWebSocket("ws://actor.test");
     const received: MessagePortWebSocketData[] = [];
     client.addEventListener("message", (event) => received.push(event.data));
 
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await vi.waitFor(() => expect(connect).toHaveBeenCalledOnce());
     expect(client.readyState).toBe(MessagePortWebSocket.CONNECTING);
     connection.resolve(runtime);
     await vi.waitFor(() => expect(runtime.readyState).toBe(MessagePortWebSocket.OPEN));
@@ -134,10 +155,12 @@ describe("MessagePortWebSocket", () => {
 
   it("closes a brokered client when its runtime connection fails", async () => {
     const broker = new MessageChannel();
-    const stop = serveMessagePortWebSockets(broker.port2, async () => {
+    const connect = vi.fn(async () => {
       throw new Error("route failed");
     });
-    const BrokeredWebSocket = createMessagePortWebSocket(broker.port1);
+    const stop = serveMessagePortWebSockets(broker.port2, connect);
+    const BrokeredWebSocket = createMessagePortWebSocketConstructor(broker.port1);
+    broker.port1.postMessage({ type: "connect", url: "ws://invalid.test" });
     const client = new BrokeredWebSocket("ws://actor.test");
     const closed = new Promise<CloseEvent>((resolve) => {
       client.addEventListener("close", resolve, { once: true });
@@ -148,18 +171,21 @@ describe("MessagePortWebSocket", () => {
       reason: "WebSocket connection failed",
       wasClean: true,
     });
+    expect(connect).toHaveBeenCalledOnce();
+    expect(connect).toHaveBeenCalledWith("ws://actor.test");
     stop();
   });
 
   it("closes a runtime socket that finishes connecting after the server stops", async () => {
     const broker = new MessageChannel();
-    const connection = Promise.withResolvers<AcceptingWebSocket>();
-    const stop = serveMessagePortWebSockets(broker.port2, () => connection.promise);
-    const BrokeredWebSocket = createMessagePortWebSocket(broker.port1);
+    const connection = Promise.withResolvers<UpgradeWebSocket>();
+    const connect = vi.fn(() => connection.promise);
+    const stop = serveMessagePortWebSockets(broker.port2, connect);
+    const BrokeredWebSocket = createMessagePortWebSocketConstructor(broker.port1);
     const client = new BrokeredWebSocket("ws://actor.test");
     const runtime = new MemorySocket();
 
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await vi.waitFor(() => expect(connect).toHaveBeenCalledOnce());
     stop();
     connection.resolve(runtime);
 

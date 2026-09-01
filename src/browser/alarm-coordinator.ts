@@ -26,7 +26,7 @@ export interface BrowserAlarmTransportStore {
   save(journal: BrowserAlarmTransportJournal): Promise<void>;
 }
 
-export interface PhysicalAlarm {
+export interface BrowserPhysicalAlarm {
   clear(): Promise<void>;
   create(when: number): Promise<void>;
 }
@@ -34,7 +34,7 @@ export interface PhysicalAlarm {
 export type BrowserAlarmCoordinatorOptions = {
   deliver(scheduledTime: number): Promise<BrowserAlarmProjection>;
   now?: () => number;
-  physical: PhysicalAlarm;
+  physical: BrowserPhysicalAlarm;
   store: BrowserAlarmTransportStore;
 };
 
@@ -159,20 +159,22 @@ export class BrowserAlarmCoordinator {
   }
 }
 
-export function parseBrowserAlarmProjection(value: unknown): BrowserAlarmProjection | null {
+function parseBrowserAlarmProjection(value: unknown): BrowserAlarmProjection | null {
   if (!isRecord(value)) return null;
   if (!isNonnegativeInteger(value.generation)) return null;
   if (value.when !== null && !isFiniteNumber(value.when)) return null;
-  return value as BrowserAlarmProjection;
+  return { ...value, generation: value.generation, when: value.when };
 }
 
 export function parseBrowserAlarmTransportJournal(
   value: unknown,
 ): BrowserAlarmTransportJournal | null {
   if (!isRecord(value)) return null;
-  if (value.delivery !== null && !isDelivery(value.delivery)) return null;
-  if (parseBrowserAlarmProjection(value.projection) === null) return null;
-  return value as BrowserAlarmTransportJournal;
+  const delivery = value.delivery === null ? null : parseBrowserAlarmDelivery(value.delivery);
+  if (delivery === null && value.delivery !== null) return null;
+  const projection = parseBrowserAlarmProjection(value.projection);
+  if (projection === null) return null;
+  return { ...value, delivery, projection };
 }
 
 function requireProjection(value: unknown): BrowserAlarmProjection {
@@ -181,13 +183,17 @@ function requireProjection(value: unknown): BrowserAlarmProjection {
   return parsed;
 }
 
-function isDelivery(value: unknown): value is BrowserAlarmDelivery {
-  return (
-    isRecord(value) &&
-    isNonnegativeInteger(value.generation) &&
-    isNonnegativeInteger(value.retryCount) &&
-    isFiniteNumber(value.wake)
-  );
+function parseBrowserAlarmDelivery(value: unknown): BrowserAlarmDelivery | null {
+  if (!isRecord(value)) return null;
+  if (!isNonnegativeInteger(value.generation)) return null;
+  if (!isNonnegativeInteger(value.retryCount)) return null;
+  if (!isFiniteNumber(value.wake)) return null;
+  return {
+    ...value,
+    generation: value.generation,
+    retryCount: value.retryCount,
+    wake: value.wake,
+  };
 }
 
 function isRecord(value: unknown): value is LooseRecord {

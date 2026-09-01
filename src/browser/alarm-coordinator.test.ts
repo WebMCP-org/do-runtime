@@ -4,21 +4,10 @@ import {
   BrowserAlarmCoordinator,
   parseBrowserAlarmTransportJournal,
   type BrowserAlarmProjection,
+  type BrowserPhysicalAlarm,
   type BrowserAlarmTransportJournal,
   type BrowserAlarmTransportStore,
-  type PhysicalAlarm,
 } from "./alarm-coordinator";
-
-class Deferred<T> {
-  readonly promise: Promise<T>;
-  resolve!: (value: T | PromiseLike<T>) => void;
-
-  constructor() {
-    this.promise = new Promise<T>((resolve) => {
-      this.resolve = resolve;
-    });
-  }
-}
 
 class MemoryTransportStore implements BrowserAlarmTransportStore {
   journal: BrowserAlarmTransportJournal | null = null;
@@ -32,11 +21,11 @@ class MemoryTransportStore implements BrowserAlarmTransportStore {
   }
 }
 
-class MemoryPhysicalAlarm implements PhysicalAlarm {
+class MemoryPhysicalAlarm implements BrowserPhysicalAlarm {
   readonly creates: number[] = [];
   clears = 0;
   createGate: Promise<void> | null = null;
-  readonly createStarted = new Deferred<void>();
+  readonly createStarted = Promise.withResolvers<void>();
 
   async clear(): Promise<void> {
     this.clears++;
@@ -62,7 +51,7 @@ describe("BrowserAlarmCoordinator", () => {
       retainedMetadata: "journal",
     };
 
-    expect(parseBrowserAlarmTransportJournal(journal)).toBe(journal);
+    expect(parseBrowserAlarmTransportJournal(journal)).toEqual(journal);
     expect(parseBrowserAlarmTransportJournal(undefined)).toBeNull();
     expect(parseBrowserAlarmTransportJournal(null)).toBeNull();
     expect(parseBrowserAlarmTransportJournal({ version: 1 })).toBeNull();
@@ -83,7 +72,7 @@ describe("BrowserAlarmCoordinator", () => {
   it("acknowledges a projection only after the physical alarm operation finishes", async () => {
     const store = new MemoryTransportStore();
     const physical = new MemoryPhysicalAlarm();
-    const physicalAcknowledgement = new Deferred<void>();
+    const physicalAcknowledgement = Promise.withResolvers<void>();
     physical.createGate = physicalAcknowledgement.promise;
     const coordinator = new BrowserAlarmCoordinator({
       deliver: vi.fn(),
@@ -148,8 +137,8 @@ describe("BrowserAlarmCoordinator", () => {
   it("allows delivery to re-project without deadlocking", async () => {
     const store = new MemoryTransportStore();
     const physical = new MemoryPhysicalAlarm();
-    const deliveryMayFinish = new Deferred<void>();
-    const reentrantProjectionFinished = new Deferred<void>();
+    const deliveryMayFinish = Promise.withResolvers<void>();
+    const reentrantProjectionFinished = Promise.withResolvers<void>();
     let coordinator!: BrowserAlarmCoordinator;
     const deliver = vi.fn(async () => {
       const projection = { generation: 2, when: 20_000 };
@@ -238,7 +227,7 @@ describe("BrowserAlarmCoordinator", () => {
   it("retains recovery until a newer projection is acknowledged", async () => {
     const store = new MemoryTransportStore();
     const physical = new MemoryPhysicalAlarm();
-    const deliveryStarted = new Deferred<void>();
+    const deliveryStarted = Promise.withResolvers<void>();
     const delivery = Promise.withResolvers<BrowserAlarmProjection>();
     const coordinator = new BrowserAlarmCoordinator({
       deliver: async () => {
@@ -251,12 +240,13 @@ describe("BrowserAlarmCoordinator", () => {
     });
     await coordinator.project({ generation: 1, when: 100 });
 
-    const firing = coordinator.fire(100).catch((error: unknown) => error);
+    const firing = coordinator.fire(100);
+    const failure = expect(firing).rejects.toThrow("old transport attempt failed");
     await deliveryStarted.promise;
     await coordinator.project({ generation: 2, when: 2_000 });
     delivery.reject(new Error("old transport attempt failed"));
 
-    await expect(firing).resolves.toEqual(expect.any(Error));
+    await failure;
     expect(store.journal).toEqual({
       delivery: { generation: 1, retryCount: 1, wake: 3_000 },
       projection: { generation: 2, when: 2_000 },
@@ -298,7 +288,7 @@ describe("BrowserAlarmCoordinator", () => {
   it("coalesces watchdog wakes while the same delivery is live", async () => {
     const store = new MemoryTransportStore();
     const physical = new MemoryPhysicalAlarm();
-    const deliveryStarted = new Deferred<void>();
+    const deliveryStarted = Promise.withResolvers<void>();
     const delivery = Promise.withResolvers<BrowserAlarmProjection>();
     let now = 1_000;
     const deliver = vi.fn(() => {

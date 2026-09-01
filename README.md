@@ -249,7 +249,7 @@ pass that mirror to `ports.hibernation` and its `snapshot()` to `webSockets`.
 Browser hosts can install the remaining Request/Response upgrade accommodation
 from `@mcp-b/do-runtime/browser`; the runtime itself supplies `WebSocketPair`.
 Hosts whose actor lives in another Worker can use `MessagePortWebSocket`,
-`createMessagePortWebSocket`, and `serveMessagePortWebSockets` from
+`createMessagePortWebSocketConstructor`, and `serveMessagePortWebSockets` from
 `@mcp-b/do-runtime/browser/message-port-websocket`; binary frames stay in
 structured clone and each socket gets one dedicated `MessagePort`.
 

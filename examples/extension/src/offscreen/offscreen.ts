@@ -22,12 +22,12 @@
  */
 
 import { newMessagePortRpcSession, RpcTarget } from "capnweb";
-import { AgentClient, type AgentClientOptions } from "agents/client";
+import { AgentClient } from "agents/client";
 import {
   browserStorageSummary,
   holdExclusiveBrowserHost,
 } from "../../../platform-shims/browser-storage";
-import { createMessagePortWebSocket } from "@mcp-b/do-runtime/browser/message-port-websocket";
+import { createMessagePortWebSocketConstructor } from "@mcp-b/do-runtime/browser/message-port-websocket";
 import type {
   CounterState,
   CounterSnapshot,
@@ -111,7 +111,7 @@ class SupervisorTarget extends RpcTarget implements SupervisorRpc {
 }
 
 const host = newMessagePortRpcSession<HostRpc>(channel.port1, new SupervisorTarget());
-const AgentWebSocket = createMessagePortWebSocket(sockets.port1);
+const AgentWebSocket = createMessagePortWebSocketConstructor(sockets.port1);
 let agent: AgentClient<unknown, CounterState> | undefined;
 let firstState: Promise<void> | undefined;
 
@@ -128,7 +128,7 @@ async function connectedAgent(): Promise<AgentClient<unknown, CounterState>> {
       protocol: "ws",
       WebSocket: AgentWebSocket,
       onStateUpdate: () => stateReceived(),
-    } as AgentClientOptions<CounterState> & { WebSocket: typeof WebSocket });
+    });
   }
   await firstState;
   return agent;
@@ -143,49 +143,38 @@ async function connectedAgent(): Promise<AgentClient<unknown, CounterState>> {
  * views other than `Uint8Array` do not survive the hop.
  */
 const ops = {
-  directStubIncrement: (): Promise<number> =>
-    host.directStubIncrement() as unknown as Promise<number>,
-  email: (subject: string, body: string): Promise<void> =>
-    host.email(subject, body) as unknown as Promise<void>,
-  evict: (): Promise<void> => host.evict() as unknown as Promise<void>,
-  increment: (): Promise<number> => host.increment() as unknown as Promise<number>,
-  enqueueIncrement: (amount: number): Promise<string> =>
-    host.enqueueIncrement(amount) as unknown as Promise<string>,
-  mcp: (method: string, params: Record<string, unknown>): Promise<unknown> =>
-    host.mcp(method, params) as unknown as Promise<unknown>,
-  snapshot: (): Promise<CounterSnapshot> => host.snapshot() as unknown as Promise<CounterSnapshot>,
-  subAgents: (): Promise<readonly SubAgentSnapshot[]> =>
-    host.subAgents() as unknown as Promise<readonly SubAgentSnapshot[]>,
-  overlapSubAgents: (): Promise<readonly SubAgentSnapshot[]> =>
-    host.overlapSubAgents() as unknown as Promise<readonly SubAgentSnapshot[]>,
-  subAgentLifecycle: (): Promise<readonly number[]> =>
-    host.subAgentLifecycle() as unknown as Promise<readonly number[]>,
-  nestedSubAgent: (): Promise<NestedSubAgentSnapshot> =>
-    host.nestedSubAgent() as unknown as Promise<NestedSubAgentSnapshot>,
-  armSubAgentWake: (delayMs: number): Promise<number> =>
-    host.armSubAgentWake(delayMs) as unknown as Promise<number>,
-  scheduledSubAgentValue: (): Promise<number> =>
-    host.scheduledSubAgentValue() as unknown as Promise<number>,
-  startThink: (name: string, text: string): Promise<void> =>
-    host.startThink(name, text) as unknown as Promise<void>,
-  submitThink: (
+  directStubIncrement: async (): Promise<number> => await host.directStubIncrement(),
+  email: async (subject: string, body: string): Promise<void> => await host.email(subject, body),
+  evict: async (): Promise<void> => await host.evict(),
+  increment: async (): Promise<number> => await host.increment(),
+  enqueueIncrement: async (amount: number): Promise<string> => await host.enqueueIncrement(amount),
+  mcp: async (method: string, params: Record<string, unknown>): Promise<unknown> =>
+    await host.mcp(method, params),
+  snapshot: async (): Promise<CounterSnapshot> => await host.snapshot(),
+  subAgents: async (): Promise<readonly SubAgentSnapshot[]> => await host.subAgents(),
+  overlapSubAgents: async (): Promise<readonly SubAgentSnapshot[]> => await host.overlapSubAgents(),
+  subAgentLifecycle: async (): Promise<readonly number[]> => await host.subAgentLifecycle(),
+  nestedSubAgent: async (): Promise<NestedSubAgentSnapshot> => await host.nestedSubAgent(),
+  armSubAgentWake: async (delayMs: number): Promise<number> => await host.armSubAgentWake(delayMs),
+  scheduledSubAgentValue: async (): Promise<number> => await host.scheduledSubAgentValue(),
+  startThink: async (name: string, text: string): Promise<void> =>
+    await host.startThink(name, text),
+  submitThink: async (
     name: string,
     text: string,
     idempotencyKey: string,
-  ): Promise<ThinkProbeSubmission> =>
-    host.submitThink(name, text, idempotencyKey) as unknown as Promise<ThinkProbeSubmission>,
-  thinkStatus: (name: string): Promise<ThinkProbeStatus> =>
-    host.thinkStatus(name) as unknown as Promise<ThinkProbeStatus>,
-  stopThink: (name: string): Promise<void> => host.stopThink(name) as unknown as Promise<void>,
-  armWake: (delayMs: number): Promise<number> =>
-    host.armWake(delayMs) as unknown as Promise<number>,
-  status: (): Promise<HostStatus> => host.status() as unknown as Promise<HostStatus>,
+  ): Promise<ThinkProbeSubmission> => await host.submitThink(name, text, idempotencyKey),
+  thinkStatus: async (name: string): Promise<ThinkProbeStatus> => await host.thinkStatus(name),
+  stopThink: async (name: string): Promise<void> => await host.stopThink(name),
+  armWake: async (delayMs: number): Promise<number> => await host.armWake(delayMs),
+  status: async (): Promise<HostStatus> => await host.status(),
   sdkIncrement: async (): Promise<number> => await (await connectedAgent()).call("increment"),
   sdkSetState: async (value: number): Promise<CounterState> => {
     if (!Number.isSafeInteger(value)) throw new TypeError("value must be a safe integer");
     const client = await connectedAgent();
-    client.setState({ value });
-    return client.state as CounterState;
+    const state = { value };
+    client.setState(state);
+    return state;
   },
   sdkState: async (): Promise<CounterState> => {
     const client = await connectedAgent();
@@ -216,10 +205,10 @@ async function runOp(op: HostOp, args: readonly unknown[]): Promise<unknown> {
       return await ops.enqueueIncrement(Number(args[0]));
     case "mcp": {
       const params = args[1];
-      if (params === null || typeof params !== "object" || Array.isArray(params)) {
+      if (!isRecord(params)) {
         throw new TypeError("MCP params must be an object");
       }
-      return await ops.mcp(String(args[0]), params as Record<string, unknown>);
+      return await ops.mcp(String(args[0]), params);
     }
     case "snapshot":
       return await ops.snapshot();
@@ -258,6 +247,10 @@ async function runOp(op: HostOp, args: readonly unknown[]): Promise<unknown> {
     case "sdkStream":
       return await ops.sdkStream();
   }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /**

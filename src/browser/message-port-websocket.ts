@@ -1,4 +1,5 @@
 import type { RawWebSocket } from "../api/web-socket";
+import type { UpgradeWebSocket } from "../browser";
 
 export type MessagePortWebSocketData = string | ArrayBuffer | ArrayBufferView;
 
@@ -7,12 +8,6 @@ export type MessagePortWebSocketWireMessage =
   | { readonly type: "close"; readonly code: number; readonly reason: string };
 
 type MessagePortWebSocketReadyMessage = { readonly type: "open" };
-
-export type AcceptingWebSocket = EventTarget &
-  RawWebSocket & {
-    accept(): void;
-    readonly readyState: number;
-  };
 
 /** One WebSocket-shaped endpoint backed by one dedicated MessagePort. */
 export class MessagePortWebSocket extends EventTarget implements RawWebSocket {
@@ -45,14 +40,9 @@ export class MessagePortWebSocket extends EventTarget implements RawWebSocket {
     autoOpen = true,
   ) {
     super();
-    this.port.addEventListener(
-      "message",
-      (event: MessageEvent<
-        MessagePortWebSocketWireMessage | MessagePortWebSocketReadyMessage
-      >) => {
-        this.#handleWireMessage(event.data);
-      },
-    );
+    this.port.addEventListener("message", (event: MessageEvent<unknown>) => {
+      this.#handleWireMessage(event.data);
+    });
     this.port.start();
     if (autoOpen) queueMicrotask(() => this.open());
   }
@@ -66,7 +56,11 @@ export class MessagePortWebSocket extends EventTarget implements RawWebSocket {
 
   close(code = 1000, reason = ""): void {
     if (!this.#beginClose()) return;
-    this.port.postMessage({ type: "close", code, reason } satisfies MessagePortWebSocketWireMessage);
+    this.port.postMessage({
+      type: "close",
+      code,
+      reason,
+    } satisfies MessagePortWebSocketWireMessage);
     this.#finishClose(code, reason, true);
   }
 
@@ -93,9 +87,12 @@ export class MessagePortWebSocket extends EventTarget implements RawWebSocket {
     this.#finishClose(code, reason, false);
   }
 
-  #handleWireMessage(
-    message: MessagePortWebSocketWireMessage | MessagePortWebSocketReadyMessage,
-  ): void {
+  #handleWireMessage(value: unknown): void {
+    const message = parseWireMessage(value);
+    if (message === null) {
+      this.close(1002, "Invalid MessagePort WebSocket message");
+      return;
+    }
     if (message.type === "open") {
       this.open();
       return;
@@ -144,6 +141,8 @@ export class MessagePortWebSocket extends EventTarget implements RawWebSocket {
   #finishClose(code: number, reason: string, wasClean: boolean): void {
     if (this.readyState === MessagePortWebSocket.CLOSED) return;
     this.readyState = MessagePortWebSocket.CLOSED;
+    this.#queuedWireMessages.length = 0;
+    this.#queuedWireFlushPending = false;
     this.port.close();
     this.#emit(new CloseEvent("close", { code, reason, wasClean }), this.onclose);
   }
@@ -178,18 +177,23 @@ export interface MessagePortWebSocket {
 }
 
 /** Connect two accepted socket endpoints and open the MessagePort side. */
-export function bridgeWebSocket(socket: AcceptingWebSocket, bridge: MessagePortWebSocket): void {
+export function bridgeWebSocket(socket: UpgradeWebSocket, bridge: MessagePortWebSocket): void {
   if (bridge.readyState >= MessagePortWebSocket.CLOSING) {
     socket.close(1001, "MessagePort transport closed");
     return;
   }
   socket.addEventListener("message", (event) => {
     if (bridge.readyState >= MessagePortWebSocket.CLOSING) return;
-    bridge.send(messageData(event));
+    const data = parseMessageData(event);
+    if (data === null) {
+      bridge.close(1002, "Invalid WebSocket message");
+      return;
+    }
+    bridge.send(data);
   });
   socket.addEventListener("close", (event) => {
-    const close = closeEvent(event);
-    bridge.close(close.code, close.reason);
+    const close = parseCloseEvent(event);
+    bridge.close(close?.code ?? 1006, close?.reason ?? "Invalid WebSocket close event");
   });
   socket.addEventListener("error", () => {
     bridge.close(1011, "WebSocket failed");
@@ -210,8 +214,18 @@ type SocketRequest = {
   readonly port: MessagePort;
 };
 
+export type MessagePortWebSocketConstructor = {
+  new (url: string | URL, protocols?: string | string[]): MessagePortWebSocket;
+  readonly CONNECTING: 0;
+  readonly OPEN: 1;
+  readonly CLOSING: 2;
+  readonly CLOSED: 3;
+};
+
 /** A browser WebSocket constructor whose sockets cross one broker MessagePort. */
-export function createMessagePortWebSocket(port: MessagePort): typeof WebSocket {
+export function createMessagePortWebSocketConstructor(
+  port: MessagePort,
+): MessagePortWebSocketConstructor {
   return class BrokeredMessagePortWebSocket extends MessagePortWebSocket {
     constructor(url: string | URL, _protocols?: string | string[]) {
       const channel = new MessageChannel();
@@ -221,18 +235,18 @@ export function createMessagePortWebSocket(port: MessagePort): typeof WebSocket 
         [channel.port2],
       );
     }
-  } as unknown as typeof WebSocket;
+  };
 }
 
 /** Serve brokered MessagePort sockets from real in-worker socket endpoints. */
 export function serveMessagePortWebSockets(
   port: MessagePort,
-  connect: (url: string) => Promise<AcceptingWebSocket>,
+  connect: (url: string) => Promise<UpgradeWebSocket>,
 ): () => void {
   const bridges = new Set<MessagePortWebSocket>();
-  const listener = (event: MessageEvent<SocketRequest>): void => {
-    const request = event.data;
-    if (request?.type !== "connect" || typeof request.url !== "string") return;
+  const listener = (event: MessageEvent<unknown>): void => {
+    const request = parseSocketRequest(event.data);
+    if (request === null) return;
     const bridge = new MessagePortWebSocket(request.url, request.port, false);
     bridges.add(bridge);
     bridge.addEventListener("close", () => bridges.delete(bridge), { once: true });
@@ -259,10 +273,52 @@ export function serveMessagePortWebSockets(
   };
 }
 
-function messageData(event: Event): MessagePortWebSocketData {
-  return (event as MessageEvent<MessagePortWebSocketData>).data;
+function parseWireMessage(
+  value: unknown,
+): MessagePortWebSocketWireMessage | MessagePortWebSocketReadyMessage | null {
+  if (!isRecord(value)) return null;
+  if (value.type === "open") return { type: "open" };
+  if (value.type === "message" && isWebSocketData(value.data)) {
+    return { type: "message", data: value.data };
+  }
+  if (
+    value.type === "close" &&
+    typeof value.code === "number" &&
+    Number.isInteger(value.code) &&
+    typeof value.reason === "string"
+  ) {
+    return { type: "close", code: value.code, reason: value.reason };
+  }
+  return null;
 }
 
-function closeEvent(event: Event): CloseEvent {
-  return event as CloseEvent;
+function parseSocketRequest(value: unknown): SocketRequest | null {
+  if (!isRecord(value)) return null;
+  if (value.type !== "connect" || typeof value.url !== "string") return null;
+  if (!(value.port instanceof MessagePort)) return null;
+  return { type: "connect", url: value.url, port: value.port };
+}
+
+function parseMessageData(event: Event): MessagePortWebSocketData | null {
+  if (!("data" in event) || !isWebSocketData(event.data)) return null;
+  return event.data;
+}
+
+function parseCloseEvent(event: Event): { readonly code: number; readonly reason: string } | null {
+  if (!("code" in event) || !("reason" in event)) return null;
+  if (typeof event.code !== "number" || !Number.isInteger(event.code)) return null;
+  if (typeof event.reason !== "string") return null;
+  return { code: event.code, reason: event.reason };
+}
+
+function isWebSocketData(value: unknown): value is MessagePortWebSocketData {
+  return (
+    typeof value === "string" ||
+    value instanceof ArrayBuffer ||
+    ArrayBuffer.isView(value)
+  );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

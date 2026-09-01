@@ -77,7 +77,7 @@ if (
 }
 if (
   typeof messagePortWebSocket.MessagePortWebSocket !== "function" ||
-  typeof messagePortWebSocket.createMessagePortWebSocket !== "function" ||
+  typeof messagePortWebSocket.createMessagePortWebSocketConstructor !== "function" ||
   typeof messagePortWebSocket.serveMessagePortWebSockets !== "function"
 ) {
   throw new Error("packed MessagePort WebSocket entry does not export its host helpers");

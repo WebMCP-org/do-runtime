@@ -39,40 +39,25 @@ const SINGLE_DOCUMENT_ERROR = "single offscreen document";
 const OFFSCREEN_CONTEXT: chrome.runtime.ContextType = "OFFSCREEN_DOCUMENT";
 const OFFSCREEN_REASON: chrome.offscreen.Reason = "WORKERS";
 
-/** Whether Chrome currently reports a live offscreen document. */
-async function offscreenExists(): Promise<boolean> {
-  const contexts = await chrome.runtime.getContexts({
-    contextTypes: [OFFSCREEN_CONTEXT],
-    documentUrls: [chrome.runtime.getURL(OFFSCREEN_URL)],
-  });
-  return contexts.length > 0;
-}
-
-function createOffscreen(): Promise<void> {
-  return chrome.offscreen.createDocument({
-    url: OFFSCREEN_URL,
-    reasons: [OFFSCREEN_REASON],
-    justification: JUSTIFICATION,
-  });
-}
-
 /**
- * Create the offscreen document if it is not there, and recover if it is there
- * in a way `getContexts` cannot see.
- *
- * **The catch is the whole of this function.** A crashed offscreen document is
- * absent from `getContexts` and still holds the one offscreen slot, so the check
- * says "create it" and the create fails. Chrome's error string is the only
- * report of the corpse; closing and retrying once is the only way back. Without
- * this, one renderer crash means the extension has no actor until the browser is
- * restarted — and nothing anywhere says why.
- *
- * Retried ONCE rather than in a loop: the second failure is a real failure and
- * belongs at the caller, not in a spin.
+ * The runtime coalesces concurrent creation and recovers Chrome's hidden,
+ * occupied offscreen slot. This adapter supplies only the Chrome operations and
+ * its string-only occupied-slot signal.
  */
 const offscreenDocument = new OffscreenDocumentCoordinator({
-  exists: offscreenExists,
-  create: createOffscreen,
+  async exists() {
+    const contexts = await chrome.runtime.getContexts({
+      contextTypes: [OFFSCREEN_CONTEXT],
+      documentUrls: [chrome.runtime.getURL(OFFSCREEN_URL)],
+    });
+    return contexts.length > 0;
+  },
+  create: () =>
+    chrome.offscreen.createDocument({
+      url: OFFSCREEN_URL,
+      reasons: [OFFSCREEN_REASON],
+      justification: JUSTIFICATION,
+    }),
   async close() {
     console.warn(
       "[do-runtime example] an offscreen document held the slot but was not listed; " +

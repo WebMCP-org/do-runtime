@@ -7,8 +7,7 @@ import {
 } from "@cloudflare/think";
 import type { LanguageModel, UIMessage } from "ai";
 import type { ThinkProbeStatus, ThinkProbeSubmission } from "../protocol";
-
-type CounterEnv = { Counter: DurableObjectNamespace };
+import type { CounterEnv } from "./counter";
 
 const CHUNKS = 12;
 const CHUNK_DELAY_MS = 150;
