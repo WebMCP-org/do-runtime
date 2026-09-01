@@ -48,6 +48,26 @@ export type NestedSubAgentSnapshot = {
   readonly leafValue: number;
 };
 
+export type ThinkProbeSubmission = {
+  readonly accepted: boolean;
+  readonly error: string | null;
+  readonly status: "pending" | "running" | "completed" | "aborted" | "skipped" | "error";
+  readonly submissionId: string;
+};
+
+export type ThinkProbeStatus = {
+  readonly assistantMessages: number;
+  readonly assistantText: string;
+  readonly emittedChunks: number;
+  readonly fiberRows: number;
+  readonly inferenceCompletions: number;
+  readonly inferenceStarts: number;
+  readonly recoveryCount: number;
+  readonly recoveryPartial: string;
+  readonly submissions: readonly Omit<ThinkProbeSubmission, "accepted">[];
+  readonly userMessages: number;
+};
+
 /**
  * What the worker reports about the host itself, as opposed to about the actor.
  *
@@ -92,6 +112,10 @@ export interface HostRpc {
   nestedSubAgent(): Promise<NestedSubAgentSnapshot>;
   armSubAgentWake(delayMs: number): Promise<number>;
   scheduledSubAgentValue(): Promise<number>;
+  startThink(name: string, text: string): Promise<void>;
+  submitThink(name: string, text: string, idempotencyKey: string): Promise<ThinkProbeSubmission>;
+  thinkStatus(name: string): Promise<ThinkProbeStatus>;
+  stopThink(name: string): Promise<void>;
   armWake(delayMs: number): Promise<number>;
   status(): Promise<HostStatus>;
 }

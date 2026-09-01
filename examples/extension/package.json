@@ -3,16 +3,19 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "vite build",
+    "build": "vite build && vite build --mode think-probe",
     "e2e": "node scripts/e2e.mjs"
   },
   "dependencies": {
+    "@cloudflare/think": "file:../../vendor/agents/packages/think",
     "@mcp-b/do-runtime": "workspace:*",
     "@modelcontextprotocol/server": "2.0.0",
     "@sqlite.org/sqlite-wasm": "3.53.0-build1",
     "agents": "file:../../vendor/agents/packages/agents",
+    "ai": "7.0.18",
     "capnweb": "0.10.0",
-    "unenv": "2.0.0-rc.24"
+    "unenv": "2.0.0-rc.24",
+    "zod": "4.4.3"
   },
   "devDependencies": {
     "@babel/plugin-proposal-decorators": "8.0.2",

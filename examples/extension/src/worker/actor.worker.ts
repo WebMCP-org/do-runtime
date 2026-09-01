@@ -65,6 +65,8 @@ import type {
   NestedSubAgentSnapshot,
   SubAgentSnapshot,
   SupervisorRpc,
+  ThinkProbeStatus,
+  ThinkProbeSubmission,
   WorkerBoot,
 } from "../protocol";
 import { Counter, type CounterEnv } from "./counter";
@@ -177,6 +179,7 @@ type FacetModule = {
 
 const FACET_SCOPES_GLOBAL = "__doRuntimeExtensionFacetScopes";
 const COUNTER_CHILD_MODULE_URL = "../counter-child.js";
+const THINK_PROBE_MODULE_URL = "../think-probe.js";
 const facetScopes: Record<string, ActorScopeBindings> = {};
 (globalThis as Record<string, unknown>)[FACET_SCOPES_GLOBAL] = facetScopes;
 
@@ -221,7 +224,7 @@ class ExtensionFacetHost implements FacetHost {
     }
 
     const started = (async (): Promise<FacetPlacement> => {
-      const facetModule = this.#moduleFor(request.id);
+      const facetModule = this.#moduleFor(request.id, request.className);
       const exported = (await facetModule.loaded)[request.className];
       if (typeof exported !== "function") {
         throw new Error(`do-runtime example: no bundled facet class named ${request.className}`);
@@ -300,7 +303,7 @@ class ExtensionFacetHost implements FacetHost {
     );
   }
 
-  #moduleFor(id: FacetId): FacetModule {
+  #moduleFor(id: FacetId, className: string): FacetModule {
     const existing = this.#modules.get(id);
     if (existing !== undefined) return existing;
 
@@ -314,7 +317,10 @@ class ExtensionFacetHost implements FacetHost {
       }
       return gate.container.globals;
     });
-    const url = new URL(COUNTER_CHILD_MODULE_URL, globalThis.location.href);
+    const url = new URL(
+      className === "ThinkProbe" ? THINK_PROBE_MODULE_URL : COUNTER_CHILD_MODULE_URL,
+      globalThis.location.href,
+    );
     url.searchParams.set("scope", key);
     const module = {
       gate,
@@ -531,6 +537,7 @@ async function place(): Promise<Live> {
     Counter: actorNamespace,
     CounterChild: facetClass("CounterChild"),
     CounterLeaf: facetClass("CounterLeaf"),
+    ThinkProbe: facetClass("ThinkProbe"),
   };
   const env: CounterEnv = { Counter: actorNamespace };
 
@@ -762,6 +769,26 @@ class HostTarget extends RpcTarget implements HostRpc {
 
   async scheduledSubAgentValue(): Promise<number> {
     return await (await placed()).entry.scheduledSubAgentValue();
+  }
+
+  async startThink(name: string, text: string): Promise<void> {
+    await (await placed()).entry.startThink(name, text);
+  }
+
+  async submitThink(
+    name: string,
+    text: string,
+    idempotencyKey: string,
+  ): Promise<ThinkProbeSubmission> {
+    return await (await placed()).entry.submitThink(name, text, idempotencyKey);
+  }
+
+  async thinkStatus(name: string): Promise<ThinkProbeStatus> {
+    return await (await placed()).entry.thinkStatus(name);
+  }
+
+  async stopThink(name: string): Promise<void> {
+    await (await placed()).entry.stopThink(name);
   }
 
   async armWake(delayMs: number): Promise<number> {

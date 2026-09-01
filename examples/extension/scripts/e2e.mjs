@@ -44,14 +44,19 @@ function check(message, actual, expected) {
 
 /** The build is a precondition, so this script owns it rather than assuming it. */
 function build() {
-  const result = spawnSync(
-    process.execPath,
-    [`${repoRoot}node_modules/vite/bin/vite.js`, "build"],
-    { cwd: example, stdio: "inherit" },
-  );
-  if (result.status !== 0) {
-    console.log("FAIL  vite build");
-    process.exit(1);
+  for (const args of [["build"], ["build", "--mode", "think-probe"]]) {
+    const result = spawnSync(
+      process.execPath,
+      [`${repoRoot}node_modules/vite/bin/vite.js`, ...args],
+      {
+        cwd: example,
+        stdio: "inherit",
+      },
+    );
+    if (result.status !== 0) {
+      console.log(`FAIL  vite ${args.join(" ")}`);
+      process.exit(1);
+    }
   }
 }
 
@@ -76,6 +81,25 @@ async function ensureHost(page) {
     const response = await chrome.runtime.sendMessage({ type: "ensure-host" });
     if (response?.ok !== true) throw new Error(response?.error ?? "host creation failed");
   });
+}
+
+async function pollOp(page, name, args, predicate, timeoutMs = BOOT_TIMEOUT_MS) {
+  const deadline = Date.now() + timeoutMs;
+  let value;
+  let lastError;
+  while (Date.now() < deadline) {
+    try {
+      value = await op(page, name, args);
+      if (predicate(value)) return value;
+      lastError = undefined;
+    } catch (error) {
+      lastError = error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw (
+    lastError ?? new Error(`${name} did not reach the expected state: ${JSON.stringify(value)}`)
+  );
 }
 
 /** Poll the popup's output pane until it shows something matching `pattern`. */
@@ -393,8 +417,137 @@ async function main() {
     const viaOffscreen = Number(printed.split("\n")[1]);
     check("the offscreen document continues the same storage", viaOffscreen, 23);
 
-    const offscreenContexts = await worker.evaluate(async () =>
-      (await chrome.runtime.getContexts({ contextTypes: ["OFFSCREEN_DOCUMENT"] })).length,
+    const completedThink = await op(popup, "submitThink", [
+      "completed",
+      "Complete one deterministic turn.",
+      "completed-turn",
+    ]);
+    check("Think accepted a durable submission", completedThink.accepted, true);
+    const completedThinkStatus = await pollOp(popup, "thinkStatus", ["completed"], (status) =>
+      status.submissions.some(
+        (submission) =>
+          submission.submissionId === completedThink.submissionId &&
+          submission.status === "completed",
+      ),
+    );
+    check("Think completed one assistant response", completedThinkStatus.assistantMessages, 1);
+    check("the Think model completed once", completedThinkStatus.inferenceCompletions, 1);
+    check("the Think turn left no recovery fiber", completedThinkStatus.fiberRows, 0);
+
+    const stoppedThink = await op(popup, "submitThink", [
+      "stopped",
+      "Stop this deterministic turn partway through.",
+      "stopped-turn",
+    ]);
+    const runningThinkStatus = await pollOp(
+      popup,
+      "thinkStatus",
+      ["stopped"],
+      (status) =>
+        status.emittedChunks >= 2 &&
+        status.fiberRows > 0 &&
+        status.submissions.some(
+          (submission) =>
+            submission.submissionId === stoppedThink.submissionId &&
+            submission.status === "running",
+        ),
+    );
+    check("Think exposed durable work while streaming", runningThinkStatus.fiberRows > 0, true);
+    await op(popup, "stopThink", ["stopped"]);
+    const stoppedThinkStatus = await pollOp(
+      popup,
+      "thinkStatus",
+      ["stopped"],
+      (status) =>
+        status.fiberRows === 0 &&
+        status.submissions.some(
+          (submission) =>
+            submission.submissionId === stoppedThink.submissionId &&
+            submission.status === "aborted",
+        ),
+    );
+    check(
+      "Think Stop retained its partial assistant text",
+      stoppedThinkStatus.assistantText.length > 0,
+      true,
+    );
+    check(
+      "Think Stop did not record a completed inference",
+      stoppedThinkStatus.inferenceCompletions,
+      0,
+    );
+
+    const afterStopThink = await op(popup, "submitThink", [
+      "stopped",
+      "Complete a new turn after Stop.",
+      "after-stop-turn",
+    ]);
+    const afterStopThinkStatus = await pollOp(popup, "thinkStatus", ["stopped"], (status) =>
+      status.submissions.some(
+        (submission) =>
+          submission.submissionId === afterStopThink.submissionId &&
+          submission.status === "completed",
+      ),
+    );
+    check("Think admitted work after Stop", afterStopThinkStatus.inferenceStarts, 2);
+    check("the post-Stop turn completed once", afterStopThinkStatus.inferenceCompletions, 1);
+    check("the post-Stop turn left no recovery fiber", afterStopThinkStatus.fiberRows, 0);
+
+    await op(popup, "startThink", [
+      "recovery",
+      "Recover this deterministic turn after host teardown.",
+    ]);
+    const beforeRecovery = await pollOp(
+      popup,
+      "thinkStatus",
+      ["recovery"],
+      (status) => status.emittedChunks >= 3 && status.fiberRows > 0,
+    );
+    check("Think persisted a recoverable in-flight fiber", beforeRecovery.fiberRows > 0, true);
+    await worker.evaluate(async () => chrome.offscreen.closeDocument());
+    await ensureHost(popup);
+    const recoveredThinkStatus = await pollOp(
+      popup,
+      "thinkStatus",
+      ["recovery"],
+      (status) =>
+        status.fiberRows === 0 && status.recoveryCount === 1 && status.inferenceCompletions === 1,
+    );
+    check(
+      "Think invoked recovery once after Worker teardown",
+      recoveredThinkStatus.recoveryCount,
+      1,
+    );
+    check(
+      "Think recovery received durable partial output",
+      recoveredThinkStatus.recoveryPartial.length > 0,
+      true,
+    );
+    check("Think restarted inference exactly once", recoveredThinkStatus.inferenceStarts, 2);
+    check(
+      "the recovered inference completed exactly once",
+      recoveredThinkStatus.inferenceCompletions,
+      1,
+    );
+    check("recovery kept one user message", recoveredThinkStatus.userMessages, 1);
+    check(
+      "recovery retained the partial and completed continuation",
+      recoveredThinkStatus.assistantMessages,
+      2,
+    );
+    check(
+      "the recovered continuation reached its final chunk",
+      recoveredThinkStatus.assistantText.includes("chunk12"),
+      true,
+    );
+
+    const finalStatus = await op(popup, "status");
+    check("the Think journeys left the container healthy", finalStatus.broken, null);
+    check("the Think journeys left the alarm scheduler healthy", finalStatus.alarmTaskFailure, null);
+
+    const offscreenContexts = await worker.evaluate(
+      async () =>
+        (await chrome.runtime.getContexts({ contextTypes: ["OFFSCREEN_DOCUMENT"] })).length,
     );
     check("the service worker created one offscreen document", offscreenContexts, 1);
   } catch (error) {

@@ -39,6 +39,8 @@ import type {
   NestedSubAgentSnapshot,
   SubAgentSnapshot,
   SupervisorRpc,
+  ThinkProbeStatus,
+  ThinkProbeSubmission,
   WorkerBoot,
 } from "../protocol";
 
@@ -164,6 +166,17 @@ const ops = {
     host.armSubAgentWake(delayMs) as unknown as Promise<number>,
   scheduledSubAgentValue: (): Promise<number> =>
     host.scheduledSubAgentValue() as unknown as Promise<number>,
+  startThink: (name: string, text: string): Promise<void> =>
+    host.startThink(name, text) as unknown as Promise<void>,
+  submitThink: (
+    name: string,
+    text: string,
+    idempotencyKey: string,
+  ): Promise<ThinkProbeSubmission> =>
+    host.submitThink(name, text, idempotencyKey) as unknown as Promise<ThinkProbeSubmission>,
+  thinkStatus: (name: string): Promise<ThinkProbeStatus> =>
+    host.thinkStatus(name) as unknown as Promise<ThinkProbeStatus>,
+  stopThink: (name: string): Promise<void> => host.stopThink(name) as unknown as Promise<void>,
   armWake: (delayMs: number): Promise<number> =>
     host.armWake(delayMs) as unknown as Promise<number>,
   status: (): Promise<HostStatus> => host.status() as unknown as Promise<HostStatus>,
@@ -222,6 +235,14 @@ async function runOp(op: HostOp, args: readonly unknown[]): Promise<unknown> {
       return await ops.armSubAgentWake(Number(args[0] ?? 0));
     case "scheduledSubAgentValue":
       return await ops.scheduledSubAgentValue();
+    case "startThink":
+      return await ops.startThink(String(args[0]), String(args[1]));
+    case "submitThink":
+      return await ops.submitThink(String(args[0]), String(args[1]), String(args[2]));
+    case "thinkStatus":
+      return await ops.thinkStatus(String(args[0]));
+    case "stopThink":
+      return await ops.stopThink(String(args[0]));
     case "armWake":
       return await ops.armWake(Number(args[0] ?? 0));
     case "status":

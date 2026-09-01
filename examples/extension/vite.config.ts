@@ -1,60 +1,101 @@
+import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
+import { doRuntimeAwaitTransform } from "@mcp-b/do-runtime/vite";
 import agents from "agents/vite";
-import { defineConfig } from "vite";
+import { defaultClientConditions, defineConfig } from "vite";
 
 const packageRoot = fileURLToPath(new URL("../../", import.meta.url));
+const resolvePackage = createRequire(import.meta.url).resolve;
 const cloudflareWorkersModule = `${packageRoot}dist/cloudflare-workers.js`;
+const cloudflareShellModule = `${packageRoot}vendor/agents/packages/shell/dist/index.js`;
+const unenvNode = (name: string): string => resolvePackage(`unenv/node/${name}`);
 
-export default defineConfig({
-  plugins: [agents()],
-  /**
-   * Un-hashed, predictable output, because a manifest cannot reference a hash.
-   * The three entries below are the three files `manifest.json` and the two HTML
-   * pages name; everything else is free to be hashed.
-   */
-  build: {
-    outDir: "dist",
-    emptyOutDir: true,
-    // MV3 pages are Chrome-only, so there is no downlevelling to do and top-level
-    // await (which the sqlite driver's ESM build uses) has to survive.
-    target: "esnext",
-    // Readable output. An example's dist is something you open and read; a real
-    // extension would leave this alone.
-    minify: false,
-    // Extensions load from disk. Preload hints buy nothing and add a chunk.
-    modulePreload: false,
-    rollupOptions: {
-      // `counter-child` is imported at runtime by the actor worker, so its class
-      // export is part of the extension's host ABI rather than dead app-entry code.
-      preserveEntrySignatures: "strict",
-      // Relative to `root`, which is this directory. The two HTML entries sit at
-      // the example root rather than under `src/`, so their built copies land at
-      // `dist/offscreen.html` and `dist/popup.html` — the flat paths the manifest
-      // and `chrome.offscreen.createDocument({ url })` both expect.
-      input: {
-        background: "src/background.ts",
-        "counter-child": "src/worker/counter-child.worker.ts",
-        offscreen: "offscreen.html",
-        popup: "popup.html",
-      },
-      output: {
-        // A Dynamic Worker gets its own global scope on workerd. In this
-        // same-worker browser host, bind the complete built facet module instead
-        // so dependencies such as the Agents SDK cannot fall through to the
-        // root actor's globals.
-        banner: (chunk) =>
-          chunk.name === "counter-child"
-            ? `const __facetKey = new URL(import.meta.url).searchParams.get("scope");
+const actorAwaitTransformInclude = [
+  "**/examples/extension/src/worker/**",
+  "**/vendor/agents/packages/agents/dist/**",
+  "**/vendor/agents/packages/think/dist/**",
+  "**/node_modules/**/agents/dist/**",
+  "**/node_modules/**/@cloudflare/think/dist/**",
+  "**/node_modules/**/@ai-sdk/**",
+  "**/node_modules/**/ai/dist/**",
+  "**/node_modules/**/chat/dist/**",
+  "**/node_modules/**/partyserver/dist/**",
+];
+
+const actorPlugins = () => [
+  ...agents(),
+  doRuntimeAwaitTransform({ include: actorAwaitTransformInclude }),
+];
+
+const facetBanner = (chunk: { name: string }): string =>
+  chunk.name === "counter-child" || chunk.name === "think-probe"
+    ? `const __facetKey = new URL(import.meta.url).searchParams.get("scope");
 const __facetScope = globalThis.__doRuntimeExtensionFacetScopes?.[__facetKey];
-if (__facetScope === undefined) throw new Error(\`CounterChild has no facet scope named \${__facetKey}\`);
+if (__facetScope === undefined) throw new Error(\`facet module has no scope named \${__facetKey}\`);
 const { scheduler, setTimeout, clearTimeout, setInterval, clearInterval, fetch, crypto } = __facetScope;`
-            : "",
-        entryFileNames: "[name].js",
-        chunkFileNames: "assets/[name]-[hash].js",
-        assetFileNames: "assets/[name]-[hash][extname]",
-      },
-    },
-  },
+    : "";
+
+export default defineConfig(({ mode }) => ({
+  plugins: actorPlugins(),
+  /**
+   * Un-hashed, predictable entries because the manifest and runtime facet
+   * loader cannot reference content hashes.
+   */
+  build:
+    mode === "think-probe"
+      ? {
+          outDir: "dist",
+          emptyOutDir: false,
+          target: "esnext",
+          minify: false,
+          modulePreload: false,
+          rollupOptions: {
+            input: "src/worker/think-probe.ts",
+            preserveEntrySignatures: "strict",
+            output: {
+              codeSplitting: false,
+              banner: facetBanner,
+              entryFileNames: "think-probe.js",
+            },
+          },
+        }
+      : {
+          outDir: "dist",
+          emptyOutDir: true,
+          // MV3 pages are Chrome-only, so there is no downlevelling to do and top-level
+          // await (which the sqlite driver's ESM build uses) has to survive.
+          target: "esnext",
+          // Readable output. An example's dist is something you open and read; a real
+          // extension would leave this alone.
+          minify: false,
+          // Extensions load from disk. Preload hints buy nothing and add a chunk.
+          modulePreload: false,
+          rollupOptions: {
+            // `counter-child` is imported at runtime by the actor worker, so its class
+            // export is part of the extension's host ABI rather than dead app-entry code.
+            preserveEntrySignatures: "strict",
+            // Relative to `root`, which is this directory. The two HTML entries sit at
+            // the example root rather than under `src/`, so their built copies land at
+            // `dist/offscreen.html` and `dist/popup.html` — the flat paths the manifest
+            // and `chrome.offscreen.createDocument({ url })` both expect.
+            input: {
+              background: "src/background.ts",
+              "counter-child": "src/worker/counter-child.worker.ts",
+              offscreen: "offscreen.html",
+              popup: "popup.html",
+            },
+            output: {
+              // A Dynamic Worker gets its own global scope on workerd. In this
+              // same-worker browser host, bind the complete built facet module instead
+              // so dependencies such as the Agents SDK cannot fall through to the
+              // root actor's globals.
+              banner: facetBanner,
+              entryFileNames: "[name].js",
+              chunkFileNames: "assets/[name]-[hash].js",
+              assetFileNames: "assets/[name]-[hash][extname]",
+            },
+          },
+        },
 
   /**
    * `new Worker(new URL(…), { type: "module" })` must build to a real module
@@ -68,11 +109,13 @@ const { scheduler, setTimeout, clearTimeout, setInterval, clearInterval, fetch, 
    */
   worker: {
     format: "es",
-    plugins: () => agents(),
+    plugins: actorPlugins,
   },
 
   resolve: {
+    ...(mode === "think-probe" ? { conditions: ["worker", ...defaultClientConditions] } : {}),
     alias: {
+      "@mcp-b/do-runtime/gate": `${packageRoot}dist/gate.js`,
       /**
        * The specifier a Workers module imports `DurableObject` and `RpcTarget`
        * from. No browser resolves it, so the host supplies it — exactly as
@@ -86,10 +129,22 @@ const { scheduler, setTimeout, clearTimeout, setInterval, clearInterval, fetch, 
        */
       "cloudflare:workers": cloudflareWorkersModule,
       "cloudflare:email": `${packageRoot}examples/platform-shims/cloudflare-email.ts`,
-      "node:async_hooks": "unenv/node/async_hooks",
-      "node:diagnostics_channel": "unenv/node/diagnostics_channel",
-      "node:os": "unenv/node/os",
-      path: "unenv/node/path",
+      ...(mode === "think-probe"
+        ? {
+            "@cloudflare/shell": cloudflareShellModule,
+            async_hooks: unenvNode("async_hooks"),
+            crypto: unenvNode("crypto"),
+            "node:crypto": unenvNode("crypto"),
+            "node:events": unenvNode("events"),
+            "node:stream/promises": unenvNode("stream/promises"),
+            "node:stream": unenvNode("stream"),
+            "node:zlib": unenvNode("zlib"),
+          }
+        : {}),
+      "node:async_hooks": unenvNode("async_hooks"),
+      "node:diagnostics_channel": unenvNode("diagnostics_channel"),
+      "node:os": unenvNode("os"),
+      path: unenvNode("path"),
     },
   },
-});
+}));

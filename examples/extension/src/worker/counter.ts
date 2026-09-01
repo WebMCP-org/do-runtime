@@ -17,6 +17,7 @@ import { McpServer } from "@modelcontextprotocol/server";
 import { Agent, callable, type StreamingResponse } from "agents";
 import type { AgentEmail } from "agents/email";
 import { createMcpHandler } from "agents/mcp/server";
+import type { ThinkProbeStatus, ThinkProbeSubmission } from "../protocol";
 
 /** What `snapshot()` hands back. JSON-compatible: it crosses two RPC hops. */
 export type CounterSnapshot = {
@@ -178,6 +179,26 @@ export class Counter extends Agent<CounterEnv, CounterState> {
     return await (await this.subAgent(CounterChild, "scheduled")).currentValue();
   }
 
+  async startThink(name: string, text: string): Promise<void> {
+    await (await this.subAgent(ThinkProbe, name)).start(text);
+  }
+
+  async submitThink(
+    name: string,
+    text: string,
+    idempotencyKey: string,
+  ): Promise<ThinkProbeSubmission> {
+    return await (await this.subAgent(ThinkProbe, name)).submit(text, idempotencyKey);
+  }
+
+  async thinkStatus(name: string): Promise<ThinkProbeStatus> {
+    return await (await this.subAgent(ThinkProbe, name)).status();
+  }
+
+  async stopThink(name: string): Promise<void> {
+    await (await this.subAgent(ThinkProbe, name)).stop();
+  }
+
   /** Reached through `CounterChild.parentAgent(Counter)`. */
   async currentValue(): Promise<number> {
     return this.state.value;
@@ -225,4 +246,12 @@ export class CounterChild extends Agent<CounterEnv, CounterState> {
   declare bumpLeaf: () => Promise<NestedSubAgentSnapshot>;
   declare armWake: (delayMs: number) => Promise<number>;
   declare currentValue: () => Promise<number>;
+}
+
+/** A type-only token for the separately bundled Think facet. */
+export class ThinkProbe extends Agent<CounterEnv> {
+  declare start: (text: string) => Promise<void>;
+  declare status: () => Promise<ThinkProbeStatus>;
+  declare stop: () => Promise<void>;
+  declare submit: (text: string, idempotencyKey: string) => Promise<ThinkProbeSubmission>;
 }
