@@ -10,7 +10,7 @@
     "@mcp-b/do-runtime": "workspace:*",
     "@modelcontextprotocol/server": "2.0.0",
     "@sqlite.org/sqlite-wasm": "3.53.0-build1",
-    "agents": "0.21.0",
+    "agents": "file:../../vendor/agents/packages/agents",
     "capnweb": "0.10.0",
     "unenv": "2.0.0-rc.24"
   },

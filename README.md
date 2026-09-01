@@ -311,10 +311,18 @@ The workerd lane is what makes the others mean something: every row it passes is
 ```bash
 git clone https://github.com/WebMCP-org/do-runtime
 cd do-runtime
+pnpm sdk:setup
 pnpm install
 pnpm exec playwright install chromium   # browser lane only
 pnpm typecheck && pnpm test
+pnpm sdk:check && pnpm sdk:test          # Rook's Agents SDK fork
 ```
+
+The repository has two independently tested layers: the runtime at the root
+and Rook's six-package Agents SDK fork in
+[`vendor/agents/`](vendor/agents/README.md). The examples consume the fork's
+built `agents` package through a `file:` dependency, which resolves their
+own peer dependencies without installing a second SDK implementation.
 
 Change runtime behaviour with the corresponding workerd source open (line citations use release `v1.20260713.1`; the conformance oracle is pinned to `v1.20260820.1`). Ask the workerd lane an observable question before inventing a local rule; record any intentional divergence in the table above and in a conformance row. Keep host seams small and typed, keep gates internal, and keep product knowledge out of the port. See [`docs/decisions.md`](docs/decisions.md) for the invariants the code cites.
 

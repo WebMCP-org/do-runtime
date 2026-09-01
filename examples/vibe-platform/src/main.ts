@@ -558,7 +558,7 @@ Run \`pnpm exec wrangler deploy\` when you are ready to deploy.
       private: true,
       type: "module",
       scripts: { deploy: "wrangler deploy", "deploy:dry": "wrangler deploy --dry-run" },
-      dependencies: { agents: "0.21.0" },
+      dependencies: { agents: "0.22.0" },
       devDependencies: { wrangler: "^4.114.0" },
     },
     null,

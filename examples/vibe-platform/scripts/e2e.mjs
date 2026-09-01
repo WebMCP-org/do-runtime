@@ -376,8 +376,8 @@ try {
     const exportedPackage = JSON.parse(
       await readFile(path.join(exportDirectory, "package.json"), "utf8"),
     );
-    if (exportedPackage.dependencies?.agents !== "0.21.0") {
-      throw new Error("exported package.json does not pin agents@0.21.0");
+    if (exportedPackage.dependencies?.agents !== "0.22.0") {
+      throw new Error("exported package.json does not pin agents@0.22.0");
     }
     await symlink(path.join(root, "node_modules"), path.join(exportDirectory, "node_modules"));
     const result = await execFileAsync(

@@ -184,6 +184,12 @@ owns only placement and physical storage operations.
 
 ## Decisions
 
+The repository also carries Rook's Agents SDK fork as a nested workspace under
+`vendor/agents`. Its dependency direction is `Rook → Agents SDK fork →
+do-runtime`; the runtime package does not import the SDK. Consumers use the
+fork's built packages, so JavaScript and declarations come from one source and
+consumer peer dependencies retain one identity.
+
 1. Hold the input gate for the synchronous slice and its microtask checkpoint.
 2. Retain it across storage backpressure only; `allowConcurrency` selects the
    released form.
