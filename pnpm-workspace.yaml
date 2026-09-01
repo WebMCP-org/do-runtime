@@ -6,6 +6,9 @@ allowBuilds:
   workerd: true
   esbuild: true
   core-js-pure: false
+  # Optional just-bash compression accelerators; the browser probe does not use them.
+  "@mongodb-js/zstd": false
+  node-liblzma: false
 # The pinned Aug 20 oracle is newer than the repository's release-age gate.
 minimumReleaseAgeExclude:
   - "@cloudflare/workerd-darwin-64@1.20260820.1"
