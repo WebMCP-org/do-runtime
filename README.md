@@ -1,6 +1,28 @@
 # do-runtime
 
+![The vibe-platform example running an Agents SDK Agent in a browser, with the Agent source on the left and its SQLite-backed application on the right](docs/assets/browser-agent-runtime.png)
+
 Cloudflare Durable Objects and Agents SDK code, running locally inside browser tabs and Chrome extensions.
+
+```ts
+import { Agent } from "agents";
+
+export class Counter extends Agent<Cloudflare.Env, { count: number }> {
+  initialState = { count: 0 };
+
+  onRequest(request: Request) {
+    if (request.method === "POST") {
+      this.setState({ count: this.state.count + 1 });
+    }
+    return Response.json(this.state);
+  }
+}
+```
+
+The browser host runs this class inside a Web Worker and keeps its state in
+SQLite on OPFS. Cloudflare runs the same source inside workerd. The screenshot
+is the repository's [in-tab example](examples/vibe-platform/README.md), with the
+Agent source, local preview, persisted state, and runtime log visible together.
 
 [![CI](https://img.shields.io/github/actions/workflow/status/WebMCP-org/do-runtime/ci.yml?branch=main)](https://github.com/WebMCP-org/do-runtime/actions)
 [![License: FSL 1.1 MIT](https://img.shields.io/badge/license-FSL--1.1--MIT-orange.svg)](LICENSE)
