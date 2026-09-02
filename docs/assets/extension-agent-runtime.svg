@@ -1,45 +1,42 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="800" viewBox="0 0 1400 800" role="img" aria-labelledby="title description">
-  <title id="title">A Durable Object runtime inside a Chrome MV3 extension</title>
-  <desc id="description">A Chrome extension popup beside the service worker, offscreen supervisor, module Worker, Agent tree, SQLite storage, and durable alarm wake path that power it.</desc>
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="720" viewBox="0 0 1400 720" role="img" aria-labelledby="title description">
+  <title id="title">A durable Agent running inside a Chrome extension</title>
+  <desc id="description">An Agent at the center of a Chrome extension, connected to persistent state, alarms, and live connections, with a sleep, wake, continue loop.</desc>
   <defs>
     <linearGradient id="page" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0" stop-color="#f8fafc" />
+      <stop offset="0.55" stop-color="#f5f7ff" />
       <stop offset="1" stop-color="#eef2ff" />
     </linearGradient>
-    <filter id="shadow" x="-20%" y="-20%" width="140%" height="150%">
-      <feDropShadow dx="0" dy="14" stdDeviation="18" flood-color="#0f172a" flood-opacity="0.16" />
+    <linearGradient id="agent" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#4f46e5" />
+      <stop offset="1" stop-color="#2563eb" />
+    </linearGradient>
+    <filter id="soft-shadow" x="-35%" y="-35%" width="170%" height="180%">
+      <feDropShadow dx="0" dy="12" stdDeviation="18" flood-color="#312e81" flood-opacity="0.14" />
     </filter>
-    <marker id="blue-arrow" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto">
-      <path d="M0 0 9 4.5 0 9Z" fill="#4f46e5" />
-    </marker>
-    <marker id="orange-arrow" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto">
-      <path d="M0 0 9 4.5 0 9Z" fill="#f97316" />
-    </marker>
+    <filter id="agent-shadow" x="-50%" y="-50%" width="200%" height="200%">
+      <feDropShadow dx="0" dy="16" stdDeviation="24" flood-color="#4338ca" flood-opacity="0.32" />
+    </filter>
     <style>
-      .display { fill: #0f172a; font: 720 34px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; letter-spacing: -0.8px; }
-      .eyebrow { fill: #4f46e5; font: 750 13px ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: 1.8px; }
-      .title { fill: #0f172a; font: 680 18px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-      .body { fill: #475569; font: 15px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .heading { fill: #111827; font: 720 36px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; letter-spacing: -0.9px; }
+      .eyebrow { fill: #4f46e5; font: 750 13px ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: 2px; }
+      .label { fill: #1e293b; font: 680 18px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
       .small { fill: #64748b; font: 13px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
       .mono { fill: #64748b; font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
-      .mono-dark { fill: #cbd5e1; font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
-      .card { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.5; }
-      .blue-line { fill: none; stroke: #4f46e5; stroke-width: 2.25; marker-end: url(#blue-arrow); }
-      .orange-line { fill: none; stroke: #f97316; stroke-width: 2.25; marker-end: url(#orange-arrow); }
     </style>
   </defs>
 
   <!-- Chromium window -->
-  <rect x="1" y="1" width="1398" height="798" rx="23" fill="#ffffff" stroke="#cbd5e1" stroke-width="2" />
+  <rect x="1" y="1" width="1398" height="718" rx="23" fill="#ffffff" stroke="#cbd5e1" stroke-width="2" />
   <path d="M24 1 H1376 A23 23 0 0 1 1399 24 V47 H1 V24 A23 23 0 0 1 24 1Z" fill="#dfe3e8" />
   <circle cx="28" cy="24" r="6" fill="#ef6a67" />
   <circle cx="50" cy="24" r="6" fill="#e7b84b" />
   <circle cx="72" cy="24" r="6" fill="#56b870" />
-  <path d="M112 8 H352 A14 14 0 0 1 366 22 V47 H98 V22 A14 14 0 0 1 112 8Z" fill="#ffffff" />
+  <path d="M112 8 H336 A14 14 0 0 1 350 22 V47 H98 V22 A14 14 0 0 1 112 8Z" fill="#ffffff" />
   <rect x="116" y="17" width="20" height="20" rx="6" fill="#4f46e5" />
   <path d="M121 27 H131 M126 22 V32" stroke="#ffffff" stroke-width="1.6" stroke-linecap="round" />
-  <text x="146" y="33" class="small" fill="#334155">do-runtime · extension proof</text>
-  <path d="M347 22 355 30 M355 22 347 30" stroke="#94a3b8" stroke-width="1.4" />
+  <text x="146" y="33" class="small">do-runtime</text>
+  <path d="M331 22 339 30 M339 22 331 30" stroke="#94a3b8" stroke-width="1.4" />
 
   <rect x="1" y="47" width="1398" height="51" fill="#ffffff" />
   <path d="M30 72 H48 M30 72 38 64 M30 72 38 80" fill="none" stroke="#64748b" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
@@ -47,116 +44,65 @@
   <path d="M126 64 A11 11 0 1 0 130 78 M126 64 132 63 131 69" fill="none" stroke="#64748b" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
   <rect x="162" y="55" width="1088" height="34" rx="17" fill="#f1f3f4" />
   <path d="M186 66 V63 A5 5 0 0 1 196 63 V66 M184 66 H198 V78 H184Z" fill="none" stroke="#64748b" stroke-width="1.4" stroke-linejoin="round" />
-  <text x="211" y="77" class="mono">chrome-extension://do-runtime/popup.html</text>
+  <text x="211" y="77" class="mono">chrome-extension://local-agent</text>
   <circle cx="1358" cy="64" r="2" fill="#64748b" />
   <circle cx="1358" cy="72" r="2" fill="#64748b" />
   <circle cx="1358" cy="80" r="2" fill="#64748b" />
   <path d="M1 98 H1399" stroke="#d7dce2" />
 
-  <!-- Extension page -->
-  <path d="M1 99 H1399 V776 A23 23 0 0 1 1376 799 H24 A23 23 0 0 1 1 776Z" fill="url(#page)" />
-  <text x="58" y="151" class="eyebrow">CHROME MV3 · LOCAL RUNTIME</text>
-  <text x="58" y="196" class="display">A Durable Object host inside the extension</text>
-  <text x="58" y="226" class="body">Chrome can discard the process. The Agent keeps its identity, SQLite state, and scheduled work.</text>
+  <!-- Abstract extension runtime -->
+  <path d="M1 99 H1399 V696 A23 23 0 0 1 1376 719 H24 A23 23 0 0 1 1 696Z" fill="url(#page)" />
+  <text x="700" y="135" text-anchor="middle" class="eyebrow">CHROME EXTENSION</text>
+  <text x="700" y="175" text-anchor="middle" class="heading">A durable Agent running locally</text>
 
-  <!-- Host lifecycle -->
-  <rect x="58" y="276" width="238" height="120" rx="16" class="card" />
-  <rect x="58" y="276" width="238" height="5" rx="2.5" fill="#64748b" />
-  <circle cx="86" cy="310" r="11" fill="#e2e8f0" />
-  <path d="M82 310 H90 M86 306 V314" stroke="#475569" stroke-width="1.7" stroke-linecap="round" />
-  <text x="106" y="316" class="title">Service worker</text>
-  <text x="82" y="351" class="small">Owns extension lifecycle</text>
-  <text x="82" y="374" class="mono">chrome.alarms.onAlarm</text>
+  <!-- The faint orbit is the extension boundary, not a process diagram. -->
+  <circle cx="700" cy="417" r="177" fill="none" stroke="#e0e7ff" stroke-width="28" />
+  <circle cx="700" cy="417" r="177" fill="none" stroke="#a5b4fc" stroke-width="2" stroke-dasharray="4 12" />
 
-  <rect x="342" y="276" width="262" height="120" rx="16" class="card" />
-  <rect x="342" y="276" width="262" height="5" rx="2.5" fill="#2563eb" />
-  <circle cx="370" cy="310" r="11" fill="#dbeafe" />
-  <rect x="365" y="305" width="10" height="10" rx="2" fill="none" stroke="#2563eb" stroke-width="1.6" />
-  <text x="390" y="316" class="title">Offscreen supervisor</text>
-  <text x="366" y="351" class="small">Owns OPFS host + AgentClient</text>
-  <text x="366" y="374" class="mono">Web Lock · Cap'n Web</text>
-
-  <rect x="650" y="250" width="294" height="172" rx="17" fill="#eef2ff" stroke="#818cf8" stroke-width="1.5" />
-  <rect x="650" y="250" width="294" height="5" rx="2.5" fill="#4f46e5" />
-  <text x="674" y="286" class="eyebrow">MODULE WORKER</text>
-  <text x="674" y="319" class="title">Counter Agent</text>
-  <text x="674" y="343" class="small">ActorContainer · input/output gates</text>
-  <rect x="674" y="365" width="116" height="32" rx="9" fill="#ffffff" stroke="#c7d2fe" />
-  <rect x="804" y="365" width="116" height="32" rx="9" fill="#ffffff" stroke="#c7d2fe" />
-  <text x="732" y="386" text-anchor="middle" class="mono">sub-agent α</text>
-  <text x="862" y="386" text-anchor="middle" class="mono">sub-agent β</text>
-
-  <path d="M296 336 H335" class="blue-line" />
-  <path d="M604 336 H643" class="blue-line" />
-
-  <!-- Durable substrate and wake loop -->
-  <rect x="58" y="500" width="238" height="118" rx="16" fill="#fff7ed" stroke="#fdba74" stroke-width="1.5" />
-  <rect x="58" y="500" width="238" height="5" rx="2.5" fill="#f97316" />
-  <text x="82" y="540" class="title">chrome.alarms</text>
-  <text x="82" y="568" class="small">Physical wake after eviction</text>
-  <text x="82" y="594" class="mono">earliest due alarm</text>
-
-  <rect x="342" y="500" width="262" height="118" rx="16" fill="#fff7ed" stroke="#fdba74" stroke-width="1.5" />
-  <rect x="342" y="500" width="262" height="5" rx="2.5" fill="#f97316" />
-  <text x="366" y="540" class="title">AlarmScheduler</text>
-  <text x="366" y="568" class="small">Durable delivery and retries</text>
-  <text x="366" y="594" class="mono">_cf_ALARM · backoff</text>
-
-  <rect x="650" y="500" width="294" height="118" rx="16" fill="#ecfdf5" stroke="#6ee7b7" stroke-width="1.5" />
-  <rect x="650" y="500" width="294" height="5" rx="2.5" fill="#0f766e" />
-  <text x="674" y="540" class="title">SQLite on OPFS</text>
-  <text x="674" y="568" class="small">Private state for every Agent</text>
-  <text x="674" y="594" class="mono">sqlite-wasm · SAH pool</text>
-
-  <path d="M797 422 V493" class="blue-line" />
-  <text x="808" y="463" class="mono">setState()</text>
-  <path d="M650 390 C598 424 536 445 488 493" class="orange-line" />
-  <text x="546" y="451" class="mono">schedule()</text>
-  <path d="M342 559 H303" class="orange-line" />
-  <path d="M177 500 V403" class="orange-line" />
-
-  <rect x="58" y="654" width="886" height="58" rx="14" fill="#ffffff" stroke="#d7dce2" />
-  <circle cx="86" cy="683" r="9" fill="#ffedd5" />
-  <path d="M86 678 V683 L90 686" fill="none" stroke="#f97316" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
-  <text x="108" y="679" class="small">Alarm path</text>
-  <text x="108" y="699" class="mono">schedule row → AlarmScheduler → chrome.alarms → service worker → same named Agent</text>
-
-  <!-- Concrete extension popup -->
-  <g filter="url(#shadow)">
-    <rect x="986" y="148" width="358" height="626" rx="20" fill="#ffffff" stroke="#cbd5e1" />
+  <!-- State -->
+  <path d="M448 417 C500 417 532 417 580 417" fill="none" stroke="#14b8a6" stroke-width="3" stroke-linecap="round" />
+  <circle cx="462" cy="417" r="5" fill="#14b8a6" />
+  <g filter="url(#soft-shadow)">
+    <circle cx="356" cy="417" r="76" fill="#ffffff" stroke="#99f6e4" stroke-width="2" />
   </g>
-  <rect x="986" y="148" width="358" height="68" rx="20" fill="#f8fafc" />
-  <path d="M986 196 H1344" stroke="#e2e8f0" />
-  <rect x="1014" y="168" width="28" height="28" rx="8" fill="#4f46e5" />
-  <path d="M1021 182 H1035 M1028 175 V189" stroke="#ffffff" stroke-width="2" stroke-linecap="round" />
-  <text x="1054" y="181" class="eyebrow">EXTENSION POPUP</text>
-  <text x="1054" y="202" class="small">Durable Object counter</text>
+  <ellipse cx="356" cy="386" rx="25" ry="9" fill="none" stroke="#0f766e" stroke-width="3" />
+  <path d="M331 386 V415 C331 420 342 424 356 424 C370 424 381 420 381 415 V386 M331 400 C331 405 342 409 356 409 C370 409 381 405 381 400" fill="none" stroke="#0f766e" stroke-width="3" />
+  <text x="356" y="457" text-anchor="middle" class="label">State</text>
 
-  <rect x="1014" y="236" width="302" height="104" rx="14" fill="#eef2ff" />
-  <text x="1036" y="267" class="small">Persisted count</text>
-  <text x="1034" y="318" fill="#312e81" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="48" font-weight="750">21</text>
-  <rect x="1219" y="256" width="73" height="24" rx="12" fill="#dcfce7" />
-  <circle cx="1234" cy="268" r="4" fill="#16a34a" />
-  <text x="1244" y="272" fill="#166534" font-family="system-ui, sans-serif" font-size="11" font-weight="650">LIVE</text>
+  <!-- Alarm -->
+  <path d="M700 319 V294" fill="none" stroke="#f97316" stroke-width="3" stroke-linecap="round" />
+  <circle cx="700" cy="306" r="5" fill="#f97316" />
+  <g filter="url(#soft-shadow)">
+    <circle cx="700" cy="255" r="65" fill="#ffffff" stroke="#fed7aa" stroke-width="2" />
+  </g>
+  <circle cx="700" cy="241" r="22" fill="none" stroke="#ea580c" stroke-width="3" />
+  <path d="M700 229 V242 L710 249" fill="none" stroke="#ea580c" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" />
+  <text x="700" y="290" text-anchor="middle" class="label">Alarms</text>
 
-  <rect x="1014" y="358" width="145" height="38" rx="10" fill="#4f46e5" />
-  <text x="1086" y="382" text-anchor="middle" fill="#ffffff" font-family="system-ui, sans-serif" font-size="13" font-weight="650">Increment</text>
-  <rect x="1171" y="358" width="145" height="38" rx="10" fill="#ffffff" stroke="#cbd5e1" />
-  <text x="1243" y="382" text-anchor="middle" fill="#334155" font-family="system-ui, sans-serif" font-size="12" font-weight="650">Arm 5s alarm</text>
+  <!-- Live connection -->
+  <path d="M820 417 C868 417 900 417 952 417" fill="none" stroke="#3b82f6" stroke-width="3" stroke-linecap="round" />
+  <circle cx="938" cy="417" r="5" fill="#3b82f6" />
+  <g filter="url(#soft-shadow)">
+    <circle cx="1044" cy="417" r="76" fill="#ffffff" stroke="#bfdbfe" stroke-width="2" />
+  </g>
+  <circle cx="1027" cy="397" r="9" fill="none" stroke="#2563eb" stroke-width="3" />
+  <circle cx="1061" cy="397" r="9" fill="none" stroke="#2563eb" stroke-width="3" />
+  <path d="M1036 397 H1052 M1030 407 C1036 419 1052 419 1058 407" fill="none" stroke="#2563eb" stroke-width="3" stroke-linecap="round" />
+  <text x="1044" y="457" text-anchor="middle" class="label">Live</text>
 
-  <text x="1014" y="433" class="small">Latest durable event</text>
-  <rect x="1014" y="448" width="302" height="246" rx="13" fill="#0f172a" />
-  <circle cx="1036" cy="471" r="4" fill="#22c55e" />
-  <text x="1050" y="475" class="mono-dark">host recreated</text>
-  <text x="1034" y="507" class="mono-dark">snapshot {</text>
-  <text x="1054" y="531" class="mono-dark">value: 21,</text>
-  <text x="1054" y="555" class="mono-dark">events: [</text>
-  <text x="1074" y="579" fill="#fdba74" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12">"sdk-schedule"</text>
-  <text x="1054" y="603" class="mono-dark">]</text>
-  <text x="1034" y="627" class="mono-dark">}</text>
-  <path d="M1034 651 H1296" stroke="#334155" />
-  <text x="1034" y="675" fill="#86efac" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12">alarm delivered after teardown</text>
+  <!-- Agent -->
+  <g filter="url(#agent-shadow)">
+    <circle cx="700" cy="417" r="112" fill="url(#agent)" />
+  </g>
+  <rect x="666" y="344" width="68" height="24" rx="12" fill="#ffffff" fill-opacity="0.18" />
+  <text x="700" y="361" text-anchor="middle" fill="#ffffff" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" font-weight="750" letter-spacing="1.4">LOCAL</text>
+  <text x="700" y="425" text-anchor="middle" fill="#ffffff" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="35" font-weight="730">Agent</text>
+  <path d="M666 452 H734" stroke="#bfdbfe" stroke-width="2" stroke-linecap="round" />
+  <circle cx="700" cy="452" r="5" fill="#ffffff" />
 
-  <circle cx="1020" cy="735" r="4" fill="#0f766e" />
-  <text x="1032" y="740" class="mono">SQLite · OPFS · AgentClient</text>
+  <!-- One durable idea -->
+  <rect x="493" y="610" width="414" height="52" rx="26" fill="#ffffff" stroke="#dbe3ef" filter="url(#soft-shadow)" />
+  <circle cx="526" cy="636" r="11" fill="#ffedd5" />
+  <path d="M526 629 V636 L531 639" fill="none" stroke="#f97316" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+  <text x="700" y="642" text-anchor="middle" class="label">sleep → wake → continue</text>
 </svg>

@@ -1,6 +1,6 @@
 # do-runtime
 
-![A Chrome MV3 extension hosting an Agents SDK Agent and sub-agents in a module Worker, backed by SQLite on OPFS with durable alarm wake-up](docs/assets/extension-agent-runtime.svg)
+![A durable Agent running locally in a Chrome extension, connected to state, alarms, and live connections](docs/assets/extension-agent-runtime.svg)
 
 Cloudflare Durable Objects and Agents SDK code, running locally inside Chrome
 extensions and browser tabs.
