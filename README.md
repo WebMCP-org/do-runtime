@@ -1,28 +1,39 @@
 # do-runtime
 
-![The vibe-platform example running an Agents SDK Agent in a browser, with the Agent source on the left and its SQLite-backed application on the right](docs/assets/browser-agent-runtime.png)
+![A Chrome MV3 extension hosting an Agents SDK Agent and sub-agents in a module Worker, backed by SQLite on OPFS with durable alarm wake-up](docs/assets/extension-agent-runtime.svg)
 
-Cloudflare Durable Objects and Agents SDK code, running locally inside browser tabs and Chrome extensions.
+Cloudflare Durable Objects and Agents SDK code, running locally inside Chrome
+extensions and browser tabs.
 
 ```ts
-import { Agent } from "agents";
+import { Agent, callable } from "agents";
 
 export class Counter extends Agent<Cloudflare.Env, { count: number }> {
   initialState = { count: 0 };
 
-  onRequest(request: Request) {
-    if (request.method === "POST") {
-      this.setState({ count: this.state.count + 1 });
-    }
-    return Response.json(this.state);
+  @callable()
+  increment() {
+    this.setState({ count: this.state.count + 1 });
+  }
+
+  @callable()
+  async armWake() {
+    await this.schedule(5, "scheduledIncrement");
+  }
+
+  scheduledIncrement() {
+    this.setState({ count: this.state.count + 1 });
   }
 }
 ```
 
-The browser host runs this class inside a Web Worker and keeps its state in
-SQLite on OPFS. Cloudflare runs the same source inside workerd. The screenshot
-is the repository's [in-tab example](examples/vibe-platform/README.md), with the
-Agent source, local preview, persisted state, and runtime log visible together.
+The [Chrome MV3 example](examples/extension/README.md) runs this ordinary Agent
+inside a module Worker. `setState()` persists to SQLite on OPFS; SDK calls and
+state sync cross a `MessagePort`-backed WebSocket; `schedule()` stores the task
+and projects its wake through `chrome.alarms`. Its end-to-end test destroys the
+offscreen host before the alarm fires, then proves Chrome rebuilds the runtime
+and calls `scheduledIncrement()` against the same state. Cloudflare runs the
+same Agent source inside workerd.
 
 [![CI](https://img.shields.io/github/actions/workflow/status/WebMCP-org/do-runtime/ci.yml?branch=main)](https://github.com/WebMCP-org/do-runtime/actions)
 [![License: FSL 1.1 MIT](https://img.shields.io/badge/license-FSL--1.1--MIT-orange.svg)](LICENSE)
@@ -143,14 +154,13 @@ Why it is shaped this way:
 
 ## Run it in a browser
 
-The two browser examples are complete hosts with Playwright end-to-end tests.
-From a fresh checkout:
+The Chrome MV3 extension is the primary reference host. From a fresh checkout:
 
 ```bash
 pnpm sdk:setup
 pnpm install
 pnpm exec playwright install chromium
-pnpm test:examples
+pnpm --filter do-runtime-example-extension e2e
 ```
 
 | Example | Browser shape | What the test proves |
@@ -158,8 +168,15 @@ pnpm test:examples
 | [Chrome MV3 extension](examples/extension/README.md) | Service worker -> offscreen document -> actor Worker -> sqlite-wasm/OPFS | An Agents SDK root and its sub-agents retain state across host teardown; alarms wake an evicted host; hibernatable sockets, state sync, callable RPC, queues, MCP, and email routing use the real SDK paths. |
 | [In-tab coding platform](examples/vibe-platform/README.md) | Page -> workspace Worker and authored-Agent Worker -> sqlite-wasm/OPFS | A user-authored Agent runs against durable local state, survives code replacement, and exports from the browser as the same source in a Wrangler project. |
 
-Run only the MV3 host with `pnpm --filter do-runtime-example-extension e2e`,
-or start the in-tab host at `http://localhost:5173` with
+Run both browser end-to-end suites with `pnpm test:examples`.
+
+The [in-tab coding platform](examples/vibe-platform/README.md) is the second
+composition: an editor, local preview, persisted Agent state, and Wrangler
+export, all inside a normal browser tab.
+
+![The vibe-platform example running an Agents SDK Agent in a browser, with the Agent source on the left and its SQLite-backed application on the right](docs/assets/browser-agent-runtime.png)
+
+Start it at `http://localhost:5173` with
 `pnpm --filter do-runtime-example-vibe-platform dev`.
 
 ## Durable Object semantics

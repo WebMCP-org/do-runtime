@@ -22,6 +22,7 @@ for (const required of [
   "package.json",
   "README.md",
   "docs/assets/browser-agent-runtime.png",
+  "docs/assets/extension-agent-runtime.svg",
   "docs/migrations.md",
   "LICENSE",
   "CHANGELOG.md",

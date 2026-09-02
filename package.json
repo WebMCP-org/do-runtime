@@ -27,6 +27,7 @@
   "files": [
     "dist",
     "docs/assets/browser-agent-runtime.png",
+    "docs/assets/extension-agent-runtime.svg",
     "docs/migrations.md",
     "CHANGELOG.md",
     "LICENSE",

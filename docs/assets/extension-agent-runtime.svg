@@ -1,0 +1,89 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="720" viewBox="0 0 1400 720" role="img" aria-labelledby="title description">
+  <title id="title">An Agents SDK runtime inside a Chrome MV3 extension</title>
+  <desc id="description">A popup reaches a service worker and offscreen supervisor, which hosts an Agent and sub-agents in a module Worker with SQLite on OPFS, durable alarms, and MessagePort WebSockets.</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#111827" />
+      <stop offset="1" stop-color="#172554" />
+    </linearGradient>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#93c5fd" />
+    </marker>
+    <style>
+      .eyebrow { fill: #93c5fd; font: 700 16px ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: 2px; }
+      .heading { fill: #f8fafc; font: 700 34px system-ui, sans-serif; }
+      .label { fill: #f8fafc; font: 650 20px system-ui, sans-serif; }
+      .small { fill: #cbd5e1; font: 15px system-ui, sans-serif; }
+      .tiny { fill: #94a3b8; font: 13px ui-monospace, SFMono-Regular, Menlo, monospace; }
+      .surface { fill: #1e293b; stroke: #475569; stroke-width: 2; }
+      .runtime { fill: #172033; stroke: #60a5fa; stroke-width: 2; }
+      .agent { fill: #1e3a5f; stroke: #7dd3fc; stroke-width: 2; }
+      .storage { fill: #123c37; stroke: #5eead4; stroke-width: 2; }
+      .alarm { fill: #432c1c; stroke: #fbbf24; stroke-width: 2; }
+      .line { fill: none; stroke: #93c5fd; stroke-width: 2.5; marker-end: url(#arrow); }
+      .wake { fill: none; stroke: #fbbf24; stroke-width: 2.5; stroke-dasharray: 8 6; marker-end: url(#arrow); }
+    </style>
+  </defs>
+
+  <rect width="1400" height="720" rx="24" fill="url(#background)" />
+  <text x="64" y="62" class="eyebrow">CHROME MV3 EXTENSION</text>
+  <text x="64" y="108" class="heading">A durable Agents SDK host in the browser</text>
+
+  <rect x="64" y="160" width="250" height="88" rx="14" class="surface" />
+  <text x="88" y="195" class="label">Popup / product UI</text>
+  <text x="88" y="222" class="small">chrome.runtime messages</text>
+
+  <rect x="64" y="294" width="250" height="88" rx="14" class="surface" />
+  <text x="88" y="329" class="label">Service worker</text>
+  <text x="88" y="356" class="small">lifecycle + physical wakes</text>
+
+  <rect x="64" y="428" width="250" height="104" rx="14" class="surface" />
+  <text x="88" y="463" class="label">Offscreen supervisor</text>
+  <text x="88" y="490" class="small">one OPFS owner</text>
+  <text x="88" y="512" class="small">spawns and replaces the Worker</text>
+
+  <path d="M189 248 L189 287" class="line" />
+  <path d="M189 382 L189 421" class="line" />
+
+  <rect x="390" y="160" width="626" height="438" rx="20" class="runtime" />
+  <text x="422" y="198" class="eyebrow">MODULE WORKER</text>
+
+  <rect x="422" y="224" width="562" height="150" rx="16" class="agent" />
+  <text x="450" y="262" class="label">Agent + local sub-agents</text>
+  <text x="450" y="292" class="small">ActorContainer · input/output gates · gated globals</text>
+  <text x="450" y="324" class="tiny">setState()   @callable()   schedule()   queue()</text>
+  <text x="450" y="350" class="tiny">state sync   streaming RPC   hibernatable sockets</text>
+
+  <rect x="422" y="410" width="266" height="142" rx="16" class="storage" />
+  <text x="450" y="449" class="label">SQLite on OPFS</text>
+  <text x="450" y="479" class="small">private actor databases</text>
+  <text x="450" y="505" class="small">state survives context loss</text>
+  <text x="450" y="529" class="tiny">sqlite-wasm SAH pool</text>
+
+  <rect x="718" y="410" width="266" height="142" rx="16" class="alarm" />
+  <text x="746" y="449" class="label">AlarmScheduler</text>
+  <text x="746" y="479" class="small">durable delivery + retries</text>
+  <text x="746" y="505" class="small">places a sleeping Agent</text>
+  <text x="746" y="529" class="tiny">_cf_ALARM</text>
+
+  <path d="M314 480 L383 480" class="line" />
+  <text x="325" y="463" class="tiny">Cap'n Web</text>
+  <path d="M555 374 L555 403" class="line" />
+  <path d="M850 374 L850 403" class="line" />
+
+  <rect x="1086" y="224" width="250" height="104" rx="14" class="surface" />
+  <text x="1114" y="260" class="label">AgentClient</text>
+  <text x="1114" y="288" class="small">MessagePort WebSocket</text>
+  <text x="1114" y="310" class="small">RPC + live state</text>
+  <path d="M1086 276 L1023 276" class="line" />
+
+  <rect x="1086" y="410" width="250" height="104" rx="14" class="alarm" />
+  <text x="1114" y="448" class="label">chrome.alarms</text>
+  <text x="1114" y="476" class="small">wakes an evicted host</text>
+  <text x="1114" y="498" class="small">at the earliest due alarm</text>
+  <path d="M984 462 L1079 462" class="wake" />
+  <path d="M1211 410 C1211 132 270 132 270 287" class="wake" />
+
+  <rect x="64" y="632" width="1272" height="48" rx="12" fill="#0f172a" stroke="#334155" />
+  <text x="700" y="662" text-anchor="middle" class="small">Chrome can discard the host; SQLite state and scheduled work reconstruct the same named Agent.</text>
+</svg>
