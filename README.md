@@ -1,19 +1,54 @@
 # do-runtime
 
-Cloudflare's Durable Object runtime, ported from [workerd](https://github.com/cloudflare/workerd) to TypeScript, so the same actors run in a browser tab and in Node.
+Cloudflare Durable Objects and Agents SDK code, running locally inside browser tabs and Chrome extensions.
 
 [![CI](https://img.shields.io/github/actions/workflow/status/WebMCP-org/do-runtime/ci.yml?branch=main)](https://github.com/WebMCP-org/do-runtime/actions)
 [![License: FSL 1.1 MIT](https://img.shields.io/badge/license-FSL--1.1--MIT-orange.svg)](LICENSE)
 
-A Durable Object is an actor: one identity, one private SQLite database, one event at a time, reachable by name. That model only ran inside Cloudflare's edge. `do-runtime` is the runtime underneath it — input and output gates, implicit transactions, facets, alarms, Worker Loader, the `cloudflare:workers` module — rebuilt over two storage substrates: **sqlite-wasm on OPFS** inside a Web Worker, and **`node:sqlite`** in a Node process. Its behaviour is pinned by one conformance suite that runs against real workerd, against Node, and against headless Chromium, so "the same semantics" is something the tests assert rather than something this README claims.
+## The problem
 
-It was extracted from Rook, SigVelo's AI agent for Chrome, which needed real Durable Object semantics under Cloudflare's Agents SDK inside a Chrome extension. Cloudflare, Workers, Durable Objects, and workerd are Cloudflare's; this is an independent port and is not affiliated with or endorsed by Cloudflare.
+An `Agent` or `DurableObject` class is TypeScript, but its safety comes from the
+host around it. [Workerd](https://github.com/cloudflare/workerd) gives every named
+object a private SQLite database, serializes events across `await`, holds replies
+until their writes commit, delivers alarms, routes object-to-object calls, and
+restores hibernatable WebSockets. Cloudflare's Agents SDK relies on those rules.
+
+A browser has the raw components needed to build that host: dedicated workers,
+WebAssembly, OPFS, and `MessagePort`. It does not assemble them into a Durable
+Object runtime. A storage adapter alone would leave concurrency, commit ordering,
+wake-up, and lifecycle behavior undefined. Those differences surface when two
+requests overlap, Chrome evicts an extension context, or a reply races the write
+it reports.
+
+`do-runtime` supplies that missing host. It ports the relevant Durable Object
+behavior from workerd to TypeScript, runs each root actor in a Web Worker, stores
+its SQLite database in OPFS, and carries capabilities between workers with
+[Cap'n Web](https://github.com/cloudflare/capnweb). Supported `Agent` and
+`DurableObject` classes can execute on-device and deploy to Cloudflare from the
+same source. A `node:sqlite` backend provides a second local host and a fast test
+lane.
+
+The repository contains the runtime and the proofs needed to use it as an
+execution target:
+
+| Area | What it contains |
+| --- | --- |
+| [`@mcp-b/do-runtime`](src/) | Input and output gates, implicit transactions, Durable Object storage APIs, facets, alarms, hibernatable WebSockets, Worker Loader, and `cloudflare:workers`. |
+| [`vendor/agents/`](vendor/agents/README.md) | Rook's Agents SDK fork. It consumes the runtime; the runtime package does not import the SDK. |
+| [`conformance/`](conformance/) | One behavioral suite run against real workerd, the Node host, and the browser host in Chromium. |
+| [`examples/extension/`](examples/extension/README.md) | A Chrome MV3 host with an offscreen supervisor, local Agents SDK actors and sub-agents, OPFS persistence, durable alarms, hibernatable sockets, and restart recovery. |
+| [`examples/vibe-platform/`](examples/vibe-platform/README.md) | An in-tab editor that runs a user-authored Agent locally and exports the unchanged source as a Wrangler project. |
+
+This work was extracted from Rook, SigVelo's AI agent for Chrome. Cloudflare,
+Workers, Durable Objects, and workerd are Cloudflare's; this is an independent
+port and is not affiliated with or endorsed by Cloudflare.
 
 ## Contents
 
-- [The model: actors, and what a Durable Object adds](#the-model-actors-and-what-a-durable-object-adds)
-- [How it runs in the browser](#how-it-runs-in-the-browser)
-- [Quickstart](#quickstart)
+- [The browser runtime](#the-browser-runtime)
+- [Run it in a browser](#run-it-in-a-browser)
+- [Durable Object semantics](#durable-object-semantics)
+- [Minimal host](#minimal-host)
 - [Hosting an actor](#hosting-an-actor)
 - [Storage, alarms, facets, I/O](#storage)
 - [Migrations](#migrations)
@@ -23,86 +58,112 @@ It was extracted from Rook, SigVelo's AI agent for Chrome, which needed real Dur
 - [Development](#development)
 - [Acknowledgements and license](#acknowledgements)
 
-## The model: actors, and what a Durable Object adds
+## The browser runtime
 
-An **actor** is the oldest answer to concurrency that does not involve locks: a unit of identity plus private state that processes one message at a time and talks to other actors only by sending messages. Nothing outside an actor can touch its state, so there is nothing to race. Erlang processes, Akka actors, Orleans grains, and Durable Objects are all this shape.
-
-A **Durable Object** is an actor with four things bolted on, and this package ports all four:
-
-| | What it means | Where it lives here |
-| --- | --- | --- |
-| **Named identity** | `idFromName("alice")` always means the same actor, and the id names its storage. | `ActorContainerOptions.id` + `uniqueKey`, `src/server/actor-id-impl.ts` |
-| **Private transactional storage** | A SQLite database only this actor can open. KV and SQL on the same file; writes coalesce into an implicit transaction that commits at the end of the event. | `src/io/actor-sqlite.ts`, `src/api/sql.ts`, `src/util/` |
-| **Input and output gates** | The single-threaded illusion survives `await`. The input gate admits one event at a time (and re-admits a continuation only through a gated primitive); the output gate holds a reply until the write it could reveal is durable. | `src/io/io-gate.ts`, `src/io/io-context.ts` |
-| **Alarms and facets** | `setAlarm()` wakes the actor later with retries and backoff. Facets are child actors under a root: own gates, own database, one tree index. | `src/server/alarm-scheduler.ts`, `src/server/facet-*.ts` |
-
-Two consequences fall out of the gates and are the whole reason the runtime is more than a SQLite wrapper:
-
-- **No interleaving.** If a method awaits storage, a second call on the same actor waits. Application code reads and writes state without locks and is still correct.
-- **No phantom reads.** A reply that could expose a write does not leave until that write is committed. A crash between "returned" and "committed" cannot lie to a caller.
-
-Everything else in the package serves those two lines.
-
-## How it runs in the browser
-
-Workerd gives every actor its own isolate, so `setTimeout`, `fetch`, and `scheduler.wait` can only ever mean the one actor in that isolate. The browser equivalent is **one root actor per Web Worker**, with the page acting as the supervisor workerd's `Server` is:
+Workerd gives every actor its own isolate, so `setTimeout`, `fetch`, and
+`scheduler.wait` always belong to that actor. The reference browser host places
+one root actor in each Web Worker. The page, or an extension's offscreen
+document, supervises placement and owns no actor storage.
 
 ```mermaid
 flowchart TB
-  subgraph page["Page — the supervisor (owns no storage)"]
-    S["spawns workers · actor registry · routes actor→actor calls · owns alarm delivery"]
+  subgraph page["Page or offscreen document / supervisor"]
+    S["spawns workers; actor registry; routes actor calls; owns alarm delivery"]
   end
 
-  subgraph wa["Web Worker — actor alice"]
+  subgraph wa["Web Worker / actor alice"]
     direction TB
-    Ca["ActorContainer<br/>input gate · output gate · state · globals"]
-    Fa["facet containers<br/>(own gates + db, same realm)"]
-    Pa[("one OPFS SAH pool<br/>sqlite-wasm")]
+    Ca["Agent or DurableObject<br/>inside ActorContainer<br/>input gate; output gate; globals"]
+    Fa["facet containers<br/>(own gates and database, same realm)"]
+    Pa[("sqlite-wasm<br/>OPFS SAH pool")]
     Ca --- Fa
     Ca --> Pa
     Fa --> Pa
   end
 
-  subgraph wb["Web Worker — actor bob"]
+  subgraph wb["Web Worker / actor bob"]
     direction TB
-    Cb["ActorContainer"]
-    Pb[("OPFS SAH pool")]
+    Cb["Agent or DurableObject<br/>inside ActorContainer"]
+    Pb[("sqlite-wasm<br/>OPFS SAH pool")]
     Cb --> Pb
   end
 
-  subgraph wal["Web Worker — alarms"]
+  subgraph wal["Web Worker / alarms"]
     direction TB
-    A["AlarmScheduler<br/>_cf_ALARM · retry ladder · backoff"]
-    PA[("OPFS SAH pool")]
+    A["AlarmScheduler<br/>_cf_ALARM; retries; backoff"]
+    PA[("sqlite-wasm<br/>OPFS SAH pool")]
     A --> PA
   end
 
-  S <-- "MessagePort · Cap'n Web" --> Ca
-  S <-- "MessagePort · Cap'n Web" --> Cb
-  S <-- "MessagePort · Cap'n Web" --> A
+  S <-- "MessagePort + Cap'n Web" --> Ca
+  S <-- "MessagePort + Cap'n Web" --> Cb
+  S <-- "MessagePort + Cap'n Web" --> A
 ```
 
 Why it is shaped this way:
 
-- **The page cannot hold storage.** OPFS synchronous access handles — the only way to run SQLite synchronously in a browser — exist only inside a dedicated worker. So the page is a pure supervisor: it creates workers, keeps the registry, and routes `alice → bob` calls. It is the offscreen document's job in a Chrome extension and `Server`'s job in workerd.
-- **One root actor per worker.** The worker entry calls `installActorScope(globalThis, () => container.globals)`, which installs gated `setTimeout`, `clearTimeout`, `setInterval`, `clearInterval`, `fetch`, `crypto`, and `scheduler` as the worker's ambient globals. With one root per realm the ambient is unambiguous, which is exactly why workerd gets this for free and why application code — and any SDK it pulls in — needs no changes.
-- **Facets stay in their parent's worker**, as they stay in their parent's isolate upstream. A facet is a separate `ActorContainer` with its own gates and its own database prefix inside the parent's pool; what it shares is the JavaScript realm and the root's synchronous facet-tree index, which is what lets a facet have facets of its own.
-- **Alarms get their own worker** because the scheduler needs a database and a database needs a worker. Setting an alarm is one durable row there; delivery comes back through the supervisor, which places the target actor if it is not running.
-- **Every hop is `MessagePort` + [Cap'n Web](https://github.com/cloudflare/capnweb).** Each worker is booted with one raw `postMessage` carrying its port; everything after is a capability-based RPC session opened by `newRpcSession()`. A container's `entry(instance)` proxy is what sits behind the session, so every call from outside is one gated event.
-
-Boot order inside an actor worker is load-bearing; each inversion below is a measured failure, not a style choice:
-
-1. Capture raw platform timers at module scope and build the `Timer` port on them — a `Timer` that reads the installed globals recurses once the scope is in.
-2. Set `globalThis.sqlite3ApiConfig = { disable: { vfs: { opfs: true, "opfs-wl": true } } }` before touching sqlite — only the SAH pool is wanted, and the other two VFSes spawn workers and arm watchdogs of their own.
-3. `sqlite3InitModule()` and `installOpfsSAHPoolVfs(...)` **before** `installActorScope` — the installer arms watchdogs through the global `setTimeout`, which must not yet be the actor's gate.
-4. `installActorScope(globalThis, resolve)` with a `resolve` that throws when the container is gone, so a torn-down worker refuses instead of falling through to raw timers.
-5. Application pool settings, not the conformance lane's test-only ones: a stable pool name (it becomes an OPFS directory name), `clearOnInit: false`, capacity sized to two databases per root plus journals. The pool takes exclusive sync access handles — one holder per pool; a second context fails to install.
+- OPFS synchronous access handles exist only inside a dedicated worker, so the
+  supervisor creates workers, keeps the registry, and routes calls between them.
+- Each root gets its own worker. `installActorScope()` can therefore install the
+  actor's gated timers, `fetch`, `crypto`, and `scheduler` as unambiguous ambient
+  globals for application and SDK code.
+- Facets stay in their parent's worker, matching workerd's isolate layout. Each
+  facet still has its own container, gates, and database prefix.
+- The reference host gives its alarm scheduler a separate worker because the
+  scheduler has durable SQLite state of its own. A single-root host can colocate
+  it with the actor worker, as the MV3 example does. Either layout can place a
+  sleeping actor when a stored alarm becomes due.
+- Each cross-worker call is a capability-based RPC session over a transferred
+  `MessagePort`. The proxy exposed by `container.entry(instance)` turns each call
+  into one gated actor event.
 
 `conformance/browser/` is that picture, runnable: [`host.ts`](conformance/browser/host.ts) is the page, [`actor.worker.ts`](conformance/browser/actor.worker.ts) is a worker hosting one actor tree over OPFS, [`alarms.worker.ts`](conformance/browser/alarms.worker.ts) is the scheduler, and [`protocol.ts`](conformance/browser/protocol.ts) is the three RPC surfaces between them.
 
-## Quickstart
+## Run it in a browser
 
-Install with `pnpm add @mcp-b/do-runtime`. The package ships ESM JavaScript and declarations and requires Node ≥ 24.11 when using the `node:sqlite` backend.
+The two browser examples are complete hosts with Playwright end-to-end tests.
+From a fresh checkout:
+
+```bash
+pnpm sdk:setup
+pnpm install
+pnpm exec playwright install chromium
+pnpm test:examples
+```
+
+| Example | Browser shape | What the test proves |
+| --- | --- | --- |
+| [Chrome MV3 extension](examples/extension/README.md) | Service worker -> offscreen document -> actor Worker -> sqlite-wasm/OPFS | An Agents SDK root and its sub-agents retain state across host teardown; alarms wake an evicted host; hibernatable sockets, state sync, callable RPC, queues, MCP, and email routing use the real SDK paths. |
+| [In-tab coding platform](examples/vibe-platform/README.md) | Page -> workspace Worker and authored-Agent Worker -> sqlite-wasm/OPFS | A user-authored Agent runs against durable local state, survives code replacement, and exports from the browser as the same source in a Wrangler project. |
+
+Run only the MV3 host with `pnpm --filter do-runtime-example-extension e2e`,
+or start the in-tab host at `http://localhost:5173` with
+`pnpm --filter do-runtime-example-vibe-platform dev`.
+
+## Durable Object semantics
+
+An actor has an identity, private state, and one admitted event at a time. A
+Durable Object adds the host behavior that keeps those properties true through
+asynchronous I/O and process loss:
+
+| | What it means | Where it lives here |
+| --- | --- | --- |
+| **Named identity** | `idFromName("alice")` always means the same actor, and the id names its storage. | `ActorContainerOptions.id` + `uniqueKey`, `src/server/actor-id-impl.ts` |
+| **Private transactional storage** | A SQLite database only this actor can open. KV and SQL share the file; writes coalesce into an implicit transaction that commits at the end of the event. | `src/io/actor-sqlite.ts`, `src/api/sql.ts`, `src/util/` |
+| **Input and output gates** | The input gate serializes event slices across `await`. The output gate holds a reply until the write it could reveal is durable. | `src/io/io-gate.ts`, `src/io/io-context.ts` |
+| **Alarms and facets** | `setAlarm()` wakes the actor later with retries and backoff. Facets are child actors with their own gates and database under a root. | `src/server/alarm-scheduler.ts`, `src/server/facet-*.ts` |
+
+If a method awaits storage, another call on the same actor waits. Application
+code can perform a read-modify-write without adding a lock. A reply that exposes
+a write also waits for that write to commit, so a crash cannot leave a caller
+holding an acknowledgement for data that never became durable.
+
+## Minimal host
+
+Install with `pnpm add @mcp-b/do-runtime`. The package ships ESM JavaScript and
+declarations. The shortest complete host uses the `node:sqlite` backend, which
+requires Node 24.11 or newer. Browser hosts place the same container inside a
+Web Worker and supply the sqlite-wasm backend shown in the runnable examples.
 
 ```ts
 import { DurableObject } from "@mcp-b/do-runtime/cloudflare-workers";
@@ -152,14 +213,12 @@ await counter.increment(); // 1
 await counter.increment(); // 2
 ```
 
-Open a second container over the same directory and `increment()` answers `3`: the instance was volatile, the storage was not. In a browser the only line that changes is `sql`, which becomes `createSqliteWasmProvider(pool, { prefix: "/counter-1" })` from `@mcp-b/do-runtime/backends/sqlite-wasm`.
-
-## Examples
-
-Two runnable browser hosts live in [`examples/`](examples/), each with its own README and Playwright e2e (`pnpm test:examples`):
-
-- [`examples/extension/`](examples/extension/) — a Chrome MV3 compatibility harness: service worker → offscreen document (with corpse recovery) → worker hosting an Agents SDK `Counter` and local sub-agents. Proves persistent state, sibling and nested facet isolation, overlapping async work, abort/delete lifecycle, sub-agent scheduling across host recreation, exclusive host ownership, hibernating `AgentClient` WebSockets, state sync, callable and streaming RPC, SDK queues, stateless MCP, inbound email routing, the MV3 CSP story (`'wasm-unsafe-eval'`), and `chrome.alarms` recreation of an evicted host before durable alarm delivery.
-- [`examples/vibe-platform/`](examples/vibe-platform/) — a self-contained vibe-coding page that authors both a front-end and an Agents SDK `Agent`, runs them in-tab with durable SQLite-backed state, and exports the unchanged sources as a Wrangler project that passes `wrangler deploy --dry-run`.
+Open a second container over the same directory and `increment()` answers `3`:
+the instance was volatile, the storage was not. Inside an initialized actor
+worker, the browser host supplies
+`createSqliteWasmProvider(pool, { prefix: "/counter-1" })` from
+`@mcp-b/do-runtime/backends/sqlite-wasm`. The supervisor, OPFS pool, and worker
+bootstrapping are shown in the browser examples above.
 
 ## Hosting an actor
 
@@ -190,6 +249,27 @@ The lifecycle:
 5. Reach the platform through `container.globals` (or install it with `installActorScope`). For a host-provided promise an actor must await, wrap it once in `container.awaitIo()`.
 6. Watch `container.onBroken`; dispose the placement; recreate it on the next event over the same storage. A failed `blockConcurrencyWhile()` rejects its caller with `BrokenActorError` and breaks the placement with that same error.
 7. Before evicting, inspect `container.quiescence()`. Mirror live sockets through `ports.hibernation`, then build the replacement with `webSockets`; do not reconnect or call `acceptWebSocket()` again.
+
+### Browser worker boot order
+
+The order inside an actor worker is load-bearing. Each inversion below has a
+measured failure in the browser test lane:
+
+1. Capture raw platform timers at module scope and build the `Timer` port on
+   them. Reading the installed globals from that port recurses after the actor
+   scope replaces them.
+2. Set
+   `globalThis.sqlite3ApiConfig = { disable: { vfs: { opfs: true, "opfs-wl": true } } }`
+   before initializing sqlite. The host uses the SAH pool; the other OPFS VFSes
+   spawn workers and arm watchdogs of their own.
+3. Run `sqlite3InitModule()` and `installOpfsSAHPoolVfs(...)` before
+   `installActorScope`. The pool installer uses global timers during startup.
+4. Install the actor scope with a resolver that throws when its container is
+   gone. A torn-down worker must refuse new work instead of falling through to
+   ungated platform timers.
+5. Use a stable pool name, preserve files with `clearOnInit: false`, and size the
+   pool for two databases per root plus journals. The pool owns exclusive sync
+   access handles, so another context cannot open it at the same time.
 
 For a standard Durable Object binding, call
 `createDurableObjectNamespace(uniqueKey, channel)` and put the result in `env`
