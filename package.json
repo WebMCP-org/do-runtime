@@ -26,6 +26,7 @@
   "types": "./dist/src/index.d.ts",
   "files": [
     "dist",
+    "docs/migrations.md",
     "CHANGELOG.md",
     "LICENSE",
     "LICENSE.workerd",

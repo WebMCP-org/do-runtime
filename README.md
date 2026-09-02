@@ -16,6 +16,7 @@ It was extracted from Rook, SigVelo's AI agent for Chrome, which needed real Dur
 - [Quickstart](#quickstart)
 - [Hosting an actor](#hosting-an-actor)
 - [Storage, alarms, facets, I/O](#storage)
+- [Migrations](#migrations)
 - [What is not supported, and stability](#what-is-not-supported)
 - [Package layout](#package-layout)
 - [Tests](#tests)
@@ -207,7 +208,19 @@ re-enters the owning input gate.
 
 `SqlDatabaseProvider.open(name)` is the runtime execution seam. The runtime owns database names, tables, transactions, reset behaviour, facet metadata, and streaming `sql.ingest()` statement boundaries; the host chooses the physical provider and prefix. Stored KV values use structured-clone semantics across workerd, Node, and the browser; existing JSON rows remain readable. `_cf_` names are reserved to the runtime.
 
-Schema migrations work exactly as on Cloudflare, at both layers. An application migrates its own tables in its constructor — synchronous DDL under boot semantics, or `ctx.blockConcurrencyWhile()` when the path is async; the Agents SDK's versioned `_ensureSchema` and Drizzle's `durable-sqlite` migrator (`drizzle-kit generate` compiled into the bundle, `migrate()` in the constructor) run unchanged, the latter pinned end-to-end by [`src/drizzle-migrations.test.ts`](src/drizzle-migrations.test.ts). The runtime's own `_cf_` tables are versioned separately, per database file, in `PRAGMA user_version`: [`src/util/sqlite-migrations.ts`](src/util/sqlite-migrations.ts) brings an older file forward at open — before any event can enter — a file or imported snapshot stamped by a newer release refuses with the remedy named, and application SQL cannot reach the stamp, because `sql.exec()` enforces workerd's pragma allowlist (decision 19).
+### Migrations
+
+Wrangler class declarations, application SQL migrations, persisted `Agent.state`,
+Agents SDK tables, and runtime-owned tables have separate owners. Application
+SQL uses the same Drizzle migration bundle and constructor pattern on Cloudflare
+and on this runtime; `do-runtime` adds no application migration registry. See
+[`docs/migrations.md`](docs/migrations.md) for the Rook-facing workflow and the
+upstream Cloudflare and Drizzle references.
+
+The runtime's own `_cf_` tables are versioned per database file in
+`PRAGMA user_version`. [`src/util/sqlite-migrations.ts`](src/util/sqlite-migrations.ts)
+brings older files forward before any event enters and refuses storage written by
+a newer package version. Application SQL cannot access that runtime-owned stamp.
 
 The browser provider takes an already-installed OPFS SAH pool (`installOpfsSAHPoolVfs`; sync access handles in a dedicated worker — no cross-origin isolation or `SharedArrayBuffer` needed). One pool per worker; the root and each local facet get separate prefixes inside it. `SqliteWasmActorStorage` adds the close, physical delete, and clone operations a local placement host needs around one prefix. The Node provider uses in-memory databases by default and a directory when asked.
 
@@ -297,6 +310,7 @@ This is `0.x`. The public surface is what [`src/index.ts`](src/index.ts) and the
 | `backends/` | `node:sqlite` and sqlite-wasm/OPFS `SqlDatabaseProvider`s |
 | `conformance/` | One suite, three hosts: workerd, Node, browser; plus the probe fixture and benchmarks |
 | `examples/` | Runnable browser hosts: an MV3 extension and an in-page vibe-coding platform |
+| `docs/migrations.md` | How Rook evolves Wrangler declarations, application SQL, and persisted Agent state without duplicating Cloudflare's migration machinery |
 | `docs/decisions.md` | The numbered invariants and decisions that source comments cite (`§1.2`, `decision 8`) |
 
 The `util → io → api → server` direction follows workerd's own layering, enforced with TypeScript project references. Source comments cite the workerd file and line they port (`← io-gate.c++:142`), and every deliberate divergence is recorded beside its implementation and in a conformance row.

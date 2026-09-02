@@ -21,6 +21,7 @@ const files = new Set(report.files.map((file) => file.path));
 for (const required of [
   "package.json",
   "README.md",
+  "docs/migrations.md",
   "LICENSE",
   "CHANGELOG.md",
   "dist/index.js",
