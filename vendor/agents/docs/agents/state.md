@@ -96,6 +96,63 @@ async onStart() {
 }
 ```
 
+## Migrating Persisted State
+
+Override `migratePersistedState()` when a release changes the application state
+shape. It receives parsed JSON before the state is exposed to the Agent.
+
+```typescript
+type CounterState = {
+  stateVersion?: number;
+  count: number;
+  label?: string;
+};
+
+function isCounterState(state: unknown): state is CounterState {
+  if (typeof state !== "object" || state === null || Array.isArray(state)) {
+    return false;
+  }
+  if (!("count" in state) || typeof state.count !== "number") return false;
+  if (
+    "stateVersion" in state &&
+    (typeof state.stateVersion !== "number" ||
+      !Number.isSafeInteger(state.stateVersion) ||
+      state.stateVersion < 0)
+  ) {
+    return false;
+  }
+  return !("label" in state) || typeof state.label === "string";
+}
+
+export class CounterAgent extends Agent<Env, CounterState> {
+  initialState: CounterState = {
+    stateVersion: 1,
+    count: 0,
+    label: "Counter"
+  };
+
+  protected migratePersistedState(state: unknown): CounterState {
+    if (!isCounterState(state)) throw new TypeError("invalid counter state");
+    if ((state.stateVersion ?? 0) >= 1) return state;
+    return {
+      ...state,
+      stateVersion: 1,
+      label: state.label ?? "Counter"
+    };
+  }
+}
+```
+
+The hook is synchronous and runs once per wake on first state access. Return the
+input by reference when it is already current. A changed value is persisted
+directly without `validateStateChange()`, protocol broadcasts, or
+`onStateChanged()`; migration is hydration, not a live state update. If the hook
+throws, the stored row remains unchanged so a corrected release can retry it.
+
+Keep migrations forward-compatible: preserve unknown fields, migrate only older
+versions, and accept a newer numeric version unchanged so rollbacks and mixed
+extension contexts can still read the shared state.
+
 ## Reading State
 
 Access the current state via the `this.state` getter:
@@ -491,10 +548,11 @@ onStateChanged(state: State, source: Connection | "server") {
 
 ### Methods
 
-| Method           | Signature                                                | Description                                   |
-| ---------------- | -------------------------------------------------------- | --------------------------------------------- |
-| `setState`       | `(state: State) => void`                                 | Update state, persist, and broadcast          |
-| `onStateChanged` | `(state: State, source: Connection \| "server") => void` | Called after state is persisted and broadcast |
+| Method                  | Signature                                                | Description                                   |
+| ----------------------- | -------------------------------------------------------- | --------------------------------------------- |
+| `setState`              | `(state: State) => void`                                 | Update state, persist, and broadcast          |
+| `migratePersistedState` | `(state: unknown) => State`                              | Migrate parsed state during hydration         |
+| `onStateChanged`        | `(state: State, source: Connection \| "server") => void` | Called after state is persisted and broadcast |
 
 ### Workflow Step Methods
 

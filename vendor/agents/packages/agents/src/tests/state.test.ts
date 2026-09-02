@@ -400,19 +400,41 @@ describe("state management", () => {
   });
 
   describe("error recovery", () => {
-    it("allows subclasses to reject valid persisted JSON without mutating it", async () => {
+    it("migrates persisted state before exposure without update side effects", async () => {
       const agentStub = await getAgentByName(
         env.TestStateAgent,
-        `rejected-persisted-state-${crypto.randomUUID()}`
+        `migrated-persisted-state-${crypto.randomUUID()}`
       );
 
-      await agentStub.insertRejectedPersistedState();
+      await agentStub.insertLegacyPersistedState();
+
+      await expect(agentStub.getState()).resolves.toEqual({
+        count: 7,
+        items: ["legacy"],
+        lastUpdated: "migrated"
+      });
+      await expect(agentStub.getPersistedStateRow()).resolves.toBe(
+        '{"count":7,"items":["legacy"],"lastUpdated":"migrated"}'
+      );
+      await expect(agentStub.getStateUpdateCalls()).resolves.toEqual([]);
+    });
+
+    it("leaves persisted state unchanged when migration fails so hydration can retry", async () => {
+      const agentStub = await getAgentByName(
+        env.TestStateAgent,
+        `failed-persisted-state-migration-${crypto.randomUUID()}`
+      );
+
+      await agentStub.insertUnmigratablePersistedState();
 
       await expect(agentStub.getPersistedStateHydrationError()).resolves.toBe(
-        "Persisted Agent state was rejected before hydration"
+        "Persisted Agent state migration failed"
+      );
+      await expect(agentStub.getPersistedStateHydrationError()).resolves.toBe(
+        "Persisted Agent state migration failed"
       );
       await expect(agentStub.getPersistedStateRow()).resolves.toBe(
-        '{"rejected":true}'
+        '{"migrationFails":true}'
       );
     });
 

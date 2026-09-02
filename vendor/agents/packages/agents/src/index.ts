@@ -1796,14 +1796,10 @@ export class Agent<
     // This handles all values including falsy ones (null, 0, false, "").
     if (result.length > 0) {
       const state = result[0].state;
-
-      // Give stricter hosts a chance to reject a present, non-current row
-      // before the default malformed-JSON recovery mutates it. The default
-      // remains a no-op, so existing Agents keep their repair behavior.
-      this.validatePersistedState(state);
+      let parsedState: unknown;
 
       try {
-        this._state = JSON.parse(state as string);
+        parsedState = JSON.parse(state ?? "null");
       } catch (e) {
         console.error(
           "Failed to parse stored state, falling back to initialState:",
@@ -1818,7 +1814,17 @@ export class Agent<
           this.sql`DELETE FROM cf_agents_state WHERE id = ${STATE_ROW_ID}`;
           return undefined as State;
         }
+        return this._state;
       }
+
+      const migratedState = this.migratePersistedState(parsedState);
+      if (migratedState !== parsedState) {
+        this.sql`
+          INSERT OR REPLACE INTO cf_agents_state (id, state)
+          VALUES (${STATE_ROW_ID}, ${JSON.stringify(migratedState)})
+        `;
+      }
+      this._state = migratedState;
       return this._state;
     }
 
@@ -3280,18 +3286,15 @@ export class Agent<
   }
 
   /**
-   * Called with an existing serialized Agent-state row immediately before
-   * hydration. Override to validate or reject persisted state by throwing.
+   * Called with parsed persisted state before it is exposed to the Agent.
+   * Override to migrate older application state synchronously.
    *
-   * This hook runs before JSON parsing and before the default malformed-state
-   * recovery, allowing clean-release hosts to refuse an invalid current row
-   * without rewriting or deleting it. Missing state does not invoke the hook.
-   *
-   * IMPORTANT: This hook must be synchronous.
+   * Return the input by reference when no migration is needed. A changed value
+   * is persisted without validation, broadcast, or state-change hooks. Throwing
+   * leaves the stored row unchanged so a later hydration can retry.
    */
-  // oxlint-disable-next-line eslint(no-unused-vars) -- parameter used by subclass overrides
-  protected validatePersistedState(_serializedState: string | null): void {
-    // override this to validate persisted state before hydration
+  protected migratePersistedState(state: unknown): State {
+    return state as State;
   }
 
   /**

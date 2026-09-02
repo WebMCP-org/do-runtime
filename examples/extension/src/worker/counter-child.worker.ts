@@ -8,19 +8,21 @@
  */
 
 import { Agent } from "agents";
+import type {
+  CounterValueState,
+  NestedSubAgentSnapshot,
+  SubAgentSnapshot,
+} from "../protocol";
 
-type CounterState = { value: number };
 type CounterEnv = { Counter: DurableObjectNamespace<Counter> };
-type SubAgentSnapshot = { name: string; value: number; parentValue: number };
-type NestedSubAgentSnapshot = { childValue: number; leafValue: number };
 
 /** A type-only parent handle; `parentAgent()` resolves it by class name. */
-class Counter extends Agent<CounterEnv, CounterState> {
+class Counter extends Agent<CounterEnv> {
   declare currentValue: () => Promise<number>;
 }
 
-export class CounterChild extends Agent<CounterEnv, CounterState> {
-  override initialState: CounterState = { value: 0 };
+export class CounterChild extends Agent<CounterEnv, CounterValueState> {
+  override initialState: CounterValueState = { value: 0 };
 
   async bump(): Promise<SubAgentSnapshot> {
     const value = this.state.value + 1;
@@ -54,8 +56,8 @@ export class CounterChild extends Agent<CounterEnv, CounterState> {
   }
 }
 
-export class CounterLeaf extends Agent<CounterEnv, CounterState> {
-  override initialState: CounterState = { value: 0 };
+export class CounterLeaf extends Agent<CounterEnv, CounterValueState> {
+  override initialState: CounterValueState = { value: 0 };
 
   async bump(): Promise<NestedSubAgentSnapshot> {
     const value = this.state.value + 1;

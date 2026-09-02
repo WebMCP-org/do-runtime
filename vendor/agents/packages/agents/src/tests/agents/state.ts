@@ -85,12 +85,22 @@ export class TestStateAgent extends Agent<Cloudflare.Env, TestState> {
     );
   }
 
-  // Insert valid JSON that this test Agent's hydration hook deliberately
-  // rejects, without touching the in-memory state sentinel.
-  insertRejectedPersistedState() {
+  // Insert the state shape used before lastUpdated was introduced.
+  insertLegacyPersistedState() {
     this.ctx.storage.sql.exec(
-      `INSERT OR REPLACE INTO cf_agents_state (id, state) VALUES ('cf_state_row_id', '{"rejected":true}')`
+      `INSERT OR REPLACE INTO cf_agents_state (id, state) VALUES ('cf_state_row_id', '{"count":7,"items":["legacy"]}')`
     );
+    // @ts-expect-error - accessing private field for testing
+    this._state = this._stateSentinel;
+  }
+
+  // Insert valid JSON whose migration deliberately fails.
+  insertUnmigratablePersistedState() {
+    this.ctx.storage.sql.exec(
+      `INSERT OR REPLACE INTO cf_agents_state (id, state) VALUES ('cf_state_row_id', '{"migrationFails":true}')`
+    );
+    // @ts-expect-error - accessing private field for testing
+    this._state = this._stateSentinel;
   }
 
   getPersistedStateRow(): string | null | undefined {
@@ -119,12 +129,24 @@ export class TestStateAgent extends Agent<Cloudflare.Env, TestState> {
     return this.state;
   }
 
-  protected override validatePersistedState(
-    serializedState: string | null
-  ): void {
-    if (serializedState === '{"rejected":true}') {
-      throw new Error("Persisted Agent state was rejected before hydration");
+  protected override migratePersistedState(state: unknown): TestState {
+    if (typeof state === "object" && state !== null) {
+      if ("migrationFails" in state) {
+        throw new Error("Persisted Agent state migration failed");
+      }
+      if (!Array.isArray(state) && !("lastUpdated" in state)) {
+        const count = "count" in state ? state.count : undefined;
+        const items = "items" in state ? state.items : undefined;
+        if (
+          typeof count === "number" &&
+          Array.isArray(items) &&
+          items.every((item): item is string => typeof item === "string")
+        ) {
+          return { ...state, count, items, lastUpdated: "migrated" };
+        }
+      }
     }
+    return super.migratePersistedState(state);
   }
 
   // Get the current schema version from cf_agents_state

@@ -47,6 +47,9 @@ popup.html ──sendMessage──▶ service worker ──chrome.offscreen.crea
 - **Persistence that survives the context.** The e2e closes and recreates the real
   offscreen document, destroying its Worker, container, and instance, then finds
   the same `Agent.setState()` counter and event rows in the replacement renderer.
+- **Application-state migration during hydration.** The e2e writes the example's
+  old unversioned Agent state, destroys the whole offscreen host, and proves the
+  replacement migrates and persists it before a newly connected client sees it.
 - **A real `AlarmScheduler`, with its persisted retry ladder.** The alarm is armed
   through `Agent.schedule()`, recorded in both Agent storage and the scheduler's
   `_cf_ALARM` table, and delivered back as a gated event. The ladder — retry counts,

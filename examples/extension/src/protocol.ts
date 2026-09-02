@@ -27,7 +27,13 @@ export interface SupervisorRpc {
 }
 
 /** The state shape the real Agents client receives over its socket. */
-export type CounterState = { readonly value: number };
+export const CURRENT_COUNTER_STATE_VERSION = 1;
+export type CounterValueState = { readonly value: number };
+export type CounterState = CounterValueState & {
+  /** Added after v0; optional so an old client remains a valid wire peer. */
+  readonly stateVersion?: number;
+  readonly label?: string;
+};
 
 /** The recent-events rows `snapshot()` reports. Mirrors `worker/counter.ts`. */
 export type CounterEvent = {
@@ -37,6 +43,8 @@ export type CounterEvent = {
 
 export type CounterSnapshot = {
   readonly value: number;
+  readonly stateVersion: number | null;
+  readonly label: string | null;
   readonly events: readonly CounterEvent[];
 };
 
@@ -136,6 +144,7 @@ export interface HostRpc {
 export type HostOp =
   | keyof HostRpc
   | "sdkIncrement"
+  | "sdkSetLegacyState"
   | "sdkSetState"
   | "sdkState"
   | "sdkStream"

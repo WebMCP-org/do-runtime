@@ -342,10 +342,16 @@ const ops = {
   armWake: async (delayMs: number): Promise<number> => await host.armWake(delayMs),
   status: async (): Promise<HostStatus> => await host.status(),
   sdkIncrement: async (): Promise<number> => await (await connectedAgent()).call("increment"),
+  sdkSetLegacyState: async (value: number): Promise<void> => {
+    if (!Number.isSafeInteger(value)) throw new TypeError("value must be a safe integer");
+    const client = await connectedAgent();
+    client.setState({ value });
+  },
   sdkSetState: async (value: number): Promise<CounterState> => {
     if (!Number.isSafeInteger(value)) throw new TypeError("value must be a safe integer");
     const client = await connectedAgent();
-    const state = { value };
+    if (client.state === undefined) throw new Error("Agents client connected without state");
+    const state = { ...client.state, value };
     client.setState(state);
     return state;
   },
@@ -413,6 +419,8 @@ async function runOp(op: HostOp, args: readonly unknown[]): Promise<unknown> {
       return await ops.status();
     case "sdkIncrement":
       return await ops.sdkIncrement();
+    case "sdkSetLegacyState":
+      return await ops.sdkSetLegacyState(Number(args[0]));
     case "sdkSetState":
       return await ops.sdkSetState(Number(args[0]));
     case "sdkState":

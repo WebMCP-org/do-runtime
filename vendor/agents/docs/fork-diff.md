@@ -402,21 +402,21 @@ here that drifts on every refresh.
 - Supersedes: the 2026-08-21 entry below. Its conclusion that a host shim could
   not cover the gap predated the do-runtime browser primitives.
 
-## 2026-08-25 — Hosts can validate serialized Agent state before hydration
+## 2026-09-02 — Agents can migrate application state during hydration
 
 - Files: `vendor/agents/packages/agents/src/index.ts`, with the regression in
   `src/tests/state.test.ts` and its `TestStateAgent` fixture.
-- Why a shim cannot cover it: the Agent state getter privately owns both the
-  persisted row read and malformed-JSON repair. A host-side preflight had to
-  query the private `cf_agents_state` table and duplicate its row id before the
-  getter could rewrite a non-current row.
-- Change: add a synchronous protected `validatePersistedState()` hook after an
-  existing row is read but before JSON parsing or recovery. The default is a
-  no-op, preserving upstream repair behavior; a subclass may throw without the
-  row being changed. Rook now validates both root and worker state through this
-  hook and no longer reads Agents' private table directly.
-- Upstreamable: yes. It is an additive hydration-policy seam for clean-release
-  or schema-strict hosts and exposes no storage implementation detail.
+- Why a shim cannot cover it: the Agent state getter privately owns the
+  persisted row, hydration cache, and first protocol publication. Migrating in
+  a subclass constructor happens after hydration and can only persist through
+  `setState()`, which treats boot repair as a user update.
+- Change: replace the validation-only seam with synchronous protected
+  `migratePersistedState()`. The hook receives parsed JSON before exposure. A
+  changed value is stored directly without write validation, broadcasts, or
+  state-change hooks; a throw leaves the original row untouched for retry.
+- Upstreamable: yes. It gives application state the same hydrate-then-stamp
+  lifecycle as Agents' internal SQLite schema without exposing the private
+  table or imposing a migration framework.
 
 ## 2026-08-25 — Think can reconcile code-declared messenger channels
 
