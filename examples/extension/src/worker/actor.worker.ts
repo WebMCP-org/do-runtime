@@ -177,11 +177,27 @@ type FacetModule = {
   readonly loaded: Promise<Record<string, unknown>>;
 };
 
+function isFacetConstructor(value: unknown): value is FacetConstructor {
+  return typeof value === "function" && value.prototype !== undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+async function loadFacetModule(url: URL): Promise<Record<string, unknown>> {
+  const module: unknown = await import(/* @vite-ignore */ url.href);
+  if (!isRecord(module)) {
+    throw new TypeError(`do-runtime example: ${url.pathname} did not export a module record`);
+  }
+  return module;
+}
+
 const FACET_SCOPES_GLOBAL = "__doRuntimeExtensionFacetScopes";
 const COUNTER_CHILD_MODULE_URL = "../counter-child.js";
 const THINK_PROBE_MODULE_URL = "../think-probe.js";
 const facetScopes: Record<string, ActorScopeBindings> = {};
-(globalThis as Record<string, unknown>)[FACET_SCOPES_GLOBAL] = facetScopes;
+Object.defineProperty(globalThis, FACET_SCOPES_GLOBAL, { value: facetScopes });
 
 type FacetPlacement = {
   readonly container: ActorContainer;
@@ -226,10 +242,9 @@ class ExtensionFacetHost implements FacetHost {
     const started = (async (): Promise<FacetPlacement> => {
       const facetModule = this.#moduleFor(request.id, request.className);
       const exported = (await facetModule.loaded)[request.className];
-      if (typeof exported !== "function") {
+      if (!isFacetConstructor(exported)) {
         throw new Error(`do-runtime example: no bundled facet class named ${request.className}`);
       }
-      const ActorClass = exported as FacetConstructor;
       const storage = new SqliteWasmActorStorage(this.#requireHost(), `/facet-${request.id}`);
       const env: CounterEnv = { Counter: counterNamespace(facetModule.gate) };
       const exports = { ...workerExports, Counter: env.Counter };
@@ -249,9 +264,7 @@ class ExtensionFacetHost implements FacetHost {
       facetModule.gate.container = container;
       let instance: object;
       try {
-        instance = await container.start(
-          (ctx, childEnv) => new ActorClass(ctx, childEnv as CounterEnv),
-        );
+        instance = await container.start((ctx) => new exported(ctx, env));
       } catch (error) {
         facetModule.gate.container = undefined;
         container.abort(error);
@@ -324,7 +337,7 @@ class ExtensionFacetHost implements FacetHost {
     url.searchParams.set("scope", key);
     const module = {
       gate,
-      loaded: import(/* @vite-ignore */ url.href) as Promise<Record<string, unknown>>,
+      loaded: loadFacetModule(url),
     };
     this.#modules.set(id, module);
     return module;
@@ -506,9 +519,9 @@ async function installSubstrate(): Promise<Substrate> {
       abandonAlarm: async (scheduledTime: number): Promise<number | null> =>
         await (await placed()).container.abandonAlarm(scheduledTime),
     }),
-    projectWake: (scheduledTime) => {
+    projectWake: async (scheduledTime) => {
       if (peer === undefined) throw new Error("cannot project an alarm before the supervisor connects");
-      return peer.projectWake(scheduledTime) as unknown as Promise<void>;
+      await peer.projectWake(scheduledTime);
     },
   });
 
@@ -583,9 +596,7 @@ async function place(): Promise<Live> {
 
   let instance: Counter;
   try {
-    instance = await container.start(
-      (ctx, actorEnv) => new Counter(ctx, actorEnv as CounterEnv),
-    );
+    instance = await container.start((ctx) => new Counter(ctx, env));
     // A break during boot has already run the handler above, and `live` was not
     // this container yet — so nothing dropped it. Refuse to publish a container
     // that is already broken rather than handing callers one that answers nothing.
@@ -839,10 +850,22 @@ async function connectAgentSocket(url: string): Promise<UpgradeWebSocket> {
   return socket;
 }
 
-self.addEventListener("message", (event: MessageEvent<WorkerBoot>) => {
+function isWorkerBoot(value: unknown): value is WorkerBoot {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "port" in value &&
+    value.port instanceof MessagePort &&
+    "sockets" in value &&
+    value.sockets instanceof MessagePort
+  );
+}
+
+self.addEventListener("message", (event: MessageEvent<unknown>) => {
   if (peer !== undefined) {
     throw new Error("do-runtime example: this actor worker was booted twice.");
   }
+  if (!isWorkerBoot(event.data)) throw new TypeError("invalid actor worker boot message");
   // `newRpcSession` from the package, never capnweb's `newMessagePortRpcSession`
   // directly: it applies the `RpcTarget` prototype graft that makes the class
   // above recognisable to capnweb, immediately before opening the session.

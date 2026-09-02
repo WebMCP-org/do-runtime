@@ -245,6 +245,19 @@ async function main() {
     });
     await ensureHost(popup);
 
+    const invalidOperation = await popup.evaluate(() =>
+      chrome.runtime.sendMessage({ type: "host-op", op: "not-an-operation", args: [] }),
+    );
+    check(
+      "an unknown host operation is rejected at the message boundary",
+      invalidOperation.ok,
+      false,
+    );
+    const invalidArgument = await popup.evaluate(() =>
+      chrome.runtime.sendMessage({ type: "host-op", op: "armWake", args: ["soon"] }),
+    );
+    check("an invalid host argument is rejected instead of coerced", invalidArgument.ok, false);
+
     const storage = await op(popup, "storageStatus");
     if (!/^storage: (persistent|best-effort), \d+ B used of \d+ B$/.test(storage)) {
       fail("the extension reports origin persistence and quota", storage);

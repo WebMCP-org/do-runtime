@@ -169,3 +169,15 @@ export type ExtensionMessage =
 export type ExtensionResponse<T = unknown> =
   | { readonly ok: true; readonly value: T }
   | { readonly ok: false; readonly error: string };
+
+/** Narrow the untyped value returned by `chrome.runtime.sendMessage`. */
+export function parseExtensionResponse(value: unknown): ExtensionResponse {
+  if (typeof value !== "object" || value === null || Array.isArray(value) || !("ok" in value)) {
+    throw new TypeError("extension context returned an invalid response");
+  }
+  if (value.ok === true && "value" in value) return { ok: true, value: value.value };
+  if (value.ok === false && "error" in value && typeof value.error === "string") {
+    return { ok: false, error: value.error };
+  }
+  throw new TypeError("extension context returned an invalid response");
+}

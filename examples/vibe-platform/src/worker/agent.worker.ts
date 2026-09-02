@@ -37,6 +37,9 @@ const POOL_NAME = "vibe-user-agent";
 const STORAGE_PREFIX = "/agent";
 const ACTOR_ID = "default";
 
+Object.defineProperty(globalThis, CLOUDFLARE_WORKERS_GLOBAL, { value: cloudflareWorkers });
+Object.defineProperty(globalThis, AGENTS_GLOBAL, { value: agents });
+
 const timer: Timer = {
   now: () => Date.now(),
   afterDelay: (ms, signal) =>
@@ -79,6 +82,26 @@ type AuthoredActor = {
   fetch(request: Request): Promise<Response> | Response;
 };
 
+type AuthoredActorConstructor = new (
+  ctx: DurableObjectState,
+  env: Record<string, never>,
+) => object;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isAuthoredActorClass(value: unknown): value is AuthoredActorConstructor {
+  return (
+    typeof value === "function" &&
+    (value.prototype instanceof DurableObject || value.prototype instanceof agents.Agent)
+  );
+}
+
+function isAuthoredActor(value: object): value is AuthoredActor {
+  return "fetch" in value && typeof value.fetch === "function";
+}
+
 let live:
   | {
       container: ActorContainer;
@@ -108,30 +131,27 @@ function installScope(): void {
 }
 
 async function evaluateActor(): Promise<{
-  ActorClass: new (ctx: DurableObjectState, env: Record<string, never>) => object;
+  ActorClass: AuthoredActorConstructor;
   className: string;
   exports: Record<string, unknown>;
 }> {
-  (globalThis as Record<string, unknown>)[CLOUDFLARE_WORKERS_GLOBAL] = cloudflareWorkers;
-  (globalThis as Record<string, unknown>)[AGENTS_GLOBAL] = agents;
   const url = URL.createObjectURL(new Blob([authoredSource], { type: "text/javascript" }));
-  let imported: Record<string, unknown>;
+  let imported: unknown;
   try {
-    imported = (await import(/* @vite-ignore */ url)) as Record<string, unknown>;
+    imported = await import(/* @vite-ignore */ url);
   } finally {
     URL.revokeObjectURL(url);
   }
+  if (!isRecord(imported)) throw new Error("The authored bundle did not export a module record.");
   const module = imported.default;
-  if (typeof module !== "object" || module === null) {
+  if (!isRecord(module)) {
     throw new Error("The authored bundle did not export a module record.");
   }
 
   // The SDK's aliased Workers module can have a different class identity from
   // the host's copy, so either public base is an authored actor.
   const classes = Object.entries(module).filter(
-    (entry): entry is [string, typeof DurableObject] =>
-      typeof entry[1] === "function" &&
-      (entry[1].prototype instanceof DurableObject || entry[1].prototype instanceof agents.Agent),
+    (entry): entry is [string, AuthoredActorConstructor] => isAuthoredActorClass(entry[1]),
   );
   if (classes.length !== 1) {
     throw new Error(
@@ -145,12 +165,9 @@ async function evaluateActor(): Promise<{
     throw new Error("The DurableObject class must use a named JavaScript export for Wrangler.");
   }
   return {
-    ActorClass: ActorClass as unknown as new (
-      ctx: DurableObjectState,
-      env: Record<string, never>,
-    ) => object,
+    ActorClass,
     className,
-    exports: module as Record<string, unknown>,
+    exports: module,
   };
 }
 
@@ -160,11 +177,12 @@ async function place(): Promise<NonNullable<typeof live>> {
   installScope();
   const evaluated = await evaluateActor();
   const storage = new SqliteWasmActorStorage(host, STORAGE_PREFIX);
+  const env: Record<string, never> = {};
   const container = await createActorContainer({
     id: ACTOR_ID,
     uniqueKey: UNIQUE_KEY,
     exports: evaluated.exports,
-    env: {},
+    env,
     ports: {
       sql: storage,
       alarms: DEFAULT_ALARM_OUTLET,
@@ -179,14 +197,13 @@ async function place(): Promise<NonNullable<typeof live>> {
     storage.close();
     report(`the user agent broke: ${describe(error)}`, true);
   });
-  let instance: object;
+  let instance: AuthoredActor;
   try {
-    instance = await container.start(
-      (ctx, env) => new evaluated.ActorClass(ctx, env as Record<string, never>),
-    );
-    if (!("fetch" in instance) || typeof instance.fetch !== "function") {
+    const candidate = await container.start((ctx) => new evaluated.ActorClass(ctx, env));
+    if (!isAuthoredActor(candidate)) {
       throw new Error(`${evaluated.className} has no fetch() handler.`);
     }
+    instance = candidate;
   } catch (error) {
     if (scopeContainer === container) scopeContainer = undefined;
     storage.close();
@@ -195,7 +212,7 @@ async function place(): Promise<NonNullable<typeof live>> {
   }
   live = {
     container,
-    entry: container.entry(instance as AuthoredActor),
+    entry: container.entry(instance),
     className: evaluated.className,
     storage,
   };
@@ -266,8 +283,19 @@ function describe(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-self.addEventListener("message", (event: MessageEvent<AgentBoot>) => {
+function isAgentBoot(value: unknown): value is AgentBoot {
+  return (
+    isRecord(value) &&
+    "port" in value &&
+    value.port instanceof MessagePort &&
+    "source" in value &&
+    typeof value.source === "string"
+  );
+}
+
+self.addEventListener("message", (event: MessageEvent<unknown>) => {
   if (peer !== undefined) throw new Error("This user-agent worker was booted twice.");
+  if (!isAgentBoot(event.data)) throw new TypeError("Invalid user-agent worker boot message.");
   authoredSource = event.data.source;
   peer = newRpcSession<PageRpc>(event.data.port, new AgentTarget());
 });

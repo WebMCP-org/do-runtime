@@ -455,7 +455,7 @@ it("Part 4 mechanic 2 a NEW external event does not inherit a running critical s
   const { ctx } = newContext();
   let marker = "init";
   const inside = Promise.withResolvers<void>();
-  const external = Promise.withResolvers<Promise<void>>();
+  const external = Promise.withResolvers<void>();
 
   const blocking = blockConcurrencyWhile(ctx, async () => {
     marker = "A";
@@ -471,7 +471,7 @@ it("Part 4 mechanic 2 a NEW external event does not inherit a running critical s
 
   inside.resolve();
   expect(await blocking).toBe("A");
-  await (await external.promise);
+  await external.promise;
   expect(marker).toBe("B");
 });
 

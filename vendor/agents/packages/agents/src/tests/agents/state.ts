@@ -8,11 +8,32 @@ export type TestState = {
   lastUpdated: string | null;
 };
 
+type LegacyTestState = Omit<TestState, "lastUpdated">;
+
+function isLegacyTestState(state: unknown): state is LegacyTestState {
+  return (
+    typeof state === "object" &&
+    state !== null &&
+    !Array.isArray(state) &&
+    !("lastUpdated" in state) &&
+    "count" in state &&
+    typeof state.count === "number" &&
+    "items" in state &&
+    Array.isArray(state.items) &&
+    state.items.every((item) => typeof item === "string")
+  );
+}
+
 export class TestStateAgent extends Agent<Cloudflare.Env, TestState> {
   // Capture the DEFAULT_STATE sentinel reference for cache reset in tests.
   // Child field initializers run after super(), at which point _state is DEFAULT_STATE.
   // @ts-expect-error - accessing private field for testing
   private _stateSentinel: TestState = this._state;
+
+  private resetStateCacheForHydration() {
+    // @ts-expect-error - accessing private field for testing
+    this._state = this._stateSentinel;
+  }
 
   initialState: TestState = {
     count: 0,
@@ -90,8 +111,7 @@ export class TestStateAgent extends Agent<Cloudflare.Env, TestState> {
     this.ctx.storage.sql.exec(
       `INSERT OR REPLACE INTO cf_agents_state (id, state) VALUES ('cf_state_row_id', '{"count":7,"items":["legacy"]}')`
     );
-    // @ts-expect-error - accessing private field for testing
-    this._state = this._stateSentinel;
+    this.resetStateCacheForHydration();
   }
 
   // Insert valid JSON whose migration deliberately fails.
@@ -99,8 +119,7 @@ export class TestStateAgent extends Agent<Cloudflare.Env, TestState> {
     this.ctx.storage.sql.exec(
       `INSERT OR REPLACE INTO cf_agents_state (id, state) VALUES ('cf_state_row_id', '{"migrationFails":true}')`
     );
-    // @ts-expect-error - accessing private field for testing
-    this._state = this._stateSentinel;
+    this.resetStateCacheForHydration();
   }
 
   getPersistedStateRow(): string | null | undefined {
@@ -122,31 +141,22 @@ export class TestStateAgent extends Agent<Cloudflare.Env, TestState> {
 
   // Access state and check if it recovered to initialState
   getStateAfterCorruption(): TestState {
-    // Reset the in-memory cache so the getter re-reads from DB
-    // @ts-expect-error - accessing private field for testing
-    this._state = this._stateSentinel;
+    this.resetStateCacheForHydration();
     // This should trigger the try-catch and fallback to initialState
     return this.state;
   }
 
   protected override migratePersistedState(state: unknown): TestState {
-    if (typeof state === "object" && state !== null) {
-      if ("migrationFails" in state) {
-        throw new Error("Persisted Agent state migration failed");
-      }
-      if (!Array.isArray(state) && !("lastUpdated" in state)) {
-        const count = "count" in state ? state.count : undefined;
-        const items = "items" in state ? state.items : undefined;
-        if (
-          typeof count === "number" &&
-          Array.isArray(items) &&
-          items.every((item): item is string => typeof item === "string")
-        ) {
-          return { ...state, count, items, lastUpdated: "migrated" };
-        }
-      }
+    if (
+      typeof state === "object" &&
+      state !== null &&
+      "migrationFails" in state
+    ) {
+      throw new Error("Persisted Agent state migration failed");
     }
-    return super.migratePersistedState(state);
+    return isLegacyTestState(state)
+      ? { ...state, lastUpdated: "migrated" }
+      : super.migratePersistedState(state);
   }
 
   // Get the current schema version from cf_agents_state
@@ -237,9 +247,7 @@ export class TestStateAgent extends Agent<Cloudflare.Env, TestState> {
       "INSERT OR REPLACE INTO cf_agents_state (id, state) VALUES ('cf_state_row_id', ?)",
       value
     );
-    // Reset in-memory cache to sentinel so getter re-reads from DB
-    // @ts-expect-error - accessing private field for testing
-    this._state = this._stateSentinel;
+    this.resetStateCacheForHydration();
   }
 
   // Simulate orphaned wasChanged: legacy DO crashed during corruption recovery,
@@ -251,8 +259,7 @@ export class TestStateAgent extends Agent<Cloudflare.Env, TestState> {
     this.ctx.storage.sql.exec(
       `INSERT OR REPLACE INTO cf_agents_state (id, state) VALUES ('cf_state_was_changed', 'true')`
     );
-    // @ts-expect-error - accessing private field for testing
-    this._state = this._stateSentinel;
+    this.resetStateCacheForHydration();
   }
 }
 

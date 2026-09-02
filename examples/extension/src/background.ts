@@ -11,7 +11,7 @@
  */
 
 import { OffscreenDocumentCoordinator } from "@mcp-b/do-runtime/browser/offscreen-document";
-import { WAKE_ALARM, type ExtensionMessage, type ExtensionResponse } from "./protocol";
+import { WAKE_ALARM, type ExtensionResponse } from "./protocol";
 
 const OFFSCREEN_URL = "offscreen.html";
 
@@ -83,6 +83,10 @@ async function projectWake(scheduledTime: number | null): Promise<void> {
   await chrome.alarms.create(WAKE_ALARM, { when: scheduledTime });
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 /**
  * `ensure-host` is the popup asking for a host before it sends any operation;
  * `project-wake` mirrors the scheduler's earliest durable wait into Chrome.
@@ -92,13 +96,21 @@ async function projectWake(scheduledTime: number | null): Promise<void> {
  */
 chrome.runtime.onMessage.addListener(
   (
-    message: ExtensionMessage,
+    message: unknown,
     _sender: chrome.runtime.MessageSender,
     sendResponse: (response: ExtensionResponse) => void,
   ): boolean => {
-    if (message?.type !== "ensure-host" && message?.type !== "project-wake") return false;
-    const operation =
-      message.type === "ensure-host" ? ensureOffscreen() : projectWake(message.scheduledTime);
+    if (!isRecord(message) || (message.type !== "ensure-host" && message.type !== "project-wake")) {
+      return false;
+    }
+    let operation: Promise<void>;
+    if (message.type === "ensure-host") {
+      operation = ensureOffscreen();
+    } else if (message.scheduledTime === null || typeof message.scheduledTime === "number") {
+      operation = projectWake(message.scheduledTime);
+    } else {
+      operation = Promise.reject(new TypeError("invalid projected wake message"));
+    }
     void operation.then(
       () => {
         sendResponse({ ok: true, value: null });

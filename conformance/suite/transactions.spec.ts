@@ -31,7 +31,7 @@ it("§1.7.1 a storage await does not end the implicit transaction", async () => 
   const probe = await host.spawn("tx-storage");
   await expectAbort(probe, "txAcrossStorageAwait", "conformance: kill before commit");
   const after = await host.respawn(probe);
-  const state = (await after.call("readTx")) as Record<string, unknown>;
+  const state = await after.call<Record<string, unknown>>("readTx");
   // One transaction spanned the await: both writes died together.
   expect(state.p1).toBeNull();
   expect(state.p2).toBeNull();
@@ -41,7 +41,7 @@ it("§1.7.1 a timer await commits, and opens a new transaction", async () => {
   const probe = await host.spawn("tx-timer");
   await expectAbort(probe, "txAcrossTimerAwait", "conformance: kill before commit");
   const after = await host.respawn(probe);
-  const state = (await after.call("readTx")) as Record<string, unknown>;
+  const state = await after.call<Record<string, unknown>>("readTx");
   expect(state.t1).toBe(1);
   expect(state.t2).toBeNull();
 });
@@ -53,16 +53,16 @@ it("§2.6 a schedule row and its follow-up setAlarm are one atomic write", async
   const probe = await host.spawn("tx-alarm");
   await expectAbort(probe, "txInsertThenAlarm", "conformance: kill between row and alarm");
   const after = await host.respawn(probe);
-  const state = (await after.call("readTx")) as Record<string, unknown>;
+  const state = await after.call<Record<string, unknown>>("readTx");
   expect(state.row).toBeNull();
 });
 
 it("§2.4 a throwing transactionSync callback rolls back, DDL included", async () => {
   const probe = await host.spawn("tx-sync");
-  const result = (await probe.call("transactionSyncRollback")) as {
+  const result = await probe.call<{
     threw: string;
     count: number;
-  };
+  }>("transactionSyncRollback");
   expect(result.threw).toContain("rollback me");
   expect(result.count).toBe(1); // the pre-existing row only
 });

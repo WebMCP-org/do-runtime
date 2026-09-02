@@ -230,6 +230,7 @@ async function place(): Promise<Live> {
   const host = await pool();
   installScope();
   const storage = new SqliteWasmActorStorage(host, STORAGE_PREFIX);
+  const env: WorkspaceEnv = {};
 
   const container = await createActorContainer({
     id: ACTOR_ID,
@@ -239,7 +240,7 @@ async function place(): Promise<Live> {
     // would register `asLoopbackDurableObjectClass(...)` values here rather than
     // the bare class.
     exports: { Workspace },
-    env: {},
+    env,
     ports: {
       sql: storage,
       // Both refuse by name — this example schedules no alarms and places no
@@ -268,9 +269,7 @@ async function place(): Promise<Live> {
 
   let instance: Workspace;
   try {
-    instance = await container.start(
-      (ctx, env): Workspace => new Workspace(ctx, env as WorkspaceEnv),
-    );
+    instance = await container.start((ctx): Workspace => new Workspace(ctx, env));
   } catch (error) {
     storage.close();
     throw error;
@@ -354,12 +353,21 @@ function describe(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-self.addEventListener("message", (event: MessageEvent) => {
+function isWorkspaceBoot(value: unknown): value is WorkspaceBoot {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "port" in value &&
+    value.port instanceof MessagePort
+  );
+}
+
+self.addEventListener("message", (event: MessageEvent<unknown>) => {
   if (peer !== undefined) throw new Error("This worker was booted twice.");
-  const boot = event.data as WorkspaceBoot;
+  if (!isWorkspaceBoot(event.data)) throw new TypeError("Invalid workspace worker boot message.");
   // A `MessagePort` cannot be serialised by capnweb, so it arrives once by raw
   // `postMessage` with a transfer list. Everything after this line is capnweb —
   // through the runtime's `newRpcSession`, never capnweb's own, because that
   // export applies the `RpcTarget` identity graft each session needs.
-  peer = newRpcSession<PageRpc>(boot.port, new WorkspaceTarget());
+  peer = newRpcSession<PageRpc>(event.data.port, new WorkspaceTarget());
 });

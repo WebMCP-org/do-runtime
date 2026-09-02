@@ -144,8 +144,8 @@ export class Counter extends Agent<CounterEnv, CounterState> {
   async snapshot(): Promise<CounterSnapshot> {
     this.#schema();
     const events = this.ctx.storage.sql
-      .exec("SELECT at, kind FROM events ORDER BY rowid DESC LIMIT ?", RECENT_EVENTS)
-      .toArray() as unknown as CounterEvent[];
+      .exec<CounterEvent>("SELECT at, kind FROM events ORDER BY rowid DESC LIMIT ?", RECENT_EVENTS)
+      .toArray();
     return {
       value: this.state.value,
       stateVersion: this.state.stateVersion ?? null,

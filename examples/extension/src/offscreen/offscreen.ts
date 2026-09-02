@@ -29,6 +29,7 @@ import {
 } from "../../../platform-shims/browser-storage";
 import { createMessagePortWebSocketConstructor } from "@mcp-b/do-runtime/browser/message-port-websocket";
 import {
+  parseExtensionResponse,
   RELAY_CLIENT_READY,
   type CounterState,
   type CounterSnapshot,
@@ -104,11 +105,12 @@ worker.postMessage(
  */
 class SupervisorTarget extends RpcTarget implements SupervisorRpc {
   async projectWake(scheduledTime: number | null): Promise<void> {
-    const response = (await chrome.runtime.sendMessage({
+    const response: unknown = await chrome.runtime.sendMessage({
       type: "project-wake",
       scheduledTime,
-    } satisfies ExtensionMessage)) as ExtensionResponse;
-    if (!response.ok) throw new Error(response.error);
+    } satisfies ExtensionMessage);
+    const result = parseExtensionResponse(response);
+    if (!result.ok) throw new Error(result.error);
   }
 }
 
@@ -372,24 +374,38 @@ const ops = {
   },
 } satisfies Record<HostOp, (...args: never[]) => Promise<unknown>>;
 
+function stringArg(args: readonly unknown[], index: number): string {
+  const value = args[index];
+  if (typeof value !== "string") throw new TypeError(`argument ${index + 1} must be a string`);
+  return value;
+}
+
+function integerArg(args: readonly unknown[], index: number): number {
+  const value = args[index];
+  if (typeof value !== "number" || !Number.isSafeInteger(value)) {
+    throw new TypeError(`argument ${index + 1} must be a safe integer`);
+  }
+  return value;
+}
+
 async function runOp(op: HostOp, args: readonly unknown[]): Promise<unknown> {
   switch (op) {
     case "directStubIncrement":
       return await ops.directStubIncrement();
     case "email":
-      return await ops.email(String(args[0]), String(args[1]));
+      return await ops.email(stringArg(args, 0), stringArg(args, 1));
     case "evict":
       return await ops.evict();
     case "increment":
       return await ops.increment();
     case "enqueueIncrement":
-      return await ops.enqueueIncrement(Number(args[0]));
+      return await ops.enqueueIncrement(integerArg(args, 0));
     case "mcp": {
       const params = args[1];
       if (!isRecord(params)) {
         throw new TypeError("MCP params must be an object");
       }
-      return await ops.mcp(String(args[0]), params);
+      return await ops.mcp(stringArg(args, 0), params);
     }
     case "snapshot":
       return await ops.snapshot();
@@ -402,31 +418,31 @@ async function runOp(op: HostOp, args: readonly unknown[]): Promise<unknown> {
     case "nestedSubAgent":
       return await ops.nestedSubAgent();
     case "armSubAgentWake":
-      return await ops.armSubAgentWake(Number(args[0] ?? 0));
+      return await ops.armSubAgentWake(integerArg(args, 0));
     case "scheduledSubAgentValue":
       return await ops.scheduledSubAgentValue();
     case "startThink":
-      return await ops.startThink(String(args[0]), String(args[1]));
+      return await ops.startThink(stringArg(args, 0), stringArg(args, 1));
     case "submitThink":
-      return await ops.submitThink(String(args[0]), String(args[1]), String(args[2]));
+      return await ops.submitThink(stringArg(args, 0), stringArg(args, 1), stringArg(args, 2));
     case "thinkStatus":
-      return await ops.thinkStatus(String(args[0]));
+      return await ops.thinkStatus(stringArg(args, 0));
     case "stopThink":
-      return await ops.stopThink(String(args[0]));
+      return await ops.stopThink(stringArg(args, 0));
     case "armWake":
-      return await ops.armWake(Number(args[0] ?? 0));
+      return await ops.armWake(integerArg(args, 0));
     case "status":
       return await ops.status();
     case "sdkIncrement":
       return await ops.sdkIncrement();
     case "sdkSetLegacyState":
-      return await ops.sdkSetLegacyState(Number(args[0]));
+      return await ops.sdkSetLegacyState(integerArg(args, 0));
     case "sdkSetState":
-      return await ops.sdkSetState(Number(args[0]));
+      return await ops.sdkSetState(integerArg(args, 0));
     case "sdkState":
       return await ops.sdkState();
     case "relayRoundTrip":
-      return await ops.relayRoundTrip(String(args[0]));
+      return await ops.relayRoundTrip(stringArg(args, 0));
     case "storageStatus":
       return await ops.storageStatus();
     case "sdkStream":
@@ -436,6 +452,10 @@ async function runOp(op: HostOp, args: readonly unknown[]): Promise<unknown> {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isHostOp(value: unknown): value is HostOp {
+  return typeof value === "string" && Object.hasOwn(ops, value);
 }
 
 /**
@@ -465,12 +485,16 @@ window.__host = ops;
 if (typeof chrome !== "undefined" && chrome.runtime?.id !== undefined) {
   chrome.runtime.onMessage.addListener(
     (
-      message: ExtensionMessage,
+      message: unknown,
       _sender: chrome.runtime.MessageSender,
       sendResponse: (response: ExtensionResponse) => void,
     ): boolean => {
-      if (message?.type !== "host-op") return false;
-      void runOp(message.op, message.args).then(
+      if (!isRecord(message) || message.type !== "host-op") return false;
+      const operation =
+        isHostOp(message.op) && Array.isArray(message.args)
+          ? runOp(message.op, message.args)
+          : Promise.reject(new TypeError("invalid host operation message"));
+      void operation.then(
         (value) => {
           sendResponse({ ok: true, value });
         },

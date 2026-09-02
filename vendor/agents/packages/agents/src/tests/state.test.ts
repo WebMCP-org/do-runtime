@@ -399,7 +399,7 @@ describe("state management", () => {
     });
   });
 
-  describe("error recovery", () => {
+  describe("persisted state migration", () => {
     it("migrates persisted state before exposure without update side effects", async () => {
       const agentStub = await getAgentByName(
         env.TestStateAgent,
@@ -437,7 +437,9 @@ describe("state management", () => {
         '{"migrationFails":true}'
       );
     });
+  });
 
+  describe("error recovery", () => {
     it("should recover from corrupted state JSON by falling back to initialState", async () => {
       // Use a unique name so this agent hasn't accessed state yet
       const agentStub = await getAgentByName(

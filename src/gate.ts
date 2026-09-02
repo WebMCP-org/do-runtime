@@ -37,17 +37,9 @@ type TransformedAwait<T> = {
   readonly reservation: PublicationReservation;
 };
 
-function isThenable(value: unknown): value is PromiseLike<unknown> {
-  return (
-    (typeof value === "object" && value !== null) ||
-    typeof value === "function"
-  ) && typeof Reflect.get(value, "then") === "function";
-}
-
 /** Re-enter the actor that owns this transformed await; fail open outside actors. */
 export function __gate<T>(value: T): T | Promise<Awaited<T>> {
   const context = tryCurrentIoContext();
-  if (!isThenable(value) && context === undefined) return value;
   if (context === undefined) return value;
   return resumeWithContext(context, Promise.resolve(value));
 }
