@@ -1,108 +1,178 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="720" viewBox="0 0 1400 720" role="img" aria-labelledby="title description">
-  <title id="title">A durable Agent running inside a Chrome extension</title>
-  <desc id="description">An Agent at the center of a Chrome extension, connected to persistent state, alarms, and live connections, with a sleep, wake, continue loop.</desc>
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="760" viewBox="0 0 1400 760" role="img" aria-labelledby="title description">
+  <title id="title">A local agent running inside a browser extension</title>
+  <desc id="description">A browser window with an extension popup open over an abstract, persistent agent workspace.</desc>
   <defs>
-    <linearGradient id="page" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#f8fafc" />
-      <stop offset="0.55" stop-color="#f5f7ff" />
-      <stop offset="1" stop-color="#eef2ff" />
+    <linearGradient id="backdrop" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#080b16" />
+      <stop offset="0.52" stop-color="#11162a" />
+      <stop offset="1" stop-color="#0a101d" />
     </linearGradient>
+    <linearGradient id="viewport" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#12182d" />
+      <stop offset="0.48" stop-color="#0e1830" />
+      <stop offset="1" stop-color="#071622" />
+    </linearGradient>
+    <radialGradient id="violet-haze" cx="0" cy="0" r="1" gradientTransform="translate(491 391) rotate(20) scale(365 290)" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#7c3aed" stop-opacity="0.34" />
+      <stop offset="0.55" stop-color="#4f46e5" stop-opacity="0.11" />
+      <stop offset="1" stop-color="#4f46e5" stop-opacity="0" />
+    </radialGradient>
+    <radialGradient id="teal-haze" cx="0" cy="0" r="1" gradientTransform="translate(745 546) rotate(-14) scale(414 236)" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#2dd4bf" stop-opacity="0.24" />
+      <stop offset="1" stop-color="#2dd4bf" stop-opacity="0" />
+    </radialGradient>
     <linearGradient id="agent" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#4f46e5" />
+      <stop stop-color="#a78bfa" />
+      <stop offset="0.5" stop-color="#6366f1" />
       <stop offset="1" stop-color="#2563eb" />
     </linearGradient>
-    <filter id="soft-shadow" x="-35%" y="-35%" width="170%" height="180%">
-      <feDropShadow dx="0" dy="12" stdDeviation="18" flood-color="#312e81" flood-opacity="0.14" />
+    <linearGradient id="thread" x1="0" y1="0" x2="1" y2="0">
+      <stop stop-color="#22d3ee" stop-opacity="0" />
+      <stop offset="0.28" stop-color="#2dd4bf" />
+      <stop offset="0.7" stop-color="#60a5fa" />
+      <stop offset="1" stop-color="#818cf8" stop-opacity="0" />
+    </linearGradient>
+    <linearGradient id="popup" x1="0" y1="0" x2="0" y2="1">
+      <stop stop-color="#ffffff" />
+      <stop offset="1" stop-color="#f5f7fb" />
+    </linearGradient>
+    <pattern id="grid" width="34" height="34" patternUnits="userSpaceOnUse">
+      <path d="M34 0H0V34" fill="none" stroke="#94a3b8" stroke-opacity="0.075" />
+    </pattern>
+    <clipPath id="window-clip">
+      <rect x="100" y="62" width="1200" height="636" rx="28" />
+    </clipPath>
+    <filter id="window-shadow" x="-20%" y="-20%" width="140%" height="155%">
+      <feDropShadow dx="0" dy="30" stdDeviation="34" flood-color="#000000" flood-opacity="0.42" />
     </filter>
-    <filter id="agent-shadow" x="-50%" y="-50%" width="200%" height="200%">
-      <feDropShadow dx="0" dy="16" stdDeviation="24" flood-color="#4338ca" flood-opacity="0.32" />
+    <filter id="popup-shadow" x="-35%" y="-25%" width="170%" height="170%">
+      <feDropShadow dx="0" dy="22" stdDeviation="24" flood-color="#020617" flood-opacity="0.38" />
     </filter>
-    <style>
-      .heading { fill: #111827; font: 720 36px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; letter-spacing: -0.9px; }
-      .eyebrow { fill: #4f46e5; font: 750 13px ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: 2px; }
-      .label { fill: #1e293b; font: 680 18px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-      .small { fill: #64748b; font: 13px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-      .mono { fill: #64748b; font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; }
-    </style>
+    <filter id="orb-glow" x="-100%" y="-100%" width="300%" height="300%">
+      <feGaussianBlur stdDeviation="18" result="blur" />
+      <feMerge>
+        <feMergeNode in="blur" />
+        <feMergeNode in="SourceGraphic" />
+      </feMerge>
+    </filter>
+    <filter id="line-glow" x="-20%" y="-250%" width="140%" height="600%">
+      <feGaussianBlur stdDeviation="6" result="blur" />
+      <feMerge>
+        <feMergeNode in="blur" />
+        <feMergeNode in="SourceGraphic" />
+      </feMerge>
+    </filter>
   </defs>
 
-  <!-- Chromium window -->
-  <rect x="1" y="1" width="1398" height="718" rx="23" fill="#ffffff" stroke="#cbd5e1" stroke-width="2" />
-  <path d="M24 1 H1376 A23 23 0 0 1 1399 24 V47 H1 V24 A23 23 0 0 1 24 1Z" fill="#dfe3e8" />
-  <circle cx="28" cy="24" r="6" fill="#ef6a67" />
-  <circle cx="50" cy="24" r="6" fill="#e7b84b" />
-  <circle cx="72" cy="24" r="6" fill="#56b870" />
-  <path d="M112 8 H336 A14 14 0 0 1 350 22 V47 H98 V22 A14 14 0 0 1 112 8Z" fill="#ffffff" />
-  <rect x="116" y="17" width="20" height="20" rx="6" fill="#4f46e5" />
-  <path d="M121 27 H131 M126 22 V32" stroke="#ffffff" stroke-width="1.6" stroke-linecap="round" />
-  <text x="146" y="33" class="small">do-runtime</text>
-  <path d="M331 22 339 30 M339 22 331 30" stroke="#94a3b8" stroke-width="1.4" />
+  <rect width="1400" height="760" rx="32" fill="url(#backdrop)" />
+  <circle cx="170" cy="126" r="230" fill="#4f46e5" fill-opacity="0.1" />
+  <circle cx="1254" cy="654" r="280" fill="#0d9488" fill-opacity="0.08" />
 
-  <rect x="1" y="47" width="1398" height="51" fill="#ffffff" />
-  <path d="M30 72 H48 M30 72 38 64 M30 72 38 80" fill="none" stroke="#64748b" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
-  <path d="M72 72 H90 M90 72 82 64 M90 72 82 80" fill="none" stroke="#cbd5e1" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
-  <path d="M126 64 A11 11 0 1 0 130 78 M126 64 132 63 131 69" fill="none" stroke="#64748b" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
-  <rect x="162" y="55" width="1088" height="34" rx="17" fill="#f1f3f4" />
-  <path d="M186 66 V63 A5 5 0 0 1 196 63 V66 M184 66 H198 V78 H184Z" fill="none" stroke="#64748b" stroke-width="1.4" stroke-linejoin="round" />
-  <text x="211" y="77" class="mono">chrome-extension://local-agent</text>
-  <circle cx="1358" cy="64" r="2" fill="#64748b" />
-  <circle cx="1358" cy="72" r="2" fill="#64748b" />
-  <circle cx="1358" cy="80" r="2" fill="#64748b" />
-  <path d="M1 98 H1399" stroke="#d7dce2" />
-
-  <!-- Abstract extension runtime -->
-  <path d="M1 99 H1399 V696 A23 23 0 0 1 1376 719 H24 A23 23 0 0 1 1 696Z" fill="url(#page)" />
-  <text x="700" y="135" text-anchor="middle" class="eyebrow">CHROME EXTENSION</text>
-  <text x="700" y="175" text-anchor="middle" class="heading">A durable Agent running locally</text>
-
-  <!-- The faint orbit is the extension boundary, not a process diagram. -->
-  <circle cx="700" cy="417" r="177" fill="none" stroke="#e0e7ff" stroke-width="28" />
-  <circle cx="700" cy="417" r="177" fill="none" stroke="#a5b4fc" stroke-width="2" stroke-dasharray="4 12" />
-
-  <!-- State -->
-  <path d="M448 417 C500 417 532 417 580 417" fill="none" stroke="#14b8a6" stroke-width="3" stroke-linecap="round" />
-  <circle cx="462" cy="417" r="5" fill="#14b8a6" />
-  <g filter="url(#soft-shadow)">
-    <circle cx="356" cy="417" r="76" fill="#ffffff" stroke="#99f6e4" stroke-width="2" />
+  <g filter="url(#window-shadow)">
+    <rect x="100" y="62" width="1200" height="636" rx="28" fill="#f8fafc" />
   </g>
-  <ellipse cx="356" cy="386" rx="25" ry="9" fill="none" stroke="#0f766e" stroke-width="3" />
-  <path d="M331 386 V415 C331 420 342 424 356 424 C370 424 381 420 381 415 V386 M331 400 C331 405 342 409 356 409 C370 409 381 405 381 400" fill="none" stroke="#0f766e" stroke-width="3" />
-  <text x="356" y="457" text-anchor="middle" class="label">State</text>
 
-  <!-- Alarm -->
-  <path d="M700 319 V294" fill="none" stroke="#f97316" stroke-width="3" stroke-linecap="round" />
-  <circle cx="700" cy="306" r="5" fill="#f97316" />
-  <g filter="url(#soft-shadow)">
-    <circle cx="700" cy="255" r="65" fill="#ffffff" stroke="#fed7aa" stroke-width="2" />
+  <g clip-path="url(#window-clip)">
+    <!-- Browser chrome -->
+    <rect x="100" y="62" width="1200" height="94" fill="#eef1f6" />
+    <circle cx="132" cy="92" r="6" fill="#ef6a67" />
+    <circle cx="154" cy="92" r="6" fill="#e6b84a" />
+    <circle cx="176" cy="92" r="6" fill="#58b96f" />
+
+    <path d="M226 75H456A15 15 0 0 1 471 90V113H211V90A15 15 0 0 1 226 75Z" fill="#ffffff" />
+    <circle cx="238" cy="94" r="7" fill="#6d5dfc" />
+    <rect x="255" y="89" width="108" height="10" rx="5" fill="#cbd2df" />
+    <path d="M443 89 451 97M451 89 443 97" stroke="#9ca7b9" stroke-width="1.6" stroke-linecap="round" />
+
+    <rect x="100" y="113" width="1200" height="43" fill="#ffffff" />
+    <path d="M132 134H148M132 134 139 127M132 134 139 141" fill="none" stroke="#68758b" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+    <path d="M175 134H191M191 134 184 127M191 134 184 141" fill="none" stroke="#c2c9d4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+    <path d="M219 128A9 9 0 1 0 222 140M219 128 225 127 224 133" fill="none" stroke="#68758b" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+    <rect x="248" y="120" width="770" height="28" rx="14" fill="#eef1f5" />
+    <path d="M270 131V128A4 4 0 0 1 278 128V131M268 131H280V140H268Z" fill="none" stroke="#8d98aa" stroke-width="1.25" stroke-linejoin="round" />
+    <rect x="292" y="130" width="155" height="8" rx="4" fill="#c9d0dc" />
+
+    <!-- The highlighted extension button anchors the popup to the browser. -->
+    <circle cx="1128" cy="134" r="18" fill="#ece9ff" />
+    <path d="M1122 125H1128V130A4 4 0 1 1 1134 134V143H1125V139A4 4 0 1 1 1122 133Z" fill="#6857e5" />
+    <circle cx="1180" cy="134" r="3" fill="#68758b" />
+    <circle cx="1191" cy="134" r="3" fill="#68758b" />
+    <circle cx="1202" cy="134" r="3" fill="#68758b" />
+
+    <!-- An ordinary web page, kept intentionally abstract. -->
+    <rect x="100" y="156" width="1200" height="542" fill="url(#viewport)" />
+    <rect x="100" y="156" width="1200" height="542" fill="url(#grid)" />
+    <rect x="100" y="156" width="1200" height="542" fill="url(#violet-haze)" />
+    <rect x="100" y="156" width="1200" height="542" fill="url(#teal-haze)" />
+
+    <rect x="136" y="193" width="52" height="468" rx="18" fill="#151d33" stroke="#ffffff" stroke-opacity="0.07" />
+    <circle cx="162" cy="222" r="10" fill="#6d5dfc" />
+    <circle cx="162" cy="282" r="6" fill="#68758b" />
+    <circle cx="162" cy="323" r="6" fill="#68758b" />
+    <circle cx="162" cy="364" r="6" fill="#68758b" />
+    <rect x="154" y="619" width="16" height="16" rx="5" fill="#29334c" />
+
+    <rect x="226" y="201" width="228" height="12" rx="6" fill="#dbe4f4" fill-opacity="0.64" />
+    <rect x="226" y="229" width="138" height="8" rx="4" fill="#9aa9c5" fill-opacity="0.28" />
+
+    <!-- One continuous thread remains while the surrounding surface fades. -->
+    <path d="M242 534C328 534 337 473 407 473S502 552 579 552 663 453 746 453 819 489 881 489" fill="none" stroke="#0b2235" stroke-width="18" stroke-linecap="round" />
+    <path d="M242 534C328 534 337 473 407 473S502 552 579 552 663 453 746 453 819 489 881 489" fill="none" stroke="url(#thread)" stroke-width="4" stroke-linecap="round" filter="url(#line-glow)" />
+    <circle cx="309" cy="513" r="4" fill="#5eead4" />
+    <circle cx="579" cy="552" r="5" fill="#67e8f9" />
+    <circle cx="800" cy="471" r="4" fill="#93c5fd" />
+
+    <!-- The agent is a presence, not another architecture box. -->
+    <circle cx="515" cy="385" r="112" fill="#5b4be8" fill-opacity="0.09" />
+    <circle cx="515" cy="385" r="82" fill="#5b4be8" fill-opacity="0.13" />
+    <circle cx="515" cy="385" r="53" fill="url(#agent)" filter="url(#orb-glow)" />
+    <path d="M492 386C502 374 528 374 538 386M498 403C510 413 522 413 534 403" fill="none" stroke="#ffffff" stroke-opacity="0.9" stroke-width="4" stroke-linecap="round" />
+    <circle cx="496" cy="370" r="5" fill="#ffffff" fill-opacity="0.92" />
+    <circle cx="534" cy="370" r="5" fill="#ffffff" fill-opacity="0.92" />
+    <circle cx="409" cy="335" r="8" fill="#2dd4bf" fill-opacity="0.9" />
+    <circle cx="648" cy="314" r="7" fill="#60a5fa" fill-opacity="0.82" />
+    <circle cx="680" cy="407" r="4" fill="#c4b5fd" fill-opacity="0.8" />
+
+    <!-- A quiet alarm pulse reads as wake-up without becoming a diagram. -->
+    <circle cx="746" cy="453" r="29" fill="#f97316" fill-opacity="0.07" stroke="#fb923c" stroke-opacity="0.28" />
+    <circle cx="746" cy="453" r="13" fill="#fb923c" fill-opacity="0.16" stroke="#fdba74" stroke-width="2" />
+    <path d="M746 445V453L752 457" fill="none" stroke="#fed7aa" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+
+    <rect x="226" y="608" width="512" height="10" rx="5" fill="#33405a" fill-opacity="0.75" />
+    <rect x="226" y="632" width="362" height="8" rx="4" fill="#29364f" fill-opacity="0.68" />
   </g>
-  <circle cx="700" cy="241" r="22" fill="none" stroke="#ea580c" stroke-width="3" />
-  <path d="M700 229 V242 L710 249" fill="none" stroke="#ea580c" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" />
-  <text x="700" y="290" text-anchor="middle" class="label">Alarms</text>
 
-  <!-- Live connection -->
-  <path d="M820 417 C868 417 900 417 952 417" fill="none" stroke="#3b82f6" stroke-width="3" stroke-linecap="round" />
-  <circle cx="938" cy="417" r="5" fill="#3b82f6" />
-  <g filter="url(#soft-shadow)">
-    <circle cx="1044" cy="417" r="76" fill="#ffffff" stroke="#bfdbfe" stroke-width="2" />
+  <!-- Extension popup -->
+  <g filter="url(#popup-shadow)">
+    <path d="M1128 151 1142 169H1114Z" fill="#ffffff" />
+    <rect x="892" y="165" width="332" height="438" rx="24" fill="url(#popup)" />
   </g>
-  <circle cx="1027" cy="397" r="9" fill="none" stroke="#2563eb" stroke-width="3" />
-  <circle cx="1061" cy="397" r="9" fill="none" stroke="#2563eb" stroke-width="3" />
-  <path d="M1036 397 H1052 M1030 407 C1036 419 1052 419 1058 407" fill="none" stroke="#2563eb" stroke-width="3" stroke-linecap="round" />
-  <text x="1044" y="457" text-anchor="middle" class="label">Live</text>
+  <rect x="893" y="166" width="330" height="436" rx="23" fill="none" stroke="#d9dfeb" />
 
-  <!-- Agent -->
-  <g filter="url(#agent-shadow)">
-    <circle cx="700" cy="417" r="112" fill="url(#agent)" />
-  </g>
-  <rect x="666" y="344" width="68" height="24" rx="12" fill="#ffffff" fill-opacity="0.18" />
-  <text x="700" y="361" text-anchor="middle" fill="#ffffff" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11" font-weight="750" letter-spacing="1.4">LOCAL</text>
-  <text x="700" y="425" text-anchor="middle" fill="#ffffff" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="35" font-weight="730">Agent</text>
-  <path d="M666 452 H734" stroke="#bfdbfe" stroke-width="2" stroke-linecap="round" />
-  <circle cx="700" cy="452" r="5" fill="#ffffff" />
+  <circle cx="935" cy="210" r="17" fill="url(#agent)" />
+  <path d="M928 211C932 206 938 206 942 211" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" />
+  <rect x="966" y="199" width="95" height="10" rx="5" fill="#182033" />
+  <rect x="966" y="218" width="56" height="7" rx="3.5" fill="#a8b1c1" />
+  <circle cx="1183" cy="210" r="6" fill="#34d399" />
+  <circle cx="1183" cy="210" r="11" fill="none" stroke="#34d399" stroke-opacity="0.2" />
+  <path d="M916 249H1200" stroke="#e4e8f0" />
 
-  <!-- One durable idea -->
-  <rect x="493" y="610" width="414" height="52" rx="26" fill="#ffffff" stroke="#dbe3ef" filter="url(#soft-shadow)" />
-  <circle cx="526" cy="636" r="11" fill="#ffedd5" />
-  <path d="M526 629 V636 L531 639" fill="none" stroke="#f97316" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
-  <text x="700" y="642" text-anchor="middle" class="label">sleep → wake → continue</text>
+  <text x="1058" y="357" text-anchor="middle" fill="#121827" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="104" font-weight="690" letter-spacing="-6">21</text>
+  <circle cx="1058" cy="395" r="5" fill="#6366f1" />
+  <circle cx="1075" cy="395" r="5" fill="#d8dce6" />
+  <circle cx="1041" cy="395" r="5" fill="#d8dce6" />
+
+  <rect x="924" y="439" width="268" height="70" rx="20" fill="#111827" />
+  <circle cx="974" cy="474" r="18" fill="#262f43" />
+  <path d="M966 474H982M974 466V482" stroke="#ffffff" stroke-width="2.6" stroke-linecap="round" />
+  <path d="M1019 474H1117" stroke="#465269" stroke-width="4" stroke-linecap="round" />
+  <path d="M1019 474C1037 474 1040 459 1055 459S1076 488 1092 488 1103 474 1117 474" fill="none" stroke="url(#thread)" stroke-width="3" stroke-linecap="round" />
+  <circle cx="1154" cy="474" r="18" fill="#fff0e6" />
+  <circle cx="1154" cy="474" r="8" fill="none" stroke="#f97316" stroke-width="2" />
+  <path d="M1154 469V474L1158 477" fill="none" stroke="#f97316" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+
+  <rect x="924" y="538" width="88" height="8" rx="4" fill="#d5dae5" />
+  <rect x="924" y="558" width="206" height="8" rx="4" fill="#e2e6ed" />
+  <circle cx="1173" cy="552" r="17" fill="#e9e7ff" />
+  <path d="M1166 553 1171 558 1181 546" fill="none" stroke="#6657de" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" />
 </svg>

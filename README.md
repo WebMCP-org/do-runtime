@@ -1,6 +1,6 @@
 # do-runtime
 
-![A durable Agent running locally in a Chrome extension, connected to state, alarms, and live connections](docs/assets/extension-agent-runtime.svg)
+![A local Agent running in an open browser-extension popup](docs/assets/extension-agent-runtime.svg)
 
 Cloudflare Durable Objects and Agents SDK code, running locally inside Chrome
 extensions and browser tabs.
