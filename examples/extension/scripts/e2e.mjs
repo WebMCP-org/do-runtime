@@ -474,7 +474,12 @@ async function main() {
 
     await worker.evaluate(async () => chrome.offscreen.closeDocument());
     await ensureHost(popup);
-    snapshot = await op(popup, "snapshot");
+    snapshot = await pollOp(
+      popup,
+      "snapshot",
+      [],
+      (candidate) => candidate.stateVersion === 1,
+    );
     check("the Agent state survived offscreen recreation", snapshot.value, 21);
     check("the replacement migrated persisted Agent state", snapshot.stateVersion, 1);
     check("the product migration filled the new field", snapshot.label, "migrated");
