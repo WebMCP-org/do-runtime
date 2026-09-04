@@ -10,7 +10,8 @@
  * for alarm identity, retry policy, and delivery.
  */
 
-import { WAKE_ALARM, type ExtensionMessage, type ExtensionResponse } from "./protocol";
+import { OffscreenDocumentCoordinator } from "@mcp-b/do-runtime/browser/offscreen-document";
+import { WAKE_ALARM, type ExtensionResponse } from "./protocol";
 
 const OFFSCREEN_URL = "offscreen.html";
 
@@ -38,69 +39,37 @@ const SINGLE_DOCUMENT_ERROR = "single offscreen document";
 const OFFSCREEN_CONTEXT: chrome.runtime.ContextType = "OFFSCREEN_DOCUMENT";
 const OFFSCREEN_REASON: chrome.offscreen.Reason = "WORKERS";
 
-/** Whether Chrome currently reports a live offscreen document. */
-async function offscreenExists(): Promise<boolean> {
-  const contexts = await chrome.runtime.getContexts({
-    contextTypes: [OFFSCREEN_CONTEXT],
-    documentUrls: [chrome.runtime.getURL(OFFSCREEN_URL)],
-  });
-  return contexts.length > 0;
-}
-
-function createOffscreen(): Promise<void> {
-  return chrome.offscreen.createDocument({
-    url: OFFSCREEN_URL,
-    reasons: [OFFSCREEN_REASON],
-    justification: JUSTIFICATION,
-  });
-}
-
 /**
- * In flight, so two callers never both try to create the document.
- *
- * **This is not defensive tidiness, it is the fix for a measured failure.**
- * `onInstalled` and the popup's first `ensure-host` arrive within milliseconds
- * of each other. Unserialised, both see no document, both call
- * `createDocument`, the loser gets "single offscreen document", and the recovery
- * below then CLOSES the winner's perfectly healthy document — taking its worker,
- * its container and its OPFS handles with it — and builds a third. Measured, the
- * symptom was a popup whose first operation came back "no extension context
- * answered" while a later one succeeded.
+ * The runtime coalesces concurrent creation and recovers Chrome's hidden,
+ * occupied offscreen slot. This adapter supplies only the Chrome operations and
+ * its string-only occupied-slot signal.
  */
-let ensuring: Promise<void> | undefined;
+const offscreenDocument = new OffscreenDocumentCoordinator({
+  async exists() {
+    const contexts = await chrome.runtime.getContexts({
+      contextTypes: [OFFSCREEN_CONTEXT],
+      documentUrls: [chrome.runtime.getURL(OFFSCREEN_URL)],
+    });
+    return contexts.length > 0;
+  },
+  create: () =>
+    chrome.offscreen.createDocument({
+      url: OFFSCREEN_URL,
+      reasons: [OFFSCREEN_REASON],
+      justification: JUSTIFICATION,
+    }),
+  async close() {
+    console.warn(
+      "[do-runtime example] an offscreen document held the slot but was not listed; " +
+        "closing it and retrying once.",
+    );
+    await chrome.offscreen.closeDocument();
+  },
+  isOccupiedError: (error) => String(error).includes(SINGLE_DOCUMENT_ERROR),
+});
 
-/**
- * Create the offscreen document if it is not there, and recover if it is there
- * in a way `getContexts` cannot see.
- *
- * **The catch is the whole of this function.** A crashed offscreen document is
- * absent from `getContexts` and still holds the one offscreen slot, so the check
- * says "create it" and the create fails. Chrome's error string is the only
- * report of the corpse; closing and retrying once is the only way back. Without
- * this, one renderer crash means the extension has no actor until the browser is
- * restarted — and nothing anywhere says why.
- *
- * Retried ONCE rather than in a loop: the second failure is a real failure and
- * belongs at the caller, not in a spin.
- */
 export function ensureOffscreen(): Promise<void> {
-  ensuring ??= (async (): Promise<void> => {
-    if (await offscreenExists()) return;
-    try {
-      await createOffscreen();
-    } catch (error: unknown) {
-      if (!String(error).includes(SINGLE_DOCUMENT_ERROR)) throw error;
-      console.warn(
-        "[do-runtime example] an offscreen document held the slot but was not listed; " +
-          "closing it and retrying once.",
-      );
-      await chrome.offscreen.closeDocument();
-      await createOffscreen();
-    }
-  })().finally(() => {
-    ensuring = undefined;
-  });
-  return ensuring;
+  return offscreenDocument.ensure();
 }
 
 async function projectWake(scheduledTime: number | null): Promise<void> {
@@ -114,6 +83,10 @@ async function projectWake(scheduledTime: number | null): Promise<void> {
   await chrome.alarms.create(WAKE_ALARM, { when: scheduledTime });
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 /**
  * `ensure-host` is the popup asking for a host before it sends any operation;
  * `project-wake` mirrors the scheduler's earliest durable wait into Chrome.
@@ -123,13 +96,21 @@ async function projectWake(scheduledTime: number | null): Promise<void> {
  */
 chrome.runtime.onMessage.addListener(
   (
-    message: ExtensionMessage,
+    message: unknown,
     _sender: chrome.runtime.MessageSender,
     sendResponse: (response: ExtensionResponse) => void,
   ): boolean => {
-    if (message?.type !== "ensure-host" && message?.type !== "project-wake") return false;
-    const operation =
-      message.type === "ensure-host" ? ensureOffscreen() : projectWake(message.scheduledTime);
+    if (!isRecord(message) || (message.type !== "ensure-host" && message.type !== "project-wake")) {
+      return false;
+    }
+    let operation: Promise<void>;
+    if (message.type === "ensure-host") {
+      operation = ensureOffscreen();
+    } else if (message.scheduledTime === null || typeof message.scheduledTime === "number") {
+      operation = projectWake(message.scheduledTime);
+    } else {
+      operation = Promise.reject(new TypeError("invalid projected wake message"));
+    }
     void operation.then(
       () => {
         sendResponse({ ok: true, value: null });

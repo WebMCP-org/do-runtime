@@ -21,6 +21,9 @@ const files = new Set(report.files.map((file) => file.path));
 for (const required of [
   "package.json",
   "README.md",
+  "docs/assets/browser-agent-runtime.png",
+  "docs/assets/extension-agent-runtime.svg",
+  "docs/migrations.md",
   "LICENSE",
   "CHANGELOG.md",
   "dist/index.js",
@@ -57,6 +60,9 @@ for (const [name, target] of Object.entries(manifest.exports)) {
   }
 }
 const runtime = modules.get(".");
+const alarmCoordinator = modules.get("./browser/alarm-coordinator");
+const messagePortWebSocket = modules.get("./browser/message-port-websocket");
+const offscreenDocument = modules.get("./browser/offscreen-document");
 const nodeBackend = modules.get("./backends/node-sqlite");
 const gate = modules.get("./gate");
 const vite = modules.get("./vite");
@@ -65,6 +71,22 @@ if (typeof runtime.createActorContainer !== "function") {
 }
 if (typeof runtime.BrokenActorError !== "function" || typeof runtime.CanceledError !== "function") {
   throw new Error("packed root entry does not export its actor lifecycle errors");
+}
+if (
+  typeof alarmCoordinator.BrowserAlarmCoordinator !== "function" ||
+  typeof alarmCoordinator.parseBrowserAlarmTransportJournal !== "function"
+) {
+  throw new Error("packed browser alarm entry does not export its coordinator and parser");
+}
+if (
+  typeof messagePortWebSocket.MessagePortWebSocket !== "function" ||
+  typeof messagePortWebSocket.createMessagePortWebSocketConstructor !== "function" ||
+  typeof messagePortWebSocket.serveMessagePortWebSockets !== "function"
+) {
+  throw new Error("packed MessagePort WebSocket entry does not export its host helpers");
+}
+if (typeof offscreenDocument.OffscreenDocumentCoordinator !== "function") {
+  throw new Error("packed offscreen document entry does not export its coordinator");
 }
 if (typeof nodeBackend.createNodeSqlProvider !== "function") {
   throw new Error("packed Node backend does not export createNodeSqlProvider");

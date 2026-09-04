@@ -26,6 +26,9 @@
   "types": "./dist/src/index.d.ts",
   "files": [
     "dist",
+    "docs/assets/browser-agent-runtime.png",
+    "docs/assets/extension-agent-runtime.svg",
+    "docs/migrations.md",
     "CHANGELOG.md",
     "LICENSE",
     "LICENSE.workerd",
@@ -44,6 +47,18 @@
     "./browser": {
       "types": "./dist/src/browser.d.ts",
       "import": "./dist/browser.js"
+    },
+    "./browser/alarm-coordinator": {
+      "types": "./dist/src/browser/alarm-coordinator.d.ts",
+      "import": "./dist/browser/alarm-coordinator.js"
+    },
+    "./browser/message-port-websocket": {
+      "types": "./dist/src/browser/message-port-websocket.d.ts",
+      "import": "./dist/browser/message-port-websocket.js"
+    },
+    "./browser/offscreen-document": {
+      "types": "./dist/src/browser/offscreen-document.d.ts",
+      "import": "./dist/browser/offscreen-document.js"
     },
     "./server/alarm-scheduler": {
       "types": "./dist/src/server/alarm-scheduler.d.ts",
@@ -76,11 +91,16 @@
     "./package.json": "./package.json"
   },
   "scripts": {
+    "sdk:setup": "pnpm --dir vendor/agents install --frozen-lockfile --ignore-scripts && pnpm sdk:build",
+    "sdk:build": "pnpm --dir vendor/agents build",
+    "sdk:sync": "pnpm sdk:build && pnpm install --filter \"do-runtime-example-*\" --frozen-lockfile --ignore-scripts",
+    "sdk:check": "pnpm --dir vendor/agents check",
+    "sdk:test": "pnpm --dir vendor/agents test",
     "build": "pnpm build:package",
     "typecheck": "pnpm build:package && tsc -b tsconfig.json && tsc -p conformance/tsconfig.json && tsc -p examples/extension/tsconfig.page.json && tsc -p examples/extension/tsconfig.worker.json && tsc -p examples/vibe-platform/tsconfig.page.json && tsc -p examples/vibe-platform/tsconfig.worker.json",
     "test": "pnpm test:unit && pnpm test:conformance",
-    "examples:build": "pnpm build:package && pnpm --filter \"do-runtime-example-*\" build",
-    "test:examples": "pnpm build:package && node examples/extension/scripts/e2e.mjs && node examples/vibe-platform/scripts/e2e.mjs",
+    "examples:build": "pnpm sdk:sync && pnpm build:package && pnpm --filter \"do-runtime-example-*\" build",
+    "test:examples": "pnpm sdk:sync && pnpm build:package && node examples/extension/scripts/e2e.mjs && node examples/vibe-platform/scripts/e2e.mjs",
     "test:unit": "vitest run --config vitest.unit.config.ts",
     "test:conformance": "pnpm test:conformance-workerd && pnpm test:conformance-node && pnpm test:conformance-browser",
     "test:conformance-workerd": "vitest run --config conformance/workerd/vitest.config.ts",

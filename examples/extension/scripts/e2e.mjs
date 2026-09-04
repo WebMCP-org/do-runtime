@@ -11,8 +11,9 @@
  * file is `.mjs` with a dynamic import rather than a dependency of the example.
  */
 
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { rmSync } from "node:fs";
+import { createServer } from "node:net";
 import { fileURLToPath } from "node:url";
 
 const example = fileURLToPath(new URL("../", import.meta.url));
@@ -44,15 +45,99 @@ function check(message, actual, expected) {
 
 /** The build is a precondition, so this script owns it rather than assuming it. */
 function build() {
-  const result = spawnSync(
-    process.execPath,
-    [`${repoRoot}node_modules/vite/bin/vite.js`, "build"],
-    { cwd: example, stdio: "inherit" },
-  );
-  if (result.status !== 0) {
-    console.log("FAIL  vite build");
-    process.exit(1);
+  for (const args of [["build"], ["build", "--mode", "think-probe"]]) {
+    const result = spawnSync(
+      process.execPath,
+      [`${repoRoot}node_modules/vite/bin/vite.js`, ...args],
+      {
+        cwd: example,
+        stdio: "inherit",
+      },
+    );
+    if (result.status !== 0) {
+      console.log(`FAIL  vite ${args.join(" ")}`);
+      process.exit(1);
+    }
   }
+}
+
+async function unusedPort() {
+  const server = createServer();
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  if (address === null || typeof address === "string") {
+    server.close();
+    throw new Error("could not allocate a relay port");
+  }
+  await new Promise((resolve, reject) => {
+    server.close((error) => (error === undefined ? resolve() : reject(error)));
+  });
+  return address.port;
+}
+
+async function startRelay() {
+  const port = await unusedPort();
+  const origin = `http://127.0.0.1:${port}`;
+  let output = "";
+  const relay = spawn(
+    process.execPath,
+    [
+      `${repoRoot}node_modules/wrangler/bin/wrangler.js`,
+      "dev",
+      "--config",
+      "wrangler.relay.jsonc",
+      "--ip",
+      "127.0.0.1",
+      "--port",
+      String(port),
+      "--persist-to",
+      `${profile}/relay-state`,
+      "--log-level",
+      "warn",
+    ],
+    {
+      cwd: example,
+      env: { ...process.env, CI: "1", NO_COLOR: "1" },
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  );
+  const remember = (chunk) => {
+    output = `${output}${chunk}`.slice(-8_000);
+  };
+  relay.stdout.on("data", remember);
+  relay.stderr.on("data", remember);
+
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    if (relay.exitCode !== null) {
+      throw new Error(`relay exited with ${relay.exitCode}\n${output}`);
+    }
+    try {
+      const response = await fetch(`${origin}/health`, { signal: AbortSignal.timeout(500) });
+      if (response.ok) return { origin, process: relay };
+    } catch {
+      // Wrangler is still starting.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  await stopRelay(relay);
+  throw new Error(`relay did not start\n${output}`);
+}
+
+async function stopRelay(relay) {
+  if (relay.exitCode !== null) return;
+  relay.kill("SIGTERM");
+  await new Promise((resolve) => {
+    const timeout = setTimeout(resolve, 5_000);
+    relay.once("exit", () => {
+      clearTimeout(timeout);
+      resolve();
+    });
+  });
+  if (relay.exitCode === null) relay.kill("SIGKILL");
 }
 
 /** One operation sent from the service worker to the real offscreen host. */
@@ -76,6 +161,25 @@ async function ensureHost(page) {
     const response = await chrome.runtime.sendMessage({ type: "ensure-host" });
     if (response?.ok !== true) throw new Error(response?.error ?? "host creation failed");
   });
+}
+
+async function pollOp(page, name, args, predicate, timeoutMs = BOOT_TIMEOUT_MS) {
+  const deadline = Date.now() + timeoutMs;
+  let value;
+  let lastError;
+  while (Date.now() < deadline) {
+    try {
+      value = await op(page, name, args);
+      if (predicate(value)) return value;
+      lastError = undefined;
+    } catch (error) {
+      lastError = error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw (
+    lastError ?? new Error(`${name} did not reach the expected state: ${JSON.stringify(value)}`)
+  );
 }
 
 /** Poll the popup's output pane until it shows something matching `pattern`. */
@@ -140,6 +244,19 @@ async function main() {
       timeout: BOOT_TIMEOUT_MS,
     });
     await ensureHost(popup);
+
+    const invalidOperation = await popup.evaluate(() =>
+      chrome.runtime.sendMessage({ type: "host-op", op: "not-an-operation", args: [] }),
+    );
+    check(
+      "an unknown host operation is rejected at the message boundary",
+      invalidOperation.ok,
+      false,
+    );
+    const invalidArgument = await popup.evaluate(() =>
+      chrome.runtime.sendMessage({ type: "host-op", op: "armWake", args: ["soon"] }),
+    );
+    check("an invalid host argument is rejected instead of coerced", invalidArgument.ok, false);
 
     const storage = await op(popup, "storageStatus");
     if (!/^storage: (persistent|best-effort), \d+ B used of \d+ B$/.test(storage)) {
@@ -343,12 +460,29 @@ async function main() {
     );
 
     // ---------------------------------------------------------------------
-    // 4. Persistence across offscreen recreation: a new document, a new worker, a new
-    //    container, the same OPFS files.
+    // 4. Persist an unversioned state from the old client contract, then replace
+    //    the document, Worker, container, and Agent instance. Hydration must
+    //    migrate it before the replacement exposes it.
+    await op(popup, "sdkSetLegacyState", [21]);
+    snapshot = await pollOp(
+      popup,
+      "snapshot",
+      [],
+      (candidate) => candidate.stateVersion === null,
+    );
+    check("the old unversioned state reached durable storage", snapshot.label, null);
+
     await worker.evaluate(async () => chrome.offscreen.closeDocument());
     await ensureHost(popup);
-    snapshot = await op(popup, "snapshot");
+    snapshot = await pollOp(
+      popup,
+      "snapshot",
+      [],
+      (candidate) => candidate.stateVersion === 1,
+    );
     check("the Agent state survived offscreen recreation", snapshot.value, 21);
+    check("the replacement migrated persisted Agent state", snapshot.stateVersion, 1);
+    check("the product migration filled the new field", snapshot.label, "migrated");
     check(
       "the alarm event survived offscreen recreation",
       snapshot.events.filter((event) => event.kind === "sdk-schedule").length,
@@ -357,6 +491,7 @@ async function main() {
 
     const reconnectedState = await op(popup, "sdkState");
     check("a recreated Agents client resynced durable state", reconnectedState.value, 21);
+    check("the recreated client received migrated state", reconnectedState.stateVersion, 1);
     const afterReload = await op(popup, "sdkIncrement");
     check("a recreated Agents client called a decorated method", afterReload, 22);
 
@@ -393,8 +528,156 @@ async function main() {
     const viaOffscreen = Number(printed.split("\n")[1]);
     check("the offscreen document continues the same storage", viaOffscreen, 23);
 
-    const offscreenContexts = await worker.evaluate(async () =>
-      (await chrome.runtime.getContexts({ contextTypes: ["OFFSCREEN_DOCUMENT"] })).length,
+    // ---------------------------------------------------------------------
+    // 7. A native Cloudflare Durable Object carries the unmodified Agents
+    //    protocol between a network client and this browser-hosted Agent.
+    const relay = await startRelay();
+    try {
+      const relayed = await op(popup, "relayRoundTrip", [relay.origin]);
+      check("a remote AgentClient synchronized through the relay DO", relayed.initialValue, 23);
+      check("relayed callable RPC reached the browser Agent", relayed.incrementedValue, 24);
+      check("relayed Agent state returned to the remote client", relayed.synchronizedValue, 24);
+      check(
+        "relayed streaming RPC preserved every chunk",
+        JSON.stringify(relayed.streamChunks),
+        JSON.stringify([24, 25]),
+      );
+      check("relayed streaming RPC preserved its final value", relayed.streamFinal, "done");
+    } finally {
+      await stopRelay(relay.process);
+    }
+
+    const completedThink = await op(popup, "submitThink", [
+      "completed",
+      "Complete one deterministic turn.",
+      "completed-turn",
+    ]);
+    check("Think accepted a durable submission", completedThink.accepted, true);
+    const completedThinkStatus = await pollOp(popup, "thinkStatus", ["completed"], (status) =>
+      status.submissions.some(
+        (submission) =>
+          submission.submissionId === completedThink.submissionId &&
+          submission.status === "completed",
+      ),
+    );
+    check("Think completed one assistant response", completedThinkStatus.assistantMessages, 1);
+    check("the Think model completed once", completedThinkStatus.inferenceCompletions, 1);
+    check("the Think turn left no recovery fiber", completedThinkStatus.fiberRows, 0);
+
+    const stoppedThink = await op(popup, "submitThink", [
+      "stopped",
+      "Stop this deterministic turn partway through.",
+      "stopped-turn",
+    ]);
+    const runningThinkStatus = await pollOp(
+      popup,
+      "thinkStatus",
+      ["stopped"],
+      (status) =>
+        status.emittedChunks >= 2 &&
+        status.fiberRows > 0 &&
+        status.submissions.some(
+          (submission) =>
+            submission.submissionId === stoppedThink.submissionId &&
+            submission.status === "running",
+        ),
+    );
+    check("Think exposed durable work while streaming", runningThinkStatus.fiberRows > 0, true);
+    await op(popup, "stopThink", ["stopped"]);
+    const stoppedThinkStatus = await pollOp(
+      popup,
+      "thinkStatus",
+      ["stopped"],
+      (status) =>
+        status.fiberRows === 0 &&
+        status.submissions.some(
+          (submission) =>
+            submission.submissionId === stoppedThink.submissionId &&
+            submission.status === "aborted",
+        ),
+    );
+    check(
+      "Think Stop retained its partial assistant text",
+      stoppedThinkStatus.assistantText.length > 0,
+      true,
+    );
+    check(
+      "Think Stop did not record a completed inference",
+      stoppedThinkStatus.inferenceCompletions,
+      0,
+    );
+
+    const afterStopThink = await op(popup, "submitThink", [
+      "stopped",
+      "Complete a new turn after Stop.",
+      "after-stop-turn",
+    ]);
+    const afterStopThinkStatus = await pollOp(popup, "thinkStatus", ["stopped"], (status) =>
+      status.submissions.some(
+        (submission) =>
+          submission.submissionId === afterStopThink.submissionId &&
+          submission.status === "completed",
+      ),
+    );
+    check("Think admitted work after Stop", afterStopThinkStatus.inferenceStarts, 2);
+    check("the post-Stop turn completed once", afterStopThinkStatus.inferenceCompletions, 1);
+    check("the post-Stop turn left no recovery fiber", afterStopThinkStatus.fiberRows, 0);
+
+    await op(popup, "startThink", [
+      "recovery",
+      "Recover this deterministic turn after host teardown.",
+    ]);
+    const beforeRecovery = await pollOp(
+      popup,
+      "thinkStatus",
+      ["recovery"],
+      (status) => status.emittedChunks >= 3 && status.fiberRows > 0,
+    );
+    check("Think persisted a recoverable in-flight fiber", beforeRecovery.fiberRows > 0, true);
+    await worker.evaluate(async () => chrome.offscreen.closeDocument());
+    await ensureHost(popup);
+    const recoveredThinkStatus = await pollOp(
+      popup,
+      "thinkStatus",
+      ["recovery"],
+      (status) =>
+        status.fiberRows === 0 && status.recoveryCount === 1 && status.inferenceCompletions === 1,
+    );
+    check(
+      "Think invoked recovery once after Worker teardown",
+      recoveredThinkStatus.recoveryCount,
+      1,
+    );
+    check(
+      "Think recovery received durable partial output",
+      recoveredThinkStatus.recoveryPartial.length > 0,
+      true,
+    );
+    check("Think restarted inference exactly once", recoveredThinkStatus.inferenceStarts, 2);
+    check(
+      "the recovered inference completed exactly once",
+      recoveredThinkStatus.inferenceCompletions,
+      1,
+    );
+    check("recovery kept one user message", recoveredThinkStatus.userMessages, 1);
+    check(
+      "recovery retained the partial and completed continuation",
+      recoveredThinkStatus.assistantMessages,
+      2,
+    );
+    check(
+      "the recovered continuation reached its final chunk",
+      recoveredThinkStatus.assistantText.includes("chunk12"),
+      true,
+    );
+
+    const finalStatus = await op(popup, "status");
+    check("the Think journeys left the container healthy", finalStatus.broken, null);
+    check("the Think journeys left the alarm scheduler healthy", finalStatus.alarmTaskFailure, null);
+
+    const offscreenContexts = await worker.evaluate(
+      async () =>
+        (await chrome.runtime.getContexts({ contextTypes: ["OFFSCREEN_DOCUMENT"] })).length,
     );
     check("the service worker created one offscreen document", offscreenContexts, 1);
   } catch (error) {

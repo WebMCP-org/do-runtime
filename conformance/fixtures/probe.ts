@@ -109,7 +109,12 @@ export class Boom extends DurableObject {
 export default { fetch() { return new Response("child"); } };
 `;
 
-export class Probe extends DurableObject<Record<string, unknown>> {
+type ProbeEnv = {
+  readonly LOADER: WorkerLoader;
+  readonly PROBE: DurableObjectNamespace<Probe>;
+};
+
+export class Probe extends DurableObject<ProbeEnv> {
   marker = "init";
   trace: string[] = [];
   #clients = new Map<string, WebSocket>();
@@ -127,8 +132,8 @@ export class Probe extends DurableObject<Record<string, unknown>> {
   #capacityClients: WebSocket[] = [];
   #throwNextMessage = false;
 
-  #child(slot = "c", className = "Child"): Record<string, (...args: never[]) => Promise<unknown>> {
-    const loader = (this.env as { LOADER: WorkerLoader }).LOADER;
+  #child(slot = "c", className = "Child"): Record<string, (...args: unknown[]) => Promise<unknown>> {
+    const loader = this.env.LOADER;
     const loaded = loader.get("probe-child", async () => ({
       compatibilityDate: "2026-07-01",
       mainModule: "child.js",
@@ -156,7 +161,7 @@ export class Probe extends DurableObject<Record<string, unknown>> {
   async gateViaFacet(): Promise<string> {
     this.marker = "A";
     this.trace.push("facet:enter");
-    await this.#child().slow(60 as never);
+    await this.#child().slow(60);
     this.trace.push("facet:exit");
     return this.marker;
   }
@@ -164,10 +169,8 @@ export class Probe extends DurableObject<Record<string, unknown>> {
   async gateViaActor(actorName: string): Promise<{ marker: string; target: number }> {
     this.marker = "A";
     this.trace.push("actor:enter");
-    const namespace = (this.env as { PROBE: DurableObjectNamespace }).PROBE;
-    const target = namespace.get(namespace.idFromName(actorName)) as unknown as {
-      remoteBump(): Promise<number>;
-    };
+    const namespace = this.env.PROBE;
+    const target = namespace.get(namespace.idFromName(actorName));
     const value = await target.remoteBump();
     await this.ctx.storage.put("crossActorResult", value);
     this.trace.push("actor:exit");
@@ -175,12 +178,12 @@ export class Probe extends DurableObject<Record<string, unknown>> {
   }
   async remoteBump(): Promise<number> {
     await scheduler.wait(60);
-    const next = (((await this.ctx.storage.get("remoteCount")) as number | undefined) ?? 0) + 1;
+    const next = ((await this.ctx.storage.get<number>("remoteCount")) ?? 0) + 1;
     await this.ctx.storage.put("remoteCount", next);
     return next;
   }
   async readRemoteCount(): Promise<number> {
-    return ((await this.ctx.storage.get("remoteCount")) as number | undefined) ?? 0;
+    return (await this.ctx.storage.get<number>("remoteCount")) ?? 0;
   }
   /** Bare timer. Measured: RELEASES, so this returns "B". */
   async gateViaTimer(): Promise<string> {
@@ -225,7 +228,7 @@ export class Probe extends DurableObject<Record<string, unknown>> {
   async storageAfterSchedulerWait(): Promise<string> {
     await scheduler.wait(10);
     await this.ctx.storage.put("afterWait", "ok");
-    return ((await this.ctx.storage.get("afterWait")) as string) ?? "MISSING";
+    return (await this.ctx.storage.get<string>("afterWait")) ?? "MISSING";
   }
 
   /**
@@ -244,7 +247,7 @@ export class Probe extends DurableObject<Record<string, unknown>> {
   async storageAfterDigest(): Promise<string> {
     const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode("probe"));
     await this.ctx.storage.put("afterDigest", digest.byteLength);
-    return `${((await this.ctx.storage.get("afterDigest")) as number) ?? "MISSING"}`;
+    return `${(await this.ctx.storage.get<number>("afterDigest")) ?? "MISSING"}`;
   }
 
   /**
@@ -263,7 +266,7 @@ export class Probe extends DurableObject<Record<string, unknown>> {
     return "armed";
   }
   async readTimerMark(): Promise<string> {
-    return ((await this.ctx.storage.get("timerMark")) as string) ?? "MISSING";
+    return (await this.ctx.storage.get<string>("timerMark")) ?? "MISSING";
   }
 
   /**
@@ -301,7 +304,7 @@ export class Probe extends DurableObject<Record<string, unknown>> {
     return "armed";
   }
   async readTicks(): Promise<number> {
-    return ((await this.ctx.storage.get("ticks")) as number) ?? 0;
+    return (await this.ctx.storage.get<number>("ticks")) ?? 0;
   }
 
   // -- §1.7.1 the transaction boundary is the gate boundary -----------------
@@ -351,7 +354,7 @@ export class Probe extends DurableObject<Record<string, unknown>> {
     return "returned-without-await";
   }
   async readUnawaited(): Promise<string> {
-    return ((await this.ctx.storage.get("unawaited")) as string) ?? "MISSING";
+    return (await this.ctx.storage.get<string>("unawaited")) ?? "MISSING";
   }
 
   // -- §1.5 critical sections ------------------------------------------------
@@ -383,8 +386,8 @@ export class Probe extends DurableObject<Record<string, unknown>> {
   }
   async facetScopesSurviveOverlappingWaits(): Promise<unknown[]> {
     return await Promise.all([
-      this.#child("scope-a").scopedWait("a" as never, 30 as never),
-      this.#child("scope-b").scopedWait("b" as never, 10 as never),
+      this.#child("scope-a").scopedWait("a", 30),
+      this.#child("scope-b").scopedWait("b", 10),
     ]);
   }
   /** Measured: abort kills the instance, storage survives. */
@@ -528,9 +531,9 @@ export class Probe extends DurableObject<Record<string, unknown>> {
    */
   async facetReentrancy(): Promise<{ out: unknown; trace: string[] }> {
     this.trace = ["parent:enter"];
-    const self = (this.env as { PROBE: DurableObjectNamespace }).PROBE;
+    const self = this.env.PROBE;
     const stub = self.get(self.idFromName("reentry"));
-    const out = await this.#child("re").callBack(stub as never);
+    const out = await this.#child("re").callBack(stub);
     this.trace.push("parent:exit");
     return { out, trace: this.trace };
   }
@@ -1002,7 +1005,8 @@ export class Probe extends DurableObject<Record<string, unknown>> {
       re: /pattern/g,
       err: new Error("boom"),
     });
-    const read = (await this.ctx.storage.get("codec")) as Record<string, unknown>;
+    const read = await this.ctx.storage.get<Record<string, unknown>>("codec");
+    if (read === undefined) throw new Error("Stored rich value disappeared.");
     return {
       when: read.when instanceof Date ? "Date" : typeof read.when,
       map: read.map instanceof Map ? "Map" : typeof read.map,
@@ -1053,7 +1057,7 @@ export class Probe extends DurableObject<Record<string, unknown>> {
     await this.ctx.storage.setAlarm(Date.now() + 20);
   }
   async readAlarmLog(): Promise<string[]> {
-    return ((await this.ctx.storage.get("alarmLog")) as string[]) ?? [];
+    return (await this.ctx.storage.get<string[]>("alarmLog")) ?? [];
   }
 
   // -- §1.8 a failed alarm is retried, and told how many times ---------------
@@ -1068,10 +1072,10 @@ export class Probe extends DurableObject<Record<string, unknown>> {
   }
   async readAlarmRetry(): Promise<{ retryCount: number; isRetry: boolean } | null> {
     return (
-      ((await this.ctx.storage.get("alarmRetry")) as {
+      (await this.ctx.storage.get<{
         retryCount: number;
         isRetry: boolean;
-      }) ?? null
+      }>("alarmRetry")) ?? null
     );
   }
 
@@ -1095,7 +1099,7 @@ export class Probe extends DurableObject<Record<string, unknown>> {
       tags,
       marker: "attachment-survived",
     });
-    const connects = (((await this.ctx.storage.get("wsConnects")) as number | undefined) ?? 0) + 1;
+    const connects = ((await this.ctx.storage.get<number>("wsConnects")) ?? 0) + 1;
     await this.ctx.storage.put("wsConnects", connects);
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -1530,7 +1534,7 @@ export class Probe extends DurableObject<Record<string, unknown>> {
 
   async readExternalObservation(): Promise<Record<string, unknown> | null> {
     return (
-      ((await this.ctx.storage.get("externalObservation")) as Record<string, unknown> | undefined) ??
+      (await this.ctx.storage.get<Record<string, unknown>>("externalObservation")) ??
       null
     );
   }
@@ -1584,7 +1588,7 @@ export class Probe extends DurableObject<Record<string, unknown>> {
       listed: this.ctx.getWebSockets().includes(ws),
       actorName: this.ctx.id.name,
       marker: this.marker,
-      connects: ((await this.ctx.storage.get("wsConnects")) as number | undefined) ?? 0,
+      connects: (await this.ctx.storage.get<number>("wsConnects")) ?? 0,
     });
   }
 
@@ -1630,7 +1634,7 @@ export class Probe extends DurableObject<Record<string, unknown>> {
   }
 
   override async alarm(info?: AlarmInvocationInfo): Promise<void> {
-    const failures = (await this.ctx.storage.get("alarmFailures")) as number | undefined;
+    const failures = await this.ctx.storage.get<number>("alarmFailures");
     if (failures !== undefined) {
       const retryCount = info?.retryCount ?? -1;
       if (retryCount < failures) {
@@ -1640,10 +1644,10 @@ export class Probe extends DurableObject<Record<string, unknown>> {
       return;
     }
 
-    const depth = (((await this.ctx.storage.get("depth")) as number) ?? 0) + 1;
+    const depth = ((await this.ctx.storage.get<number>("depth")) ?? 0) + 1;
     await this.ctx.storage.put("depth", depth);
     const push = async (entry: string) => {
-      const log = ((await this.ctx.storage.get("alarmLog")) as string[]) ?? [];
+      const log = (await this.ctx.storage.get<string[]>("alarmLog")) ?? [];
       log.push(entry);
       await this.ctx.storage.put("alarmLog", log);
     };

@@ -477,13 +477,12 @@ export class HibernatableWebSocketRegistry {
   }
 
   get WebSocketPair(): WebSocketPairConstructor {
-    const registry = this;
     this.#pairConstructor ??= new Proxy(
       class WebSocketPair {
         declare readonly 0: WebSocket;
         declare readonly 1: WebSocket;
       },
-      { construct: () => registry.#createPair() },
+      { construct: () => this.#createPair() },
     );
     return this.#pairConstructor;
   }

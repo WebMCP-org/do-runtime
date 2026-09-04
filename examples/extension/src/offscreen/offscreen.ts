@@ -22,24 +22,29 @@
  */
 
 import { newMessagePortRpcSession, RpcTarget } from "capnweb";
-import { AgentClient, type AgentClientOptions } from "agents/client";
+import { AgentClient } from "agents/client";
 import {
   browserStorageSummary,
   holdExclusiveBrowserHost,
 } from "../../../platform-shims/browser-storage";
-import { createMessagePortWebSocket } from "../../../platform-shims/message-port-websocket";
-import type {
-  CounterState,
-  CounterSnapshot,
-  ExtensionMessage,
-  ExtensionResponse,
-  HostRpc,
-  HostOp,
-  HostStatus,
-  NestedSubAgentSnapshot,
-  SubAgentSnapshot,
-  SupervisorRpc,
-  WorkerBoot,
+import { createMessagePortWebSocketConstructor } from "@mcp-b/do-runtime/browser/message-port-websocket";
+import {
+  parseExtensionResponse,
+  RELAY_CLIENT_READY,
+  type CounterState,
+  type CounterSnapshot,
+  type ExtensionMessage,
+  type ExtensionResponse,
+  type HostRpc,
+  type HostOp,
+  type HostStatus,
+  type NestedSubAgentSnapshot,
+  type RelayRoundTrip,
+  type SubAgentSnapshot,
+  type SupervisorRpc,
+  type ThinkProbeStatus,
+  type ThinkProbeSubmission,
+  type WorkerBoot,
 } from "../protocol";
 
 const storageStatus = browserStorageSummary();
@@ -100,16 +105,17 @@ worker.postMessage(
  */
 class SupervisorTarget extends RpcTarget implements SupervisorRpc {
   async projectWake(scheduledTime: number | null): Promise<void> {
-    const response = (await chrome.runtime.sendMessage({
+    const response: unknown = await chrome.runtime.sendMessage({
       type: "project-wake",
       scheduledTime,
-    } satisfies ExtensionMessage)) as ExtensionResponse;
-    if (!response.ok) throw new Error(response.error);
+    } satisfies ExtensionMessage);
+    const result = parseExtensionResponse(response);
+    if (!result.ok) throw new Error(result.error);
   }
 }
 
 const host = newMessagePortRpcSession<HostRpc>(channel.port1, new SupervisorTarget());
-const AgentWebSocket = createMessagePortWebSocket(sockets.port1);
+const AgentWebSocket = createMessagePortWebSocketConstructor(sockets.port1);
 let agent: AgentClient<unknown, CounterState> | undefined;
 let firstState: Promise<void> | undefined;
 
@@ -126,10 +132,181 @@ async function connectedAgent(): Promise<AgentClient<unknown, CounterState>> {
       protocol: "ws",
       WebSocket: AgentWebSocket,
       onStateUpdate: () => stateReceived(),
-    } as AgentClientOptions<CounterState> & { WebSocket: typeof WebSocket });
+    });
   }
   await firstState;
   return agent;
+}
+
+type CloseableSocket = EventTarget & {
+  readonly CLOSING: number;
+  readonly OPEN: number;
+  readonly readyState: number;
+  close(code?: number, reason?: string): void;
+};
+
+function waitForOpen(socket: CloseableSocket): Promise<void> {
+  if (socket.readyState === socket.OPEN) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const opened = (): void => {
+      cleanup();
+      resolve();
+    };
+    const failed = (): void => {
+      cleanup();
+      reject(new Error("WebSocket closed before opening"));
+    };
+    const cleanup = (): void => {
+      socket.removeEventListener("open", opened);
+      socket.removeEventListener("close", failed);
+      socket.removeEventListener("error", failed);
+    };
+    socket.addEventListener("open", opened, { once: true });
+    socket.addEventListener("close", failed, { once: true });
+    socket.addEventListener("error", failed, { once: true });
+  });
+}
+
+async function beforeTimeout<T>(promise: Promise<T>, label: string): Promise<T> {
+  const timeout = AbortSignal.timeout(15_000);
+  return await Promise.race([
+    promise,
+    new Promise<never>((_resolve, reject) => {
+      timeout.addEventListener("abort", () => reject(new Error(`${label} timed out`)), {
+        once: true,
+      });
+    }),
+  ]);
+}
+
+function relayAddress(origin: string): {
+  readonly host: string;
+  readonly hostSocket: string;
+  readonly protocol: "ws" | "wss";
+} {
+  const url = new URL(origin);
+  if (
+    (url.protocol !== "http:" && url.protocol !== "https:") ||
+    url.username !== "" ||
+    url.password !== "" ||
+    url.pathname !== "/" ||
+    url.search !== "" ||
+    url.hash !== ""
+  ) {
+    throw new TypeError("relay origin must be a bare HTTP(S) origin");
+  }
+  const protocol = url.protocol === "https:" ? "wss" : "ws";
+  url.protocol = `${protocol}:`;
+  url.pathname = "/host";
+  return { host: url.host, hostSocket: url.href, protocol };
+}
+
+function isRelayFrame(value: unknown): value is string | ArrayBuffer {
+  return typeof value === "string" || value instanceof ArrayBuffer;
+}
+
+/** A real network AgentClient reaches the local Agent through a native relay DO. */
+async function runRelayRoundTrip(origin: string): Promise<RelayRoundTrip> {
+  const address = relayAddress(origin);
+  const relayHost = new WebSocket(address.hostSocket);
+  relayHost.binaryType = "arraybuffer";
+
+  let local: InstanceType<typeof AgentWebSocket> | undefined;
+  let resolveLocal!: () => void;
+  let rejectLocal!: (error: Error) => void;
+  const localReady = new Promise<void>((resolve, reject) => {
+    resolveLocal = resolve;
+    rejectLocal = reject;
+  });
+
+  relayHost.addEventListener("message", (event: MessageEvent<unknown>) => {
+    if (local === undefined) {
+      if (event.data !== RELAY_CLIENT_READY) {
+        rejectLocal(new Error("relay sent a frame before pairing its client"));
+        return;
+      }
+      local = new AgentWebSocket("ws://actor.invalid/agents/counter/counter");
+      local.binaryType = "arraybuffer";
+      local.addEventListener("message", (localEvent) => {
+        if (relayHost.readyState === relayHost.OPEN) relayHost.send(localEvent.data);
+      });
+      local.addEventListener("close", (close) => {
+        if (relayHost.readyState < relayHost.CLOSING) {
+          relayHost.close(close.code, close.reason);
+        }
+      });
+      void waitForOpen(local).then(resolveLocal, rejectLocal);
+      return;
+    }
+    if (!isRelayFrame(event.data)) {
+      local.close(1003, "unsupported relay frame");
+      return;
+    }
+    if (local.readyState === local.OPEN) local.send(event.data);
+  });
+  relayHost.addEventListener("close", () => {
+    if (local !== undefined && local.readyState < local.CLOSING) {
+      local.close(1000, "relay closed");
+    }
+  });
+  relayHost.addEventListener("error", () => rejectLocal(new Error("relay host socket failed")));
+
+  let client: AgentClient<unknown, CounterState> | undefined;
+  try {
+    await beforeTimeout(waitForOpen(relayHost), "relay host connection");
+
+    let resolveInitial!: (state: CounterState) => void;
+    let resolveSynchronized!: (state: CounterState) => void;
+    const initialState = new Promise<CounterState>((resolve) => {
+      resolveInitial = resolve;
+    });
+    const synchronizedState = new Promise<CounterState>((resolve) => {
+      resolveSynchronized = resolve;
+    });
+    let receivedInitial = false;
+    client = new AgentClient<unknown, CounterState>({
+      agent: "Counter",
+      name: "counter",
+      host: address.host,
+      protocol: address.protocol,
+      WebSocket,
+      defaultCallTimeout: 10_000,
+      onStateUpdate: (state) => {
+        if (!receivedInitial) {
+          receivedInitial = true;
+          resolveInitial(state);
+        } else {
+          resolveSynchronized(state);
+        }
+      },
+    });
+
+    const [initial] = await beforeTimeout(
+      Promise.all([initialState, client.ready, localReady]),
+      "relayed Agent handshake",
+    );
+    const incrementedValue = await client.call<number>("increment");
+    const synchronized = await beforeTimeout(synchronizedState, "relayed state update");
+    const streamChunks: unknown[] = [];
+    const streamFinal = await client.call("streamValues", [], {
+      stream: { onChunk: (chunk) => streamChunks.push(chunk) },
+    });
+    return {
+      initialValue: initial.value,
+      incrementedValue,
+      synchronizedValue: synchronized.value,
+      streamChunks,
+      streamFinal,
+    };
+  } finally {
+    client?.close(1000, "relay proof complete");
+    if (local !== undefined && local.readyState < local.CLOSING) {
+      local.close(1000, "relay proof complete");
+    }
+    if (relayHost.readyState < relayHost.CLOSING) {
+      relayHost.close(1000, "relay proof complete");
+    }
+  }
 }
 
 /**
@@ -141,44 +318,52 @@ async function connectedAgent(): Promise<AgentClient<unknown, CounterState>> {
  * views other than `Uint8Array` do not survive the hop.
  */
 const ops = {
-  directStubIncrement: (): Promise<number> =>
-    host.directStubIncrement() as unknown as Promise<number>,
-  email: (subject: string, body: string): Promise<void> =>
-    host.email(subject, body) as unknown as Promise<void>,
-  evict: (): Promise<void> => host.evict() as unknown as Promise<void>,
-  increment: (): Promise<number> => host.increment() as unknown as Promise<number>,
-  enqueueIncrement: (amount: number): Promise<string> =>
-    host.enqueueIncrement(amount) as unknown as Promise<string>,
-  mcp: (method: string, params: Record<string, unknown>): Promise<unknown> =>
-    host.mcp(method, params) as unknown as Promise<unknown>,
-  snapshot: (): Promise<CounterSnapshot> => host.snapshot() as unknown as Promise<CounterSnapshot>,
-  subAgents: (): Promise<readonly SubAgentSnapshot[]> =>
-    host.subAgents() as unknown as Promise<readonly SubAgentSnapshot[]>,
-  overlapSubAgents: (): Promise<readonly SubAgentSnapshot[]> =>
-    host.overlapSubAgents() as unknown as Promise<readonly SubAgentSnapshot[]>,
-  subAgentLifecycle: (): Promise<readonly number[]> =>
-    host.subAgentLifecycle() as unknown as Promise<readonly number[]>,
-  nestedSubAgent: (): Promise<NestedSubAgentSnapshot> =>
-    host.nestedSubAgent() as unknown as Promise<NestedSubAgentSnapshot>,
-  armSubAgentWake: (delayMs: number): Promise<number> =>
-    host.armSubAgentWake(delayMs) as unknown as Promise<number>,
-  scheduledSubAgentValue: (): Promise<number> =>
-    host.scheduledSubAgentValue() as unknown as Promise<number>,
-  armWake: (delayMs: number): Promise<number> =>
-    host.armWake(delayMs) as unknown as Promise<number>,
-  status: (): Promise<HostStatus> => host.status() as unknown as Promise<HostStatus>,
+  directStubIncrement: async (): Promise<number> => await host.directStubIncrement(),
+  email: async (subject: string, body: string): Promise<void> => await host.email(subject, body),
+  evict: async (): Promise<void> => await host.evict(),
+  increment: async (): Promise<number> => await host.increment(),
+  enqueueIncrement: async (amount: number): Promise<string> => await host.enqueueIncrement(amount),
+  mcp: async (method: string, params: Record<string, unknown>): Promise<unknown> =>
+    await host.mcp(method, params),
+  snapshot: async (): Promise<CounterSnapshot> => await host.snapshot(),
+  subAgents: async (): Promise<readonly SubAgentSnapshot[]> => await host.subAgents(),
+  overlapSubAgents: async (): Promise<readonly SubAgentSnapshot[]> => await host.overlapSubAgents(),
+  subAgentLifecycle: async (): Promise<readonly number[]> => await host.subAgentLifecycle(),
+  nestedSubAgent: async (): Promise<NestedSubAgentSnapshot> => await host.nestedSubAgent(),
+  armSubAgentWake: async (delayMs: number): Promise<number> => await host.armSubAgentWake(delayMs),
+  scheduledSubAgentValue: async (): Promise<number> => await host.scheduledSubAgentValue(),
+  startThink: async (name: string, text: string): Promise<void> =>
+    await host.startThink(name, text),
+  submitThink: async (
+    name: string,
+    text: string,
+    idempotencyKey: string,
+  ): Promise<ThinkProbeSubmission> => await host.submitThink(name, text, idempotencyKey),
+  thinkStatus: async (name: string): Promise<ThinkProbeStatus> => await host.thinkStatus(name),
+  stopThink: async (name: string): Promise<void> => await host.stopThink(name),
+  armWake: async (delayMs: number): Promise<number> => await host.armWake(delayMs),
+  status: async (): Promise<HostStatus> => await host.status(),
   sdkIncrement: async (): Promise<number> => await (await connectedAgent()).call("increment"),
-  sdkSetState: async (value: number): Promise<CounterState> => {
+  sdkSetLegacyState: async (value: number): Promise<void> => {
     if (!Number.isSafeInteger(value)) throw new TypeError("value must be a safe integer");
     const client = await connectedAgent();
     client.setState({ value });
-    return client.state as CounterState;
+  },
+  sdkSetState: async (value: number): Promise<CounterState> => {
+    if (!Number.isSafeInteger(value)) throw new TypeError("value must be a safe integer");
+    const client = await connectedAgent();
+    if (client.state === undefined) throw new Error("Agents client connected without state");
+    const state = { ...client.state, value };
+    client.setState(state);
+    return state;
   },
   sdkState: async (): Promise<CounterState> => {
     const client = await connectedAgent();
     if (client.state === undefined) throw new Error("Agents client connected without state");
     return client.state;
   },
+  relayRoundTrip: async (origin: string): Promise<RelayRoundTrip> =>
+    await runRelayRoundTrip(origin),
   storageStatus: async (): Promise<string> => await storageStatus,
   sdkStream: async (): Promise<{ chunks: unknown[]; final: unknown }> => {
     const chunks: unknown[] = [];
@@ -189,24 +374,38 @@ const ops = {
   },
 } satisfies Record<HostOp, (...args: never[]) => Promise<unknown>>;
 
+function stringArg(args: readonly unknown[], index: number): string {
+  const value = args[index];
+  if (typeof value !== "string") throw new TypeError(`argument ${index + 1} must be a string`);
+  return value;
+}
+
+function integerArg(args: readonly unknown[], index: number): number {
+  const value = args[index];
+  if (typeof value !== "number" || !Number.isSafeInteger(value)) {
+    throw new TypeError(`argument ${index + 1} must be a safe integer`);
+  }
+  return value;
+}
+
 async function runOp(op: HostOp, args: readonly unknown[]): Promise<unknown> {
   switch (op) {
     case "directStubIncrement":
       return await ops.directStubIncrement();
     case "email":
-      return await ops.email(String(args[0]), String(args[1]));
+      return await ops.email(stringArg(args, 0), stringArg(args, 1));
     case "evict":
       return await ops.evict();
     case "increment":
       return await ops.increment();
     case "enqueueIncrement":
-      return await ops.enqueueIncrement(Number(args[0]));
+      return await ops.enqueueIncrement(integerArg(args, 0));
     case "mcp": {
       const params = args[1];
-      if (params === null || typeof params !== "object" || Array.isArray(params)) {
+      if (!isRecord(params)) {
         throw new TypeError("MCP params must be an object");
       }
-      return await ops.mcp(String(args[0]), params as Record<string, unknown>);
+      return await ops.mcp(stringArg(args, 0), params);
     }
     case "snapshot":
       return await ops.snapshot();
@@ -219,24 +418,44 @@ async function runOp(op: HostOp, args: readonly unknown[]): Promise<unknown> {
     case "nestedSubAgent":
       return await ops.nestedSubAgent();
     case "armSubAgentWake":
-      return await ops.armSubAgentWake(Number(args[0] ?? 0));
+      return await ops.armSubAgentWake(integerArg(args, 0));
     case "scheduledSubAgentValue":
       return await ops.scheduledSubAgentValue();
+    case "startThink":
+      return await ops.startThink(stringArg(args, 0), stringArg(args, 1));
+    case "submitThink":
+      return await ops.submitThink(stringArg(args, 0), stringArg(args, 1), stringArg(args, 2));
+    case "thinkStatus":
+      return await ops.thinkStatus(stringArg(args, 0));
+    case "stopThink":
+      return await ops.stopThink(stringArg(args, 0));
     case "armWake":
-      return await ops.armWake(Number(args[0] ?? 0));
+      return await ops.armWake(integerArg(args, 0));
     case "status":
       return await ops.status();
     case "sdkIncrement":
       return await ops.sdkIncrement();
+    case "sdkSetLegacyState":
+      return await ops.sdkSetLegacyState(integerArg(args, 0));
     case "sdkSetState":
-      return await ops.sdkSetState(Number(args[0]));
+      return await ops.sdkSetState(integerArg(args, 0));
     case "sdkState":
       return await ops.sdkState();
+    case "relayRoundTrip":
+      return await ops.relayRoundTrip(stringArg(args, 0));
     case "storageStatus":
       return await ops.storageStatus();
     case "sdkStream":
       return await ops.sdkStream();
   }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isHostOp(value: unknown): value is HostOp {
+  return typeof value === "string" && Object.hasOwn(ops, value);
 }
 
 /**
@@ -266,12 +485,16 @@ window.__host = ops;
 if (typeof chrome !== "undefined" && chrome.runtime?.id !== undefined) {
   chrome.runtime.onMessage.addListener(
     (
-      message: ExtensionMessage,
+      message: unknown,
       _sender: chrome.runtime.MessageSender,
       sendResponse: (response: ExtensionResponse) => void,
     ): boolean => {
-      if (message?.type !== "host-op") return false;
-      void runOp(message.op, message.args).then(
+      if (!isRecord(message) || message.type !== "host-op") return false;
+      const operation =
+        isHostOp(message.op) && Array.isArray(message.args)
+          ? runOp(message.op, message.args)
+          : Promise.reject(new TypeError("invalid host operation message"));
+      void operation.then(
         (value) => {
           sendResponse({ ok: true, value });
         },

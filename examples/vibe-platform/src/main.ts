@@ -140,7 +140,13 @@ async function doText(method: string, path: string, body?: string): Promise<stri
 
 const filePath = (path: string): string => `/file?path=${encodeURIComponent(path)}`;
 
-const listFiles = async (): Promise<string[]> => JSON.parse(await doText("GET", "/files"));
+async function listFiles(): Promise<string[]> {
+  const paths: unknown = JSON.parse(await doText("GET", "/files"));
+  if (!Array.isArray(paths) || !paths.every((path): path is string => typeof path === "string")) {
+    throw new TypeError("GET /files returned an invalid file list");
+  }
+  return paths;
+}
 const readFile = (path: string): Promise<string> => doText("GET", filePath(path));
 const writeFile = (path: string, content: string): Promise<string> =>
   doText("PUT", filePath(path), content);
@@ -206,22 +212,25 @@ async function bundleWorkspace(
       },
     ],
   });
-  const { output } = await bundle.generate(
-    iifeName === undefined
-      ? { format: "esm" }
-      : {
-          format: "iife",
-          name: iifeName,
-          globals: {
-            "cloudflare:workers": CLOUDFLARE_WORKERS_GLOBAL,
-            agents: AGENTS_GLOBAL,
+  try {
+    const { output } = await bundle.generate(
+      iifeName === undefined
+        ? { format: "esm" }
+        : {
+            format: "iife",
+            name: iifeName,
+            globals: {
+              "cloudflare:workers": CLOUDFLARE_WORKERS_GLOBAL,
+              agents: AGENTS_GLOBAL,
+            },
           },
-        },
-  );
-  await bundle.close();
-  const first = output[0];
-  if (first === undefined) throw new Error("rolldown produced no output chunk");
-  return iifeName === undefined ? first.code : `${first.code}\nexport default ${iifeName};\n`;
+    );
+    const first = output[0];
+    if (first === undefined) throw new Error("rolldown produced no output chunk");
+    return iifeName === undefined ? first.code : `${first.code}\nexport default ${iifeName};\n`;
+  } finally {
+    await bundle.close();
+  }
 }
 
 const build = (): Promise<string> =>
@@ -396,7 +405,7 @@ addEventListener("message", (event: MessageEvent) => {
   if (event.source !== preview.contentWindow || event.origin !== "null") return;
   const data: unknown = event.data;
   if (typeof data === "object" && data !== null && "preview" in data) {
-    log(`preview: ${String((data as { preview: unknown }).preview)}`, true);
+    log(`preview: ${String(data.preview)}`, true);
     return;
   }
   if (
@@ -405,33 +414,30 @@ addEventListener("message", (event: MessageEvent) => {
     "previewApi" in data &&
     event.ports[0] !== undefined
   ) {
-    void forwardPreviewApi((data as { previewApi: unknown }).previewApi, event.ports[0]);
+    void forwardPreviewApi(data.previewApi, event.ports[0]);
   }
 });
 
-type PreviewApiRequest = {
-  method: string;
-  path: string;
-  headers: [string, string][];
-  body?: Uint8Array;
-};
+type PreviewApiRequest = Omit<WireRequest, "url"> & { path: string };
 
 function isPreviewApiRequest(value: unknown): value is PreviewApiRequest {
   if (typeof value !== "object" || value === null) return false;
-  const request = value as Partial<PreviewApiRequest>;
   return (
-    typeof request.method === "string" &&
-    typeof request.path === "string" &&
-    request.path.startsWith("/api/") &&
-    Array.isArray(request.headers) &&
-    request.headers.every(
+    "method" in value &&
+    typeof value.method === "string" &&
+    "path" in value &&
+    typeof value.path === "string" &&
+    value.path.startsWith("/api/") &&
+    "headers" in value &&
+    Array.isArray(value.headers) &&
+    value.headers.every(
       (header) =>
         Array.isArray(header) &&
         header.length === 2 &&
         typeof header[0] === "string" &&
         typeof header[1] === "string",
     ) &&
-    (request.body === undefined || request.body instanceof Uint8Array)
+    (!("body" in value) || value.body === undefined || value.body instanceof Uint8Array)
   );
 }
 
@@ -558,7 +564,7 @@ Run \`pnpm exec wrangler deploy\` when you are ready to deploy.
       private: true,
       type: "module",
       scripts: { deploy: "wrangler deploy", "deploy:dry": "wrangler deploy --dry-run" },
-      dependencies: { agents: "0.21.0" },
+      dependencies: { agents: "0.22.0" },
       devDependencies: { wrangler: "^4.114.0" },
     },
     null,

@@ -1,0 +1,178 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="760" viewBox="0 0 1400 760" role="img" aria-labelledby="title description">
+  <title id="title">A local agent running inside a browser extension</title>
+  <desc id="description">A browser window with an extension popup open over an abstract, persistent agent workspace.</desc>
+  <defs>
+    <linearGradient id="backdrop" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#080b16" />
+      <stop offset="0.52" stop-color="#11162a" />
+      <stop offset="1" stop-color="#0a101d" />
+    </linearGradient>
+    <linearGradient id="viewport" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#12182d" />
+      <stop offset="0.48" stop-color="#0e1830" />
+      <stop offset="1" stop-color="#071622" />
+    </linearGradient>
+    <radialGradient id="violet-haze" cx="0" cy="0" r="1" gradientTransform="translate(491 391) rotate(20) scale(365 290)" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#7c3aed" stop-opacity="0.34" />
+      <stop offset="0.55" stop-color="#4f46e5" stop-opacity="0.11" />
+      <stop offset="1" stop-color="#4f46e5" stop-opacity="0" />
+    </radialGradient>
+    <radialGradient id="teal-haze" cx="0" cy="0" r="1" gradientTransform="translate(745 546) rotate(-14) scale(414 236)" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#2dd4bf" stop-opacity="0.24" />
+      <stop offset="1" stop-color="#2dd4bf" stop-opacity="0" />
+    </radialGradient>
+    <linearGradient id="agent" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#a78bfa" />
+      <stop offset="0.5" stop-color="#6366f1" />
+      <stop offset="1" stop-color="#2563eb" />
+    </linearGradient>
+    <linearGradient id="thread" x1="0" y1="0" x2="1" y2="0">
+      <stop stop-color="#22d3ee" stop-opacity="0" />
+      <stop offset="0.28" stop-color="#2dd4bf" />
+      <stop offset="0.7" stop-color="#60a5fa" />
+      <stop offset="1" stop-color="#818cf8" stop-opacity="0" />
+    </linearGradient>
+    <linearGradient id="popup" x1="0" y1="0" x2="0" y2="1">
+      <stop stop-color="#ffffff" />
+      <stop offset="1" stop-color="#f5f7fb" />
+    </linearGradient>
+    <pattern id="grid" width="34" height="34" patternUnits="userSpaceOnUse">
+      <path d="M34 0H0V34" fill="none" stroke="#94a3b8" stroke-opacity="0.075" />
+    </pattern>
+    <clipPath id="window-clip">
+      <rect x="100" y="62" width="1200" height="636" rx="28" />
+    </clipPath>
+    <filter id="window-shadow" x="-20%" y="-20%" width="140%" height="155%">
+      <feDropShadow dx="0" dy="30" stdDeviation="34" flood-color="#000000" flood-opacity="0.42" />
+    </filter>
+    <filter id="popup-shadow" x="-35%" y="-25%" width="170%" height="170%">
+      <feDropShadow dx="0" dy="22" stdDeviation="24" flood-color="#020617" flood-opacity="0.38" />
+    </filter>
+    <filter id="orb-glow" x="-100%" y="-100%" width="300%" height="300%">
+      <feGaussianBlur stdDeviation="18" result="blur" />
+      <feMerge>
+        <feMergeNode in="blur" />
+        <feMergeNode in="SourceGraphic" />
+      </feMerge>
+    </filter>
+    <filter id="line-glow" x="-20%" y="-250%" width="140%" height="600%">
+      <feGaussianBlur stdDeviation="6" result="blur" />
+      <feMerge>
+        <feMergeNode in="blur" />
+        <feMergeNode in="SourceGraphic" />
+      </feMerge>
+    </filter>
+  </defs>
+
+  <rect width="1400" height="760" rx="32" fill="url(#backdrop)" />
+  <circle cx="170" cy="126" r="230" fill="#4f46e5" fill-opacity="0.1" />
+  <circle cx="1254" cy="654" r="280" fill="#0d9488" fill-opacity="0.08" />
+
+  <g filter="url(#window-shadow)">
+    <rect x="100" y="62" width="1200" height="636" rx="28" fill="#f8fafc" />
+  </g>
+
+  <g clip-path="url(#window-clip)">
+    <!-- Browser chrome -->
+    <rect x="100" y="62" width="1200" height="94" fill="#eef1f6" />
+    <circle cx="132" cy="92" r="6" fill="#ef6a67" />
+    <circle cx="154" cy="92" r="6" fill="#e6b84a" />
+    <circle cx="176" cy="92" r="6" fill="#58b96f" />
+
+    <path d="M226 75H456A15 15 0 0 1 471 90V113H211V90A15 15 0 0 1 226 75Z" fill="#ffffff" />
+    <circle cx="238" cy="94" r="7" fill="#6d5dfc" />
+    <rect x="255" y="89" width="108" height="10" rx="5" fill="#cbd2df" />
+    <path d="M443 89 451 97M451 89 443 97" stroke="#9ca7b9" stroke-width="1.6" stroke-linecap="round" />
+
+    <rect x="100" y="113" width="1200" height="43" fill="#ffffff" />
+    <path d="M132 134H148M132 134 139 127M132 134 139 141" fill="none" stroke="#68758b" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+    <path d="M175 134H191M191 134 184 127M191 134 184 141" fill="none" stroke="#c2c9d4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+    <path d="M219 128A9 9 0 1 0 222 140M219 128 225 127 224 133" fill="none" stroke="#68758b" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+    <rect x="248" y="120" width="770" height="28" rx="14" fill="#eef1f5" />
+    <path d="M270 131V128A4 4 0 0 1 278 128V131M268 131H280V140H268Z" fill="none" stroke="#8d98aa" stroke-width="1.25" stroke-linejoin="round" />
+    <rect x="292" y="130" width="155" height="8" rx="4" fill="#c9d0dc" />
+
+    <!-- The highlighted extension button anchors the popup to the browser. -->
+    <circle cx="1128" cy="134" r="18" fill="#ece9ff" />
+    <path d="M1122 125H1128V130A4 4 0 1 1 1134 134V143H1125V139A4 4 0 1 1 1122 133Z" fill="#6857e5" />
+    <circle cx="1180" cy="134" r="3" fill="#68758b" />
+    <circle cx="1191" cy="134" r="3" fill="#68758b" />
+    <circle cx="1202" cy="134" r="3" fill="#68758b" />
+
+    <!-- An ordinary web page, kept intentionally abstract. -->
+    <rect x="100" y="156" width="1200" height="542" fill="url(#viewport)" />
+    <rect x="100" y="156" width="1200" height="542" fill="url(#grid)" />
+    <rect x="100" y="156" width="1200" height="542" fill="url(#violet-haze)" />
+    <rect x="100" y="156" width="1200" height="542" fill="url(#teal-haze)" />
+
+    <rect x="136" y="193" width="52" height="468" rx="18" fill="#151d33" stroke="#ffffff" stroke-opacity="0.07" />
+    <circle cx="162" cy="222" r="10" fill="#6d5dfc" />
+    <circle cx="162" cy="282" r="6" fill="#68758b" />
+    <circle cx="162" cy="323" r="6" fill="#68758b" />
+    <circle cx="162" cy="364" r="6" fill="#68758b" />
+    <rect x="154" y="619" width="16" height="16" rx="5" fill="#29334c" />
+
+    <rect x="226" y="201" width="228" height="12" rx="6" fill="#dbe4f4" fill-opacity="0.64" />
+    <rect x="226" y="229" width="138" height="8" rx="4" fill="#9aa9c5" fill-opacity="0.28" />
+
+    <!-- One continuous thread remains while the surrounding surface fades. -->
+    <path d="M242 534C328 534 337 473 407 473S502 552 579 552 663 453 746 453 819 489 881 489" fill="none" stroke="#0b2235" stroke-width="18" stroke-linecap="round" />
+    <path d="M242 534C328 534 337 473 407 473S502 552 579 552 663 453 746 453 819 489 881 489" fill="none" stroke="url(#thread)" stroke-width="4" stroke-linecap="round" filter="url(#line-glow)" />
+    <circle cx="309" cy="513" r="4" fill="#5eead4" />
+    <circle cx="579" cy="552" r="5" fill="#67e8f9" />
+    <circle cx="800" cy="471" r="4" fill="#93c5fd" />
+
+    <!-- The agent is a presence, not another architecture box. -->
+    <circle cx="515" cy="385" r="112" fill="#5b4be8" fill-opacity="0.09" />
+    <circle cx="515" cy="385" r="82" fill="#5b4be8" fill-opacity="0.13" />
+    <circle cx="515" cy="385" r="53" fill="url(#agent)" filter="url(#orb-glow)" />
+    <path d="M492 386C502 374 528 374 538 386M498 403C510 413 522 413 534 403" fill="none" stroke="#ffffff" stroke-opacity="0.9" stroke-width="4" stroke-linecap="round" />
+    <circle cx="496" cy="370" r="5" fill="#ffffff" fill-opacity="0.92" />
+    <circle cx="534" cy="370" r="5" fill="#ffffff" fill-opacity="0.92" />
+    <circle cx="409" cy="335" r="8" fill="#2dd4bf" fill-opacity="0.9" />
+    <circle cx="648" cy="314" r="7" fill="#60a5fa" fill-opacity="0.82" />
+    <circle cx="680" cy="407" r="4" fill="#c4b5fd" fill-opacity="0.8" />
+
+    <!-- A quiet alarm pulse reads as wake-up without becoming a diagram. -->
+    <circle cx="746" cy="453" r="29" fill="#f97316" fill-opacity="0.07" stroke="#fb923c" stroke-opacity="0.28" />
+    <circle cx="746" cy="453" r="13" fill="#fb923c" fill-opacity="0.16" stroke="#fdba74" stroke-width="2" />
+    <path d="M746 445V453L752 457" fill="none" stroke="#fed7aa" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />
+
+    <rect x="226" y="608" width="512" height="10" rx="5" fill="#33405a" fill-opacity="0.75" />
+    <rect x="226" y="632" width="362" height="8" rx="4" fill="#29364f" fill-opacity="0.68" />
+  </g>
+
+  <!-- Extension popup -->
+  <g filter="url(#popup-shadow)">
+    <path d="M1128 151 1142 169H1114Z" fill="#ffffff" />
+    <rect x="892" y="165" width="332" height="438" rx="24" fill="url(#popup)" />
+  </g>
+  <rect x="893" y="166" width="330" height="436" rx="23" fill="none" stroke="#d9dfeb" />
+
+  <circle cx="935" cy="210" r="17" fill="url(#agent)" />
+  <path d="M928 211C932 206 938 206 942 211" fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" />
+  <rect x="966" y="199" width="95" height="10" rx="5" fill="#182033" />
+  <rect x="966" y="218" width="56" height="7" rx="3.5" fill="#a8b1c1" />
+  <circle cx="1183" cy="210" r="6" fill="#34d399" />
+  <circle cx="1183" cy="210" r="11" fill="none" stroke="#34d399" stroke-opacity="0.2" />
+  <path d="M916 249H1200" stroke="#e4e8f0" />
+
+  <text x="1058" y="357" text-anchor="middle" fill="#121827" font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" font-size="104" font-weight="690" letter-spacing="-6">21</text>
+  <circle cx="1058" cy="395" r="5" fill="#6366f1" />
+  <circle cx="1075" cy="395" r="5" fill="#d8dce6" />
+  <circle cx="1041" cy="395" r="5" fill="#d8dce6" />
+
+  <rect x="924" y="439" width="268" height="70" rx="20" fill="#111827" />
+  <circle cx="974" cy="474" r="18" fill="#262f43" />
+  <path d="M966 474H982M974 466V482" stroke="#ffffff" stroke-width="2.6" stroke-linecap="round" />
+  <path d="M1019 474H1117" stroke="#465269" stroke-width="4" stroke-linecap="round" />
+  <path d="M1019 474C1037 474 1040 459 1055 459S1076 488 1092 488 1103 474 1117 474" fill="none" stroke="url(#thread)" stroke-width="3" stroke-linecap="round" />
+  <circle cx="1154" cy="474" r="18" fill="#fff0e6" />
+  <circle cx="1154" cy="474" r="8" fill="none" stroke="#f97316" stroke-width="2" />
+  <path d="M1154 469V474L1158 477" fill="none" stroke="#f97316" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+
+  <rect x="924" y="538" width="88" height="8" rx="4" fill="#d5dae5" />
+  <rect x="924" y="558" width="206" height="8" rx="4" fill="#e2e6ed" />
+  <circle cx="1173" cy="552" r="17" fill="#e9e7ff" />
+  <path d="M1166 553 1171 558 1181 546" fill="none" stroke="#6657de" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" />
+</svg>

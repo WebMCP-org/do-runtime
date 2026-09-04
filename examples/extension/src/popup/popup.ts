@@ -8,7 +8,12 @@
  * closes.
  */
 
-import type { ExtensionMessage, ExtensionResponse, HostOp } from "../protocol";
+import {
+  parseExtensionResponse,
+  type ExtensionMessage,
+  type ExtensionResponse,
+  type HostOp,
+} from "../protocol";
 
 function mustFind<T extends Element>(selector: string): T {
   const element = document.querySelector<T>(selector);
@@ -29,10 +34,9 @@ function print(label: string, value: unknown): void {
  * claimed this message". Every other answer is an `ExtensionResponse`, because
  * `sendResponse` cannot reject and the two sides settle rather than throw.
  */
-async function sendOnce<T>(
-  message: ExtensionMessage,
-): Promise<ExtensionResponse<T> | undefined> {
-  return (await chrome.runtime.sendMessage(message)) as ExtensionResponse<T> | undefined;
+async function sendOnce(message: ExtensionMessage): Promise<ExtensionResponse | undefined> {
+  const response: unknown = await chrome.runtime.sendMessage(message);
+  return response === undefined ? undefined : parseExtensionResponse(response);
 }
 
 /**
@@ -47,11 +51,11 @@ async function sendOnce<T>(
  * A real error from the other side is NOT retried — it comes straight out of
  * here, because retrying a call that failed on its merits would only hide it.
  */
-async function send<T>(message: ExtensionMessage): Promise<T> {
-  let response = await sendOnce<T>(message);
+async function send(message: ExtensionMessage): Promise<unknown> {
+  let response = await sendOnce(message);
   if (response === undefined) {
     await new Promise((resolve) => setTimeout(resolve, 100));
-    response = await sendOnce<T>(message);
+    response = await sendOnce(message);
   }
   if (response === undefined) {
     throw new Error("no extension context answered; is the offscreen document up?");

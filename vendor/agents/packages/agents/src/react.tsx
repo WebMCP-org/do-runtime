@@ -1,0 +1,1543 @@
+import type { PartySocket } from "partysocket";
+import { usePartySocket } from "partysocket/react";
+import { useCallback, useRef, use, useMemo, useState, useEffect } from "react";
+import type { MCPServersState, RPCRequest, RPCResponse } from "./";
+import type {
+  AgentConnectionError,
+  AgentPromiseReturnType,
+  AgentStub,
+  CallOptions,
+  OptionalAgentMethods,
+  RequiredAgentMethods,
+  StreamOptions,
+  UntypedAgentStub
+} from "./client";
+import type { ClientParameters } from "./serializable";
+import {
+  createStubProxy,
+  DEFAULT_CALL_TIMEOUT_MS,
+  AgentConnectionError as AgentConnectionErrorCtor,
+  isTerminalCloseEvent
+} from "./client";
+import { buildSubAgentPathUnchecked } from "./sub-routing";
+import { camelCaseToKebabCase } from "./utils";
+import { MessageType } from "./types";
+import {
+  applyAgentToolEvent,
+  createAgentToolEventState,
+  type AgentToolCollectionMessage,
+  type AgentToolCollectionState,
+  type AgentToolEventMessage,
+  type AgentToolEventState,
+  type AgentToolProjectionMessage,
+  type AgentToolRunPart,
+  type AgentToolRunState
+} from "./chat/agent-tools";
+import { CHAT_MESSAGE_TYPES } from "./chat/protocol";
+export { agentToolRunMayExecute } from "./agent-tool-types";
+
+const AGENT_CHAT_REPLAY_MESSAGE_TYPES = new Set<string>([
+  CHAT_MESSAGE_TYPES.CHAT_MESSAGES,
+  CHAT_MESSAGE_TYPES.USE_CHAT_RESPONSE,
+  CHAT_MESSAGE_TYPES.CHAT_CLEAR,
+  CHAT_MESSAGE_TYPES.STREAM_RESUMING,
+  CHAT_MESSAGE_TYPES.STREAM_RESUME_NONE,
+  CHAT_MESSAGE_TYPES.STREAM_PENDING,
+  CHAT_MESSAGE_TYPES.MESSAGE_UPDATED,
+  CHAT_MESSAGE_TYPES.CHAT_RECOVERING
+]);
+
+type QueryObject = Record<string, string | null>;
+type TerminalReconnectOptions = {
+  shouldReconnectOnClose?: (event: CloseEvent) => boolean;
+};
+
+interface CacheEntry {
+  promise: Promise<QueryObject>;
+  expiresAt: number;
+}
+
+const queryCache = new Map<string, CacheEntry>();
+
+function createCacheKey(
+  agentNamespace: string,
+  name: string | undefined,
+  subChainOrDeps: ReadonlyArray<{ agent: string; name: string }> | unknown[],
+  deps?: unknown[]
+): string {
+  // Backwards-compatible overload: if called with 3 args, the third
+  // argument is `deps` and `subChain` defaults to empty. With 4 args,
+  // the third is the sub-chain. This keeps existing callers (and
+  // the `_testUtils` surface) working while letting new callers
+  // include the nested chain in the cache key.
+  //
+  // Empty sub-chain must produce the same key as the old 3-arg
+  // form, so nested-addressing code can opt-in without invalidating
+  // existing caches.
+  if (deps === undefined) {
+    return JSON.stringify([
+      agentNamespace,
+      name || "default",
+      ...(subChainOrDeps as unknown[])
+    ]);
+  }
+  const subChain = subChainOrDeps as ReadonlyArray<{
+    agent: string;
+    name: string;
+  }>;
+  if (subChain.length === 0) {
+    return JSON.stringify([agentNamespace, name || "default", ...deps]);
+  }
+  return JSON.stringify([
+    agentNamespace,
+    name || "default",
+    subChain.map((s) => [s.agent, s.name]),
+    ...deps
+  ]);
+}
+
+/** Build a URL path tail `/sub/{agent-kebab}/{name}/...` from a sub chain. */
+function buildSubPath(
+  subChain: ReadonlyArray<{ agent: string; name: string }>,
+  extraPath?: string
+): string {
+  return buildSubAgentPathUnchecked(
+    subChain.map((step) => ({ className: step.agent, name: step.name })),
+    extraPath
+  );
+}
+
+function getCacheEntry(key: string): CacheEntry | undefined {
+  const entry = queryCache.get(key);
+  if (!entry) return undefined;
+
+  if (Date.now() >= entry.expiresAt) {
+    queryCache.delete(key);
+    return undefined;
+  }
+
+  return entry;
+}
+
+function setCacheEntry(
+  key: string,
+  promise: Promise<QueryObject>,
+  cacheTtl: number
+): CacheEntry {
+  const entry: CacheEntry = {
+    promise,
+    expiresAt: Date.now() + cacheTtl
+  };
+  queryCache.set(key, entry);
+  return entry;
+}
+
+function deleteCacheEntry(key: string): void {
+  queryCache.delete(key);
+}
+
+// Export for testing purposes
+export const _testUtils = {
+  queryCache,
+  setCacheEntry,
+  getCacheEntry,
+  deleteCacheEntry,
+  clearCache: () => queryCache.clear(),
+  createStubProxy,
+  createCacheKey
+};
+
+/**
+ * Options for the useAgent hook
+ * @template State Type of the Agent's state
+ */
+export type UseAgentOptions<State = unknown> = Omit<
+  Parameters<typeof usePartySocket>[0],
+  "party" | "room" | "query"
+> &
+  TerminalReconnectOptions & {
+    /** Name of the agent to connect to (ignored if basePath is set) */
+    agent: string;
+    /** Name of the specific Agent instance (ignored if basePath is set) */
+    name?: string;
+    /**
+     * Full URL path - bypasses agent/name URL construction.
+     * When set, the client connects to this path directly.
+     * Server must handle routing manually (e.g., with getAgentByName + fetch).
+     * @example
+     * // Client connects to /user, server routes based on session
+     * useAgent({ agent: "UserAgent", basePath: "user" })
+     */
+    basePath?: string;
+    /** Query parameters - can be static object or async function */
+    query?: QueryObject | (() => Promise<QueryObject>);
+    /** Dependencies for async query caching */
+    queryDeps?: unknown[];
+    /** Cache TTL in milliseconds for auth tokens/time-sensitive data */
+    cacheTtl?: number;
+    /** Called when the Agent's state is updated */
+    onStateUpdate?: (state: State, source: "server" | "client") => void;
+    /** Called when a state update fails (e.g., connection is readonly) */
+    onStateUpdateError?: (error: string) => void;
+    /** Called when MCP server state is updated */
+    onMcpUpdate?: (mcpServers: MCPServersState) => void;
+    /**
+     * Called when the server sends the agent's identity on connect.
+     * Useful when using basePath, as the actual instance name is determined server-side.
+     * @param name The actual agent instance name
+     * @param agent The agent class name (kebab-case)
+     */
+    onIdentity?: (name: string, agent: string) => void;
+    /**
+     * Called when identity changes on reconnect (different instance than before).
+     * If not provided and identity changes, a warning will be logged.
+     * @param oldName Previous instance name
+     * @param newName New instance name
+     * @param oldAgent Previous agent class name
+     * @param newAgent New agent class name
+     */
+    onIdentityChange?: (
+      oldName: string,
+      newName: string,
+      oldAgent: string,
+      newAgent: string
+    ) => void;
+    /**
+     * Additional path to append to the URL.
+     * Works with both standard routing and basePath.
+     * @example
+     * // With basePath: /user/settings
+     * { basePath: "user", path: "settings" }
+     * // Standard: /agents/my-agent/room/settings
+     * { agent: "MyAgent", name: "room", path: "settings" }
+     */
+    path?: string;
+    /**
+     * Connect to a sub-agent (facet) via its parent. Flat array,
+     * root-first. Each step addresses one parent↔child hop.
+     *
+     * The hook's returned `.agent` / `.name` report the **leaf**
+     * identity (the deepest entry in `sub`), so downstream hooks
+     * like `useAgentChat` see the child they actually talk to.
+     * `.path` exposes the full chain for observability, deep links,
+     * and reconnect keying.
+     *
+     * @example
+     * ```ts
+     * // Two-level nesting: Inbox (Alice) → Chat (abc)
+     * useAgent({
+     *   agent: "inbox", name: userId,
+     *   sub: [{ agent: "chat", name: chatId }]
+     * });
+     *
+     * // Three-level: tenant → inbox → chat
+     * useAgent({
+     *   agent: "tenant", name: tenantId,
+     *   sub: [
+     *     { agent: "inbox", name: userId },
+     *     { agent: "chat",  name: chatId }
+     *   ]
+     * });
+     * ```
+     *
+     * @experimental The API surface may change before stabilizing.
+     */
+    sub?: ReadonlyArray<{ agent: string; name: string }>;
+    /**
+     * Default timeout (in milliseconds) applied to non-streaming `call()`s
+     * that don't pass an explicit `timeout`. Acts as a backstop so calls
+     * whose response is lost (e.g. the connection is replaced mid-flight)
+     * reject instead of hanging forever.
+     *
+     * Defaults to 30 000 ms. Set to `0` to disable the default timeout.
+     * Streaming calls never get a default timeout (long-lived streams are
+     * legitimate); pass an explicit `timeout` to bound them.
+     */
+    defaultCallTimeout?: number;
+    /** Called when the connection closes with a terminal code and will not reconnect. */
+    onConnectionError?: (error: AgentConnectionError) => void;
+  };
+
+type OptionalArgsAgentMethodCall<AgentT> = <
+  K extends keyof OptionalAgentMethods<AgentT>
+>(
+  method: K,
+  args?: ClientParameters<OptionalAgentMethods<AgentT>[K]>,
+  options?: CallOptions | StreamOptions
+) => AgentPromiseReturnType<AgentT, K>;
+
+type RequiredArgsAgentMethodCall<AgentT> = <
+  K extends keyof RequiredAgentMethods<AgentT>
+>(
+  method: K,
+  args: ClientParameters<RequiredAgentMethods<AgentT>[K]>,
+  options?: CallOptions | StreamOptions
+) => AgentPromiseReturnType<AgentT, K>;
+
+type AgentMethodCall<AgentT> = OptionalArgsAgentMethodCall<AgentT> &
+  RequiredArgsAgentMethodCall<AgentT>;
+
+type UntypedAgentMethodCall = <T = unknown>(
+  method: string,
+  args?: unknown[],
+  options?: CallOptions | StreamOptions
+) => Promise<T>;
+
+/**
+ * React hook for connecting to an Agent
+ */
+export function useAgent<State = unknown>(
+  options: UseAgentOptions<State>
+): Omit<PartySocket, "path"> & {
+  agent: string;
+  name: string;
+  /** Full root-first address chain, including leaf. Single entry when `sub` isn't set. */
+  path: ReadonlyArray<{ agent: string; name: string }>;
+  identified: boolean;
+  ready: Promise<void>;
+  state: State | undefined;
+  connectionError: AgentConnectionError | null;
+  setState: (state: State) => void;
+  call: UntypedAgentMethodCall;
+  stub: UntypedAgentStub;
+  getHttpUrl: () => string;
+};
+export function useAgent<
+  AgentT extends {
+    get state(): State;
+  },
+  State
+>(
+  options: UseAgentOptions<State>
+): Omit<PartySocket, "path"> & {
+  agent: string;
+  name: string;
+  path: ReadonlyArray<{ agent: string; name: string }>;
+  identified: boolean;
+  ready: Promise<void>;
+  state: State | undefined;
+  connectionError: AgentConnectionError | null;
+  setState: (state: State) => void;
+  call: AgentMethodCall<AgentT>;
+  stub: AgentStub<AgentT>;
+  getHttpUrl: () => string;
+};
+export function useAgent<State>(options: UseAgentOptions<unknown>): Omit<
+  PartySocket,
+  "path"
+> & {
+  agent: string;
+  name: string;
+  path: ReadonlyArray<{ agent: string; name: string }>;
+  identified: boolean;
+  ready: Promise<void>;
+  state: State | undefined;
+  connectionError: AgentConnectionError | null;
+  setState: (state: State) => void;
+  call: UntypedAgentMethodCall | AgentMethodCall<unknown>;
+  stub: UntypedAgentStub;
+  getHttpUrl: () => string;
+} {
+  const agentNamespace = camelCaseToKebabCase(options.agent);
+  // NOTE: `path` is destructured out (as `userPath`) so it does NOT
+  // end up in `restOptions`. Spreading `restOptions` after the
+  // computed `path: combinedPath` would otherwise let the user's raw
+  // `path` overwrite the combined sub-agent URL, dropping every
+  // `/sub/{child}/{name}` segment on the way to the socket.
+  const {
+    query,
+    queryDeps,
+    cacheTtl,
+    sub: subOption,
+    path: userPath,
+    defaultCallTimeout,
+    onConnectionError,
+    shouldReconnectOnClose,
+    ...restOptions
+  } = options;
+
+  const subChain = useMemo(
+    () => (subOption ?? []).map((s) => ({ agent: s.agent, name: s.name })),
+    // Stable serialization — deep changes re-memoize.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [JSON.stringify(subOption ?? [])]
+  );
+
+  // The "leaf" is the deepest entry in the chain; it's what
+  // downstream code (useAgentChat etc.) should see as the
+  // authoritative identity.
+  const leafAgent =
+    subChain.length > 0 ? subChain[subChain.length - 1].agent : options.agent;
+  const leafName =
+    subChain.length > 0
+      ? subChain[subChain.length - 1].name
+      : options.name || "default";
+
+  // Full root-first chain, including the leaf. Exposed as `.path`
+  // and used for cache keying so nested sessions with the same leaf
+  // name don't collide.
+  const fullPath = useMemo(
+    () => [
+      { agent: options.agent, name: options.name || "default" },
+      ...subChain
+    ],
+    [options.agent, options.name, subChain]
+  );
+
+  // Keep track of pending RPC calls.
+  //
+  // Each entry is tagged with the socket the request was transmitted on
+  // (`sentOn`). Requests are only handed to a socket once it's OPEN —
+  // until then they stay queued here (`sentOn: null`). This matters
+  // because `usePartySocket` *replaces* the socket object whenever
+  // connection options change (async query refresh, path change, etc.):
+  // anything buffered inside a replaced socket is lost forever, and a
+  // call transmitted on a replaced socket can never receive its
+  // response. Tagging lets us:
+  // - flush still-queued requests on whichever socket connects next
+  //   (safe: they were never transmitted, so no double-execution risk)
+  // - reject calls transmitted on a socket that closed or was replaced
+  //   (their response can never arrive)
+  // - avoid rejecting calls in flight on the *new* socket when a stale
+  //   close event from an old socket trickles in
+  const pendingCallsRef = useRef(
+    new Map<
+      string,
+      {
+        resolve: (value: unknown) => void;
+        reject: (error: Error) => void;
+        stream?: StreamOptions;
+        timeoutId?: ReturnType<typeof setTimeout>;
+        /** Serialized RPC request, kept so it can be (re)transmitted */
+        request: string;
+        /** Socket the request was transmitted on; null while queued */
+        sentOn: PartySocket | null;
+      }
+    >()
+  );
+
+  // Always points at the socket from the latest render. `call`,
+  // `setState`, and the queue-flushing logic go through this ref so
+  // that stale `agent` references held by old effect closures still
+  // route their traffic to the live socket instead of a dead one.
+  const socketRef = useRef<PartySocket | null>(null);
+
+  const defaultCallTimeoutRef = useRef(
+    defaultCallTimeout ?? DEFAULT_CALL_TIMEOUT_MS
+  );
+  defaultCallTimeoutRef.current = defaultCallTimeout ?? DEFAULT_CALL_TIMEOUT_MS;
+
+  /** Reject (and remove) every pending call transmitted on `socket`. */
+  const rejectCallsSentOn = (socket: PartySocket, reason: string) => {
+    const error = new Error(reason);
+    for (const [id, pending] of pendingCallsRef.current) {
+      if (pending.sentOn === socket) {
+        if (pending.timeoutId) clearTimeout(pending.timeoutId);
+        pendingCallsRef.current.delete(id);
+        pending.reject(error);
+        pending.stream?.onError?.(reason);
+      }
+    }
+  };
+
+  /** Transmit queued (never-sent) calls if the live socket is open. */
+  const flushQueuedCalls = () => {
+    const socket = socketRef.current;
+    if (!socket || socket.readyState !== socket.OPEN) return;
+    for (const pending of pendingCallsRef.current.values()) {
+      if (pending.sentOn === null) {
+        socket.send(pending.request);
+        pending.sentOn = socket;
+      }
+    }
+  };
+
+  /** Reject (and remove) every still-queued (never transmitted) call. */
+  const rejectQueuedCalls = (reason: string) => {
+    const error = new Error(reason);
+    for (const [id, pending] of pendingCallsRef.current) {
+      if (pending.sentOn === null) {
+        if (pending.timeoutId) clearTimeout(pending.timeoutId);
+        pendingCallsRef.current.delete(id);
+        pending.reject(error);
+        pending.stream?.onError?.(reason);
+      }
+    }
+  };
+
+  const cacheKey = useMemo(
+    () =>
+      createCacheKey(agentNamespace, options.name, subChain, queryDeps || []),
+    [agentNamespace, options.name, subChain, queryDeps]
+  );
+
+  // Track current cache key in a ref for use in onClose handler.
+  // This ensures we invalidate the correct cache entry when the connection closes,
+  // even if the component re-renders with different props before onClose fires.
+  // We update synchronously during render (not in useEffect) to avoid race
+  // conditions where onClose could fire before the effect runs.
+  const cacheKeyRef = useRef(cacheKey);
+  cacheKeyRef.current = cacheKey;
+
+  const ttl = cacheTtl ?? 5 * 60 * 1000;
+
+  // Track cache invalidation to force re-render when TTL expires
+  const [cacheInvalidatedAt, setCacheInvalidatedAt] = useState<number>(0);
+
+  // Disable socket while waiting for async query to refresh after disconnect
+  const isAsyncQuery = query && typeof query === "function";
+  const [awaitingQueryRefresh, setAwaitingQueryRefresh] = useState(false);
+
+  // Get or create the query promise
+  const queryPromise = useMemo(() => {
+    // Re-run when cache is invalidated after TTL expiry
+    void cacheInvalidatedAt;
+
+    if (!query || typeof query !== "function") {
+      return null;
+    }
+
+    // Always check cache first to deduplicate concurrent requests
+    const cached = getCacheEntry(cacheKey);
+    if (cached) {
+      return cached.promise;
+    }
+
+    // Create new promise
+    const promise = query().catch((error) => {
+      console.error(
+        `[useAgent] Query failed for agent "${options.agent}":`,
+        error
+      );
+      deleteCacheEntry(cacheKey);
+      throw error;
+    });
+
+    // Always cache to deduplicate concurrent requests
+    setCacheEntry(cacheKey, promise, ttl);
+
+    return promise;
+  }, [cacheKey, query, options.agent, ttl, cacheInvalidatedAt]);
+
+  // Schedule cache invalidation when TTL expires
+  useEffect(() => {
+    if (!queryPromise || ttl <= 0) return;
+
+    const entry = getCacheEntry(cacheKey);
+    if (!entry) return;
+
+    const timeUntilExpiry = entry.expiresAt - Date.now();
+
+    // Always set a timer (with min 0ms) to ensure cleanup function is returned
+    const timer = setTimeout(
+      () => {
+        deleteCacheEntry(cacheKey);
+        setCacheInvalidatedAt(Date.now());
+      },
+      Math.max(0, timeUntilExpiry)
+    );
+
+    return () => clearTimeout(timer);
+  }, [cacheKey, queryPromise, ttl]);
+
+  let resolvedQuery: QueryObject | undefined;
+
+  if (query) {
+    if (typeof query === "function") {
+      // Use React's use() to resolve the promise
+      const queryResult = use(queryPromise!);
+
+      // Check for non-primitive values and warn
+      if (queryResult) {
+        for (const [key, value] of Object.entries(queryResult)) {
+          if (
+            value !== null &&
+            value !== undefined &&
+            typeof value !== "string" &&
+            typeof value !== "number" &&
+            typeof value !== "boolean"
+          ) {
+            console.warn(
+              `[useAgent] Query parameter "${key}" is an object and will be converted to "[object Object]". ` +
+                "Query parameters should be string, number, boolean, or null."
+            );
+          }
+        }
+        resolvedQuery = queryResult;
+      }
+    } else {
+      // Sync query - use directly
+      resolvedQuery = query;
+    }
+  }
+
+  // Re-enable socket after async query resolves
+  useEffect(() => {
+    if (awaitingQueryRefresh && resolvedQuery !== undefined) {
+      setAwaitingQueryRefresh(false);
+    }
+  }, [awaitingQueryRefresh, resolvedQuery]);
+
+  // Track agent state for reactivity — updated on server broadcasts and client setState
+  const [agentState, setAgentState] = useState<State | undefined>(undefined);
+  const [connectionError, setConnectionError] =
+    useState<AgentConnectionError | null>(null);
+  const connectionErrorRef = useRef<AgentConnectionError | null>(null);
+  const connectionErrorAddressKeyRef = useRef<string | null>(null);
+  // Holds agent-tool frames delivered before a `useAgentToolEvents`
+  // subscriber attaches (see AgentToolReplayBuffer). A ref, not the socket
+  // WeakMap entry, so the construction-time `onMessage` below never depends
+  // on the socket reference being assigned yet.
+  const agentToolReplayRef = useRef<AgentToolReplayBuffer>({
+    frames: [],
+    drained: false
+  });
+  const agentChatReplayRef = useRef<AgentChatReplayBuffer>({
+    frames: [],
+    subscribers: 0,
+    overflowed: false
+  });
+  const replayAddressKeyRef = useRef<string | null>(null);
+  const shouldReconnectOnCloseRef = useRef(shouldReconnectOnClose);
+  shouldReconnectOnCloseRef.current = shouldReconnectOnClose;
+  const classifyReconnect = useCallback(
+    (event: CloseEvent) =>
+      (shouldReconnectOnCloseRef.current?.(event) ?? true) &&
+      !isTerminalCloseEvent(event),
+    []
+  );
+
+  // Store identity in React state for reactivity. Seed with the
+  // leaf's address — what the server will echo back in
+  // `cf_agent_identity`.
+  const [identity, setIdentity] = useState({
+    name: leafName,
+    agent: camelCaseToKebabCase(leafAgent),
+    identified: false
+  });
+
+  // Track previous identity for change detection
+  const previousIdentityRef = useRef<{
+    name: string | null;
+    agent: string | null;
+  }>({ name: null, agent: null });
+
+  // Ready promise - resolves when identity is received, resets on close
+  const readyRef = useRef<
+    { promise: Promise<void>; resolve: () => void } | undefined
+  >(undefined);
+
+  const resetReady = () => {
+    let resolve: () => void;
+    const promise = new Promise<void>((r) => {
+      resolve = r;
+    });
+    readyRef.current = { promise, resolve: resolve! };
+  };
+
+  if (!readyRef.current) {
+    resetReady();
+  }
+
+  const mutableAgentRef = useRef<{
+    agent: string;
+    name: string;
+    identified: boolean;
+  } | null>(null);
+
+  // Combine the sub-agent chain with the user-provided `path`.
+  // Order matters: `/sub/{child}/{name}/...` comes before `path` so
+  // the server sees the hierarchy it expects.
+  const combinedPath = useMemo(
+    () => buildSubPath(subChain, userPath),
+    [subChain, userPath]
+  );
+
+  // If basePath is provided, use it directly; otherwise construct from agent/name
+  const socketOptions = options.basePath
+    ? {
+        basePath: options.basePath,
+        path: combinedPath || undefined,
+        query: resolvedQuery,
+        ...restOptions,
+        shouldReconnectOnClose: classifyReconnect
+      }
+    : {
+        party: agentNamespace,
+        prefix: "agents",
+        room: options.name || "default",
+        path: combinedPath || undefined,
+        query: resolvedQuery,
+        ...restOptions,
+        shouldReconnectOnClose: classifyReconnect
+      };
+
+  const socketEnabled = !awaitingQueryRefresh && (restOptions.enabled ?? true);
+
+  // Identifies *which agent instance* this hook is addressing. Queued
+  // (never-transmitted) RPC calls are only safe to flush onto a later
+  // socket if it still points at the same instance — a call composed for
+  // agent "alpha" must not execute on agent "beta" just because the
+  // `name` prop changed while the call was waiting for a connection.
+  // Credentials (query params) are deliberately excluded: a token
+  // refresh doesn't change where calls go.
+  const addressKey = JSON.stringify([
+    options.host ?? null,
+    options.basePath ?? null,
+    agentNamespace,
+    options.name || "default",
+    combinedPath || null
+  ]);
+  if (replayAddressKeyRef.current !== addressKey) {
+    replayAddressKeyRef.current = addressKey;
+    agentToolReplayRef.current = { frames: [], drained: false };
+    // Only the frames belong to the old address. The chat buffer is cleared in
+    // place, never replaced: a mounted `useAgentChat` holds a release closure
+    // over THIS object, so a fresh one would both start at zero subscribers
+    // while a hook is still listening (every frame delivered live AND stashed,
+    // duplicating the next mount's replay) and never see that hook's
+    // decrement.
+    agentChatReplayRef.current.frames.length = 0;
+    agentChatReplayRef.current.overflowed = false;
+  }
+  const visibleConnectionError =
+    connectionErrorAddressKeyRef.current === addressKey
+      ? connectionError
+      : null;
+  connectionErrorRef.current = visibleConnectionError;
+
+  const agent = usePartySocket({
+    ...socketOptions,
+    enabled: socketEnabled,
+    onOpen: (event: Event) => {
+      connectionErrorAddressKeyRef.current = null;
+      setConnectionError(null);
+      // The socket is open: transmit any RPC requests that were issued
+      // while disconnected (or while a previous socket was being
+      // replaced). They were never handed to a socket before, so this
+      // cannot double-execute anything server-side.
+      flushQueuedCalls();
+      options.onOpen?.(event);
+    },
+    onMessage: (message) => {
+      if (typeof message.data === "string") {
+        let parsedMessage: Record<string, unknown>;
+        try {
+          parsedMessage = JSON.parse(message.data);
+        } catch (_error) {
+          // silently ignore invalid messages for now
+          // TODO: log errors with log levels
+          return options.onMessage?.(message);
+        }
+        if (parsedMessage.type === "agent-tool-event") {
+          // Stash for a subscriber that hasn't attached yet; the frame
+          // still falls through to socket listeners and options.onMessage.
+          const buffer = agentToolReplayRef.current;
+          if (
+            !buffer.drained &&
+            buffer.frames.length < AGENT_TOOL_REPLAY_BUFFER_LIMIT
+          ) {
+            buffer.frames.push(message.data);
+          }
+        }
+        if (
+          typeof parsedMessage.type === "string" &&
+          AGENT_CHAT_REPLAY_MESSAGE_TYPES.has(parsedMessage.type)
+        ) {
+          bufferChatReplayFrame(
+            agentChatReplayRef.current,
+            message.data,
+            parsedMessage.type
+          );
+        }
+        if (parsedMessage.type === MessageType.CF_AGENT_IDENTITY) {
+          const oldName = previousIdentityRef.current.name;
+          const oldAgent = previousIdentityRef.current.agent;
+          const newName = parsedMessage.name as string;
+          const newAgent = parsedMessage.agent as string;
+
+          const currentAgent = mutableAgentRef.current;
+          if (currentAgent) {
+            currentAgent.name = newName;
+            currentAgent.agent = newAgent;
+            currentAgent.identified = true;
+          }
+
+          // Update reactive state (triggers re-render)
+          setIdentity({ name: newName, agent: newAgent, identified: true });
+
+          // Resolve ready promise
+          readyRef.current?.resolve();
+
+          // Detect identity change on reconnect
+          if (
+            oldName !== null &&
+            oldAgent !== null &&
+            (oldName !== newName || oldAgent !== newAgent)
+          ) {
+            if (options.onIdentityChange) {
+              options.onIdentityChange(oldName, newName, oldAgent, newAgent);
+            } else {
+              const agentChanged = oldAgent !== newAgent;
+              const nameChanged = oldName !== newName;
+              let changeDescription = "";
+              if (agentChanged && nameChanged) {
+                changeDescription = `agent "${oldAgent}" → "${newAgent}", instance "${oldName}" → "${newName}"`;
+              } else if (agentChanged) {
+                changeDescription = `agent "${oldAgent}" → "${newAgent}"`;
+              } else {
+                changeDescription = `instance "${oldName}" → "${newName}"`;
+              }
+              console.warn(
+                `[agents] Identity changed on reconnect: ${changeDescription}. ` +
+                  "This can happen with server-side routing (e.g., basePath with getAgentByName) " +
+                  "where the instance is determined by auth/session. " +
+                  "Provide onIdentityChange callback to handle this explicitly, " +
+                  "or ignore if this is expected for your routing pattern."
+              );
+            }
+          }
+
+          // Track for next change detection
+          previousIdentityRef.current = { name: newName, agent: newAgent };
+
+          // Call onIdentity callback
+          options.onIdentity?.(newName, newAgent);
+          return;
+        }
+        if (parsedMessage.type === MessageType.CF_AGENT_STATE) {
+          setAgentState(parsedMessage.state as State);
+          options.onStateUpdate?.(parsedMessage.state as State, "server");
+          return;
+        }
+        if (parsedMessage.type === MessageType.CF_AGENT_STATE_ERROR) {
+          options.onStateUpdateError?.(parsedMessage.error as string);
+          return;
+        }
+        if (parsedMessage.type === MessageType.CF_AGENT_MCP_SERVERS) {
+          options.onMcpUpdate?.(parsedMessage.mcp as MCPServersState);
+          return;
+        }
+        if (parsedMessage.type === MessageType.RPC) {
+          const response = parsedMessage as RPCResponse;
+          const pending = pendingCallsRef.current.get(response.id);
+          if (!pending) {
+            console.warn(
+              `[useAgent] Discarded an RPC response with no matching pending call (id "${response.id}"). ` +
+                "The call likely timed out or was rejected when its connection closed before the response arrived."
+            );
+            return;
+          }
+
+          if (!response.success) {
+            if (pending.timeoutId) clearTimeout(pending.timeoutId);
+            pending.reject(new Error(response.error));
+            pendingCallsRef.current.delete(response.id);
+            pending.stream?.onError?.(response.error);
+            return;
+          }
+
+          // Handle streaming responses
+          if ("done" in response) {
+            if (response.done) {
+              if (pending.timeoutId) clearTimeout(pending.timeoutId);
+              pending.resolve(response.result);
+              pendingCallsRef.current.delete(response.id);
+              pending.stream?.onDone?.(response.result);
+            } else {
+              pending.stream?.onChunk?.(response.result);
+            }
+          } else {
+            // Non-streaming response
+            if (pending.timeoutId) clearTimeout(pending.timeoutId);
+            pending.resolve(response.result);
+            pendingCallsRef.current.delete(response.id);
+          }
+          return;
+        }
+      }
+      options.onMessage?.(message);
+    },
+    onClose: (event: CloseEvent) => {
+      // Identify which socket actually closed. Close events are
+      // dispatched asynchronously, so a close from an old socket that
+      // was just replaced can arrive while a new socket is already
+      // connecting (or connected). `event.target` is the PartySocket
+      // that dispatched the event; fall back to the live socket if the
+      // environment doesn't populate it.
+      const closedSocket =
+        (event.target as PartySocket | null) ?? socketRef.current;
+      const isCurrentSocket = closedSocket === socketRef.current;
+      const terminalClose = isTerminalCloseEvent(event);
+
+      // Calls transmitted on the closed socket can never receive their
+      // response — reject them. Calls still queued (never transmitted)
+      // stay pending and are flushed when a socket next opens; calls
+      // in flight on a *different* (newer) socket are untouched.
+      if (closedSocket) {
+        rejectCallsSentOn(closedSocket, "Connection closed");
+        if (isCurrentSocket && !closedSocket.shouldReconnect) {
+          rejectQueuedCalls("Connection closed");
+        }
+      }
+
+      if (isCurrentSocket) {
+        // Reset ready state for next connection
+        resetReady();
+        if (mutableAgentRef.current) {
+          mutableAgentRef.current.identified = false;
+        }
+        setIdentity((prev) => ({ ...prev, identified: false }));
+
+        if (closedSocket?.shouldReconnect) {
+          // Pause reconnection for async queries until fresh query params are ready.
+          if (isAsyncQuery) {
+            setAwaitingQueryRefresh(true);
+          }
+
+          // Invalidate cache and trigger re-render to fetch fresh query params.
+          deleteCacheEntry(cacheKeyRef.current);
+          setCacheInvalidatedAt(Date.now());
+        }
+
+        if (!closedSocket?.shouldReconnect && terminalClose) {
+          const error = new AgentConnectionErrorCtor(event);
+          connectionErrorAddressKeyRef.current = addressKey;
+          setConnectionError(error);
+          onConnectionError?.(error);
+        }
+      }
+
+      // Call user's onClose if provided
+      options.onClose?.(event);
+    }
+  }) as PartySocket & {
+    agent: string;
+    name: string;
+    identified: boolean;
+    ready: Promise<void>;
+    state: State | undefined;
+    connectionError: AgentConnectionError | null;
+    setState: (state: State) => void;
+    call: UntypedAgentMethodCall;
+    stub: UntypedAgentStub;
+    getHttpUrl: () => string;
+  };
+  // Update the live-socket ref before anything below can use it.
+  socketRef.current = agent;
+
+  // When `usePartySocket` replaces the socket object (connection options
+  // changed — async query refresh, path change, enabled toggle, ...) the
+  // old socket's event listeners are detached at the same commit, so its
+  // final close event may never be observed by our onClose handler.
+  // Sweep here instead: anything transmitted on the old socket can never
+  // get a response, and the identity it established no longer applies.
+  // Queued (never-transmitted) calls survive and flush when the new
+  // socket opens.
+  const prevSocketRef = useRef<PartySocket | null>(null);
+  const prevAddressKeyRef = useRef(addressKey);
+  useEffect(() => {
+    const prev = prevSocketRef.current;
+    prevSocketRef.current = agent;
+    const prevAddress = prevAddressKeyRef.current;
+    prevAddressKeyRef.current = addressKey;
+
+    // Destination guard: if the agent address changed (different agent,
+    // name, or path — not just refreshed credentials), calls that are
+    // still queued were composed for the *old* instance. Reject them
+    // before anything can flush them onto the new instance.
+    if (prevAddress !== addressKey) {
+      connectionErrorAddressKeyRef.current = null;
+      setConnectionError(null);
+      rejectQueuedCalls(
+        "Call discarded: the agent address changed before the request could be sent"
+      );
+    }
+
+    if (prev && prev !== agent) {
+      rejectCallsSentOn(prev, "Connection closed");
+      resetReady();
+      if (mutableAgentRef.current) {
+        mutableAgentRef.current.identified = false;
+      }
+      setIdentity((current) =>
+        current.identified ? { ...current, identified: false } : current
+      );
+    }
+    // The helpers only touch refs; re-running on socket/address change is all we need.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [agent, addressKey]);
+
+  // Create the call method. Deliberately dependency-free: it routes
+  // through refs, so even a stale `agent` reference captured by an old
+  // effect closure issues calls against the live socket.
+  const call = useCallback(
+    <T = unknown,>(
+      method: string,
+      args: unknown[] = [],
+      options?: CallOptions | StreamOptions
+    ): Promise<T> => {
+      return new Promise((resolve, reject) => {
+        const socket = socketRef.current;
+        if (
+          socket &&
+          connectionErrorRef.current &&
+          socket.readyState === socket.CLOSED
+        ) {
+          reject(new Error("Connection closed"));
+          return;
+        }
+
+        const id = crypto.randomUUID();
+        let timeoutId: ReturnType<typeof setTimeout> | undefined;
+
+        // Detect legacy format: { onChunk?, onDone?, onError? } vs new format: { timeout?, stream? }
+        const isLegacyFormat =
+          options &&
+          ("onChunk" in options || "onDone" in options || "onError" in options);
+        const streamOptions = isLegacyFormat
+          ? (options as StreamOptions)
+          : (options as CallOptions | undefined)?.stream;
+        const timeout = isLegacyFormat
+          ? undefined
+          : (options as CallOptions | undefined)?.timeout;
+
+        // Apply the default timeout as a backstop for non-streaming
+        // calls so a lost response rejects instead of hanging forever.
+        // An explicit `timeout` (including 0 = disabled) always wins.
+        const effectiveTimeout =
+          timeout !== undefined
+            ? timeout
+            : streamOptions
+              ? undefined
+              : defaultCallTimeoutRef.current;
+
+        if (effectiveTimeout) {
+          timeoutId = setTimeout(() => {
+            const pending = pendingCallsRef.current.get(id);
+            pendingCallsRef.current.delete(id);
+            const errorMessage = `RPC call to ${method} timed out after ${effectiveTimeout}ms`;
+            pending?.stream?.onError?.(errorMessage);
+            reject(new Error(errorMessage));
+          }, effectiveTimeout);
+        }
+
+        const rpcRequest: RPCRequest = {
+          args,
+          id,
+          method,
+          type: MessageType.RPC
+        };
+        const request = JSON.stringify(rpcRequest);
+
+        pendingCallsRef.current.set(id, {
+          reject,
+          resolve: resolve as (value: unknown) => void,
+          stream: streamOptions,
+          timeoutId,
+          request,
+          sentOn: null
+        });
+
+        // Transmit immediately if the live socket is open; otherwise the
+        // request stays queued and is flushed on the next open event.
+        // We never hand requests to a non-open socket: its internal
+        // buffer is lost forever if the socket gets replaced.
+        if (socket && socket.readyState === socket.OPEN) {
+          socket.send(request);
+          const pending = pendingCallsRef.current.get(id);
+          if (pending) pending.sentOn = socket;
+        }
+      });
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    []
+  );
+
+  agent.setState = (newState: State) => {
+    // Route through the live socket so stale `agent` references don't
+    // write into a replaced socket's dead buffer.
+    (socketRef.current ?? agent).send(
+      JSON.stringify({ state: newState, type: MessageType.CF_AGENT_STATE })
+    );
+    setAgentState(newState);
+    options.onStateUpdate?.(newState, "client");
+  };
+
+  agent.call = call;
+  // Use reactive identity state (updates on identity message)
+  agent.agent = identity.agent;
+  agent.name = identity.name;
+  // Full root-first chain including the leaf. Computed from the
+  // user-provided options — the server doesn't need to echo it
+  // back because the client already knows. Write past the
+  // PartySocket `.path: string` shape via an unknown cast — the
+  // overload signatures expose this as `ReadonlyArray<...>`.
+  (
+    agent as unknown as { path: ReadonlyArray<{ agent: string; name: string }> }
+  ).path = fullPath;
+  agent.identified = identity.identified;
+  // Registered during render, so the mapping exists before any effect (in
+  // particular `useAgentToolEvents`' drain) can look it up.
+  agentToolReplayBuffers.set(agent, agentToolReplayRef.current);
+  agentChatReplayBuffers.set(agent, agentChatReplayRef.current);
+  agent.ready = readyRef.current!.promise;
+  agent.state = agentState;
+  agent.connectionError = visibleConnectionError;
+  mutableAgentRef.current = agent;
+  // Memoize stub so it's referentially stable across renders
+  // (call is already stable via useCallback)
+  const stub = useMemo(() => createStubProxy(call), [call]);
+  agent.stub = stub;
+  agent.getHttpUrl = () => {
+    // TODO: upstream to partysocket — expose an HTTP URL property
+    // @ts-expect-error accessing protected PartySocket internals
+    const wsUrl: string = (agent._url as string | null) || agent._pkurl || "";
+    return wsUrl.replace("ws://", "http://").replace("wss://", "https://");
+  };
+
+  // warn if agent isn't in lowercase
+  if (identity.agent !== identity.agent.toLowerCase()) {
+    console.warn(
+      "Agent name: " +
+        identity.agent +
+        " should probably be in lowercase. Received: " +
+        identity.agent
+    );
+  }
+
+  // The overload signatures return `Omit<PartySocket, "path"> & { path: ... }`,
+  // but `agent` is inferred as the raw PartySocket. Cast to satisfy
+  // the overload contract — the runtime override of `agent.path`
+  // above ensures the shape matches.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return agent as any;
+}
+
+type AgentToolEventAgent = Pick<
+  PartySocket,
+  "addEventListener" | "removeEventListener"
+>;
+
+/**
+ * Frames the server replays at socket connect can arrive before
+ * `useAgentToolEvents` attaches its listener — the listener binds in a
+ * passive effect, after paint. A network transport loses that race in
+ * practice (the connect round trip outlasts the effect flush), but an
+ * in-process transport (a port bridge to a local worker) completes connect
+ * and replay first, reliably on a hot remount, and the frames were lost.
+ *
+ * `useAgent` already parses every string frame in its construction-time
+ * `onMessage` — before anything can be delivered — so it stashes
+ * `agent-tool-event` frames here until the first subscriber drains them.
+ * One-shot: after the first drain the live listener owns delivery (the
+ * socket is a stable EventTarget across reconnects), and the client-side
+ * `(parent, run, sequence)` dedupe makes the buffered/live overlap safe.
+ */
+type AgentToolReplayBuffer = { frames: string[]; drained: boolean };
+const agentToolReplayBuffers = new WeakMap<object, AgentToolReplayBuffer>();
+// Bounds a connection whose app never mounts a subscriber; a full replay of
+// retained runs sits far below this.
+const AGENT_TOOL_REPLAY_BUFFER_LIMIT = 4096;
+
+// A chat surface can unmount while useAgent keeps its socket alive.
+type AgentChatReplayBuffer = {
+  frames: string[];
+  subscribers: number;
+  overflowed: boolean;
+};
+const agentChatReplayBuffers = new WeakMap<object, AgentChatReplayBuffer>();
+const AGENT_CHAT_REPLAY_BUFFER_LIMIT = 4096;
+
+function bufferChatReplayFrame(
+  buffer: AgentChatReplayBuffer,
+  data: string,
+  type: unknown
+): void {
+  if (buffer.subscribers > 0) return;
+  if (buffer.frames.length === AGENT_CHAT_REPLAY_BUFFER_LIMIT) {
+    buffer.frames.length = 0;
+    buffer.overflowed = true;
+  }
+  if (buffer.overflowed) {
+    // A partial chunk log cannot reconstruct the transcript. Keep only the
+    // latest snapshot with no later mutations; hydration and the normal resume
+    // handshake reconcile completed and still-active streams on the next mount.
+    if (
+      type === CHAT_MESSAGE_TYPES.CHAT_MESSAGES ||
+      type === CHAT_MESSAGE_TYPES.CHAT_CLEAR
+    ) {
+      buffer.frames.splice(0, buffer.frames.length, data);
+    } else if (
+      type === CHAT_MESSAGE_TYPES.USE_CHAT_RESPONSE ||
+      type === CHAT_MESSAGE_TYPES.MESSAGE_UPDATED
+    ) {
+      // Stream completion and tool updates need not send another snapshot.
+      // Do not overwrite fresh hydration after the transcript advanced.
+      buffer.frames.length = 0;
+    }
+    return;
+  }
+  buffer.frames.push(data);
+}
+
+/** @internal Buffer a chat frame while no subscriber is mounted. */
+export function _bufferAgentChatReplayFrame(agent: object, data: string): void {
+  let buffer = agentChatReplayBuffers.get(agent);
+  if (!buffer) {
+    buffer = { frames: [], subscribers: 0, overflowed: false };
+    agentChatReplayBuffers.set(agent, buffer);
+  }
+  try {
+    const message = JSON.parse(data) as { type?: unknown };
+    bufferChatReplayFrame(buffer, data, message.type);
+  } catch {
+    // Only parsed chat frames can be replayed.
+  }
+}
+
+/** @internal Drain chat frames after the live listener is attached; the returned release must run when the subscriber unmounts. */
+export function _drainAgentChatReplayFrames(
+  agent: object,
+  onFrame: (data: string) => void
+): () => void {
+  let buffer = agentChatReplayBuffers.get(agent);
+  if (!buffer) {
+    buffer = { frames: [], subscribers: 0, overflowed: false };
+    agentChatReplayBuffers.set(agent, buffer);
+  }
+  buffer.subscribers++;
+  for (const data of buffer.frames.splice(0)) onFrame(data);
+  buffer.overflowed = false;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    buffer.subscribers--;
+  };
+}
+
+/**
+ * INTERNAL. Buffer a raw `agent-tool-event` frame for an agent socket until
+ * `useAgentToolEvents` first subscribes to it. `useAgent` calls this for
+ * every such frame automatically; a host driving a custom (non-`useAgent`)
+ * socket can call it from its own construction-time message hook to get the
+ * same no-lost-replay guarantee. No-op once the first subscriber drained.
+ */
+export function _bufferAgentToolReplayFrame(agent: object, data: string): void {
+  let buffer = agentToolReplayBuffers.get(agent);
+  if (!buffer) {
+    buffer = { frames: [], drained: false };
+    agentToolReplayBuffers.set(agent, buffer);
+  }
+  if (buffer.drained) return;
+  if (buffer.frames.length >= AGENT_TOOL_REPLAY_BUFFER_LIMIT) return;
+  buffer.frames.push(data);
+}
+
+/** Shared head of every dedupe key for one run, so a replay can purge them. */
+function agentToolRunKeyPrefix(message: AgentToolEventMessage): string {
+  return [message.parentToolCallId ?? "", message.event.runId, ""].join("\0");
+}
+
+function agentToolDedupeKey(message: AgentToolEventMessage): string {
+  if (message.replayId) {
+    return `${message.replayId}\0${agentToolRunKeyPrefix(message)}${message.sequence}`;
+  }
+  if (message.revision !== undefined) return `live\0${message.revision}`;
+  return `${agentToolRunKeyPrefix(message)}${message.sequence}`;
+}
+
+type AgentToolPendingReplay = {
+  id: string;
+  enumerated: boolean;
+  liveRuns: Set<string>;
+  chunks: Map<string, AgentToolEventMessage[]>;
+};
+
+export function useAgentToolEvents<
+  Part extends AgentToolRunPart = AgentToolRunPart
+>(options: {
+  agent: AgentToolEventAgent;
+}): {
+  runsById: Record<string, AgentToolRunState<Part>>;
+  runsByToolCallId: Record<string, AgentToolRunState<Part>[]>;
+  unboundRuns: AgentToolRunState<Part>[];
+  collection: AgentToolCollectionState;
+  getRunsForToolCall(toolCallId: string): AgentToolRunState<Part>[];
+  resetLocalState(): void;
+} {
+  const { agent } = options;
+  const [owned, setOwned] = useState(() => ({
+    agent,
+    state: createAgentToolEventState<Part>()
+  }));
+  // Never expose the previous conversation's rows during the render before
+  // its effect is cleaned up and the new source subscribes.
+  const state =
+    owned.agent === agent ? owned.state : createAgentToolEventState<Part>();
+  const sourceRef = useRef(agent);
+  sourceRef.current = agent;
+  const subscribedSourceRef = useRef(agent);
+  const seenRef = useRef(new Set<string>());
+  const pendingRef = useRef<AgentToolPendingReplay | null>(null);
+  const coverageRef = useRef(new Map<string, Map<string, number>>());
+
+  useEffect(() => {
+    // StrictMode restarts this effect without replacing the transport or the
+    // projection. Its one-shot early buffer has already drained, so retain
+    // the pending replay and dedupe state until the source actually changes.
+    if (subscribedSourceRef.current !== agent) {
+      subscribedSourceRef.current = agent;
+      seenRef.current.clear();
+      pendingRef.current = null;
+      coverageRef.current.clear();
+    }
+    setOwned((prev) =>
+      prev.agent === agent
+        ? prev
+        : {
+            agent,
+            state: createAgentToolEventState<Part>()
+          }
+    );
+    const update = (
+      apply: (prev: AgentToolEventState<Part>) => AgentToolEventState<Part>
+    ) => {
+      setOwned((prev) =>
+        prev.agent === agent && sourceRef.current === agent
+          ? { agent, state: apply(prev.state) }
+          : prev
+      );
+    };
+    const onMessage = (event: MessageEvent) => {
+      if (sourceRef.current !== agent) return;
+      if (typeof event.data !== "string") return;
+      let message: AgentToolProjectionMessage;
+      try {
+        message = JSON.parse(event.data) as AgentToolProjectionMessage;
+      } catch {
+        return;
+      }
+      if (!message || message.type !== "agent-tool-event" || !message.event)
+        return;
+      if (message.event.kind === "collection") {
+        if (!message.replayId) return;
+        const collectionEvent = message.event;
+        if (collectionEvent.status === "loading") {
+          if (pendingRef.current?.id === message.replayId) return;
+          pendingRef.current = {
+            id: message.replayId,
+            enumerated: false,
+            liveRuns: new Set(),
+            chunks: new Map()
+          };
+          // A restarted parent may number live revisions from zero again.
+          seenRef.current.clear();
+        }
+        const pending = pendingRef.current;
+        if (!pending || pending.id !== message.replayId) return;
+        let projectionMessage = message as AgentToolCollectionMessage;
+        if (collectionEvent.status === "ready") {
+          pending.enumerated = true;
+          const roster = new Set(collectionEvent.runIds);
+          for (const runId of pending.chunks.keys()) {
+            if (!roster.has(runId)) pending.chunks.delete(runId);
+          }
+          for (const runId of coverageRef.current.keys()) {
+            if (!roster.has(runId) && !pending.liveRuns.has(runId))
+              coverageRef.current.delete(runId);
+          }
+          projectionMessage = {
+            ...projectionMessage,
+            event: {
+              ...collectionEvent,
+              runIds: [...new Set([...roster, ...pending.liveRuns])]
+            }
+          };
+        } else if (collectionEvent.status === "error") {
+          if (collectionEvent.runId)
+            pending.chunks.delete(collectionEvent.runId);
+          else pending.chunks.clear();
+        }
+        update((prev) => applyAgentToolEvent(prev, projectionMessage));
+        return;
+      }
+      const runMessage = message as AgentToolEventMessage;
+      if (runMessage.replayId && runMessage.replayId !== pendingRef.current?.id)
+        return;
+      const key = agentToolDedupeKey(runMessage);
+      // A replayed `started` opens a complete, authoritative re-send of the
+      // run: the server renumbers replayed frames over stored chunks only,
+      // while live numbering also counted non-stored progress frames, so a
+      // replayed sequence can equal an already-seen live one. Forget every key
+      // seen for the run and let the reducer rebuild it from the replay (its
+      // `started` resets the parts) instead of dropping frames — a dropped
+      // replayed terminal would leave the row running forever.
+      if (
+        runMessage.replay &&
+        !runMessage.replayId &&
+        runMessage.event.kind === "started"
+      ) {
+        const prefix = agentToolRunKeyPrefix(runMessage);
+        for (const seen of seenRef.current) {
+          if (seen.startsWith(prefix)) seenRef.current.delete(seen);
+        }
+        coverageRef.current.delete(runMessage.event.runId);
+      } else if (seenRef.current.has(key)) {
+        return;
+      }
+      seenRef.current.add(key);
+      const pending = pendingRef.current;
+      const runId = runMessage.event.runId;
+      if (!runMessage.replay) {
+        // Inspection and the parent's live tail are independent RPC paths.
+        // Covered chunks can arrive after hydration with a new parent revision;
+        // the child cursor still proves that their content is already present.
+        if (
+          runMessage.event.kind === "chunk" &&
+          runMessage.event.cursor &&
+          runMessage.event.cursor.sequence <=
+            (coverageRef.current
+              .get(runId)
+              ?.get(runMessage.event.cursor.epoch) ?? -1)
+        )
+          return;
+        pending?.liveRuns.add(runId);
+        if (
+          pending &&
+          runMessage.event.kind === "chunk" &&
+          (!pending.enumerated || pending.chunks.has(runId))
+        ) {
+          const chunks = pending.chunks.get(runId) ?? [];
+          chunks.push(runMessage);
+          pending.chunks.set(runId, chunks);
+        }
+      } else if (runMessage.replayId && runMessage.event.kind === "snapshot") {
+        if (!runMessage.event.snapshot) {
+          pending?.chunks.set(runId, pending.chunks.get(runId) ?? []);
+        } else {
+          const buffered = pending?.chunks.get(runId) ?? [];
+          pending?.chunks.delete(runId);
+          const snapshot = runMessage.event.snapshot;
+          const coverage = new Map(coverageRef.current.get(runId));
+          if (snapshot.replay?.cursor) {
+            coverage.set(
+              snapshot.replay.cursor.epoch,
+              Math.max(
+                coverage.get(snapshot.replay.cursor.epoch) ?? -1,
+                snapshot.replay.cursor.sequence - 1
+              )
+            );
+          }
+          for (const chunk of snapshot.replay?.chunks ?? []) {
+            if (chunk.cursor) {
+              coverage.set(
+                chunk.cursor.epoch,
+                Math.max(
+                  coverage.get(chunk.cursor.epoch) ?? -1,
+                  chunk.cursor.sequence
+                )
+              );
+            }
+          }
+          const uncovered = buffered.filter((frame) => {
+            if (frame.event.kind !== "chunk") return false;
+            const cursor = frame.event.cursor;
+            return (
+              !cursor || cursor.sequence > (coverage.get(cursor.epoch) ?? -1)
+            );
+          });
+          // A legacy child cannot prove which concurrent chunks its snapshot
+          // contains. Preserve live state rather than clear it or duplicate it.
+          const unordered = buffered.length > 0 && !snapshot.replay?.cursor;
+          if (!unordered) coverageRef.current.set(runId, coverage);
+          update((prev) => {
+            let next = applyAgentToolEvent(
+              prev,
+              unordered
+                ? ({
+                    ...runMessage,
+                    event: { ...runMessage.event, snapshot: undefined }
+                  } as AgentToolEventMessage)
+                : runMessage
+            );
+            if (unordered)
+              return {
+                ...next,
+                collection: {
+                  status: "error",
+                  stale: true,
+                  error:
+                    "The child could not order its saved transcript with live updates. Reconnect to refresh."
+                }
+              };
+            for (const frame of uncovered)
+              next = applyAgentToolEvent(next, frame);
+            return next;
+          });
+          return;
+        }
+      }
+      update((prev) => applyAgentToolEvent<Part>(prev, runMessage));
+    };
+
+    const onClose = () => {
+      if (sourceRef.current !== agent) return;
+      pendingRef.current = null;
+      update((prev) => ({
+        ...prev,
+        collection: { status: "loading", stale: true }
+      }));
+    };
+    const onError = () => {
+      if (sourceRef.current !== agent) return;
+      update((prev) => ({
+        ...prev,
+        collection: {
+          status: "error",
+          stale: true,
+          error: "Could not connect to delegated work."
+        }
+      }));
+    };
+    agent.addEventListener("message", onMessage);
+    agent.addEventListener("close", onClose);
+    agent.addEventListener("error", onError);
+    // Drain frames that arrived before this listener existed (the server
+    // replays retained runs at socket connect, which an in-process
+    // transport completes before this passive effect — see
+    // agentToolReplayBuffers). Listener first, then drain: a frame landing
+    // mid-drain is deduped by `seenRef`, not lost.
+    const replay = agentToolReplayBuffers.get(agent);
+    if (replay) {
+      replay.drained = true;
+      for (const data of replay.frames.splice(0)) {
+        onMessage(new MessageEvent("message", { data }));
+      }
+    }
+    return () => {
+      agent.removeEventListener("message", onMessage);
+      agent.removeEventListener("close", onClose);
+      agent.removeEventListener("error", onError);
+    };
+  }, [agent]);
+
+  const resetLocalState = useCallback(() => {
+    seenRef.current.clear();
+    pendingRef.current = null;
+    coverageRef.current.clear();
+    setOwned({ agent, state: createAgentToolEventState<Part>() });
+  }, [agent]);
+
+  const getRunsForToolCall = useCallback(
+    (toolCallId: string) => state.runsByToolCallId[toolCallId] ?? [],
+    [state.runsByToolCallId]
+  );
+
+  return {
+    ...state,
+    getRunsForToolCall,
+    resetLocalState
+  };
+}

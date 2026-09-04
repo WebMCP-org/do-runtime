@@ -18,13 +18,22 @@ export type WorkerBoot = {
 /** The one Chrome watchdog mirroring the scheduler's earliest durable wake. */
 export const WAKE_ALARM = "do-runtime-wake";
 
+/** The authless relay fixture tells its host when an Agents client is paired. */
+export const RELAY_CLIENT_READY = "do-runtime:relay-client-ready";
+
 /** What the actor worker can ask its offscreen supervisor to project. */
 export interface SupervisorRpc {
   projectWake(scheduledTime: number | null): Promise<void>;
 }
 
 /** The state shape the real Agents client receives over its socket. */
-export type CounterState = { readonly value: number };
+export const CURRENT_COUNTER_STATE_VERSION = 1;
+export type CounterValueState = { readonly value: number };
+export type CounterState = CounterValueState & {
+  /** Added after v0; optional so an old client remains a valid wire peer. */
+  readonly stateVersion?: number;
+  readonly label?: string;
+};
 
 /** The recent-events rows `snapshot()` reports. Mirrors `worker/counter.ts`. */
 export type CounterEvent = {
@@ -34,6 +43,8 @@ export type CounterEvent = {
 
 export type CounterSnapshot = {
   readonly value: number;
+  readonly stateVersion: number | null;
+  readonly label: string | null;
   readonly events: readonly CounterEvent[];
 };
 
@@ -46,6 +57,35 @@ export type SubAgentSnapshot = {
 export type NestedSubAgentSnapshot = {
   readonly childValue: number;
   readonly leafValue: number;
+};
+
+export type ThinkProbeSubmission = {
+  readonly accepted: boolean;
+  readonly error: string | null;
+  readonly status: "pending" | "running" | "completed" | "aborted" | "skipped" | "error";
+  readonly submissionId: string;
+};
+
+export type ThinkProbeStatus = {
+  readonly assistantMessages: number;
+  readonly assistantText: string;
+  readonly emittedChunks: number;
+  readonly fiberRows: number;
+  readonly inferenceCompletions: number;
+  readonly inferenceStarts: number;
+  readonly recoveryCount: number;
+  readonly recoveryPartial: string;
+  readonly submissions: readonly Omit<ThinkProbeSubmission, "accepted">[];
+  readonly userMessages: number;
+};
+
+/** What the authless Cloudflare relay proof observes through a remote AgentClient. */
+export type RelayRoundTrip = {
+  readonly initialValue: number;
+  readonly incrementedValue: number;
+  readonly synchronizedValue: number;
+  readonly streamChunks: readonly unknown[];
+  readonly streamFinal: unknown;
 };
 
 /**
@@ -92,6 +132,10 @@ export interface HostRpc {
   nestedSubAgent(): Promise<NestedSubAgentSnapshot>;
   armSubAgentWake(delayMs: number): Promise<number>;
   scheduledSubAgentValue(): Promise<number>;
+  startThink(name: string, text: string): Promise<void>;
+  submitThink(name: string, text: string, idempotencyKey: string): Promise<ThinkProbeSubmission>;
+  thinkStatus(name: string): Promise<ThinkProbeStatus>;
+  stopThink(name: string): Promise<void>;
   armWake(delayMs: number): Promise<number>;
   status(): Promise<HostStatus>;
 }
@@ -100,9 +144,11 @@ export interface HostRpc {
 export type HostOp =
   | keyof HostRpc
   | "sdkIncrement"
+  | "sdkSetLegacyState"
   | "sdkSetState"
   | "sdkState"
   | "sdkStream"
+  | "relayRoundTrip"
   | "storageStatus";
 
 /**
@@ -123,3 +169,15 @@ export type ExtensionMessage =
 export type ExtensionResponse<T = unknown> =
   | { readonly ok: true; readonly value: T }
   | { readonly ok: false; readonly error: string };
+
+/** Narrow the untyped value returned by `chrome.runtime.sendMessage`. */
+export function parseExtensionResponse(value: unknown): ExtensionResponse {
+  if (typeof value !== "object" || value === null || Array.isArray(value) || !("ok" in value)) {
+    throw new TypeError("extension context returned an invalid response");
+  }
+  if (value.ok === true && "value" in value) return { ok: true, value: value.value };
+  if (value.ok === false && "error" in value && typeof value.error === "string") {
+    return { ok: false, error: value.error };
+  }
+  throw new TypeError("extension context returned an invalid response");
+}

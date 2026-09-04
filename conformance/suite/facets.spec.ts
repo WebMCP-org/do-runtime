@@ -128,10 +128,10 @@ it("§1.10 a facet that breaks on its own leaves the parent and its siblings ali
 
 it("§1.10 a facet may call back into a parent that is awaiting it", async () => {
   const probe = await host.spawn("reentry");
-  const result = (await probe.call("facetReentrancy")) as {
+  const result = await probe.call<{
     out: unknown;
     trace: string[];
-  };
+  }>("facetReentrancy");
   expect(result.out).toBe("pong");
   // The parent's own method ran DURING the parent's await on the child.
   expect(result.trace).toEqual(["parent:enter", "parent:ping", "parent:exit"]);

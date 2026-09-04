@@ -47,6 +47,9 @@ popup.html ──sendMessage──▶ service worker ──chrome.offscreen.crea
 - **Persistence that survives the context.** The e2e closes and recreates the real
   offscreen document, destroying its Worker, container, and instance, then finds
   the same `Agent.setState()` counter and event rows in the replacement renderer.
+- **Application-state migration during hydration.** The e2e writes the example's
+  old unversioned Agent state, destroys the whole offscreen host, and proves the
+  replacement migrates and persists it before a newly connected client sees it.
 - **A real `AlarmScheduler`, with its persisted retry ladder.** The alarm is armed
   through `Agent.schedule()`, recorded in both Agent storage and the scheduler's
   `_cf_ALARM` table, and delivered back as a gated event. The ladder — retry counts,
@@ -73,6 +76,13 @@ popup.html ──sendMessage──▶ service worker ──chrome.offscreen.crea
   back to the replacement without reconnecting. It also covers standard named
   routing, `getAgentByName()` direct stubs, a decorated `@callable()` method,
   and a streaming callable's chunks and final value.
+- **A real network relay boundary.** The e2e boots an authless, hibernatable
+  Durable Object on local workerd, connects another real `AgentClient` through
+  it, and proves state synchronization plus callable and streaming RPC reach the
+  browser-hosted Agent without the relay interpreting an Agents frame. The
+  fixture deliberately uses Cloudflare's native Durable Object runtime; this
+  package remains on the browser-host side, while authentication and product
+  routing remain consumer concerns.
 - **The SDK's stateless MCP handler.** The actor serves `createMcpHandler()` and
   exposes a real `McpServer` tool that reads its current state. The e2e performs
   MCP `tools/list` and `tools/call` requests through the gated actor fetch path.
@@ -113,7 +123,9 @@ cd examples/extension && node scripts/e2e.mjs
 
 It builds first, launches a headless Chromium with a throwaway profile in
 `.e2e-profile/`, loads `dist/` as an unpacked extension, and prints a `PASS`/`FAIL`
-line per assertion. It exits non-zero if any assertion fails.
+line per assertion. It also runs a deterministic Think model through normal
+completion, Stop, later reuse, and offscreen Worker teardown/recovery. It exits
+non-zero if any assertion fails.
 
 `playwright` resolves from the repository root's `node_modules`, which is why the
 script is plain `.mjs` with a dynamic import rather than a dependency of this
@@ -129,8 +141,10 @@ only as a competing supervisor and asserts that Web Locks refuse it before OPFS.
 | --- | --- |
 | `src/worker/counter.ts` | The root actor and its typed sub-agent class token. |
 | `src/worker/counter-child.worker.ts` | The real bundled child and nested-child classes. |
+| `src/worker/think-probe.ts` | A deterministic Think facet used only by the browser composition test. |
 | `src/worker/actor.worker.ts` | The host: raw timers, sqlite boot order, root/facet placement, and alarm scheduler. |
 | `src/offscreen/offscreen.ts` | The supervisor: spawns the worker, holds the session, forwards extension messages. |
+| `relay/worker.ts` | The authless native Durable Object used only to prove the external relay seam. |
 | `src/background.ts` | The service worker: offscreen lifecycle and `chrome.alarms` projection. |
 | `src/popup/popup.ts` | Four buttons and an output pane. |
 | `src/protocol.ts` | The types both TypeScript projects compile. It imports nothing. |
@@ -138,6 +152,7 @@ only as a competing supervisor and asserts that Web Locks refuse it before OPFS.
 | `@mcp-b/do-runtime` `HibernationMirror` | The process-local `HibernationHost` record shared by this example and the conformance embedders. |
 | `../platform-shims/message-port-websocket.ts` | The client-side WebSocket adapter carried over a `MessagePort`. |
 | `public/manifest.json` | Copied verbatim into `dist/` by Vite's `publicDir`. |
+| `wrangler.relay.jsonc` | Local-workerd configuration for the relay proof. |
 
 Two `tsconfig`s, because `"DOM"` and `"WebWorker"` declare incompatible versions of
 the same globals and no one project can check both halves:
@@ -239,7 +254,8 @@ substrate. Cloudflare-managed products remain explicit integration boundaries:
 | --- | --- |
 | HTTP and durable state | Workflows: a real Workflow binding and Workflow runtime |
 | Hibernatable WebSockets and bidirectional state sync across same-Worker container eviction | Socket survival across Worker/offscreen destruction: a platform-owned transport |
-| Decorated callable and streaming RPC | AI chat and tool approval: `@cloudflare/ai-chat` plus a model provider |
+| Decorated callable and streaming RPC | Production model providers and client/tool approval integrations |
+| Think chat with a deterministic model: durable submit, Stop, partial persistence, and recovery across Worker teardown | |
 | SQLite-backed queue and root/sub-agent `Agent.schedule()` | Outbound email: an Email Routing send binding |
 | Local sub-agents, nesting, restart, abort, and delete | |
 | Stateless MCP server and tools | |
@@ -257,12 +273,12 @@ Written down because this example exists partly to find them.
 - **The hibernation mirror is not process durability.** It survives a container
   replacement inside this Worker. It cannot survive destruction of the Worker
   that owns the raw `MessagePort` socket; that lifecycle reconnects instead.
-- **The facet entry repeats the Agents SDK bundle.** The root worker and
-  `counter-child.js` each carry their own copy (about 1.3 MB unminified for the
-  child in this readable demo build). The separate entry is intentional: its
-  output banner binds the complete chunk—including SDK internals—to that
-  facet's async primitives. A product build can minify it; sharing the SDK chunk
-  would reintroduce the parent-global bug this e2e catches.
+- **The facet entries repeat their dependencies.** The root worker,
+  `counter-child.js`, and `think-probe.js` are self-contained (about 1.3 MB and
+  6.4 MB unminified for the two facets in this readable demo build). Each output
+  banner binds the complete chunk—including SDK internals—to that facet's async
+  primitives. A product build can minify them; sharing those chunks would
+  reintroduce the parent-global bug this e2e catches.
 - **Vite emits the sqlite proxy workers even when they are disabled.** The driver
   references `sqlite3-opfs-async-proxy.js` and `sqlite3-worker1.mjs` through
   `new URL(..., import.meta.url)`, so both land in `dist/assets/` (~600 kB) even

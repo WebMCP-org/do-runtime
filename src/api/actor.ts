@@ -241,7 +241,7 @@ export class DurableObjectId implements globalThis.DurableObjectId {
   }
 
   equals(other: globalThis.DurableObjectId): boolean {
-    return this.#id.equals(innerIdOf(other));
+    return this.#id.equals(requireDurableObjectId(other).getInner());
   }
 }
 
@@ -249,10 +249,6 @@ export class DurableObjectId implements globalThis.DurableObjectId {
 function requireDurableObjectId(id: globalThis.DurableObjectId): DurableObjectId {
   if (id instanceof DurableObjectId) return id;
   throw new TypeError(FOREIGN_ACTOR_ID_MESSAGE);
-}
-
-function innerIdOf(id: globalThis.DurableObjectId): ActorId {
-  return requireDurableObjectId(id).getInner();
 }
 
 // =======================================================================================
