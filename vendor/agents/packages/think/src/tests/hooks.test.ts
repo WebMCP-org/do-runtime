@@ -839,11 +839,11 @@ describe("Think — actions compile into guarded tools", () => {
     );
     await agent.useEchoActionForTest("ledger-key");
     await agent.setActionLedgerRetentionForTest({
-      settledMs: 10,
-      pendingMs: 10,
+      settledMs: 60_000,
+      pendingMs: 60_000,
       maxSweepRows: 10
     });
-    const old = Date.now() - 1_000;
+    const old = Date.now() - 120_000;
     await agent.insertActionLedgerRowForTest({
       key: "action:echo:old-settled",
       status: "settled",
