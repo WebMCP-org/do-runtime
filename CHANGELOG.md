@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.7.0
+
+### Minor Changes
+
+- 3caa712: Move the reusable Chrome-host mechanics out of Rook: add a crash-safe browser alarm coordinator with durable transport recovery, package the MessagePort-backed WebSocket transport used between browser supervisors and actor workers, and share offscreen-document creation and stale-slot recovery.
+
+### Patch Changes
+
+- a2570d4: Ship a migration guide that separates Cloudflare Durable Object class lifecycle,
+  Drizzle application schemas, persisted Agents state, and runtime-owned storage.
+- 41b6ccc: Keep transformed foreign awaits visible to lifecycle checks until their continuations are published, and preserve native synchronous-iterable behavior in transformed `for await` loops.
+
+  Restore WebSocket auto-response configuration and timestamps when a host recreates an actor from its hibernation mirror.
+
+  Roll back failed SQLite WASM snapshot replacements and direct storage copies. If rollback also fails, retain the original database images in `SqliteWasmRestoreError.recoverySnapshot` for host recovery. This rollback is in memory; hosts needing replacement to survive process loss should restore into a fresh prefix before switching placement.
+
+  Correct the minimal-host setup and verify its documented TypeScript configuration and code against the files included in the package.
+
 ## 0.6.1
 
 ### Patch Changes
