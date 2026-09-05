@@ -3134,7 +3134,7 @@ export class Think<
           this._restoreClientTools();
           this._restoreBody();
           this._setupProtocolHandlers();
-          await this._initializeChannels();
+          await this.internal_reconcileChannels();
         }
       );
 
@@ -4600,7 +4600,12 @@ export class Think<
     };
   }
 
-  private async _initializeChannels(): Promise<void> {
+  /**
+   * Reconcile code-declared channels immediately. Static declarations are
+   * initialized on startup automatically; call this after changing app-owned
+   * data that {@link configureChannels} or {@link getMessengers} reads.
+   */
+  async internal_reconcileChannels(): Promise<void> {
     if (this.parentPath.length > 0) {
       return;
     }
@@ -4626,15 +4631,6 @@ export class Think<
     // credentials and routes.
     this._channels = channels;
     this._messengerRuntime = messengerRuntime;
-  }
-
-  /**
-   * Reconcile code-declared channels immediately. Static declarations are
-   * initialized on startup automatically; call this after changing app-owned
-   * data that {@link configureChannels} or {@link getMessengers} reads.
-   */
-  async internal_reconcileChannels(): Promise<void> {
-    await this._initializeChannels();
   }
 
   /**
