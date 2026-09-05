@@ -5,6 +5,24 @@ shim could not cover it, and whether it is upstreamable. The measured footprint
 lives in [the vendor fork audit](audit/vendor-fork-audit.md); do not duplicate a count
 here that drifts on every refresh.
 
+## 2026-09-05 — Synchronize Agent-tool cancellation tests with execution
+
+- `packages/think/src/tests/agent-tools.test.ts`: replace the 50 ms model-step
+  delay and 5 ms caller sleep in cancellation/reset tests with the existing
+  held-model fixture. Wait for the first step, then cancel or reset; the model
+  cannot finish normally while the control RPC is in transit. Observe runner
+  cleanup before checking the retained cancellation, and always cancel held
+  work in `finally`.
+- `packages/think/src/tests/agents/think-session.ts`: include abort controllers
+  in the existing cleanup inspection. Only the runner's finalizer deletes its
+  controller; cancellation clears the other inspected maps earlier.
+- The [post-merge CI failure](https://github.com/WebMCP-org/do-runtime/actions/runs/33977489359)
+  reproduced locally by delaying each control RPC 250 ms: both tests read a
+  completed run. The held fixture passes under the same delay. Completed runs
+  correctly remain completed when cancelled later; production semantics,
+  retries, and timeouts are unchanged. This is upstreamable test stabilization
+  inside the native Workers suite; a browser-host shim cannot fix its timing.
+
 ## 2026-09-05 — Remove duplicated fork bookkeeping
 
 - `packages/agents/src/react.tsx`: route live Agent-tool frames through the
