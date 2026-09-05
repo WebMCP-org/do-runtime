@@ -6,8 +6,10 @@
  * beforeCallStart rejection, and interrupt handling.
  */
 import { env } from "cloudflare:workers";
-import { createExecutionContext } from "cloudflare:test";
+import { createExecutionContext, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
+import type { VoiceInputMixinMembers } from "../voice-input";
+import type { TestVoiceInputAgent } from "./agents/voice-input";
 import worker from "./worker";
 
 // --- Helpers ---
@@ -355,6 +357,53 @@ describe("VoiceInput — continuous STT pipeline", () => {
 });
 
 describe("VoiceInput — transcriber lifecycle errors", () => {
+  it.each([new Error("close failed"), undefined])(
+    "reports a rejected close value (%s) after cleanup and still logs it",
+    async (failure) => {
+      const errorLog = vi.spyOn(console, "error").mockImplementation(() => {});
+      const path = uniquePath("test-voice-input-agent");
+      const { ws } = await connectWS(path);
+      try {
+        await waitForStatus(ws, "idle");
+        const stub = env.TestVoiceInputAgent.get(
+          env.TestVoiceInputAgent.idFromName(path.split("/").at(-1)!)
+        ) as DurableObjectStub<TestVoiceInputAgent>;
+        await runInDurableObject(stub, (instance) => {
+          instance.createTranscriber = () => ({
+            createSession: () => ({
+              feed() {},
+              close() {},
+              waitUntilClosed: () => Promise.reject(failure)
+            })
+          });
+          const voice: VoiceInputMixinMembers = instance;
+          voice.onCallEnd = (connection, error) => {
+            expect(error).toBe(failure);
+            connection.send(JSON.stringify({ type: "_call_ended" }));
+          };
+        });
+        sendJSON(ws, { type: "start_call" });
+        await waitForStatus(ws, "listening");
+
+        const ending = collectMessagesUntil(
+          ws,
+          (msg) => msg.type === "_call_ended"
+        );
+        sendJSON(ws, { type: "end_call" });
+        expect(await ending).toContainEqual({ type: "status", status: "idle" });
+        expect(errorLog).toHaveBeenCalledWith({
+          component: "voice",
+          stage: "background_task",
+          message: "end_call failed",
+          error: failure ?? new Error("end_call failed")
+        });
+      } finally {
+        ws.close();
+        errorLog.mockRestore();
+      }
+    }
+  );
+
   it("waits for transcriber readiness and reports a structured startup failure", async () => {
     const errorLog = vi.spyOn(console, "error").mockImplementation(() => {});
     const { ws } = await connectWS(uniquePath("test-voice-input-agent"));

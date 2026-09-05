@@ -1414,6 +1414,16 @@ export class Probe extends DurableObject<ProbeEnv> {
     this.ctx.setWebSocketAutoResponse();
   }
 
+  externalAutoResponse(tag: string): Record<string, unknown> {
+    const pair = this.ctx.getWebSocketAutoResponse();
+    const socket = this.ctx.getWebSockets(tag)[0];
+    if (socket === undefined) throw new Error(`No socket tagged ${tag}.`);
+    return {
+      pair: pair === null ? null : { request: pair.request, response: pair.response },
+      timestamp: this.ctx.getWebSocketAutoResponseTimestamp(socket)?.getTime() ?? null,
+    };
+  }
+
   autoResponseSemantics(id: string): Record<string, unknown> {
     const first = this.ctx.getWebSocketAutoResponse();
     const second = this.ctx.getWebSocketAutoResponse();

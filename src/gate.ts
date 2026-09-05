@@ -100,7 +100,7 @@ function publishOutcome<T, Result>(
   promise: Promise<T>,
   finish: (outcome: Outcome<T>, reservation: PublicationReservation) => Result,
 ): Promise<Result> {
-  return new Promise<Result>((resolve, reject) => {
+  const result = new Promise<Result>((resolve, reject) => {
     const publish = context.makeTransformReentryCallback((outcome: Outcome<T>) => {
       const reservation = reservePublication(context);
       if (reservation === undefined) {
@@ -118,6 +118,10 @@ function publishOutcome<T, Result>(
       },
     );
   });
+  // Keep the actor alive through both the foreign wait and queued publication.
+  // The caller receives failures; they are not failed background tasks.
+  context.addTask(result.then(() => {}, () => {}));
+  return result;
 }
 
 function resumeAwaitWithContext<T>(
@@ -163,8 +167,17 @@ function iteratorFor<T>(iterable: AsyncIterable<T> | Iterable<T>): AsyncIterator
   const subject = Object(iterable);
   const asyncIterator: unknown = Reflect.get(subject, Symbol.asyncIterator);
   if (typeof asyncIterator === "function") return Reflect.apply(asyncIterator, iterable, []);
-  const iterator: unknown = Reflect.get(subject, Symbol.iterator);
-  if (typeof iterator === "function") return Reflect.apply(iterator, iterable, []);
+  if (asyncIterator !== undefined && asyncIterator !== null) {
+    throw new TypeError("Symbol.asyncIterator is not callable");
+  }
+  const method: unknown = Reflect.get(subject, Symbol.iterator);
+  if (typeof method === "function") {
+    const iterator = Reflect.apply(method, iterable, []) as Iterator<T>;
+    // Let native for-await unwrap sync values and handle rejection/closing.
+    return (async function* () {
+      for await (const value of { [Symbol.iterator]: () => iterator }) yield value;
+    })();
+  }
   throw new TypeError("value is not async iterable or iterable");
 }
 

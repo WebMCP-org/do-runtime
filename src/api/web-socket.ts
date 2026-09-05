@@ -20,9 +20,12 @@ export interface RawWebSocket {
 }
 
 export interface HibernationHost {
+  /** Retained auto-response configuration, restored before actor construction. */
+  readonly autoResponsePair?: { request: string; response: string } | null;
   accepted(socket: RawWebSocket, tags: readonly string[]): void;
   attachment(socket: RawWebSocket, bytes: Uint8Array | null): void;
   autoResponse(pair: { request: string; response: string } | null): void;
+  autoResponseTimestamp?(socket: RawWebSocket, timestamp: number): void;
   closed(socket: RawWebSocket): void;
 }
 
@@ -473,6 +476,10 @@ export class HibernatableWebSocketRegistry {
     this.#ctx = ctx;
     this.#dispatch = dispatch;
     this.#host = host;
+    const pair = host?.autoResponsePair;
+    if (pair != null) {
+      this.setWebSocketAutoResponse(new RuntimeWebSocketRequestResponsePair(pair.request, pair.response));
+    }
     for (const value of rehydrated) this.#rehydrate(value);
   }
 
@@ -612,6 +619,7 @@ export class HibernatableWebSocketRegistry {
       const data = (event as MessageEvent).data as unknown;
       if (typeof data === "string" && data === this.#autoResponse?.request) {
         entry.autoResponseTimestamp = this.#ctx.now();
+        this.#host?.autoResponseTimestamp?.(socket, entry.autoResponseTimestamp);
         socket.send(this.#autoResponse.response);
         return;
       }

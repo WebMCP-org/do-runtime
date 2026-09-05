@@ -610,13 +610,12 @@ export function withVoiceInput<TBase extends AgentLike>(
       this.#startupTokens.delete(connection.id);
       this.#abortInputTurn(connection, "call_ended");
       this.#requestActiveTurnAbort(connection, "call_ended");
-      let failed = false;
-      let failure: unknown;
+      let failure: unknown = null;
       try {
         await this.#cm.endCall(connection.id);
       } catch (error) {
-        failed = true;
         failure = error;
+        throw error;
       } finally {
         this.#callTokens.delete(connection.id);
         this.#releaseKeepAlive(connection.id);
@@ -626,9 +625,8 @@ export function withVoiceInput<TBase extends AgentLike>(
           { type: "status", status: "idle" },
           "VoiceInput"
         );
-        await this.onCallEnd(connection, failed ? failure : null);
+        await this.onCallEnd(connection, failure);
       }
-      if (failed) throw failure;
     }
 
     #handleInterrupt(connection: Connection) {

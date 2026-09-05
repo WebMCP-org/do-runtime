@@ -585,9 +585,8 @@ export function useAgent<State>(options: UseAgentOptions<unknown>): Omit<
   const connectionErrorRef = useRef<AgentConnectionError | null>(null);
   const connectionErrorAddressKeyRef = useRef<string | null>(null);
   // Holds agent-tool frames delivered before a `useAgentToolEvents`
-  // subscriber attaches (see AgentToolReplayBuffer). A ref, not the socket
-  // WeakMap entry, so the construction-time `onMessage` below never depends
-  // on the socket reference being assigned yet.
+  // subscriber attaches (see AgentToolReplayBuffer). Keep it across socket
+  // replacements at the same address and register it before effects attach.
   const agentToolReplayRef = useRef<AgentToolReplayBuffer>({
     frames: [],
     drained: false
@@ -732,13 +731,7 @@ export function useAgent<State>(options: UseAgentOptions<unknown>): Omit<
         if (parsedMessage.type === "agent-tool-event") {
           // Stash for a subscriber that hasn't attached yet; the frame
           // still falls through to socket listeners and options.onMessage.
-          const buffer = agentToolReplayRef.current;
-          if (
-            !buffer.drained &&
-            buffer.frames.length < AGENT_TOOL_REPLAY_BUFFER_LIMIT
-          ) {
-            buffer.frames.push(message.data);
-          }
+          _bufferAgentToolReplayFrame(agent, message.data);
         }
         if (
           typeof parsedMessage.type === "string" &&

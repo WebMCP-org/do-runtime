@@ -5,6 +5,26 @@ shim could not cover it, and whether it is upstreamable. The measured footprint
 lives in [the vendor fork audit](audit/vendor-fork-audit.md); do not duplicate a count
 here that drifts on every refresh.
 
+## 2026-09-05 — Remove duplicated fork bookkeeping
+
+- `packages/agents/src/react.tsx`: route live Agent-tool frames through the
+  existing `_bufferAgentToolReplayFrame` helper, which already serves custom
+  sockets and replay regressions. Preserve the ref and address-reset behavior;
+  PartySocket installs its message handler after render registers the buffer.
+  The host cannot consolidate this private hook state. Upstreamable with the
+  retained pre-subscription replay patch; no export changes.
+- `packages/think/src/think.ts`: move channel initialization into the existing
+  `internal_reconcileChannels` method and call it on startup. The private
+  `_initializeChannels` forwarding layer had no other consumers. This is
+  constructor-owned SDK initialization, so the host cannot remove the layer.
+  Upstreamable with the channel-reconciliation seam.
+- `packages/voice/src/voice-input.ts`: rethrow close failures directly from
+  `catch` and let `finally` perform cleanup and `onCallEnd`, removing the second
+  failure flag and delayed rethrow. The private mixin owns this order and keeps
+  the call token alive through final transcript flushing. Upstreamable with
+  the retained error-aware call-end hook. Real Durable Object WebSocket tests
+  cover both an `Error` and an `undefined` rejection.
+
 ## 2026-08-31 — Reconcile the 0.22 audit with current Rook
 
 - Replay the release refresh onto Rook `a8547bd3`, retaining the newer

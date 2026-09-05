@@ -4,6 +4,58 @@
 > checkout. App-relative paths describe that source checkout. The SDK source
 > and maintained gate now live in this repository.
 
+## 2026-09-05 complexity recheck
+
+Compared production TypeScript directly with the exact released
+[0.22 source](https://github.com/cloudflare/agents/tree/676b3d35a82db3147c7aa1505f7f2d5ef48f359b),
+then traced fork additions into both Rook's `think-browser-host` checkout and
+the prepared `rook-agents-0-22-audit-fixes` checkout. This pass reviews fork
+complexity, not all inherited SDK code.
+
+Removed three small duplications: React's separate Agent-tool replay enqueue
+branch, Think's private channel-initialization forwarding method, and Voice's
+failure flag/delayed rethrow. The production change is **13 fewer lines**;
+public exports and storage formats are unchanged. Details and upstreamability
+are recorded in [the fork ledger](../fork-diff.md).
+
+The remaining production source delta, excluding tests and build output:
+
+| Package  | Changed files | Added / removed lines |
+| -------- | ------------: | --------------------: |
+| Agents   |            25 |         +2,267 / -548 |
+| AI Chat  |             1 |             +44 / -21 |
+| Think    |             5 |       +1,659 / -1,127 |
+| Voice    |             3 |             +75 / -27 |
+| Shell    |             1 |               +7 / -3 |
+| Codemode |             0 |                 0 / 0 |
+
+Retained findings, in cutover priority order:
+
+1. **Replay and Stop are SDK behavior Rook consumes.** Durable cancellation
+   fences, child liveness, request receipts, replay cursors, and immutable
+   hydration seeds cover tested races shared by Think and AI Chat. They do not
+   duplicate the runtime's input/output gates. Upstream replay batching and
+   chat throttling are already reused unchanged.
+2. **The browser context edits still matter.** Reproducing Voice's upstream
+   `Promise.resolve().then(fn)` path against current do-runtime loses its input
+   lock after a foreign await; the retained eager async entry succeeds. Keep
+   that boundary and Lifecycle's alarm queue context fix. Agent already wraps
+   each constructor once; its original-method map supports Think's override
+   detection and needs no additional wrapper cache.
+3. **Most small host seams have concrete callers.** Rook uses the stub-probe
+   classifier, model preparation, channel reconciliation, messenger delivery,
+   dictation error/flush/meter hooks, and read-only Git scans. The Shell patch
+   is just three `refresh: false` options. Codemode and the Agents client have
+   no production divergence from the release pin.
+4. **Keep product choices separate from shim retirement.** Think's omitted
+   Codemode/skill-runner integration creates substantial deleted-source
+   divergence, but restoring those features is a product and packaging
+   decision. Runtime cutover alone does not establish a need for them.
+
+Validation on Node 24.11.1: rebuilt all six packages; `pnpm sdk:check` passed;
+all **1,320 SDK tests across 42 files** passed with retries disabled; both
+runtime examples passed against the rebuilt local fork (`pnpm test:examples`).
+
 ## 2026-08-31 extraction
 
 - Retained only the six-package Rook closure: Agents, AI Chat, Think, Voice,
@@ -22,8 +74,8 @@ Status: reconciled 2026-08-31 against released upstream commit
 Agents 0.22.0 / AI Chat 0.11.0 / Codemode 0.5.1 / Voice 0.4.0 / Shell 0.4.3).
 Earlier release audits and measurements below are historical.
 
-[Upstream diff](upstream-diff.md) records _why_ each retained edit exists and
-[shim surface](shim-surface.md) records _what_ each compatibility shim covers.
+[The fork ledger](../fork-diff.md) records _why_ each retained edit exists.
+The older shim-surface references below describe the source Rook checkout.
 This file records release-by-release overlap decisions and measures how much
 of the fork is browser adaptation or product code. Re-measure it at every
 vendor refresh rather than trusting the historical numbers below.
