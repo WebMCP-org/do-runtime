@@ -29,7 +29,8 @@ type ThinkAgentToolTestStub = {
   setAgentToolOutputForTest(runId: string, output: unknown): Promise<void>;
   clearAgentToolOutputForTest(runId: string): Promise<void>;
   setStripTextResponseForTest(strip: boolean): Promise<void>;
-  setBeforeStepAsyncDelay(ms: number): Promise<void>;
+  holdAgentToolModelForTest(): Promise<void>;
+  getBeforeStepLog(): ReturnType<ThinkTestAgent["getBeforeStepLog"]>;
   resetTurnStateForTest(): Promise<void>;
   startAgentToolRun(
     input: unknown,
@@ -40,6 +41,7 @@ type ThinkAgentToolTestStub = {
     reason?: unknown
   ): ReturnType<ThinkTestAgent["cancelAgentToolRun"]>;
   getAgentToolCleanupMapSizesForTest(): Promise<{
+    abortControllers: number;
     lastErrors: number;
     preTurnAssistantIds: number;
   }>;
@@ -346,42 +348,51 @@ describe("Think agent tools", () => {
     const agent = await freshAgent();
     const runId = crypto.randomUUID();
 
-    await agent.setBeforeStepAsyncDelay(50);
+    await agent.holdAgentToolModelForTest();
     await agent.startAgentToolRun("skipped probe", { runId });
-    await new Promise((resolve) => setTimeout(resolve, 5));
-    await agent.resetTurnStateForTest();
+    try {
+      await expect.poll(() => agent.getBeforeStepLog()).not.toHaveLength(0);
+      await agent.resetTurnStateForTest();
 
-    const inspection = await waitForAgentToolRun(agent, runId);
-
-    expect(inspection).toMatchObject({
-      runId,
-      status: "error",
-      error: "Agent tool run was skipped before the child could finish."
-    });
+      const inspection = await waitForAgentToolRun(agent, runId);
+      expect(inspection).toMatchObject({
+        runId,
+        status: "error",
+        error: "Agent tool run was skipped before the child could finish."
+      });
+    } finally {
+      await agent.cancelAgentToolRun(runId, "test cleanup");
+    }
   });
 
   it("preserves explicit agent-tool cancellation as aborted", async () => {
     const agent = await freshAgent();
     const runId = crypto.randomUUID();
 
-    await agent.setBeforeStepAsyncDelay(50);
+    await agent.holdAgentToolModelForTest();
     await agent.startAgentToolRun("cancelled probe", { runId });
-    await new Promise((resolve) => setTimeout(resolve, 5));
-    await agent.cancelAgentToolRun(runId, "stop");
+    try {
+      await expect.poll(() => agent.getBeforeStepLog()).not.toHaveLength(0);
+      await expect(agent.cancelAgentToolRun(runId, "stop")).resolves.toEqual({
+        childStillRunning: false
+      });
 
-    const inspection = await waitForAgentToolRun(agent, runId);
-    expect(inspection).toMatchObject({
-      runId,
-      status: "aborted",
-      error: "stop"
-    });
-
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    await expect(agent.inspectAgentToolRun(runId)).resolves.toMatchObject({
-      runId,
-      status: "aborted",
-      error: "stop"
-    });
+      // Only the runner's finalizer removes its abort controller.
+      await expect
+        .poll(() => agent.getAgentToolCleanupMapSizesForTest())
+        .toEqual({
+          abortControllers: 0,
+          lastErrors: 0,
+          preTurnAssistantIds: 0
+        });
+      await expect(agent.inspectAgentToolRun(runId)).resolves.toMatchObject({
+        runId,
+        status: "aborted",
+        error: "stop"
+      });
+    } finally {
+      await agent.cancelAgentToolRun(runId, "test cleanup");
+    }
   });
 
   it("cleans in-memory agent-tool bookkeeping after a run completes", async () => {
@@ -394,6 +405,7 @@ describe("Think agent tools", () => {
 
     expect(inspection?.status).toBe("error");
     expect(await agent.getAgentToolCleanupMapSizesForTest()).toEqual({
+      abortControllers: 0,
       lastErrors: 0,
       preTurnAssistantIds: 0
     });

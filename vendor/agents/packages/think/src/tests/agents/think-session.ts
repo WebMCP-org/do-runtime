@@ -2418,14 +2418,17 @@ export class ThinkTestAgent extends Think {
   }
 
   async getAgentToolCleanupMapSizesForTest(): Promise<{
+    abortControllers: number;
     lastErrors: number;
     preTurnAssistantIds: number;
   }> {
     const self = this as unknown as {
+      _agentToolAbortControllers: Map<string, AbortController>;
       _agentToolLastErrors: Map<string, string>;
       _agentToolPreTurnAssistantIds: Map<string, Set<string>>;
     };
     return {
+      abortControllers: self._agentToolAbortControllers.size,
       lastErrors: self._agentToolLastErrors.size,
       preTurnAssistantIds: self._agentToolPreTurnAssistantIds.size
     };
