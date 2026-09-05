@@ -42,9 +42,10 @@ same Agent source inside workerd.
 
 An `Agent` or `DurableObject` class is TypeScript, but its safety comes from the
 host around it. [Workerd](https://github.com/cloudflare/workerd) gives every named
-object a private SQLite database, serializes events across `await`, holds replies
-until their writes commit, delivers alarms, routes object-to-object calls, and
-restores hibernatable WebSockets. Cloudflare's Agents SDK relies on those rules.
+object a private SQLite database, gates storage access and event continuations,
+holds replies until their writes commit, delivers alarms, routes object-to-object
+calls, and restores hibernatable WebSockets. Cloudflare's Agents SDK relies on
+those rules.
 
 A browser has the raw components needed to build that host: dedicated workers,
 WebAssembly, OPFS, and `MessagePort`. It does not assemble them into a Durable
@@ -93,10 +94,12 @@ port and is not affiliated with or endorsed by Cloudflare.
 
 ## The browser runtime
 
-Workerd gives every actor its own isolate, so `setTimeout`, `fetch`, and
-`scheduler.wait` always belong to that actor. The reference browser host places
-one root actor in each Web Worker. The page, or an extension's offscreen
-document, supervises placement and owns no actor storage.
+Workerd tracks each actor's I/O context inside a Worker isolate;
+[multiple actors can share that isolate](https://developers.cloudflare.com/durable-objects/reference/in-memory-state/).
+The reference browser host places one root actor in each Web Worker so its
+ambient timers, `fetch`, and `scheduler` resolve to that root.
+The page, or an extension's offscreen document, supervises placement and owns no
+actor storage.
 
 ```mermaid
 flowchart TB
@@ -181,21 +184,25 @@ Start it at `http://localhost:5173` with
 
 ## Durable Object semantics
 
-An actor has an identity, private state, and one admitted event at a time. A
-Durable Object adds the host behavior that keeps those properties true through
-asynchronous I/O and process loss:
+An actor has an identity and private state. A Durable Object adds gates that
+serialize event slices and storage access, plus storage and lifecycle behavior
+that survives process loss:
 
 | | What it means | Where it lives here |
 | --- | --- | --- |
 | **Named identity** | `idFromName("alice")` always means the same actor, and the id names its storage. | `ActorContainerOptions.id` + `uniqueKey`, `src/server/actor-id-impl.ts` |
-| **Private transactional storage** | A SQLite database only this actor can open. KV and SQL share the file; writes coalesce into an implicit transaction that commits at the end of the event. | `src/io/actor-sqlite.ts`, `src/api/sql.ts`, `src/util/` |
+| **Private transactional storage** | A SQLite database only this actor can open. KV and SQL share the file; writes coalesce into implicit transactions that commit at gate-release boundaries. | `src/io/actor-sqlite.ts`, `src/api/sql.ts`, `src/util/` |
 | **Input and output gates** | The input gate serializes event slices across `await`. The output gate holds a reply until the write it could reveal is durable. | `src/io/io-gate.ts`, `src/io/io-context.ts` |
 | **Alarms and facets** | `setAlarm()` wakes the actor later with retries and backoff. Facets are child actors with their own gates and database under a root. | `src/server/alarm-scheduler.ts`, `src/server/facet-*.ts` |
 
-If a method awaits storage, another call on the same actor waits. Application
-code can perform a read-modify-write without adding a lock. A reply that exposes
-a write also waits for that write to commit, so a crash cannot leave a caller
-holding an acknowledgement for data that never became durable.
+With the default storage options, a method awaiting storage holds other calls
+back, so a read-modify-write that only awaits storage needs no extra lock.
+Awaiting external I/O such as `fetch()` releases the input gate: another event
+can run before the method resumes. Use
+[`blockConcurrencyWhile()`](https://developers.cloudflare.com/durable-objects/api/state/#blockconcurrencywhile)
+when an async operation must exclude other events. A reply that exposes a write
+waits for that write to commit, so a crash cannot leave a caller holding an
+acknowledgement for data that never became durable.
 
 ## Minimal host
 
@@ -204,7 +211,33 @@ declarations. The shortest complete host uses the `node:sqlite` backend, which
 requires Node 24.11 or newer. Browser hosts place the same container inside a
 Web Worker and supply the sqlite-wasm backend shown in the runnable examples.
 
+For a standalone TypeScript host, install the ambient Node and Workers types:
+
+```bash
+pnpm add -D typescript @types/node @cloudflare/workers-types@5.20260820.1
+```
+
+Use the following `tsconfig.json`. An existing Workers project can keep its
+generated Cloudflare types instead of loading `@cloudflare/workers-types` too.
+
+```json
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "NodeNext",
+    "lib": ["ESNext"],
+    "types": ["node", "@cloudflare/workers-types"],
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true
+  }
+}
+```
+
+Save this as `host.mts` and run `pnpm exec tsc && node host.mts`:
+
 ```ts
+import { mkdir } from "node:fs/promises";
 import { DurableObject } from "@mcp-b/do-runtime/cloudflare-workers";
 import { createActorContainer, DEFAULT_ALARM_OUTLET, noFacets, type Timer } from "@mcp-b/do-runtime";
 import { createNodeSqlProvider } from "@mcp-b/do-runtime/backends/node-sqlite";
@@ -234,6 +267,7 @@ const timer: Timer = {
     }),
 };
 
+await mkdir("./data", { recursive: true });
 const container = await createActorContainer({
   id: "counter-1",
   uniqueKey: "my-app", // keep this stable forever: every DurableObjectId is derived from it
@@ -255,7 +289,7 @@ await counter.increment(); // 2
 Open a second container over the same directory and `increment()` answers `3`:
 the instance was volatile, the storage was not. Inside an initialized actor
 worker, the browser host supplies
-`createSqliteWasmProvider(pool, { prefix: "/counter-1" })` from
+`createSqliteWasmProvider({ pool, capi: sqlite3.capi }, { prefix: "/counter-1" })` from
 `@mcp-b/do-runtime/backends/sqlite-wasm`. The supervisor, OPFS pool, and worker
 bootstrapping are shown in the browser examples above.
 
@@ -344,6 +378,8 @@ a newer package version. Application SQL cannot access that runtime-owned stamp.
 The browser provider takes an already-installed OPFS SAH pool (`installOpfsSAHPoolVfs`; sync access handles in a dedicated worker — no cross-origin isolation or `SharedArrayBuffer` needed). One pool per worker; the root and each local facet get separate prefixes inside it. `SqliteWasmActorStorage` adds the close, physical delete, and clone operations a local placement host needs around one prefix. The Node provider uses in-memory databases by default and a directory when asked.
 
 Both concrete providers also implement `SqlDatabaseSnapshotProvider`. After the host has stopped the actor, `provider.close()` releases every database handle; `exportSnapshot()` then returns the SQLite images for the whole actor storage scope, and `importSnapshot()` replaces an idle scope. The same snapshot can seed a cold local replica because SQLite images are portable between these providers. Node snapshots require a dedicated directory-backed provider. This is backup/restore and replica seeding, not Cloudflare's time-indexed PITR or continuously updated read replication.
+
+The browser provider attempts to restore the original images when a snapshot import or direct `SqliteWasmActorStorage.copyFrom()` replacement fails; `SqliteWasmRestoreError.recoverySnapshot` retains those images if rollback also fails. This rollback lives in memory and cannot survive Worker or process loss during replacement; a host requiring that guarantee must import into a fresh prefix and durably switch placement after success.
 
 ### Alarms
 

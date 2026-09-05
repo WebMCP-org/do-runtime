@@ -300,6 +300,42 @@ describe("handler dispatch and close state", () => {
 });
 
 describe("auto-response, timeout, pair, and tags", () => {
+  it("preserves auto-responses and their timestamps through eviction", async () => {
+    const actor = await host.spawn("ws-auto-response-eviction");
+    const client = await host.connect(actor, ["connection-id"]);
+    const read = () =>
+      actor.call<{
+        pair: { request: string; response: string } | null;
+        timestamp: number;
+      }>("externalAutoResponse", "connection-id");
+    await actor.call("setAutoResponse", "ping", "pong");
+    await client.send("ping");
+    expect(await client.nextMessage()).toBe("pong");
+    const before = await read();
+    expect(before.timestamp).toBeTypeOf("number");
+
+    await host.evict(actor);
+    expect(await read()).toEqual(before);
+    await host.evict(actor);
+    await client.send("ping");
+    expect(await client.nextMessage()).toBe("pong");
+    const after = await read();
+    expect(after.pair).toEqual({ request: "ping", response: "pong" });
+    expect(after.timestamp).toBeGreaterThanOrEqual(before.timestamp);
+    expect(await actor.call("readExternalObservation")).toBeNull();
+    await host.evict(actor);
+    expect(await read()).toEqual(after);
+
+    await actor.call("clearAutoResponse");
+    await host.evict(actor);
+    expect(await read()).toEqual({ pair: null, timestamp: after.timestamp });
+    await client.send("ping");
+    await eventually(
+      () => actor.call("readExternalObservation"),
+      (value) => value !== null,
+    );
+  });
+
   it("E1-E5 auto-responds exact text, stamps the socket, and clears with undefined", async () => {
     const actor = await host.spawn("ws-auto-response");
     await actor.call("openSelfSocket", "socket", ["socket"]);

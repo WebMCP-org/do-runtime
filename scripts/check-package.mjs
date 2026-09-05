@@ -1,5 +1,8 @@
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const root = new URL("../", import.meta.url);
 const manifest = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
@@ -96,6 +99,48 @@ if (typeof gate.__gate !== "function" || typeof gate.__gateAsyncIterable !== "fu
 }
 if (typeof vite.doRuntimeAwaitTransform !== "function") {
   throw new Error("packed Vite entry does not export doRuntimeAwaitTransform");
+}
+
+// Compile and run the documented host against only the files npm will ship.
+const consumer = mkdtempSync(join(tmpdir(), "do-runtime-consumer-"));
+try {
+  const nodeModules = join(consumer, "node_modules");
+  const packageDirectory = join(nodeModules, manifest.name);
+  for (const file of files) {
+    const destination = join(packageDirectory, file);
+    mkdirSync(dirname(destination), { recursive: true });
+    copyFileSync(new URL(file, root), destination);
+  }
+  for (const dependency of [
+    ...Object.keys(manifest.dependencies),
+    "@cloudflare/workers-types",
+    "@types/node",
+  ]) {
+    const destination = join(nodeModules, dependency);
+    mkdirSync(dirname(destination), { recursive: true });
+    symlinkSync(fileURLToPath(new URL(`node_modules/${dependency}`, root)), destination, "junction");
+  }
+  const minimalHost = readFileSync(join(packageDirectory, "README.md"), "utf8")
+    .split("## Minimal host\n")[1]?.split("\n## ")[0];
+  const source = minimalHost?.match(/```ts\n([\s\S]*?)```/)?.[1];
+  const config = minimalHost?.match(/```json\n([\s\S]*?)```/)?.[1];
+  if (!source || !config) throw new Error("README minimal host or TypeScript configuration is missing");
+  writeFileSync(join(consumer, "tsconfig.json"), config);
+  writeFileSync(
+    join(consumer, "host.mts"),
+    `${source}\nimport { strictEqual } from "node:assert";\nstrictEqual(await counter.increment(), 3);\n`,
+  );
+  for (const args of [
+    [fileURLToPath(new URL("node_modules/typescript/bin/tsc", root)), "-p", consumer],
+    [join(consumer, "host.mts")],
+  ]) {
+    const result = spawnSync(process.execPath, args, { cwd: consumer, encoding: "utf8", timeout: 30_000 });
+    if (result.status !== 0) {
+      throw new Error(result.stderr || result.stdout || String(result.error || "README consumer smoke failed"));
+    }
+  }
+} finally {
+  rmSync(consumer, { recursive: true, force: true });
 }
 
 console.log(`package smoke passed with ${files.size} files`);

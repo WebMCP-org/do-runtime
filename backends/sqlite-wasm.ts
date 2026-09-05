@@ -167,13 +167,12 @@ export class SqliteWasmActorStorage implements SqlDatabaseProvider {
         bytes: new Uint8Array(await source.#host.pool.exportFile(file)),
       });
     }
-    this.deleteAll();
-    for (const { name, bytes } of images) {
-      await this.#host.pool.importDb(
-        `${this.#prefix}.${name}.sqlite`,
-        bytes,
-      );
-    }
+    this.close();
+    await replaceDatabases(
+      this.#host.pool,
+      this.#prefix,
+      images.map(({ name, bytes }) => ({ name, image: bytes })),
+    );
   }
 
   #ownedFiles(): string[] {
@@ -231,12 +230,75 @@ export function createSqliteWasmProvider(
       requireClosed(openDatabases);
       requireValidSqlDatabaseSnapshot(snapshot);
       requireImportableRuntimeStorage(snapshot);
-      for (const file of ownedFiles()) host.pool.unlink(file);
-      for (const { name, image } of snapshot.databases) {
-        await host.pool.importDb(`${prefix}.${name}.sqlite`, new Uint8Array(image));
-      }
+      await replaceDatabases(host.pool, prefix, snapshot.databases);
     },
   };
+}
+
+/** A failed rollback retains the original images so the host can recover to another prefix. */
+export class SqliteWasmRestoreError extends AggregateError {
+  constructor(errors: unknown[], readonly recoverySnapshot: SqlDatabaseSnapshot) {
+    super(
+      errors,
+      "SQLite replacement and rollback failed; restore recoverySnapshot to an idle provider.",
+    );
+    this.name = "SqliteWasmRestoreError";
+  }
+}
+
+async function replaceDatabases(
+  pool: OpfsSahPool,
+  prefix: string,
+  databases: SqlDatabaseSnapshot["databases"],
+): Promise<void> {
+  const replacement = databases.map(({ name, image }) => ({ name, image: new Uint8Array(image) }));
+  const ownedFiles = () => pool.getFileNames().filter((file) => file.startsWith(`${prefix}.`));
+  const files = ownedFiles();
+  requireNoRecoverySidecars(files);
+  const original: Array<{ name: string; image: Uint8Array }> = [];
+  for (const file of files) {
+    const name = file.slice(prefix.length + 1, -".sqlite".length);
+    requireSafeDatabaseName(name);
+    original.push({ name, image: new Uint8Array(await pool.exportFile(file)) });
+  }
+  const touched = new Set<string>();
+  try {
+    for (const file of files) {
+      // unlink can remove the pool's mapping before a backing-file write fails.
+      touched.add(file);
+      if (!pool.unlink(file)) throw new Error(`SAH pool did not unlink ${file}`);
+    }
+    for (const { name, image } of replacement) {
+      const file = `${prefix}.${name}.sqlite`;
+      touched.add(file);
+      await pool.importDb(file, image);
+    }
+  } catch (error) {
+    // ponytail: rollback lives in memory; use a fresh prefix and a host-owned switch
+    // when replacement must survive the worker/process dying during import.
+    const errors = [error];
+    for (const file of ownedFiles()) {
+      if (!touched.has(file)) continue;
+      try {
+        if (!pool.unlink(file)) throw new Error(`SAH pool did not unlink ${file}`);
+      } catch (rollbackError) {
+        errors.push(rollbackError);
+      }
+    }
+    for (const { name, image } of original) {
+      const file = `${prefix}.${name}.sqlite`;
+      if (!touched.has(file)) continue;
+      try {
+        await pool.importDb(file, new Uint8Array(image));
+      } catch (rollbackError) {
+        errors.push(rollbackError);
+      }
+    }
+    if (errors.length > 1) {
+      throw new SqliteWasmRestoreError(errors, { version: 1, databases: original });
+    }
+    throw error;
+  }
 }
 
 export class SqliteWasmDatabase implements SqlDatabase {

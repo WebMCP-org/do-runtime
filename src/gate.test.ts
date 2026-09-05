@@ -219,6 +219,46 @@ describe("__gate", () => {
 });
 
 describe("transformed await resume", () => {
+  test.each(["fulfillment", "rejection"])("stays busy through a foreign await and queued %s", async (outcome) => {
+    const actor = new TestActor();
+    const context = new IoContext(actor, timer);
+    const pending = Promise.withResolvers<number>();
+    const failure = new Error("foreign await failed");
+    const resumed = context.run(async () => {
+      try {
+        return __resumeAwait(await __gateAwait(pending.promise));
+      } catch (error) {
+        requireInputLock(context, "caught foreign rejection");
+        return error;
+      }
+    });
+    await portHop();
+
+    let drained = false;
+    const draining = context.drainWaitUntil().then(() => { drained = true; });
+    await portHop();
+    expect(context.hasCurrent()).toBe(false);
+    expect(context.waitUntilTaskCount()).toBeGreaterThan(0);
+    expect(drained).toBe(false);
+
+    // Another event can enter during the wait, then hold up its publication.
+    const lock = await context.run(() => context.getInputLock());
+    try {
+      if (outcome === "fulfillment") pending.resolve(42);
+      else pending.reject(failure);
+      await expect.poll(() => actor.inputGate.waiters.length).toBe(1);
+      expect(context.waitUntilTaskCount()).toBeGreaterThan(0);
+      expect(drained).toBe(false);
+    } finally {
+      lock.release();
+    }
+
+    await expect(resumed).resolves.toBe(outcome === "fulfillment" ? 42 : failure);
+    await draining;
+    expect(context.waitUntilTaskCount()).toBe(0);
+    expect(context.waitUntilStatus()).toBeUndefined();
+  });
+
   test("preserves BrokenActorError when a failed section cannot re-enter", async () => {
     const context = newContext();
     const cause = new Error("section failed");
@@ -310,6 +350,59 @@ describe("transformed await resume", () => {
 });
 
 describe("__gateAsyncIterable", () => {
+  test("awaits sync iterable values while retaining async iterator values", async () => {
+    const promised = Promise.resolve(42);
+    const values: unknown[] = [];
+    for await (const value of __gateAsyncIterable([promised])) values.push(value);
+    expect(values).toEqual([42]);
+
+    const asyncIterable: AsyncIterable<Promise<number>> = {
+      [Symbol.asyncIterator]: () => ({
+        next: async () => ({ done: false, value: promised }),
+      }),
+    };
+    for await (const value of __gateAsyncIterable(asyncIterable)) {
+      expect(value).toBe(promised);
+      break;
+    }
+  });
+
+  test("matches native sync iterator cleanup after rejection and early return", async () => {
+    const failure = new Error("yield failed");
+    async function consume(gated: boolean, reject: boolean) {
+      let closed = false;
+      function* source() {
+        try {
+          yield reject ? Promise.reject(failure) : Promise.resolve(42);
+        } finally {
+          closed = true;
+        }
+      }
+      const iterable = source();
+      let caught: unknown;
+      try {
+        for await (const value of gated ? __gateAsyncIterable(iterable) : iterable) {
+          expect(value).toBe(42);
+          break;
+        }
+      } catch (error) {
+        caught = error;
+      }
+      return { closed, caught };
+    }
+
+    for (const reject of [false, true]) {
+      expect(await consume(true, reject)).toEqual(await consume(false, reject));
+    }
+  });
+
+  test("rejects a non-callable async iterator instead of using its sync iterator", async () => {
+    const iterable = Object.assign([1], { [Symbol.asyncIterator]: 1 });
+    await expect(async () => {
+      for await (const value of __gateAsyncIterable(iterable)) void value;
+    }).rejects.toThrow(TypeError);
+  });
+
   test("forwards early return to the underlying iterator", async () => {
     let canceled = false;
     const iterable: AsyncIterable<number> = {

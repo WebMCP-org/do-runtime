@@ -9,6 +9,7 @@ import {
   type ActorContainerOptions,
   type HibernationHost,
 } from "../server/actor-container";
+import { HibernationMirror } from "../server/hibernation-mirror";
 import type { RawWebSocket } from "./web-socket";
 
 const timer: Timer = {
@@ -182,6 +183,51 @@ async function started(
 }
 
 describe("hibernation embedder contract", () => {
+  test("preserves auto-response configuration and timestamps across container replacement", async () => {
+    let now = 10;
+    const mirror = new HibernationMirror();
+    const ports = {
+      ...options().ports,
+      timer: { ...timer, now: () => now },
+      hibernation: mirror,
+    };
+    const first = await started({ ports });
+    const [client, server] = rawPair();
+    const replies: unknown[] = [];
+    client.addEventListener("message", (event) => replies.push((event as MessageEvent).data));
+    await first.container.run(() => {
+      first.container.state.acceptWebSocket(server, ["id"]);
+      first.container.state.setWebSocketAutoResponse(
+        new first.container.globals.WebSocketRequestResponsePair("ping", "pong"),
+      );
+    });
+    client.send("ping");
+    expect(mirror.snapshot()[0]?.autoResponseTimestamp).toBe(10);
+
+    first.container.abort(new Error("evicted"));
+    // An idle transport can answer and update the mirror before the next placement.
+    mirror.autoResponseTimestamp(server, 15);
+    const replacement = new HibernationMirror(mirror.snapshot(), mirror.autoResponsePair);
+    const secondContainer = await createActorContainer(
+      options({
+        ports: { ...ports, hibernation: replacement },
+        webSockets: replacement.snapshot(),
+      }),
+    );
+    const secondActor = await secondContainer.start((ctx) => {
+      expect(ctx.getWebSocketAutoResponse()?.request).toBe("ping");
+      expect(ctx.getWebSocketAutoResponseTimestamp(server)?.getTime()).toBe(15);
+      return new SocketActor(ctx);
+    });
+    now = 20;
+    client.send("ping");
+    await quiesce();
+    expect(replies).toEqual(["pong", "pong"]);
+    expect(first.actor.messages).toEqual([]);
+    expect(secondActor.messages).toEqual([]);
+    expect(replacement.snapshot()[0]?.autoResponseTimestamp).toBe(20);
+  });
+
   test("mirrors acceptance and attachment bytes, then rebuilds before the constructor", async () => {
     const mirror = recorder();
     const first = await started({

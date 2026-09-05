@@ -42,6 +42,15 @@ export class HibernationMirror implements HibernationHost {
     this.#autoResponsePair = cloneAutoResponse(pair);
   }
 
+  /** Also called by a host that answers a ping while no actor container is live. */
+  autoResponseTimestamp(socket: RawWebSocket, timestamp: number): void {
+    const entry = this.#entries.get(socket);
+    if (entry === undefined) {
+      throw new Error("Hibernation mirror: auto-response preceded socket acceptance.");
+    }
+    entry.autoResponseTimestamp = timestamp;
+  }
+
   closed(socket: RawWebSocket): void {
     this.#entries.delete(socket);
   }
