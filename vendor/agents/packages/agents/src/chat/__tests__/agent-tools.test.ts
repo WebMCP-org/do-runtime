@@ -50,13 +50,7 @@ describe("agent tool event reducer", () => {
     const retained = state;
     for (const event of [
       { kind: "collection", status: "loading" },
-      { kind: "collection", status: "error", error: "Roster unavailable" },
-      {
-        kind: "collection",
-        status: "error",
-        error: "Child unavailable",
-        runId: "bound"
-      }
+      { kind: "collection", status: "error", error: "Roster unavailable" }
     ] satisfies AgentToolCollectionMessage["event"][]) {
       state = applyAgentToolEvent(state, {
         type: "agent-tool-event",

@@ -16,7 +16,10 @@ const childInput = z.object({
   unconfirmedCancellation: z.boolean().optional(),
   holdCancellation: z.boolean().optional(),
   holdInspection: z.boolean().optional(),
-  holdReplayAfterCancellation: z.boolean().optional()
+  holdReplayAfterCancellation: z.boolean().optional(),
+  /** Fail the FIRST inspection after admission; persisted so it survives a
+   * parent crash and reproduces a recovery pass that seals `inspect-failed`. */
+  failInspection: z.boolean().optional()
 });
 type ChildInput = z.infer<typeof childInput>;
 
@@ -221,6 +224,7 @@ export class TestAgentToolLifecycleChild extends Agent {
         starts INTEGER NOT NULL DEFAULT 0,
         cancels INTEGER NOT NULL DEFAULT 0,
         tails INTEGER NOT NULL DEFAULT 0,
+        fail_inspection INTEGER NOT NULL DEFAULT 0,
         started_at INTEGER NOT NULL
       )
     `;
@@ -239,8 +243,10 @@ export class TestAgentToolLifecycleChild extends Agent {
     this.cancellationError = input.cancellationError;
     this.unconfirmedCancellation = input.unconfirmedCancellation ?? false;
     this.sql`
-      INSERT OR IGNORE INTO lifecycle_child (run_id, status, starts, started_at)
-      VALUES (${options.runId}, ${input.complete ? "completed" : "running"}, 1, ${Date.now()})
+      INSERT OR IGNORE INTO lifecycle_child
+        (run_id, status, starts, fail_inspection, started_at)
+      VALUES (${options.runId}, ${input.complete ? "completed" : "running"}, 1,
+              ${input.failInspection ? 1 : 0}, ${Date.now()})
     `;
     return this.inspection();
   }
@@ -277,6 +283,14 @@ export class TestAgentToolLifecycleChild extends Agent {
   }
 
   async inspectAgentToolRun(): Promise<AgentToolRunInspection | null> {
+    this.ensureTable();
+    const pending = this.sql<{
+      fail_inspection: number;
+    }>`SELECT fail_inspection FROM lifecycle_child`[0];
+    if (pending?.fail_inspection) {
+      this.sql`UPDATE lifecycle_child SET fail_inspection = 0`;
+      throw new Error("child inspection temporarily unavailable");
+    }
     const inspection = this.inspection();
     if (
       this.holdInspection &&

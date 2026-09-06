@@ -77,3 +77,6 @@ jobs:
 
       - name: Validate package tarball
         run: pnpm check:package
+
+      - name: Pack Rook Agents SDK fork
+        run: pnpm sdk:pack

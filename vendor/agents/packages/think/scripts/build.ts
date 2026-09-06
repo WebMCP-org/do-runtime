@@ -26,6 +26,7 @@ async function main() {
       neverBundle: ["cloudflare:workers"]
     },
     format: "esm",
+    outputOptions: { keepNames: true },
     sourcemap: true,
     fixedExtension: false
   });

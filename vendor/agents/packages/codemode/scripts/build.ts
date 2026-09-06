@@ -28,6 +28,7 @@ async function main() {
   await build({
     clean: true,
     dts: true,
+    target: "es2021",
     entry: [
       "src/index.ts",
       "src/ai.ts",
@@ -41,6 +42,7 @@ async function main() {
       neverBundle: ["cloudflare:workers"]
     },
     format: "esm",
+    outputOptions: { keepNames: true },
     sourcemap: true,
     fixedExtension: false
   });

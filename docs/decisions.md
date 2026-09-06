@@ -173,6 +173,11 @@ One namespace scheduler owns `_cf_ALARM`, delivery, retry, backoff, and
 abandonment. A host timer layer carries only a physical one-shot projection.
 Facets have no independent alarm slot.
 
+The projection retains active delivery deadlines through retry persistence and
+abandonment, including deliveries whose entry was cancelled. Hosts acknowledge
+a consumed wake only after the latest projection is accepted and runtime
+activity has settled; timer-first delivery must leave a wake for worker recovery.
+
 ### §2.7 Facet lifecycle
 
 The runtime owns stable ids, depth and name limits, start fencing, abort,

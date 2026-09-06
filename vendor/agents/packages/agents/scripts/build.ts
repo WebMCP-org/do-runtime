@@ -72,6 +72,7 @@ async function main() {
       neverBundle: ["cloudflare:workers", "cloudflare:email"]
     },
     format: "esm",
+    outputOptions: { keepNames: true },
     sourcemap: true,
     fixedExtension: false
   });

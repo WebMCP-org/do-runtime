@@ -117,7 +117,8 @@
     "prepublishOnly": "pnpm check:package",
     "publish:dry": "pnpm publish --access public --dry-run",
     "bench:node": "vitest run --config conformance/bench/vitest.node.config.ts",
-    "bench:browser": "vitest run --config conformance/bench/vitest.browser.config.ts"
+    "bench:browser": "vitest run --config conformance/bench/vitest.browser.config.ts",
+    "sdk:pack": "pnpm sdk:build && rm -rf dist/sdk && pnpm --dir vendor/agents --filter agents --filter \"@cloudflare/*\" --fail-if-no-match -r pack --pack-destination \"$PWD/dist/sdk\""
   },
   "dependencies": {
     "@ungap/structured-clone": "1.3.3",

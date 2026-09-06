@@ -149,6 +149,11 @@ directly without `validateStateChange()`, protocol broadcasts, or
 `onStateChanged()`; migration is hydration, not a live state update. If the hook
 throws, the stored row remains unchanged so a corrected release can retry it.
 
+Malformed JSON also fails hydration without changing the stored row, whether or
+not `initialState` is defined. The Agent does not cache a fallback, broadcast an
+update, or delete the malformed value. Repair the stored row explicitly before
+retrying. `initialState` applies only when the application state row is absent.
+
 Keep migrations forward-compatible: preserve unknown fields, migrate only older
 versions, and accept a newer numeric version unchanged so rollbacks and mixed
 extension contexts can still read the shared state.

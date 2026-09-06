@@ -25,14 +25,16 @@ import { MessageType } from "./types";
 import {
   applyAgentToolEvent,
   createAgentToolEventState,
-  type AgentToolCollectionMessage,
   type AgentToolCollectionState,
   type AgentToolEventMessage,
   type AgentToolEventState,
-  type AgentToolProjectionMessage,
   type AgentToolRunPart,
   type AgentToolRunState
 } from "./chat/agent-tools";
+import {
+  isAgentToolCollectionMessage,
+  parseAgentToolProjectionMessage
+} from "./agent-tool-types";
 import { CHAT_MESSAGE_TYPES } from "./chat/protocol";
 export { agentToolRunMayExecute } from "./agent-tool-types";
 
@@ -1306,16 +1308,9 @@ export function useAgentToolEvents<
     const onMessage = (event: MessageEvent) => {
       if (sourceRef.current !== agent) return;
       if (typeof event.data !== "string") return;
-      let message: AgentToolProjectionMessage;
-      try {
-        message = JSON.parse(event.data) as AgentToolProjectionMessage;
-      } catch {
-        return;
-      }
-      if (!message || message.type !== "agent-tool-event" || !message.event)
-        return;
-      if (message.event.kind === "collection") {
-        if (!message.replayId) return;
+      const message = parseAgentToolProjectionMessage(event.data);
+      if (!message) return;
+      if (isAgentToolCollectionMessage(message)) {
         const collectionEvent = message.event;
         if (collectionEvent.status === "loading") {
           if (pendingRef.current?.id === message.replayId) return;
@@ -1330,7 +1325,7 @@ export function useAgentToolEvents<
         }
         const pending = pendingRef.current;
         if (!pending || pending.id !== message.replayId) return;
-        let projectionMessage = message as AgentToolCollectionMessage;
+        let projectionMessage = message;
         if (collectionEvent.status === "ready") {
           pending.enumerated = true;
           const roster = new Set(collectionEvent.runIds);
@@ -1349,14 +1344,12 @@ export function useAgentToolEvents<
             }
           };
         } else if (collectionEvent.status === "error") {
-          if (collectionEvent.runId)
-            pending.chunks.delete(collectionEvent.runId);
-          else pending.chunks.clear();
+          pending.chunks.clear();
         }
         update((prev) => applyAgentToolEvent(prev, projectionMessage));
         return;
       }
-      const runMessage = message as AgentToolEventMessage;
+      const runMessage = message;
       if (runMessage.replayId && runMessage.replayId !== pendingRef.current?.id)
         return;
       const key = agentToolDedupeKey(runMessage);
@@ -1407,12 +1400,13 @@ export function useAgentToolEvents<
           pending.chunks.set(runId, chunks);
         }
       } else if (runMessage.replayId && runMessage.event.kind === "snapshot") {
-        if (!runMessage.event.snapshot) {
+        const snapshotEvent = runMessage.event;
+        if (!snapshotEvent.snapshot) {
           pending?.chunks.set(runId, pending.chunks.get(runId) ?? []);
         } else {
           const buffered = pending?.chunks.get(runId) ?? [];
           pending?.chunks.delete(runId);
-          const snapshot = runMessage.event.snapshot;
+          const snapshot = snapshotEvent.snapshot;
           const coverage = new Map(coverageRef.current.get(runId));
           if (snapshot.replay?.cursor) {
             coverage.set(
@@ -1449,10 +1443,10 @@ export function useAgentToolEvents<
             let next = applyAgentToolEvent(
               prev,
               unordered
-                ? ({
+                ? {
                     ...runMessage,
-                    event: { ...runMessage.event, snapshot: undefined }
-                  } as AgentToolEventMessage)
+                    event: { ...snapshotEvent, snapshot: undefined }
+                  }
                 : runMessage
             );
             if (unordered)

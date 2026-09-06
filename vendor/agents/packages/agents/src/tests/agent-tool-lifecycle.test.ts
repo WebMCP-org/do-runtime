@@ -131,6 +131,52 @@ describe("awaited agent-tool cancellation at the child boundary", () => {
     }
   });
 
+  it("re-drives an interrupted run whose liveness was never observed", async () => {
+    const name = `lifecycle-interrupted-${crypto.randomUUID()}`;
+    let parent = await parentForTest(name);
+    await parent.startForTest("run", "original", { failInspection: true });
+    await expect
+      .poll(() => parent.childForTest("run"))
+      .toMatchObject({ tails: 1 });
+
+    // Crash the parent mid-run. Startup recovery inspects the child, that
+    // inspection fails, and the row is sealed `interrupted` carrying NO
+    // liveness observation — so it still reserves capacity.
+    await expect(Promise.resolve(parent.restartForTest())).rejects.toThrow(
+      "forced parent restart"
+    );
+    parent = await parentForTest(name);
+    await expect
+      .poll(() => parent.inspectAgentTool("run"))
+      .toMatchObject({ status: "interrupted", reason: "inspect-failed" });
+    expect(
+      (await parent.observationsForTest("run")).childStillRunning
+    ).toBeUndefined();
+    await parent.startForTest("blocked", "blocked", { complete: true });
+    await expect
+      .poll(() => parent.resultForTest("blocked"))
+      .toMatchObject({
+        status: "error",
+        error: "maxConcurrentAgentTools (1) exceeded"
+      });
+
+    // The child reached its own terminal while the parent was away. The next
+    // start must re-inspect that unresolved row, repair it, and release the
+    // slot it was holding.
+    await parent.finishChildForTest("run");
+    await expect(Promise.resolve(parent.restartForTest())).rejects.toThrow(
+      "forced parent restart"
+    );
+    parent = await parentForTest(name);
+    await expect
+      .poll(() => parent.inspectAgentTool("run"))
+      .toMatchObject({ status: "completed", summary: "child finished" });
+    await parent.startForTest("next", "next", { complete: true });
+    await expect
+      .poll(() => parent.resultForTest("next"))
+      .toMatchObject({ status: "completed" });
+  });
+
   it("publishes the accepted aborted outcome when a stale completion arrives later", async () => {
     const parent = await parentForTest();
     await parent.startForTest("run", "original", { holdInspection: true });

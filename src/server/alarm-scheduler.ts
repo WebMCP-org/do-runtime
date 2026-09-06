@@ -271,11 +271,15 @@ export type AlarmSchedulerOptions = {
   db: SqlDatabase;
   getActor: GetActorFn;
   /**
-   * Browser hosts can mirror the earliest durable wake onto a platform watchdog
-   * such as `chrome.alarms`. Workerd needs no such seam because its process owns
-   * the scheduler timer.
+   * Browser hosts can mirror the earliest pending wake onto a platform watchdog
+   * such as `chrome.alarms`. Active deliveries keep their original deadline in
+   * that projection until completion, retry, or abandonment bookkeeping finishes,
+   * even if cancellation removes their entry meanwhile. Their count is reported
+   * separately so a host can also wait for deliveries newer than its consumed wake.
+   * Failed bookkeeping leaves the retained alarm projected as due for recovery.
+   * Workerd needs no such seam because its process owns the scheduler timer.
    */
-  projectWake?: (scheduledTime: number | null) => Promise<void> | void;
+  projectWake?: (scheduledTime: number | null, activeDeliveries: number) => Promise<void> | void;
   /**
    * ← `std::default_random_engine`, seeded from the monotonic clock
    * (`alarm-scheduler.c++:20-27`). A test seam on a runtime-internal class, not
@@ -347,7 +351,7 @@ export class AlarmScheduler {
   readonly #timer: Timer;
   readonly #random: () => number;
   readonly #getActor: GetActorFn;
-  readonly #projectWake: ((scheduledTime: number | null) => Promise<void> | void) | undefined;
+  readonly #projectWake: AlarmSchedulerOptions["projectWake"];
   readonly #db: SqliteDatabase;
   /** ← `kj::HashMap<ActorKey, ScheduledAlarm> alarms`, whose key is one string. */
   readonly #alarms = new Map<string, ScheduledAlarm>();
@@ -355,6 +359,8 @@ export class AlarmScheduler {
   readonly #tasks = new Set<Promise<void>>();
   #taskFailure: { readonly exception: unknown } | undefined;
   #projection: Promise<void> = Promise.resolve();
+  // A delivery can outlive its entry or await abandonment after reaching FINISHED.
+  readonly #activeDeliveries = new Set<ScheduledAlarm>();
 
   constructor(options: AlarmSchedulerOptions) {
     this.#timer = options.timer;
@@ -416,13 +422,13 @@ export class AlarmScheduler {
 
   /** ← `deleteAll` (`alarm-scheduler.c++:129-134`). */
   deleteAll(): void {
+    // A refused write must leave the live schedule intact for recovery.
+    this.#db.run(STMT.deleteAll);
     // Cancel all in-memory alarm tasks. Upstream's `alarms.clear()` destroys every task with its
     // entry; here the abort is that destruction's timer half, and a task that has already passed
     // its wake finds itself unmapped and returns.
     for (const entry of this.#alarms.values()) entry.cancel.abort();
     this.#alarms.clear();
-    // Wipe the persistent store.
-    this.#db.run(STMT.deleteAll);
     this.#projectNextWake();
   }
 
@@ -668,12 +674,11 @@ export class AlarmScheduler {
 
     entry.status = "STARTED";
     entry.wakeTime = null;
-    this.#projectNextWake();
-    const retryCount = entry.countedRetry;
-
-    const retryInfo = await this.#runAlarmGuarded(actorId, scheduledTime, retryCount);
-
+    this.#activeDeliveries.add(entry);
     try {
+      this.#projectNextWake();
+      const retryInfo = await this.#runAlarmGuarded(actorId, scheduledTime, entry.countedRetry);
+
       // ← `:214`'s second `KJ_ASSERT_NONNULL`, which upstream reaches by way of its outer catch when
       // `deleteAll()` cleared the map during the run.
       if (this.#alarms.get(actorId) !== entry) return;
@@ -760,6 +765,14 @@ export class AlarmScheduler {
     } catch (exception) {
       // ← `KJ_LOG(ERROR, "Failed to run alarm and was unable to schedule a retry", exception)`.
       this.#taskFailed(exception);
+      if (this.#alarms.get(actorId) === entry) entry.status = "FINISHED";
+    } finally {
+      this.#activeDeliveries.delete(entry);
+      try {
+        this.#projectNextWake();
+      } catch (exception) {
+        this.#taskFailed(exception);
+      }
     }
   }
 
@@ -810,15 +823,23 @@ export class AlarmScheduler {
     return Math.min(max, Math.floor(this.#random() * (max + 1)));
   }
 
-  /** The earliest wake a browser watchdog must keep alive across process death. */
+  /** The pending wake and unfinished deliveries a browser watchdog must keep alive. */
   #projectNextWake(): void {
     if (this.#projectWake === undefined) return;
     let earliest: number | null = null;
+    // The native timer can start delivery before the physical alarm fires. Its
+    // deadline must stay projected even if cancellation removes the scheduled entry.
+    for (const entry of this.#activeDeliveries) {
+      if (earliest === null || entry.scheduledTime < earliest) earliest = entry.scheduledTime;
+    }
     for (const entry of this.#alarms.values()) {
-      const wake = entry.status === "STARTED" ? entry.queuedAlarm : entry.wakeTime;
+      // A finished delivery can still await abandonment or have failed bookkeeping.
+      // Keep its durable alarm due until cleanup supplies a wake or removes the entry.
+      const wake =
+        entry.status === "STARTED" ? entry.queuedAlarm : (entry.wakeTime ?? entry.scheduledTime);
       if (wake !== null && (earliest === null || wake < earliest)) earliest = wake;
     }
-    this.#projection = Promise.resolve(this.#projectWake(earliest));
+    this.#projection = Promise.resolve(this.#projectWake(earliest, this.#activeDeliveries.size));
     void this.#projection.catch((exception: unknown) => this.#taskFailed(exception));
   }
 

@@ -495,15 +495,255 @@ export type AgentToolCollectionMessage = {
     | {
         kind: "collection";
         status: "error";
+        /** Roster enumeration itself failed; the retained rows are stale. */
         error: string;
-        /** A detail read failed without invalidating the enumerated roster. */
-        runId?: string;
       };
 };
 
 export type AgentToolProjectionMessage =
   | AgentToolEventMessage
   | AgentToolCollectionMessage;
+
+type UnknownRecord = Record<string, unknown>;
+type AgentToolSnapshotPayload = NonNullable<
+  Extract<AgentToolEvent, { kind: "snapshot" }>["snapshot"]
+>;
+
+function isRecord(value: unknown): value is UnknownRecord {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isOptionalString(value: unknown): boolean {
+  return value === undefined || typeof value === "string";
+}
+
+function isOptionalNumber(value: unknown): boolean {
+  return value === undefined || typeof value === "number";
+}
+
+function isOptionalBoolean(value: unknown): boolean {
+  return value === undefined || typeof value === "boolean";
+}
+
+function isAgentToolRunStatus(value: unknown): value is AgentToolRunStatus {
+  return (
+    value === "starting" ||
+    value === "running" ||
+    value === "completed" ||
+    value === "error" ||
+    value === "aborted" ||
+    value === "interrupted"
+  );
+}
+
+function isAgentToolInterruptedReason(
+  value: unknown
+): value is AgentToolInterruptedReason {
+  return (
+    value === "no-progress" ||
+    value === "window-exceeded" ||
+    value === "not-tailable" ||
+    value === "inspect-timeout" ||
+    value === "inspect-failed" ||
+    value === "recovery-deadline" ||
+    value === "budget-exceeded"
+  );
+}
+
+function isAgentToolReplayCursor(
+  value: unknown
+): value is AgentToolReplayCursor {
+  return (
+    isRecord(value) &&
+    typeof value.epoch === "string" &&
+    typeof value.sequence === "number"
+  );
+}
+
+function isAgentToolStoredChunk(value: unknown): value is AgentToolStoredChunk {
+  return (
+    isRecord(value) &&
+    typeof value.sequence === "number" &&
+    typeof value.body === "string" &&
+    (value.cursor === undefined || isAgentToolReplayCursor(value.cursor))
+  );
+}
+
+function isAgentToolProgressSnapshot(
+  value: unknown
+): value is AgentToolProgressSnapshot {
+  return (
+    isRecord(value) &&
+    isOptionalNumber(value.fraction) &&
+    isOptionalString(value.message) &&
+    isOptionalString(value.phase) &&
+    isOptionalString(value.milestone) &&
+    typeof value.at === "number"
+  );
+}
+
+function isAgentToolMilestone(value: unknown): value is AgentToolMilestone {
+  return (
+    isRecord(value) &&
+    typeof value.name === "string" &&
+    typeof value.sequence === "number" &&
+    typeof value.at === "number"
+  );
+}
+
+function isAgentToolRunSnapshot(value: unknown): value is AgentToolRunSnapshot {
+  return (
+    isRecord(value) &&
+    typeof value.runId === "string" &&
+    typeof value.agentType === "string" &&
+    isOptionalString(value.parentToolCallId) &&
+    isAgentToolRunStatus(value.status) &&
+    (value.display === undefined || isRecord(value.display)) &&
+    isOptionalString(value.notifySource) &&
+    typeof value.displayOrder === "number" &&
+    typeof value.startedAt === "number" &&
+    isOptionalNumber(value.completedAt) &&
+    isOptionalString(value.summary) &&
+    isOptionalString(value.error) &&
+    (value.reason === undefined ||
+      isAgentToolInterruptedReason(value.reason)) &&
+    isOptionalBoolean(value.childStillRunning)
+  );
+}
+
+function isAgentToolSnapshotPayload(
+  value: unknown
+): value is AgentToolSnapshotPayload {
+  if (!isRecord(value)) return false;
+  if (
+    value.progress !== undefined &&
+    !isAgentToolProgressSnapshot(value.progress)
+  ) {
+    return false;
+  }
+  if (
+    value.milestones !== undefined &&
+    (!Array.isArray(value.milestones) ||
+      !value.milestones.every(isAgentToolMilestone))
+  ) {
+    return false;
+  }
+  if (value.replay === undefined) return true;
+  return (
+    isRecord(value.replay) &&
+    Array.isArray(value.replay.chunks) &&
+    value.replay.chunks.every(isAgentToolStoredChunk) &&
+    (value.replay.cursor === undefined ||
+      isAgentToolReplayCursor(value.replay.cursor))
+  );
+}
+
+function isAgentToolEvent(value: unknown): value is AgentToolEvent {
+  if (!isRecord(value) || typeof value.runId !== "string") return false;
+  switch (value.kind) {
+    case "started":
+      return (
+        typeof value.agentType === "string" &&
+        typeof value.order === "number" &&
+        (value.display === undefined || isRecord(value.display))
+      );
+    case "chunk":
+      return (
+        typeof value.body === "string" &&
+        (value.cursor === undefined || isAgentToolReplayCursor(value.cursor))
+      );
+    case "snapshot":
+      return (
+        isAgentToolRunSnapshot(value.run) &&
+        (value.snapshot === undefined ||
+          isAgentToolSnapshotPayload(value.snapshot))
+      );
+    case "finished":
+      return typeof value.summary === "string";
+    case "error":
+      return typeof value.error === "string";
+    case "aborted":
+      return (
+        isOptionalString(value.reason) &&
+        isOptionalBoolean(value.childStillRunning)
+      );
+    case "interrupted":
+      return (
+        typeof value.error === "string" &&
+        (value.reason === undefined ||
+          isAgentToolInterruptedReason(value.reason)) &&
+        isOptionalBoolean(value.childStillRunning)
+      );
+    default:
+      return false;
+  }
+}
+
+function hasAgentToolMessageEnvelope(value: UnknownRecord): boolean {
+  return (
+    value.type === "agent-tool-event" &&
+    typeof value.sequence === "number" &&
+    isOptionalString(value.parentToolCallId) &&
+    (value.replay === undefined || value.replay === true) &&
+    isOptionalString(value.replayId) &&
+    isOptionalNumber(value.revision)
+  );
+}
+
+/** Narrow a parsed projection message to its collection variant. */
+export function isAgentToolCollectionMessage(
+  value: unknown
+): value is AgentToolCollectionMessage {
+  if (
+    !isRecord(value) ||
+    !hasAgentToolMessageEnvelope(value) ||
+    value.replay !== true ||
+    typeof value.replayId !== "string" ||
+    !isRecord(value.event) ||
+    value.event.kind !== "collection"
+  ) {
+    return false;
+  }
+  switch (value.event.status) {
+    case "loading":
+      return true;
+    case "ready":
+      return (
+        Array.isArray(value.event.runIds) &&
+        value.event.runIds.every((runId) => typeof runId === "string")
+      );
+    case "error":
+      return typeof value.event.error === "string";
+    default:
+      return false;
+  }
+}
+
+function isAgentToolEventMessage(
+  value: unknown
+): value is AgentToolEventMessage {
+  return (
+    isRecord(value) &&
+    hasAgentToolMessageEnvelope(value) &&
+    isAgentToolEvent(value.event)
+  );
+}
+
+/** Parse and validate one untrusted `agent-tool-event` WebSocket frame. */
+export function parseAgentToolProjectionMessage(
+  data: string
+): AgentToolProjectionMessage | undefined {
+  let value: unknown;
+  try {
+    value = JSON.parse(data);
+  } catch {
+    return undefined;
+  }
+  if (isAgentToolCollectionMessage(value) || isAgentToolEventMessage(value)) {
+    return value;
+  }
+  return undefined;
+}
 
 export type AgentToolRunPart = { type: string };
 

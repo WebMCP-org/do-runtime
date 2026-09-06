@@ -387,6 +387,8 @@ Construct one `AlarmScheduler` per namespace over a `SqlDatabase` of its own. It
 
 A suspending browser host can project the scheduler's next wake through `BrowserAlarmCoordinator` from `@mcp-b/do-runtime/browser/alarm-coordinator`. The coordinator journals the physical hop, rejects stale projections, rearms a consumed watchdog, and reconciles after background-worker restart. The host supplies durable journal storage, the physical alarm calls, and delivery back into its scheduler; logical delivery policy remains in `AlarmScheduler`.
 
+The scheduler's `projectWake(when, activeDeliveries)` callback reports the earliest pending wake and the number of deliveries whose cleanup is still unfinished. Active deliveries keep their original deadline projected through retry persistence and awaited abandonment, even after cancellation removes an entry. This keeps recovery armed when the scheduler's timer fires before the browser's physical alarm. A host can acknowledge a consumed watchdog only after its latest projection is durably acknowledged, activity is zero, and the pending wake is absent or later than the consumed deadline. If bookkeeping fails, the retained alarm stays projected as due so physical recovery can reconstruct the scheduler from its durable row.
+
 ### Facets
 
 `ctx.facets.get(name, () => ({ $class: ctx.exports.Child }))` asks `ports.facets.start()` for a placement. The host answers with a `FacetHandle` whose `stub` is a promise — placement is asynchronous while the API stays synchronous, so a constructor failure surfaces on the first method call. The runtime owns ids (stable across delete-and-recreate), depth and name limits, clone, cascading deletion, durable deletion receipts, and stale-reference fencing. A broken facet takes its descendants down and nothing else: never its parent, never its siblings.
@@ -499,6 +501,14 @@ and Rook's six-package Agents SDK fork in
 [`vendor/agents/`](vendor/agents/README.md). The examples consume the fork's
 built `agents` package through a `file:` dependency, which resolves their
 own peer dependencies without installing a second SDK implementation.
+
+`pnpm sdk:pack` builds and packs the six SDK packages into `dist/sdk/` with
+their upstream names. After the SDK and consumer gates pass, attach these
+tarballs to a GitHub release tagged `rook-sdk-<source-commit>` at the tested
+commit. Rook pins those release asset URLs and their lockfile integrity;
+it does not need a sibling checkout, SDK source aliases, or a local candidate
+archive. Publish a new source tag for each SDK change instead of replacing
+an existing release's assets. The runtime's npm release remains independent.
 
 Change runtime behaviour with the corresponding workerd source open (line citations use release `v1.20260713.1`; the conformance oracle is pinned to `v1.20260820.1`). Ask the workerd lane an observable question before inventing a local rule; record any intentional divergence in the table above and in a conformance row. Keep host seams small and typed, keep gates internal, and keep product knowledge out of the port. See [`docs/decisions.md`](docs/decisions.md) for the invariants the code cites.
 

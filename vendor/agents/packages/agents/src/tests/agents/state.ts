@@ -104,6 +104,7 @@ export class TestStateAgent extends Agent<Cloudflare.Env, TestState> {
     this.ctx.storage.sql.exec(
       `INSERT OR REPLACE INTO cf_agents_state (id, state) VALUES ('cf_state_row_id', 'invalid{json')`
     );
+    this.resetStateCacheForHydration();
   }
 
   // Insert the state shape used before lastUpdated was introduced.
@@ -137,13 +138,6 @@ export class TestStateAgent extends Agent<Cloudflare.Env, TestState> {
     } catch (error) {
       return error instanceof Error ? error.message : String(error);
     }
-  }
-
-  // Access state and check if it recovered to initialState
-  getStateAfterCorruption(): TestState {
-    this.resetStateCacheForHydration();
-    // This should trigger the try-catch and fallback to initialState
-    return this.state;
   }
 
   protected override migratePersistedState(state: unknown): TestState {
@@ -311,13 +305,25 @@ export class TestStateAgentNoInitial extends Agent {
     this.ctx.storage.sql.exec(
       `INSERT OR REPLACE INTO cf_agents_state (id, state) VALUES ('cf_state_row_id', 'invalid{json')`
     );
-  }
-
-  // Reset in-memory cache and read from DB
-  getStateAfterCorruption() {
     // @ts-expect-error - accessing private field for testing
     this._state = this._stateSentinel;
-    return this.state;
+  }
+
+  getPersistedStateRow(): string | null | undefined {
+    return this.ctx.storage.sql
+      .exec<{ state: string | null }>(
+        "SELECT state FROM cf_agents_state WHERE id = 'cf_state_row_id'"
+      )
+      .toArray()[0]?.state;
+  }
+
+  getPersistedStateHydrationError(): string | undefined {
+    try {
+      void this.state;
+      return undefined;
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
   }
 
   // Set state to a falsy value directly in the DB

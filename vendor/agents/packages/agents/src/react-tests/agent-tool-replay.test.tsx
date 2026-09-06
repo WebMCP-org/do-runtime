@@ -143,9 +143,12 @@ describe("agent-tool replay over a real Worker", () => {
         status: "completed",
         summary: "retained result"
       });
-      expect(readState(observer.container).collection).toMatchObject({
-        status: "error",
-        stale: true
+      // The roster was enumerated correctly; a row with no child to read is
+      // complete from its retained snapshot alone and must not downgrade the
+      // collection every other run is presented from.
+      expect(readState(observer.container).collection).toEqual({
+        status: "ready",
+        stale: false
       });
     });
     await expect(
