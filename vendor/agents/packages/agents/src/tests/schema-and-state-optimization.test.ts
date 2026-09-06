@@ -408,8 +408,8 @@ describe("single-row state optimization", () => {
     });
   });
 
-  describe("corrupted state recovery", () => {
-    it("should recover from corrupted JSON and fall back to initialState", async () => {
+  describe("corrupted state preservation", () => {
+    it("preserves corrupted JSON when initialState is defined", async () => {
       const agent = await getAgentByName(
         env.TestStateAgent,
         `corrupted-recovery-${crypto.randomUUID()}`
@@ -418,17 +418,13 @@ describe("single-row state optimization", () => {
       // Insert corrupted JSON directly
       await agent.insertCorruptedState();
 
-      // Access state — should trigger parse error and recover
-      const state = await agent.getStateAfterCorruption();
-
-      expect(state).toEqual({
-        count: 0,
-        items: [],
-        lastUpdated: null
-      });
+      await expect(agent.getPersistedStateHydrationError()).resolves.toContain(
+        "invalid{json"
+      );
+      await expect(agent.getPersistedStateRow()).resolves.toBe("invalid{json");
     });
 
-    it("should clear corrupted state row when no initialState defined", async () => {
+    it("preserves corrupted JSON when no initialState is defined", async () => {
       const agent = await getAgentByName(
         env.TestStateAgentNoInitial,
         `corrupted-no-initial-${crypto.randomUUID()}`
@@ -437,31 +433,30 @@ describe("single-row state optimization", () => {
       // Insert corrupted JSON
       await agent.insertCorruptedState();
 
-      // Access state — should return undefined and clear the corrupted row
-      const state = await agent.getStateAfterCorruption();
-      expect(state).toBeUndefined();
-
-      // Corrupted row should be cleaned up
-      const count = await agent.getStateRowCount();
-      expect(count).toBe(0);
+      await expect(agent.getPersistedStateHydrationError()).resolves.toContain(
+        "invalid{json"
+      );
+      await expect(agent.getPersistedStateHydrationError()).resolves.toContain(
+        "invalid{json"
+      );
+      await expect(agent.getPersistedStateRow()).resolves.toBe("invalid{json");
     });
 
-    it("should persist recovered state so future reads don't hit corrupted data", async () => {
+    it("keeps reporting the decode failure on later reads", async () => {
       const name = `corrupted-persist-${crypto.randomUUID()}`;
       const agent = await getAgentByName(env.TestStateAgent, name);
 
       await agent.insertCorruptedState();
-      await agent.getStateAfterCorruption();
+      await expect(agent.getPersistedStateHydrationError()).resolves.toContain(
+        "invalid{json"
+      );
 
-      // Get new stub — should read the recovered state, not corrupted data
+      // A new stub must not observe a cached fallback after failed hydration.
       const agent2 = await getAgentByName(env.TestStateAgent, name);
-      const state = await agent2.getState();
-
-      expect(state).toEqual({
-        count: 0,
-        items: [],
-        lastUpdated: null
-      });
+      await expect(agent2.getPersistedStateHydrationError()).resolves.toContain(
+        "invalid{json"
+      );
+      await expect(agent2.getPersistedStateRow()).resolves.toBe("invalid{json");
     });
   });
 

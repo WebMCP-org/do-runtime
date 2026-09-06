@@ -1796,26 +1796,10 @@ export class Agent<
     // This handles all values including falsy ones (null, 0, false, "").
     if (result.length > 0) {
       const state = result[0].state;
-      let parsedState: unknown;
-
-      try {
-        parsedState = JSON.parse(state ?? "null");
-      } catch (e) {
-        console.error(
-          "Failed to parse stored state, falling back to initialState:",
-          e
-        );
-        if (this.initialState !== DEFAULT_STATE) {
-          this._state = this.initialState;
-          // Persist the fixed state to prevent future parse errors
-          this._setStateInternal(this.initialState);
-        } else {
-          // No initialState defined - clear corrupted data to prevent infinite retry loop
-          this.sql`DELETE FROM cf_agents_state WHERE id = ${STATE_ROW_ID}`;
-          return undefined as State;
-        }
-        return this._state;
-      }
+      // Decode before caching or writing. A malformed row belongs to the
+      // application; replacing it with initialState would destroy the evidence
+      // needed to repair it and turn a failed hydration into silent data loss.
+      const parsedState: unknown = JSON.parse(state ?? "null");
 
       const migratedState = this.migratePersistedState(parsedState);
       if (migratedState !== parsedState) {
@@ -9801,12 +9785,15 @@ export class Agent<
 
       await Promise.all(
         rows.map(async (row) => {
+          // A row that never registered a child — an admission-cap rejection,
+          // or a run cancelled before registration — has no transcript to read.
+          // Its whole state already went out with the sequence-0 snapshot and
+          // terminal frames above; resolving a child here would only manufacture
+          // an empty facet.
+          if (!this.hasSubAgent(row.agent_type, row.run_id)) return;
           let timer: ReturnType<typeof setTimeout> | undefined;
           try {
             const read = (async () => {
-              if (!this.hasSubAgent(row.agent_type, row.run_id)) {
-                throw new Error("retained child is unavailable");
-              }
               const child = await this._cf_resolveSubAgent(
                 row.agent_type,
                 row.run_id
@@ -9852,12 +9839,13 @@ export class Agent<
               connection
             );
           } catch (error) {
-            collection({
-              kind: "collection",
-              status: "error",
-              runId: row.run_id,
-              error: `Could not load delegated run ${row.run_id}: ${error instanceof Error ? error.message : String(error)}`
-            });
+            // One retained child's transcript is missing, but the enumerated
+            // roster it belongs to is still correct. Downgrading the collection
+            // here would mark every other run stale over a single slow or
+            // evicted child, so this stays a log line.
+            console.warn(
+              `[Agent] Could not load delegated run ${row.run_id}: ${error instanceof Error ? error.message : String(error)}`
+            );
           } finally {
             if (timer !== undefined) clearTimeout(timer);
           }
@@ -9907,9 +9895,18 @@ export class Agent<
              give_up_delivered_at
       FROM cf_agent_tool_runs
       WHERE detached = 0 AND (status IN ('starting', 'running')
-        OR (status = 'aborted' AND child_still_running IS NOT 0))
+        OR (status IN ('aborted', 'interrupted')
+            AND child_still_running IS NOT 0))
       ORDER BY started_at ASC
     `;
+    // NOTE: `interrupted` rows without confirmed shutdown are re-driven here for
+    // the same reason they still hold capacity in `_activeAgentToolRunCount`:
+    // the soft terminal only records that the parent gave up collecting, so the
+    // child may since have reached its real terminal (repairing the row) or may
+    // still be tailable (re-attach). A reconcile that seals `inspect-timeout` /
+    // `inspect-failed` / `recovery-deadline` writes no liveness at all, so
+    // without this the row it just wrote could never be re-inspected and its
+    // reserved slot could only be released by an explicit Stop.
     // NOTE: detached runs are deliberately excluded. The awaited reconcile seals
     // a still-running, not-tailable run `interrupted` because a lost observer
     // means the dispatching turn cannot continue. For a DETACHED run a lost
@@ -10231,7 +10228,7 @@ export class Agent<
       SELECT run_id
       FROM cf_agent_tool_runs
       WHERE status IN ('starting', 'running')
-        OR (detached = 0 AND status = 'aborted'
+        OR (detached = 0 AND status IN ('aborted', 'interrupted')
             AND child_still_running IS NOT 0)
       ORDER BY started_at ASC
     `.map((row) => row.run_id);

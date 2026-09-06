@@ -5,6 +5,65 @@ shim could not cover it, and whether it is upstreamable. The measured footprint
 lives in [the vendor fork audit](audit/vendor-fork-audit.md); do not duplicate a count
 here that drifts on every refresh.
 
+## 2026-09-05 — Preserve actor identity in built SDK packages
+
+- Every package's `scripts/build.ts` sets the bundler's `keepNames` output
+  option. Agent uses constructor names, including `ThinkMessengerStateAgent`,
+  for sub-agent identity; a consumer cannot recover an original name if the
+  SDK build renames it. Preserve names explicitly across the six-package
+  closure, including the exported Agent and Durable Object bases in AI Chat,
+  Voice, and Codemode.
+- Set the existing Agents/Think `es2021` target in the remaining four package
+  builds too. Native async functions and awaits must remain available to the
+  browser host's actor-context transform. Neither setting changes SDK source
+  behavior; both preserve it across the package boundary and are upstreamable.
+
+## 2026-09-05 — Preserve malformed state and expose Shell method metadata
+
+- `packages/agents/src/index.ts`: let persisted-state JSON decoding fail before
+  caching or writing anything. The previous inherited fallback silently
+  replaced malformed JSON with `initialState`, or deleted it when no default
+  existed. That loses released application data before the owning Agent can
+  reject it. Valid JSON still uses the single `migratePersistedState` hook;
+  missing rows still initialize normally. No parallel raw-state hook is added.
+- Update the existing native state and schema-optimization regressions to
+  assert byte-for-byte retention, repeated decode failures, and successful
+  migration after an explicit repair. Rook's frozen released-state fixtures
+  remain unchanged. This deliberately changes the default SDK corruption
+  behavior, is documented in the state guide, and is upstreamable as lossless
+  hydration; a host cannot recover a row after the SDK has overwritten it.
+- `packages/shell/package.json` and `scripts/build.ts`: expose existing
+  `src/state-methods.ts` through `@cloudflare/shell/state-methods`. Browser hosts
+  need its method metadata and argument adapters without importing the
+  Codemode runtime from `shell/workers`. No implementation is copied or changed.
+  This package boundary is upstreamable and replaces Rook's source-file alias.
+
+## 2026-09-05 — Preserve Rook's later Agent-tool fixes during the SDK cutover
+
+- Port the complete SDK changes from Rook commits `224aa327` and `ecc3ae3b`
+  onto this fork's released 0.22 source. These are the only SDK changes after
+  the `a8547bd3` Rook baseline imported here; retain this repository's newer
+  Lifecycle, state-migration, replay-buffer, and cancellation-test changes.
+- `packages/agents/src/agent-tool-types.ts` owns the shared projection-frame
+  parser and type guards. `react.tsx` uses them before updating the Agent-tool
+  collection, so malformed ready frames cannot clear the retained roster.
+  The existing React regression covers a ready frame without its run ids.
+- `packages/agents/src/index.ts` re-inspects awaited `interrupted` runs whose
+  child shutdown is unconfirmed, both during reconciliation and startup
+  recovery. A child that has completed repairs its retained row and releases
+  capacity; a live child can be re-attached. The native lifecycle regression
+  forces an inspection failure across a parent restart and verifies that a
+  later restart recovers the finished child and admits another run.
+- Agent-tool replay skips child reads for rows that never registered a child
+  and logs individual detail-read failures without invalidating the roster.
+  A collection error now means enumeration failed. Update the collection
+  type, React consumer, reducer, type assertions, and real-Worker replay test
+  together; no persisted row shape changes.
+- A host shim cannot select private recovery rows or repair frames after the
+  SDK has sent them. These fixes and their shared protocol parser belong in
+  the SDK and are upstreamable with the retained Agent-tool lifecycle and
+  replay patches.
+
 ## 2026-09-05 — Synchronize Agent-tool cancellation tests with execution
 
 - `packages/think/src/tests/agent-tools.test.ts`: replace the 50 ms model-step
@@ -1019,7 +1078,11 @@ below survives, and it is unrelated to atomicity.\_
 - Upstreamable: yes. Separate Agent invocations can interleave at every await in
   Workers too, so cancel-before-child-admission must not restart cancelled work.
 
-## 2026-07-31 — Codemode exposes the durable connector-call sequence
+## 2026-07-31 — Codemode exposes the durable connector-call sequence (retired 2026-08-31)
+
+_The focused delegation cutover removed this fork. Current Codemode exposes no
+connector sequence, and `ctx.agents.run` keys one prepared item by the outer
+Think tool-call id plus the model-authored item key._
 
 - File: `vendor/agents/packages/codemode/src/connectors/types.ts` and
   `src/proxy-tool.ts`, with host boundary coverage in

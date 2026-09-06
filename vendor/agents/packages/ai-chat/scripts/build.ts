@@ -5,6 +5,7 @@ async function main() {
   await build({
     clean: true,
     dts: true,
+    target: "es2021",
     entry: [
       "src/index.ts",
       "src/react.tsx",
@@ -16,6 +17,7 @@ async function main() {
       neverBundle: ["cloudflare:workers", "cloudflare:email"]
     },
     format: "esm",
+    outputOptions: { keepNames: true },
     sourcemap: true,
     fixedExtension: false
   });

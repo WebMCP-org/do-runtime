@@ -30,6 +30,11 @@
       "import": "./dist/workers.js",
       "require": "./dist/workers.js"
     },
+    "./state-methods": {
+      "types": "./dist/state-methods.d.ts",
+      "import": "./dist/state-methods.js",
+      "require": "./dist/state-methods.js"
+    },
     "./git": {
       "types": "./dist/git/index.d.ts",
       "import": "./dist/git/index.js",

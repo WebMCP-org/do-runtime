@@ -440,7 +440,7 @@ describe("state management", () => {
   });
 
   describe("error recovery", () => {
-    it("should recover from corrupted state JSON by falling back to initialState", async () => {
+    it("retries hydration after the application repairs corrupted state JSON", async () => {
       // Use a unique name so this agent hasn't accessed state yet
       const agentStub = await getAgentByName(
         env.TestStateAgent,
@@ -450,14 +450,23 @@ describe("state management", () => {
       // Insert corrupted state directly (before any state access)
       await agentStub.insertCorruptedState();
 
-      // Access state - should trigger try-catch and recover to initialState
-      const state = await agentStub.getStateAfterCorruption();
+      await expect(
+        agentStub.getPersistedStateHydrationError()
+      ).resolves.toContain("invalid{json");
+      await expect(
+        agentStub.getPersistedStateHydrationError()
+      ).resolves.toContain("invalid{json");
+      await expect(agentStub.getPersistedStateRow()).resolves.toBe(
+        "invalid{json"
+      );
+      await expect(agentStub.getStateUpdateCalls()).resolves.toEqual([]);
 
-      // Should have recovered to initialState
-      expect(state).toEqual({
-        count: 0,
-        items: [],
-        lastUpdated: null
+      // A corrected row can still pass through the normal migration path.
+      await agentStub.insertLegacyPersistedState();
+      await expect(agentStub.getState()).resolves.toEqual({
+        count: 7,
+        items: ["legacy"],
+        lastUpdated: "migrated"
       });
     });
   });

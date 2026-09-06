@@ -100,13 +100,7 @@ const _missingStandardInput: typeof standardInput = undefined;
 const collectionEvents: AgentToolCollectionMessage["event"][] = [
   { kind: "collection", status: "loading" },
   { kind: "collection", status: "ready", runIds: [] },
-  { kind: "collection", status: "error", error: "Could not read the roster" },
-  {
-    kind: "collection",
-    status: "error",
-    error: "Could not read the child",
-    runId: "retained-run"
-  }
+  { kind: "collection", status: "error", error: "Could not read the roster" }
 ];
 void collectionEvents;
 
@@ -123,3 +117,14 @@ const errorWithoutDiagnostic: AgentToolCollectionMessage["event"] = {
   status: "error"
 };
 void errorWithoutDiagnostic;
+
+// A collection error is roster-wide; a single unreadable run is logged and
+// skipped server-side rather than downgrading the enumerated roster.
+const errorForOneRun: AgentToolCollectionMessage["event"] = {
+  kind: "collection",
+  status: "error",
+  error: "Could not read the child",
+  // @ts-expect-error An error collection never names one run.
+  runId: "retained-run"
+};
+void errorForOneRun;

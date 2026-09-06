@@ -500,6 +500,14 @@ and Rook's six-package Agents SDK fork in
 built `agents` package through a `file:` dependency, which resolves their
 own peer dependencies without installing a second SDK implementation.
 
+`pnpm sdk:pack` builds and packs the six SDK packages into `dist/sdk/` with
+their upstream names. After the SDK and consumer gates pass, attach these
+tarballs to a GitHub release tagged `rook-sdk-<source-commit>` at the tested
+commit. Rook pins those release asset URLs and their lockfile integrity;
+it does not need a sibling checkout, SDK source aliases, or a local candidate
+archive. Publish a new source tag for each SDK change instead of replacing
+an existing release's assets. The runtime's npm release remains independent.
+
 Change runtime behaviour with the corresponding workerd source open (line citations use release `v1.20260713.1`; the conformance oracle is pinned to `v1.20260820.1`). Ask the workerd lane an observable question before inventing a local rule; record any intentional divergence in the table above and in a conformance row. Keep host seams small and typed, keep gates internal, and keep product knowledge out of the port. See [`docs/decisions.md`](docs/decisions.md) for the invariants the code cites.
 
 ## Acknowledgements

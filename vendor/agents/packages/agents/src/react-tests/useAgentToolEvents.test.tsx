@@ -197,16 +197,32 @@ describe("useAgentToolEvents", () => {
     source.dispatch(
       collectionFrame("new", {
         kind: "collection",
+        status: "ready",
+        runIds: ["r1"]
+      })
+    );
+    await vi.waitFor(() =>
+      expect(readState(container).collection).toEqual({
+        status: "ready",
+        stale: false
+      })
+    );
+    // An unreadable single run never reaches the client: the server logs and
+    // skips that detail read, so an enumerated roster stays authoritative. The
+    // only `error` collection frame is a failure to enumerate at all, and it
+    // downgrades the whole collection while keeping the last-known rows.
+    source.dispatch(
+      collectionFrame("new", {
+        kind: "collection",
         status: "error",
-        error: "Child transcript unavailable",
-        runId: "r1"
+        error: "Roster unavailable"
       })
     );
     await vi.waitFor(() => {
       expect(readState(container).collection).toEqual({
         status: "error",
         stale: true,
-        error: "Child transcript unavailable"
+        error: "Roster unavailable"
       });
       expect(Object.keys(readState(container).runsById)).toEqual(["r1"]);
     });
@@ -1171,6 +1187,40 @@ describe("useAgentToolEvents", () => {
 
     await vi.waitFor(() => {
       expect(readState(container).runsById.r1?.status).toBe("running");
+    });
+  });
+
+  it("ignores a ready collection frame without a run roster", async () => {
+    const { agent, dispatch, raw } = createToolAgent();
+    const { container } = await render(<Harness agent={agent} />);
+
+    dispatch(
+      collectionFrame("replay", { kind: "collection", status: "loading" })
+    );
+    raw(
+      JSON.stringify({
+        type: "agent-tool-event",
+        replay: true,
+        replayId: "replay",
+        sequence: 0,
+        event: { kind: "collection", status: "ready" }
+      })
+    );
+    dispatch(
+      evt(0, { kind: "started", runId: "r1", agentType: "A", order: 0 })
+    );
+    dispatch(
+      collectionFrame("replay", {
+        kind: "collection",
+        status: "ready",
+        runIds: ["r1"]
+      })
+    );
+
+    await vi.waitFor(() => {
+      const state = readState(container);
+      expect(state.collection).toEqual({ status: "ready", stale: false });
+      expect(state.runsById.r1?.status).toBe("running");
     });
   });
 });
