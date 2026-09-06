@@ -14,9 +14,14 @@
 
 import { describe, expect, test } from "vitest";
 import { createNodeSqlProvider } from "../../backends/node-sqlite";
+import {
+  BrowserAlarmCoordinator,
+  type BrowserAlarmProjection,
+  type BrowserAlarmTransportJournal,
+} from "../browser/alarm-coordinator";
 import type { Timer } from "../io/io-context";
 import type { SqlDatabase } from "../util/sqlite";
-import type { AlarmResult, AlarmTarget } from "./alarm-scheduler";
+import type { AlarmResult, AlarmSchedulerOptions, AlarmTarget } from "./alarm-scheduler";
 import {
   ALARM_RETRY_MAX_TRIES,
   ALARM_RETRY_START_SECONDS,
@@ -180,7 +185,7 @@ async function harness(
     db?: SqlDatabase;
     random?: () => number;
     now?: number;
-    projectWake?: (scheduledTime: number | null) => void;
+    projectWake?: AlarmSchedulerOptions["projectWake"];
   } = {},
 ): Promise<Harness> {
   const timer = new FakeTimer(options.now);
@@ -251,12 +256,129 @@ describe("the retry ladder constants", () => {
 });
 
 // =======================================================================================
+// Native scheduler timers can win the race with a browser's physical alarm.
+
+describe("browser wake recovery", () => {
+  test("keeps a timer-first delivery physically armed through cancellation and cleanup", async () => {
+    let journal: BrowserAlarmTransportJournal | null = null;
+    let physicalWake: number | null = null;
+    let generation = 0;
+    const coordinator = new BrowserAlarmCoordinator({
+      store: {
+        load: async () => journal,
+        save: async (next) => {
+          journal = next;
+        },
+      },
+      physical: {
+        create: async (when) => {
+          physicalWake = when;
+        },
+        clear: async () => {
+          physicalWake = null;
+        },
+      },
+      deliver: async () => {
+        throw new Error("The physical alarm has not fired");
+      },
+    });
+    const context = await harness({
+      projectWake: (when) => coordinator.project({ generation: ++generation, when }),
+    });
+    const delivery = Promise.withResolvers<void>();
+    context.actor.holds.set(0, delivery.promise);
+    await fire(context);
+    await coordinator.reconcile();
+    expect(physicalWake).toBe(context.timer.now());
+
+    context.scheduler.deleteAll();
+    await coordinator.reconcile();
+    expect(context.rows()).toEqual([]);
+    expect(physicalWake).toBe(context.timer.now());
+
+    delivery.resolve();
+    await settle();
+    await coordinator.reconcile();
+    expect(physicalWake).toBeNull();
+  });
+
+  test("recovers a timer-first worker loss from the journal and durable running row", async () => {
+    const db = await newDatabase();
+    const now = 1_000_000;
+    let journal: BrowserAlarmTransportJournal | null = null;
+    let physicalWake: number | null = null;
+    let projection: BrowserAlarmProjection = { generation: 0, when: null };
+    const store = {
+      load: async () => journal,
+      save: async (next: BrowserAlarmTransportJournal) => {
+        journal = next;
+      },
+    };
+    const physical = {
+      create: async (when: number) => {
+        physicalWake = when;
+      },
+      clear: async () => {
+        physicalWake = null;
+      },
+    };
+    let coordinator = new BrowserAlarmCoordinator({
+      store,
+      physical,
+      now: () => now,
+      deliver: async () => {
+        throw new Error("The original worker was lost");
+      },
+    });
+    const projectWake = (when: number | null) => {
+      projection = { generation: projection.generation + 1, when };
+      return coordinator.project(projection);
+    };
+    const original = await harness({ db, now, projectWake });
+    original.actor.holds.set(0, NEVER);
+    await fire(original);
+    await coordinator.reconcile();
+    expect(physicalWake).toBe(now);
+
+    let recovered: Harness | undefined;
+    coordinator = new BrowserAlarmCoordinator({
+      store,
+      physical,
+      now: () => now,
+      deliver: async () => {
+        recovered = await harness({ db, now, projectWake });
+        await coordinator.reconcile();
+        return projection;
+      },
+    });
+    // The background worker is new too; its journal reconstructs a lost physical wake.
+    physicalWake = null;
+    await coordinator.reconcile();
+    expect(physicalWake).toBe(now);
+    await coordinator.fire(now);
+    expect(physicalWake).toBe(now + 2_000);
+    if (!recovered) throw new Error("The physical alarm did not reconstruct the scheduler");
+    expect(recovered.state()[0]).toMatchObject({ running: 0, retry_time: now + 2_000 });
+    expect(recovered.actor.deliveries).toEqual([]);
+
+    await recovered.timer.advance(2_000);
+    await coordinator.reconcile();
+    expect(recovered.actor.deliveries).toEqual([{ scheduledTime: now, retryCount: 0 }]);
+    expect(physicalWake).toBeNull();
+  });
+});
+
+// =======================================================================================
 // The persistent table
 
 describe("_cf_ALARM", () => {
   test("projects the earliest durable wake after every public schedule change", async () => {
     const projected: (number | null)[] = [];
-    const { scheduler } = await harness({ projectWake: (wake) => projected.push(wake) });
+    const { scheduler } = await harness({
+      projectWake: (wake) => {
+        projected.push(wake);
+      },
+    });
     expect(projected).toEqual([null]);
 
     scheduler.setAlarm("later", 1_009_000);
@@ -266,6 +388,114 @@ describe("_cf_ALARM", () => {
 
     expect(projected).toEqual([null, 1_009_000, 1_005_000, 1_009_000, null]);
   });
+
+  test("projects delivery activity through unrelated changes until completion is persisted", async () => {
+    const db = await newDatabase();
+    const projections: {
+      when: number | null;
+      active: number;
+      rows: readonly (readonly unknown[])[];
+    }[] = [];
+    const context = await harness({
+      db,
+      projectWake: (when, active) => {
+        projections.push({
+          when,
+          active,
+          rows: db.exec("SELECT running FROM _cf_ALARM WHERE actor_id = 'a'", []).rawRows,
+        });
+      },
+    });
+    const delivery = Promise.withResolvers<void>();
+    context.actor.holds.set(0, delivery.promise);
+    await fire(context);
+    const future = context.timer.now() + 60_000;
+    context.scheduler.setAlarm("unrelated", future);
+    expect(projections.at(-1)).toEqual({ when: context.timer.now(), active: 1, rows: [[1]] });
+    context.scheduler.deleteAlarm("unrelated");
+    expect(projections.at(-1)).toEqual({ when: context.timer.now(), active: 1, rows: [[1]] });
+
+    delivery.resolve();
+    await settle();
+    expect(projections.at(-1)).toEqual({ when: null, active: 0, rows: [] });
+  });
+
+  test("finishes delivery activity only after the retry wake is durable", async () => {
+    const db = await newDatabase();
+    const projections: {
+      when: number | null;
+      active: number;
+      rows: readonly (readonly unknown[])[];
+    }[] = [];
+    const context = await harness({
+      db,
+      projectWake: (when, active) => {
+        projections.push({
+          when,
+          active,
+          rows: db.exec("SELECT running, retry_time FROM _cf_ALARM WHERE actor_id = 'a'", [])
+            .rawRows,
+        });
+      },
+    });
+    context.actor.results = [USER_FAILURE];
+    await fire(context);
+    const retryTime = context.timer.now() + 2_000;
+    expect(projections.at(-1)).toEqual({ when: retryTime, active: 0, rows: [[0, retryTime]] });
+  });
+
+  test("counts concurrent deliveries independently when a queued alarm becomes due", async () => {
+    const projected: { when: number | null; active: number }[] = [];
+    const context = await harness({
+      projectWake: (when, active) => {
+        projected.push({ when, active });
+      },
+    });
+    const first = Promise.withResolvers<void>();
+    const second = Promise.withResolvers<void>();
+    context.actor.holds.set(0, first.promise);
+    context.actor.holds.set(1, second.promise);
+    await fire(context);
+    context.scheduler.setAlarm("b", context.timer.now());
+    await context.timer.fireDue();
+    expect(projected.at(-1)).toEqual({ when: context.timer.now(), active: 2 });
+
+    context.scheduler.setAlarm("a", context.timer.now());
+    first.resolve();
+    await settle();
+    expect(projected.at(-1)).toEqual({ when: context.timer.now(), active: 1 });
+    await context.timer.fireDue();
+    expect(projected.at(-1)).toEqual({ when: context.timer.now(), active: 1 });
+
+    second.resolve();
+    await settle();
+    expect(projected.at(-1)).toEqual({ when: null, active: 0 });
+    expect(context.rows()).toEqual([]);
+  });
+
+  test.each([false, true])(
+    "a failed start projection preserves recovery when cleanup projection also fails: %s",
+    async (failCleanup) => {
+      const projected: { when: number | null; active: number }[] = [];
+      let started = false;
+      const context = await harness({
+        projectWake: (when, active) => {
+          projected.push({ when, active });
+          if (active > 0) {
+            started = true;
+            throw new Error("start projection failed");
+          }
+          if (started && failCleanup) throw new Error("cleanup projection failed");
+        },
+      });
+      await fire(context);
+
+      expect(projected.at(-1)).toEqual({ when: context.timer.now(), active: 0 });
+      expect(context.actor.deliveries).toEqual([]);
+      expect(context.state()[0]?.running).toBe(1);
+      expect(String(context.scheduler.taskFailure())).toContain("start projection failed");
+    },
+  );
 
   test("refuses an incompatible present table before changing the database", async () => {
     const db = await newDatabase();
@@ -326,6 +556,28 @@ describe("_cf_ALARM", () => {
     expect(rows()).toEqual([]);
     expect(scheduler.getAlarm("a")).toBe(null);
     expect(timer.delays()).toEqual([]);
+  });
+
+  test("a refused deleteAll preserves pending alarms after an active delivery finishes", async () => {
+    const projected: { when: number | null; active: number }[] = [];
+    const context = await harness({
+      db: refusing(await newDatabase(), /DELETE FROM _cf_ALARM\s*$/),
+      projectWake: (when, active) => {
+        projected.push({ when, active });
+      },
+    });
+    const delivery = Promise.withResolvers<void>();
+    context.actor.holds.set(0, delivery.promise);
+    await fire(context);
+    const future = context.timer.now() + 60_000;
+    context.scheduler.setAlarm("b", future);
+
+    expect(() => context.scheduler.deleteAll()).toThrow("metadata write refused");
+    delivery.resolve();
+    await settle();
+    expect(projected.at(-1)).toEqual({ when: future, active: 0 });
+    expect(context.timer.delays()).toEqual([60_000]);
+    expect(context.rows()).toEqual([{ actor_id: "b", scheduled_time: future }]);
   });
 
   test("loadAlarmsFromDb reschedules everything a previous session left behind", async () => {
@@ -646,6 +898,29 @@ describe("abandonAlarm", () => {
     await ladder(context, ALARM_RETRY_MAX_TRIES);
   }
 
+  test("keeps abandonment active even when cancellation removes its scheduled entry", async () => {
+    const projected: { when: number | null; active: number }[] = [];
+    const context = await harness({
+      projectWake: (when, active) => {
+        projected.push({ when, active });
+      },
+    });
+    const abandoned = Promise.withResolvers<void>();
+    context.actor.abandonAlarm = async () => {
+      await abandoned.promise;
+      return null;
+    };
+    const scheduledTime = context.timer.now();
+    await exhaust(context);
+    expect(projected.at(-1)?.active).toBe(1);
+    context.scheduler.deleteAll();
+    expect(projected.at(-1)).toEqual({ when: scheduledTime, active: 1 });
+
+    abandoned.resolve();
+    await settle();
+    expect(projected.at(-1)).toEqual({ when: null, active: 0 });
+  });
+
   test("is notified once, with the alarm's own scheduled time, and clears the alarm", async () => {
     // ← `:243-252`.
     const context = await harness();
@@ -670,7 +945,12 @@ describe("abandonAlarm", () => {
   test("a failed notification keeps the alarm in the scheduler rather than losing it", async () => {
     // ← "If the notification fails, we keep the alarm in the scheduler so it is
     // not silently lost" (`:243-250`).
-    const context = await harness();
+    const projected: { when: number | null; active: number }[] = [];
+    const context = await harness({
+      projectWake: (when, active) => {
+        projected.push({ when, active });
+      },
+    });
     const scheduledTime = context.timer.now();
     context.actor.abandonFails = true;
     await exhaust(context);
@@ -678,6 +958,7 @@ describe("abandonAlarm", () => {
     expect(context.scheduler.getAlarm("a")).toBe(scheduledTime);
     expect(context.rows()).toEqual([{ actor_id: "a", scheduled_time: scheduledTime }]);
     expect(String(context.scheduler.taskFailure())).toContain("abandon notification failed");
+    expect(projected.at(-1)).toEqual({ when: scheduledTime, active: 0 });
   });
 
   test("an alarm queued while the notification was in flight is promoted, not deleted", async () => {
@@ -1085,13 +1366,20 @@ describe("the retry state survives a restart", () => {
     // failure has to leave the mark set: the in-memory retry is about to be lost
     // with the process, and the row is the only thing that outlives it.
     const db = await newDatabase();
-    const context = await harness({ db: refusing(db, /SET retry_time/) });
+    const projected: { when: number | null; active: number }[] = [];
+    const context = await harness({
+      db: refusing(db, /SET retry_time/),
+      projectWake: (when, active) => {
+        projected.push({ when, active });
+      },
+    });
     context.actor.results = [USER_FAILURE];
     await fire(context);
 
     expect(String(context.scheduler.taskFailure())).toContain("metadata write refused");
     expect(context.timer.delays()).toEqual([]);
     expect(context.state()[0]?.running).toBe(1);
+    expect(projected.at(-1)).toEqual({ when: context.timer.now(), active: 0 });
 
     const second = await harness({ db, now: context.timer.now() });
     expect(second.timer.delays()).toEqual([2_000]);
