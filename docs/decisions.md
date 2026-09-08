@@ -178,6 +178,14 @@ abandonment, including deliveries whose entry was cancelled. Hosts acknowledge
 a consumed wake only after the latest projection is accepted and runtime
 activity has settled; timer-first delivery must leave a wake for worker recovery.
 
+Failed start or completion bookkeeping retries on that same scheduler's timer
+with bounded backoff. A completed handler result stays with the pending cleanup,
+so a failed abandonment notification or metadata write neither redelivers the
+handler nor charges its retry count again. The retained alarm stays due for
+restart recovery until cleanup is durable. Cancellation drops the retry with its
+entry; a queued or replacement alarm keeps its own durable row. The scheduler's
+co-located SQLite tests inject these failures at the target and database boundaries.
+
 ### §2.7 Facet lifecycle
 
 The runtime owns stable ids, depth and name limits, start fencing, abort,

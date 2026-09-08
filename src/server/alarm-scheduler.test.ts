@@ -915,10 +915,13 @@ describe("abandonAlarm", () => {
     expect(projected.at(-1)?.active).toBe(1);
     context.scheduler.deleteAll();
     expect(projected.at(-1)).toEqual({ when: scheduledTime, active: 1 });
+    const newer = scheduledTime + 1_000_000;
+    context.scheduler.setAlarm("a", newer);
 
     abandoned.resolve();
     await settle();
-    expect(projected.at(-1)).toEqual({ when: null, active: 0 });
+    expect(projected.at(-1)).toEqual({ when: newer, active: 0 });
+    expect(context.rows()).toEqual([{ actor_id: "a", scheduled_time: newer }]);
   });
 
   test("is notified once, with the alarm's own scheduled time, and clears the alarm", async () => {
@@ -942,7 +945,7 @@ describe("abandonAlarm", () => {
     expect(context.rows()).toEqual([{ actor_id: "a", scheduled_time: 9_000_000 }]);
   });
 
-  test("a failed notification keeps the alarm in the scheduler rather than losing it", async () => {
+  test("a failed notification retries abandonment without delivering the alarm again", async () => {
     // ← "If the notification fails, we keep the alarm in the scheduler so it is
     // not silently lost" (`:243-250`).
     const projected: { when: number | null; active: number }[] = [];
@@ -959,6 +962,16 @@ describe("abandonAlarm", () => {
     expect(context.rows()).toEqual([{ actor_id: "a", scheduled_time: scheduledTime }]);
     expect(String(context.scheduler.taskFailure())).toContain("abandon notification failed");
     expect(projected.at(-1)).toEqual({ when: scheduledTime, active: 0 });
+    expect(context.timer.delays()).toEqual([2_000]);
+
+    context.actor.abandonFails = false;
+    await context.timer.advance(2_000);
+
+    expect(context.actor.abandoned).toEqual([scheduledTime, scheduledTime]);
+    expect(context.actor.deliveries).toHaveLength(ALARM_RETRY_MAX_TRIES + 1);
+    expect(context.rows()).toEqual([]);
+    expect(context.timer.delays()).toEqual([]);
+    expect(projected.at(-1)).toEqual({ when: null, active: 0 });
   });
 
   test("an alarm queued while the notification was in flight is promoted, not deleted", async () => {
@@ -979,6 +992,7 @@ describe("abandonAlarm", () => {
     await settle();
 
     expect(context.scheduler.getAlarm("a")).toBe(8_000_000);
+    expect(context.rows()).toEqual([{ actor_id: "a", scheduled_time: 8_000_000 }]);
   });
 });
 
@@ -1050,18 +1064,22 @@ async function restart(previous: Harness): Promise<Harness> {
 const NEVER = new Promise<void>(() => {});
 
 /** Refuses one statement and passes everything else through. */
-function refusing(db: SqlDatabase, statement: RegExp): SqlDatabase {
+function refusing(
+  db: SqlDatabase,
+  statement: RegExp,
+  unavailable = () => true,
+): SqlDatabase {
   return {
     prepare: (sql) => {
       const prepared = db.prepare(sql);
-      if (statement.test(prepared.sql)) {
+      if (unavailable() && statement.test(prepared.sql)) {
         prepared.close();
         throw new Error("metadata write refused");
       }
       return prepared;
     },
     exec: (sql, params) => {
-      if (statement.test(sql)) throw new Error("metadata write refused");
+      if (unavailable() && statement.test(sql)) throw new Error("metadata write refused");
       return db.exec(sql, params);
     },
     get databaseSize(): number {
@@ -1333,12 +1351,13 @@ describe("the retry state survives a restart", () => {
     expect(second.actor.deliveries).toEqual([]);
   });
 
-  test("a delivery that cannot record that it started does not start", async () => {
+  test("a delivery retries a failed running mark before invoking its handler", async () => {
     // Running one anyway would make an interruption undetectable, which is the
     // one thing the mark exists to prevent. The row is untouched, so the alarm
     // is still due and a later scheduler picks it up unchanged.
     const db = await newDatabase();
-    const context = await harness({ db: refusing(db, /SET running = 1/) });
+    let unavailable = true;
+    const context = await harness({ db: refusing(db, /SET running = 1/, () => unavailable) });
     const scheduledTime = context.timer.now();
     await fire(context);
 
@@ -1356,33 +1375,99 @@ describe("the retry state survives a restart", () => {
       },
     ]);
 
-    const second = await harness({ db, now: context.timer.now() });
-    await second.timer.fireDue();
-    expect(second.actor.deliveries).toHaveLength(1);
+    expect(context.timer.delays()).toEqual([2_000]);
+    unavailable = false;
+    await context.timer.advance(2_000);
+    expect(context.actor.deliveries).toEqual([{ scheduledTime, retryCount: 0 }]);
+    expect(context.rows()).toEqual([]);
   });
 
-  test("a retry that cannot be persisted leaves the alarm recoverable rather than armed", async () => {
+  test("failed retry persistence is retried without delivering or counting the result twice", async () => {
     // The write carries both the ladder and the end of the delivery, so its
-    // failure has to leave the mark set: the in-memory retry is about to be lost
-    // with the process, and the row is the only thing that outlives it.
+    // failure has to leave the mark set for restart recovery while the live
+    // scheduler retries the write without charging another handler failure.
     const db = await newDatabase();
+    let unavailable = true;
     const projected: { when: number | null; active: number }[] = [];
     const context = await harness({
-      db: refusing(db, /SET retry_time/),
+      db: refusing(db, /SET retry_time/, () => unavailable),
       projectWake: (when, active) => {
         projected.push({ when, active });
       },
     });
-    context.actor.results = [USER_FAILURE];
+    context.actor.results = [USER_FAILURE, OK];
     await fire(context);
 
     expect(String(context.scheduler.taskFailure())).toContain("metadata write refused");
-    expect(context.timer.delays()).toEqual([]);
+    expect(context.timer.delays()).toEqual([2_000]);
     expect(context.state()[0]?.running).toBe(1);
     expect(projected.at(-1)).toEqual({ when: context.timer.now(), active: 0 });
 
-    const second = await harness({ db, now: context.timer.now() });
-    expect(second.timer.delays()).toEqual([2_000]);
+    await context.timer.advance(2_000);
+    expect(context.actor.deliveries).toHaveLength(1);
+    expect(context.timer.delays()).toEqual([4_000]);
+    expect(context.state()[0]).toMatchObject({ counted_retry: 0, backoff: 0, running: 1 });
+
+    unavailable = false;
+    await context.timer.advance(4_000);
+    expect(context.actor.deliveries).toHaveLength(1);
+    expect(context.state()[0]).toMatchObject({
+      backoff: 1,
+      counted_retry: 1,
+      previous_retry_counted: 1,
+      running: 0,
+    });
+    expect(context.timer.delays()).toEqual([2_000]);
+    expect(projected.at(-1)).toEqual({ when: context.timer.now() + 2_000, active: 0 });
+    await context.timer.advance(2_000);
+    expect(context.actor.deliveries.map(({ retryCount }) => retryCount)).toEqual([0, 1]);
+    expect(context.rows()).toEqual([]);
+  });
+
+  test.each(["deleteAlarm", "deleteAll"] as const)(
+    "%s cancels failed bookkeeping without redelivering its completed handler",
+    async (operation) => {
+      const db = await newDatabase();
+      let unavailable = true;
+      const context = await harness({ db: refusing(db, /SET retry_time/, () => unavailable) });
+      context.actor.results = [USER_FAILURE];
+      await fire(context);
+
+      if (operation === "deleteAlarm") context.scheduler.deleteAlarm("a");
+      else context.scheduler.deleteAll();
+      expect(context.timer.delays()).toEqual([]);
+      unavailable = false;
+      await context.timer.advance(2_000);
+      expect(context.actor.deliveries).toHaveLength(1);
+      expect(context.rows()).toEqual([]);
+    },
+  );
+
+  test("failed queued-alarm cleanup promotes the queued row after storage recovers", async () => {
+    const db = await newDatabase();
+    let unavailable = true;
+    const context = await harness({ db: refusing(db, /SET running = 0/, () => unavailable) });
+    const held = Promise.withResolvers<void>();
+    context.actor.holds.set(0, held.promise);
+    await fire(context);
+    const later = context.timer.now() + 10_000;
+    context.scheduler.setAlarm("a", later);
+    held.resolve();
+    await settle();
+    expect(context.timer.delays()).toEqual([2_000]);
+    expect(context.state()[0]).toMatchObject({ scheduled_time: later, running: 1 });
+
+    unavailable = false;
+    await context.timer.advance(2_000);
+    expect(context.actor.deliveries).toHaveLength(1);
+    expect(context.timer.delays()).toEqual([8_000]);
+    expect(context.state()[0]).toMatchObject({ scheduled_time: later, running: 0 });
+    await context.timer.advance(8_000);
+    expect(context.actor.deliveries.map(({ scheduledTime }) => scheduledTime)).toEqual([
+      later - 10_000,
+      later,
+    ]);
+    expect(context.rows()).toEqual([]);
   });
 });
 
