@@ -387,7 +387,7 @@ Construct one `AlarmScheduler` per namespace over a `SqlDatabase` of its own. It
 
 A suspending browser host can project the scheduler's next wake through `BrowserAlarmCoordinator` from `@mcp-b/do-runtime/browser/alarm-coordinator`. The coordinator journals the physical hop, rejects stale projections, rearms a consumed watchdog, and reconciles after background-worker restart. The host supplies durable journal storage, the physical alarm calls, and delivery back into its scheduler; logical delivery policy remains in `AlarmScheduler`.
 
-The scheduler's `projectWake(when, activeDeliveries)` callback reports the earliest pending wake and the number of deliveries whose cleanup is still unfinished. Active deliveries keep their original deadline projected through retry persistence and awaited abandonment, even after cancellation removes an entry. This keeps recovery armed when the scheduler's timer fires before the browser's physical alarm. A host can acknowledge a consumed watchdog only after its latest projection is durably acknowledged, activity is zero, and the pending wake is absent or later than the consumed deadline. If bookkeeping fails, the retained alarm stays projected as due so physical recovery can reconstruct the scheduler from its durable row.
+The scheduler's `projectWake(when, activeDeliveries)` callback reports the earliest pending wake and the number of active delivery or cleanup attempts. Active attempts keep their original deadline projected through retry persistence and awaited abandonment, even after cancellation removes an entry. This keeps recovery armed when the scheduler's timer fires before the browser's physical alarm. A host can acknowledge a consumed watchdog only after its latest projection is durably acknowledged, activity is zero, and the pending wake is absent or later than the consumed deadline. If bookkeeping fails, the scheduler retries it with bounded backoff without redelivering a completed handler. The retained alarm stays projected as due so physical recovery can also reconstruct the scheduler from its durable row.
 
 ### Facets
 
@@ -449,6 +449,7 @@ The browser cannot reproduce every workerd facility. Where it cannot, the runtim
 | Response BYOB readers | Refused; their continuation cannot be re-gated. Use a default reader or `arrayBuffer()`. |
 | Facet `setAlarm()` | Refused synchronously, where workerd breaks the actor asynchronously ([workerd#6810](https://github.com/cloudflare/workerd/issues/6810)). |
 | Alarm exception provenance | Unclassified handler failures stay retryable; browser errors lack jsg provenance. |
+| Alarm bookkeeping failure | Start and completion bookkeeping retry with bounded backoff; workerd leaves these alarms retained without a timer. Completed handlers are not redelivered for cleanup failures. Covered by the scheduler's SQLite fault-injection tests. |
 
 ### Stability
 
