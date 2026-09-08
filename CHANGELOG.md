@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.8.0
+
+### Minor Changes
+
+- 297b300: Sync runtime behavior with workerd 1.20260907.1 and its Workers types. Add alarm abort retry control, RPC error Durable Object IDs, compiled Wasm loader inputs, current Python loader flags, and the current no-op tracing API. Correct cancellation, WebSocket buffer ownership and automatic replies, retained close-handler tags, SQLite savepoint matching, and failed database setup cleanup.
+
+  Actor-global outbound WebSocket construction now refuses before a native handshake can bypass storage confirmation. WebSocket pairs and host-owned transports remain supported. The upstream audit documents remaining SQLite engine protections and native-platform differences.
+
+### Patch Changes
+
+- ea578fb: Report active alarm deliveries and retain their projected deadlines through `projectWake` until completion, retry persistence, and abandonment finish. This keeps browser recovery armed when the native scheduler timer fires first or unrelated alarms change. Browser hosts can use the activity count with the acknowledged pending wake to confirm delivery cleanup. Preserve recoverable alarms when deletion, scheduler bookkeeping, or projection callbacks fail.
+- 297b300: Add opt-in browser AsyncLocalStorage and Vite async-function lowering for Agents
+  SDK context, tracing and OAuth. Preserve captured scopes across actor admission,
+  reentry and timers; test overlapping browser entries and deferred generators.
+- ae6a9a5: Retry failed alarm start and completion bookkeeping on the existing scheduler timer. Transient abandonment or metadata-write failures no longer leave an alarm retained without a live wake. Cleanup retries preserve the completed handler result and its retry budget, and cancellation or replacement retains the correct alarm owner and durable row.
+
 ## 0.7.0
 
 ### Minor Changes
