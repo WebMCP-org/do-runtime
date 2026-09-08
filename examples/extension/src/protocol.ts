@@ -132,6 +132,9 @@ export interface HostRpc {
   nestedSubAgent(): Promise<NestedSubAgentSnapshot>;
   armSubAgentWake(delayMs: number): Promise<number>;
   scheduledSubAgentValue(): Promise<number>;
+  startMcpProbe(origin: string): Promise<{ publicReady: boolean; authUrls: string[] }>;
+  finishMcpProbe(): Promise<unknown>;
+  deliverMcpProbeCallback(url: string): Promise<unknown>;
   startThink(name: string, text: string): Promise<void>;
   submitThink(name: string, text: string, idempotencyKey: string): Promise<ThinkProbeSubmission>;
   thinkStatus(name: string): Promise<ThinkProbeStatus>;

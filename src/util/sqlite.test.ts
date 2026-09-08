@@ -231,6 +231,23 @@ describe("statement classification", () => {
     db.run("RELEASE SAVEPOINT FOO");
   });
 
+  test("savepoint names fold ASCII only when restoring cached metadata", async () => {
+    const db = await openDatabase();
+    const metadata = new SqliteMetadata(db);
+    metadata.setAlarm(1_000, false);
+
+    db.run('SAVEPOINT "Étage"');
+    metadata.setAlarm(2_000, false);
+    db.run('SAVEPOINT "étage"');
+    metadata.setAlarm(3_000, false);
+
+    db.run('ROLLBACK TO "ÉTAGE"');
+    expect(metadata.getAlarm()).toBe(1_000);
+    db.run('RELEASE "ÉTAGE"');
+    db.reset();
+    db.close();
+  });
+
   test("reset is refused while a transaction is open", async () => {
     const db = await openDatabase();
 

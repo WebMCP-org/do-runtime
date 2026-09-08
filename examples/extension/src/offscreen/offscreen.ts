@@ -332,6 +332,9 @@ const ops = {
   nestedSubAgent: async (): Promise<NestedSubAgentSnapshot> => await host.nestedSubAgent(),
   armSubAgentWake: async (delayMs: number): Promise<number> => await host.armSubAgentWake(delayMs),
   scheduledSubAgentValue: async (): Promise<number> => await host.scheduledSubAgentValue(),
+  startMcpProbe: async (origin: string) => await host.startMcpProbe(origin),
+  finishMcpProbe: async () => await host.finishMcpProbe(),
+  deliverMcpProbeCallback: async (url: string) => await host.deliverMcpProbeCallback(url),
   startThink: async (name: string, text: string): Promise<void> =>
     await host.startThink(name, text),
   submitThink: async (
@@ -421,6 +424,12 @@ async function runOp(op: HostOp, args: readonly unknown[]): Promise<unknown> {
       return await ops.armSubAgentWake(integerArg(args, 0));
     case "scheduledSubAgentValue":
       return await ops.scheduledSubAgentValue();
+    case "startMcpProbe":
+      return await ops.startMcpProbe(stringArg(args, 0));
+    case "finishMcpProbe":
+      return await ops.finishMcpProbe();
+    case "deliverMcpProbeCallback":
+      return await ops.deliverMcpProbeCallback(stringArg(args, 0));
     case "startThink":
       return await ops.startThink(stringArg(args, 0), stringArg(args, 1));
     case "submitThink":

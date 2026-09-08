@@ -210,6 +210,7 @@ export type EventOutcome =
   | "canceled"
   | "script-not-found"
   | "exception"
+  | "aborted"
   | "exceeded-cpu"
   | "unknown";
 
@@ -323,12 +324,6 @@ type ScheduledAlarm = {
   backoff: number;
   /** Counter for retry attempts that apply to the retry limit. */
   countedRetry: number;
-};
-
-/** ← `AlarmScheduler::RetryInfo` (`alarm-scheduler.h:103-106`). */
-type RetryInfo = {
-  readonly retry: boolean;
-  readonly retryCountsAgainstLimit: boolean;
 };
 
 /**
@@ -624,23 +619,15 @@ export class AlarmScheduler {
     }
   }
 
-  /** ← `runAlarm` (`alarm-scheduler.c++:158-164`). */
-  async #runAlarm(actorId: string, scheduledTime: number, retryCount: number): Promise<RetryInfo> {
-    const result = await this.#getActor(actorId).deliverAlarm(scheduledTime, retryCount);
-    return {
-      retry: result.outcome !== "ok" && result.retry,
-      retryCountsAgainstLimit: result.retryCountsAgainstLimit,
-    };
-  }
-
   /** ← the try/catch lambda around `runAlarm` (`alarm-scheduler.c++:197-211`). */
   async #runAlarmGuarded(
     actorId: string,
     scheduledTime: number,
     retryCount: number,
-  ): Promise<RetryInfo> {
+  ): Promise<AlarmResult> {
     try {
-      return await this.#runAlarm(actorId, scheduledTime, retryCount);
+      const result = await this.#getActor(actorId).deliverAlarm(scheduledTime, retryCount);
+      return { ...result, retry: result.outcome !== "ok" && result.retry };
     } catch (exception) {
       this.#taskFailed(exception);
       return {
@@ -649,6 +636,7 @@ export class AlarmScheduler {
         // the sandbox for any user-caused error. Let's not count this retry attempt against the
         // limit.
         retryCountsAgainstLimit: false,
+        outcome: "exception",
       };
     }
   }
@@ -658,7 +646,7 @@ export class AlarmScheduler {
     delay: number,
     entry: ScheduledAlarm,
     scheduledTime: number,
-    completed?: RetryInfo,
+    completed?: AlarmResult,
     bookkeepingBackoff = 0,
   ): Promise<void> {
     const actorId = entry.actorId;
@@ -760,7 +748,8 @@ export class AlarmScheduler {
         if (entry.queuedAlarm !== null) {
           throw new Error("An alarm that will not retry still has an alarm queued behind it.");
         }
-        this.deleteAlarm(actorId);
+        if (retryInfo.outcome === "aborted") await this.#abandon(entry, scheduledTime);
+        else this.deleteAlarm(actorId);
       }
     } catch (exception) {
       this.#taskFailed(exception);
@@ -786,7 +775,7 @@ export class AlarmScheduler {
   }
 
   /**
-   * ← the `countedRetry >= RETRY_MAX_TRIES` block (`alarm-scheduler.c++:237-253`).
+   * ← `AlarmScheduler::abandonAlarm`, shared by exhausted retries and terminal aborts.
    *
    * Its comment, verbatim, because the second half is the whole point: "Notify
    * the actor to clear its in-memory alarm state so getAlarm() reflects the
@@ -812,11 +801,13 @@ export class AlarmScheduler {
   async #abandon(entry: ScheduledAlarm, scheduledTime: number): Promise<void> {
     const actorId = entry.actorId;
     const newerAlarm = await this.#getActor(actorId).abandonAlarm(scheduledTime);
+    // The entry may have been canceled or replaced while cleanup was pending.
     if (this.#alarms.get(actorId) !== entry) return;
     if (newerAlarm !== null && entry.queuedAlarm === null) {
       this.setAlarm(actorId, newerAlarm);
     }
     if (entry.queuedAlarm !== null) {
+      // Keep the replacement's durable row: deleteAlarm() would erase it.
       this.#db.run(STMT.clearRunning, actorId);
       this.#replace(entry, this.#scheduleAlarm(this.#timer.now(), actorId, entry.queuedAlarm));
     } else {

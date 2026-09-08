@@ -239,6 +239,36 @@ test("tracing runs the callback and returns its value", () => {
   ).toThrow("from inside the span");
 });
 
+test("untraced spans expose the current chainable API", () => {
+  const span = tracing.startSpan("manual");
+  expect(span).toBeInstanceOf(tracing.Span);
+  expect(span.isTraced).toBe(false);
+  expect(span.setAttribute("count", 1)).toBe(span);
+  expect(span.setAttributes({ ready: true, omitted: undefined })).toBe(span);
+  span.recordException(new Error("unrecorded"));
+  span.end();
+  span.end();
+  expect(span.isTraced).toBe(false);
+  expect(() => Reflect.construct(tracing.Span, [])).toThrow(TypeError);
+  expect(() => Reflect.construct(tracing.Span, [true])).toThrow(TypeError);
+});
+
+test("tracing scopes restore active spans and forward callback arguments", () => {
+  expect(tracing.getActiveSpan()).toBeUndefined();
+  expect(tracing.enterSpan("outer", (outer, value) => {
+    expect(tracing.getActiveSpan()).toBe(outer);
+    tracing.startSpan("inactive");
+    expect(tracing.getActiveSpan()).toBe(outer);
+    expect(() => tracing.startActiveSpan("inner", (inner, message) => {
+      expect(tracing.getActiveSpan()).toBe(inner);
+      throw new Error(message);
+    }, "inner failure")).toThrow("inner failure");
+    expect(tracing.getActiveSpan()).toBe(outer);
+    return value + 1;
+  }, 41)).toBe(42);
+  expect(tracing.getActiveSpan()).toBeUndefined();
+});
+
 test("the four RPC stub types refuse construction and point at the transport", () => {
   expect(() => new RpcStub({})).toThrow(RPC_STUB_UNIMPLEMENTED_MESSAGE);
   expect(() => new RpcPromise()).toThrow(RPC_STUB_UNIMPLEMENTED_MESSAGE);

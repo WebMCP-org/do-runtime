@@ -9,11 +9,12 @@ allowBuilds:
   # Optional just-bash compression accelerators; the browser probe does not use them.
   "@mongodb-js/zstd": false
   node-liblzma: false
-# The pinned Aug 20 oracle is newer than the repository's release-age gate.
+# Allow the pinned oracle through the repository's release-age gate.
 minimumReleaseAgeExclude:
-  - "@cloudflare/workerd-darwin-64@1.20260820.1"
-  - "@cloudflare/workerd-darwin-arm64@1.20260820.1"
-  - "@cloudflare/workerd-linux-64@1.20260820.1"
-  - "@cloudflare/workerd-linux-arm64@1.20260820.1"
-  - "@cloudflare/workerd-windows-64@1.20260820.1"
-  - "workerd@1.20260820.1"
+  - "@cloudflare/workerd-darwin-64@1.20260907.1"
+  - "@cloudflare/workerd-darwin-arm64@1.20260907.1"
+  - "@cloudflare/workerd-linux-64@1.20260907.1"
+  - "@cloudflare/workerd-linux-arm64@1.20260907.1"
+  - "@cloudflare/workerd-windows-64@1.20260907.1"
+  - "workerd@1.20260907.1"
+  - "@cloudflare/workers-types@5.20260907.1"

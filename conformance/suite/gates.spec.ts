@@ -8,8 +8,9 @@
 import { expect, it } from "vitest";
 import { host } from "conformance:host";
 
-it("harness: a posted event preserves its rejection", async () => {
+it("harness: a posted event preserves its rejection and Durable Object id", async () => {
   const probe = await host.spawn("post-rejection");
+  const id = await probe.call("readId");
   const outcome = await probe.post("failPostedEvent").settled.then(
     (value) => ({ status: "fulfilled", value }) as const,
     (error: unknown) => ({ status: "rejected", error }) as const,
@@ -18,6 +19,7 @@ it("harness: a posted event preserves its rejection", async () => {
   expect(outcome.status).toBe("rejected");
   if (outcome.status === "rejected") {
     expect(String(outcome.error)).toContain("conformance: posted event failed");
+    expect(outcome.error).toHaveProperty("durableObjectId", id);
   }
 });
 
@@ -82,6 +84,11 @@ it("§1.2 a local storage await HOLDS the input gate", async () => {
 it("§1.2 a continuation after scheduler.wait can still touch storage", async () => {
   const probe = await host.spawn("gate-after-wait");
   expect(await probe.call("storageAfterSchedulerWait")).toBe("ok");
+});
+
+it("§1.2 scheduler cancellation ignores synthetic abort and stopped source events", async () => {
+  const probe = await host.spawn("scheduler-abort-events");
+  expect(await probe.call("schedulerAbortEvents")).toBe("Error: real abort");
 });
 
 /**

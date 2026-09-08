@@ -157,6 +157,9 @@ export class Probe extends DurableObject<ProbeEnv> {
   failPostedEvent(): never {
     throw new Error("conformance: posted event failed");
   }
+  readId(): string {
+    return this.ctx.id.toString();
+  }
   /** Outbound facet RPC. Measured on workerd: RELEASES, so this returns "B". */
   async gateViaFacet(): Promise<string> {
     this.marker = "A";
@@ -229,6 +232,21 @@ export class Probe extends DurableObject<ProbeEnv> {
     await scheduler.wait(10);
     await this.ctx.storage.put("afterWait", "ok");
     return (await this.ctx.storage.get<string>("afterWait")) ?? "MISSING";
+  }
+
+  /** Real cancellation follows abort algorithms, independently of source event listeners. */
+  async schedulerAbortEvents(): Promise<string> {
+    const controller = new AbortController();
+    controller.signal.addEventListener("abort", (event) => {
+      if (controller.signal.aborted) event.stopImmediatePropagation();
+    });
+    const waited = scheduler.wait(100, { signal: controller.signal }).then(
+      () => "elapsed",
+      (reason: unknown) => String(reason),
+    );
+    controller.signal.dispatchEvent(new Event("abort"));
+    controller.abort(new Error("real abort"));
+    return waited;
   }
 
   /**
@@ -1070,6 +1088,10 @@ export class Probe extends DurableObject<ProbeEnv> {
     await this.ctx.storage.put("alarmFailures", failures);
     await this.ctx.storage.setAlarm(Date.now() + 20);
   }
+  async armAbortingAlarm(retryAlarm: boolean): Promise<void> {
+    await this.ctx.storage.put("alarmAbortRetry", retryAlarm);
+    await this.ctx.storage.setAlarm(Date.now() + 20);
+  }
   async readAlarmRetry(): Promise<{ retryCount: number; isRetry: boolean } | null> {
     return (
       (await this.ctx.storage.get<{
@@ -1603,11 +1625,14 @@ export class Probe extends DurableObject<ProbeEnv> {
   }
 
   webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean): void {
+    let tags: string[] = [];
+    const tagsError = captureError(() => { tags = this.ctx.getTags(ws); });
     const event: Record<string, unknown> = {
       id: this.#socketId(ws),
       close: { code, reason, wasClean },
       readyState: ws.readyState,
       listedDuringHandler: this.ctx.getWebSockets().includes(ws),
+      tagsDuringHandler: tagsError ?? tags,
     };
     event.sendAfterPeerClose = captureError(() => ws.send("after-peer-close"));
     event.reciprocalClose = captureError(() => ws.close(code, reason));
@@ -1644,6 +1669,18 @@ export class Probe extends DurableObject<ProbeEnv> {
   }
 
   override async alarm(info?: AlarmInvocationInfo): Promise<void> {
+    const retryAlarm = await this.ctx.storage.get<boolean>("alarmAbortRetry");
+    if (retryAlarm !== undefined) {
+      const retryCount = info?.retryCount ?? -1;
+      await this.ctx.storage.put("alarmRetry", { retryCount, isRetry: info?.isRetry ?? false });
+      // Commit the observation before abort rolls back the next write.
+      await scheduler.wait(1);
+      if (retryCount === 0) {
+        void this.ctx.storage.put("abortedWrite", true);
+        this.ctx.abort("conformance: alarm abort", { retryAlarm });
+      }
+      return;
+    }
     const failures = await this.ctx.storage.get<number>("alarmFailures");
     if (failures !== undefined) {
       const retryCount = info?.retryCount ?? -1;

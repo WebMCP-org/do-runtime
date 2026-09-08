@@ -214,7 +214,7 @@ Web Worker and supply the sqlite-wasm backend shown in the runnable examples.
 For a standalone TypeScript host, install the ambient Node and Workers types:
 
 ```bash
-pnpm add -D typescript @types/node @cloudflare/workers-types@5.20260820.1
+pnpm add -D typescript @types/node @cloudflare/workers-types@5.20260907.1
 ```
 
 Use the following `tsconfig.json`. An existing Workers project can keep its
@@ -431,19 +431,22 @@ Actor bundles can also install `doRuntimeAwaitTransform()` from `@mcp-b/do-runti
 
 ## What is not supported
 
-The browser cannot reproduce every workerd facility. Where it cannot, the runtime **fails closed**: the API exists, throws a named error that the conformance suite asserts on every lane, and never silently does less.
+The browser cannot reproduce every workerd facility. Unsupported runtime APIs throw named errors. Native engine behavior and partial implementations have the explicit limits below; see the [September workerd audit](docs/workerd-sync.md) for the upstream changes behind them.
 
 | Area | Contract here |
 | --- | --- |
 | Cloudflare point-in-time recovery and read replication | Unsupported by local SQLite; named methods throw. Bookmarks are development counters, not recovery points. |
 | Actor-class stub serialization | Throws; needs workerd's serializer and channel tokens. |
 | Module-scope `waitUntil`, `cache`, `abortIsolate`, Workers RPC stub constructors | Named `cloudflare:workers` boundaries throw. |
-| `DurableObjectState.abort()` | Breaks later storage and re-entry; cannot synchronously terminate the calling JavaScript slice. |
+| `DurableObjectState.abort()` | Breaks later storage and re-entry; cannot synchronously terminate the calling JavaScript slice. Alarms observe the abort even if the handler returns; `{ retryAlarm: false }` abandons that alarm. |
+| Outbound `new WebSocket(url)` inside actor globals | Refused before opening a connection because the native handshake cannot wait for the output gate. `WebSocketPair` and host-owned transports remain supported. |
+| `cloudflare:workers` tracing | No-op spans expose the current API. Active span identity follows synchronous callbacks only; there is no observer or propagation across awaits. |
 | Stored value wire bytes | Browser-safe versioned structured-clone encoding rather than V8's private format; public value types align and legacy JSON rows remain readable. |
 | SQL row counters | Local `rowsRead`/`rowsWritten`, including `sql.ingest()`, use returned rows and SQLite changes; workerd uses unavailable libsql billing counters. |
 | Reserved SQL names | `_cf_` detected from tokenized SQL text, which can reject more than workerd's authorizer. `ANALYZE` on a reserved table is refused where workerd allows it. |
 | Authorizer-only SQL forms | `ATTACH`, `DETACH`, the temp-schema creations (both `CREATE TEMP …` and the `temp.` qualifier), `VACUUM`, and virtual-table modules outside upstream's four (`fts5`, `fts5vocab`, `rtree`, `rtree_i32`) are refused from the leading keyword, with workerd's own messages. These reach the authorizer's own decisions — action codes and its temp-schema rule — rather than `SqlStorageRegulator` callbacks, so porting the regulator did not carry them. The refused and allowed forms are matched through SQLite's identifier quoting, whitespace or none. `EXPLAIN` in front of a refused form still compiles here, where workerd's authorizer refuses it. |
 | SQL function allowlist | Not enforced. Workerd's authorizer denies any function outside its 138-name `ALLOWED_SQLITE_FUNCTIONS` list; this runtime allows every function the backend compiled, including build-detail readers such as `sqlite_version()` and `sqlite_source_id()`. |
+| SQLite internal functions and default expressions | The current engines lack workerd's internal-function and default-expression authorizer patches. Native authorizer callbacks exist in both engines, but the runtime does not wire them into its SQL policy. See the [engine findings](docs/workerd-sync.md#sqlite-engine-work-still-required). |
 | PRAGMA allowlist | Workerd's allowlist enforced from tokenized SQL text. A `pragma_*` table-valued function with a string or bound argument is authorized by pragma name only, where workerd's authorizer also sees the resolved argument; the pinned conformance row is the contract. |
 | Node SQLite length limit | Bound and returned strings and blobs are capped at 4 MiB; `node:sqlite` cannot cap an unreturned SQL-computed value. The browser backend uses SQLite's native limit. |
 | Response BYOB readers | Refused; their continuation cannot be re-gated. Use a default reader or `arrayBuffer()`. |
@@ -511,7 +514,7 @@ it does not need a sibling checkout, SDK source aliases, or a local candidate
 archive. Publish a new source tag for each SDK change instead of replacing
 an existing release's assets. The runtime's npm release remains independent.
 
-Change runtime behaviour with the corresponding workerd source open (line citations use release `v1.20260713.1`; the conformance oracle is pinned to `v1.20260820.1`). Ask the workerd lane an observable question before inventing a local rule; record any intentional divergence in the table above and in a conformance row. Keep host seams small and typed, keep gates internal, and keep product knowledge out of the port. See [`docs/decisions.md`](docs/decisions.md) for the invariants the code cites.
+Change runtime behaviour with the corresponding workerd source open (line citations use release `v1.20260713.1`; the conformance oracle is pinned to `v1.20260907.1`). Ask the workerd lane an observable question before inventing a local rule; record any intentional divergence in the table above and in a conformance row. Keep host seams small and typed, keep gates internal, and keep product knowledge out of the port. See [`docs/decisions.md`](docs/decisions.md) for the invariants the code cites.
 
 ## Acknowledgements
 

@@ -314,8 +314,7 @@ export class SqliteWasmDatabase implements SqlDatabase {
   ) {
     this.#host = host;
     this.#filename = filename;
-    this.#database = new host.pool.OpfsSAHPoolDb(filename);
-    this.#setLengthLimit();
+    this.#database = this.#openDatabase();
   }
 
   prepare(sql: string): SqlDatabaseStatement {
@@ -357,8 +356,7 @@ export class SqliteWasmDatabase implements SqlDatabase {
     if (!this.#host.pool.unlink(this.#filename)) {
       throw new Error(`SAH pool did not unlink ${this.#filename}`);
     }
-    this.#database = new this.#host.pool.OpfsSAHPoolDb(this.#filename);
-    this.#setLengthLimit();
+    this.#database = this.#openDatabase();
   }
 
   close(): void {
@@ -368,14 +366,22 @@ export class SqliteWasmDatabase implements SqlDatabase {
     this.onClose();
   }
 
-  #setLengthLimit(): void {
-    const pointer = this.#database.pointer;
-    if (pointer === undefined) throw new Error("The database handle is closed.");
-    this.#host.capi.sqlite3_limit(
-      pointer,
-      this.#host.capi.SQLITE_LIMIT_LENGTH,
-      SQLITE_LENGTH_LIMIT,
-    );
+  /** ← `SqliteDatabase::init`: a failed setup still owns a handle that must close. */
+  #openDatabase(): SqliteWasmDatabaseHandle {
+    const database = new this.#host.pool.OpfsSAHPoolDb(this.#filename);
+    try {
+      const pointer = database.pointer;
+      if (pointer === undefined) throw new Error("The database handle is closed.");
+      this.#host.capi.sqlite3_limit(
+        pointer,
+        this.#host.capi.SQLITE_LIMIT_LENGTH,
+        SQLITE_LENGTH_LIMIT,
+      );
+      return database;
+    } catch (error) {
+      database.close();
+      throw error;
+    }
   }
 
   #pragma(name: string): number {

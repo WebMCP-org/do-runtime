@@ -14,7 +14,14 @@ import { describe, expect, test } from "vitest";
 import type { Actor, Timer } from "../io/io-context";
 import { IoContext } from "../io/io-context";
 import { InputGate, type Lock, OutputGate } from "../io/io-gate";
-import { ALREADY_ACCEPTED_MESSAGE, acceptWebSocket, type RawWebSocket } from "./web-socket";
+import {
+  ALREADY_ACCEPTED_MESSAGE,
+  AcceptedWebSocket,
+  HibernatableWebSocketRegistry,
+  WebSocketRequestResponsePair,
+  acceptWebSocket,
+  type RawWebSocket,
+} from "./web-socket";
 
 class TestActor implements Actor {
   readonly inputGate = new InputGate();
@@ -156,6 +163,84 @@ describe("incoming frames", () => {
 });
 
 describe("outgoing messages", () => {
+  test("queued writes stop if the actor aborts before their output lock releases", async () => {
+    const { ctx, socket } = newFixture();
+    const write = Promise.withResolvers<void>();
+    void ctx.lockOutputWhile(write.promise);
+    const accepted = await ctx.run(() => acceptWebSocket(ctx, socket));
+    await ctx.run(() => {
+      accepted.send("pending");
+      accepted.close(1000);
+    });
+
+    ctx.abort(new Error("actor stopped"));
+    write.resolve();
+    await quiesce();
+    expect(socket.sent).toEqual([]);
+    expect(socket.closed).toEqual([]);
+    expect(ctx.waitUntilStatus()).toBeUndefined();
+  });
+
+  test("auto-responses bypass output locks but remain behind earlier sends", async () => {
+    // ← workerd hibernation-manager-test.c++: active replies bypass the output gate.
+    const { ctx } = newFixture();
+    const registry = new HibernatableWebSocketRegistry(ctx, {
+      message: () => {},
+      close: () => {},
+      error: () => {},
+    });
+    const pair = new registry.WebSocketPair();
+    const client = pair[0];
+    const server = pair[1] as AcceptedWebSocket;
+    const messages: string[] = [];
+    await ctx.run(() => {
+      registry.acceptWebSocket(server);
+      client.accept();
+      client.addEventListener("message", (event) => messages.push(String(event.data)));
+      registry.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
+    });
+    const write = Promise.withResolvers<void>();
+    void ctx.lockOutputWhile(write.promise);
+
+    registry.receive(server, "message", new MessageEvent("message", { data: "ping" }));
+    await quiesce();
+    expect(messages).toEqual(["pong"]);
+
+    await ctx.run(() => server.send("app"));
+    registry.receive(server, "message", new MessageEvent("message", { data: "ping" }));
+    await quiesce();
+    expect(messages).toEqual(["pong"]);
+
+    write.resolve();
+    await quiesce();
+    expect(messages).toEqual(["pong", "app", "pong"]);
+  });
+
+  test("auto-responses after close are consumed without sending or failing", async () => {
+    // ← workerd a451899: close() suppresses automatic replies immediately.
+    const { ctx } = newFixture();
+    const messages: (string | ArrayBuffer)[] = [];
+    const registry = new HibernatableWebSocketRegistry(ctx, {
+      message: (_socket, message) => messages.push(message),
+      close: () => {},
+      error: () => {},
+    });
+    const socket = new registry.WebSocketPair()[1] as AcceptedWebSocket;
+    registry.acceptWebSocket(socket);
+    registry.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
+
+    await ctx.run(() => {
+      socket.close(4000, "done");
+      expect(() =>
+        registry.receive(socket, "message", new MessageEvent("message", { data: "ping" })),
+      ).not.toThrow();
+    });
+    await quiesce();
+    expect(messages).toEqual([]);
+    expect(registry.getWebSocketAutoResponseTimestamp(socket)?.getTime()).toBe(0);
+    expect(ctx.waitUntilStatus()).toBeUndefined();
+  });
+
   test("§1.1 a send waits for the output locks outstanding when it was enqueued", async () => {
     // ← `outgoingMessages->insert(GatedMessage{IoContext::current()
     // .waitForOutputLocksIfNecessary(), …})` (`web-socket.c++:689`). A frame is an outgoing
@@ -189,6 +274,35 @@ describe("outgoing messages", () => {
     await ctx.run(() => accepted.send("after-the-write"));
     await quiesce();
     expect(socket.sent).toEqual(["behind-the-write", "after-the-write"]);
+  });
+
+  test("binary sends snapshot bytes before the caller mutates or detaches the buffer", async () => {
+    // ← workerd 8457bac: queued sends own their bytes before leaving the isolate lock.
+    const { ctx, socket } = newFixture();
+    const write = Promise.withResolvers<void>();
+    void ctx.lockOutputWhile(write.promise);
+    const sent: number[][] = [];
+    socket.send = (data) => {
+      if (data instanceof ArrayBuffer) sent.push([...new Uint8Array(data)]);
+      else if (ArrayBuffer.isView(data)) {
+        sent.push([...new Uint8Array(data.buffer, data.byteOffset, data.byteLength)]);
+      }
+    };
+    const accepted = await ctx.run(() => acceptWebSocket(ctx, socket));
+    const bytes = new Uint8Array([1, 2, 3, 4]);
+
+    await ctx.run(() => {
+      accepted.send(bytes.buffer);
+      accepted.send(bytes.subarray(1, 3));
+      accepted.send(new DataView(bytes.buffer, 2, 1));
+      bytes.fill(9);
+      structuredClone(bytes.buffer, { transfer: [bytes.buffer] });
+    });
+    expect(sent).toEqual([]);
+
+    write.resolve();
+    await quiesce();
+    expect(sent).toEqual([[1, 2, 3, 4], [2, 3], [3]]);
   });
 
   test("sends leave in the order they were made", async () => {

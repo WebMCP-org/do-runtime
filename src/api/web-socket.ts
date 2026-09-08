@@ -115,7 +115,7 @@ type PairState = {
 
 type SocketAcceptance =
   | { mode: "classic" }
-  | { mode: "hibernatable"; registry: HibernatableWebSocketRegistry };
+  | { mode: "hibernatable"; registry: HibernatableWebSocketRegistry; tags: readonly string[] };
 
 type SocketDelivery =
   | { mode: "pending" }
@@ -127,6 +127,9 @@ type SocketMetadata = {
   attachment?: Uint8Array;
   rawListenersInstalled?: true;
 };
+
+/** Raw listeners follow transport ownership without retaining a released actor wrapper. */
+type SocketReceiver = { socket: AcceptedWebSocket };
 
 const metadata = new WeakMap<object, SocketMetadata>();
 
@@ -257,9 +260,11 @@ export class AcceptedWebSocket extends EventTarget implements RawWebSocket, WebS
   readonly protocol = "";
   readonly url = "";
 
-  #ctx: IoContext;
+  #ctx: IoContext | undefined;
   readonly #socket: RawWebSocket;
   readonly #pairState: PairState | undefined;
+  readonly #receiver: SocketReceiver;
+  #released = false;
   #delivery: SocketDelivery = { mode: "pending" };
   #pump: Promise<void> = Promise.resolve();
   #pending: { type: SocketEvent; event: Event }[] = [];
@@ -273,16 +278,26 @@ export class AcceptedWebSocket extends EventTarget implements RawWebSocket, WebS
   onclose: ((event: CloseEvent) => void) | null = null;
   onerror: ((event: Event) => void) | null = null;
 
-  constructor(ctx: IoContext, socket: RawWebSocket, pairState?: PairState) {
+  constructor(
+    ctx: IoContext | undefined,
+    socket: RawWebSocket,
+    pairState?: PairState,
+    receiver?: SocketReceiver,
+  ) {
     super();
     this.#ctx = ctx;
     this.#socket = socket;
     this.#pairState = pairState;
+    this.#receiver = receiver ?? { socket: this };
+    this.#receiver.socket = this;
     if (pairState === undefined) this.#enableClassic();
-    for (const type of SOCKET_EVENTS) {
-      socket.addEventListener(type, (event: Event) => {
-        this.#receive(type, event);
-      });
+    if (receiver === undefined) {
+      const target = this.#receiver;
+      for (const type of SOCKET_EVENTS) {
+        socket.addEventListener(type, (event: Event) => {
+          target.socket.#receive(type, event);
+        });
+      }
     }
   }
 
@@ -299,6 +314,9 @@ export class AcceptedWebSocket extends EventTarget implements RawWebSocket, WebS
   }
 
   accept(): void {
+    if (this.#released) {
+      throw new TypeError("Can't accept() WebSocket that was already used in a response.");
+    }
     if (this.#delivery.mode === "hibernatable") {
       throw new TypeError(HIBERNATION_AFTER_ACCEPT_MESSAGE);
     }
@@ -308,15 +326,24 @@ export class AcceptedWebSocket extends EventTarget implements RawWebSocket, WebS
   }
 
   send(data: string | ArrayBufferLike | ArrayBufferView | Blob): void {
+    if (this.#released) return;
     if (this.#delivery.mode === "hibernatable" && this.#ownClose) {
       throw new TypeError("Can't call WebSocket send() after close().");
     }
     if (this.#peerClose || this.#readyState === AcceptedWebSocket.CLOSED) return;
     this.#markPairUsed();
-    this.#enqueue(() => this.#socket.send(data));
+    const message = cloneMessageData(data);
+    this.#enqueue(() => this.#socket.send(message));
+  }
+
+  /** Internal hibernation replies share the pump without waiting on unrelated storage. */
+  sendAutoResponse(message: string): void {
+    if (this.#released || this.#readyState >= AcceptedWebSocket.CLOSING) return;
+    this.#enqueue(() => this.#socket.send(message), Promise.resolve());
   }
 
   close(code?: number, reason = ""): void {
+    if (this.#released) return;
     if (this.#readyState === AcceptedWebSocket.CLOSED || this.#ownClose) return;
     if (this.#delivery.mode === "hibernatable" || this.#pairState !== undefined) {
       validateClose(code, reason);
@@ -340,7 +367,10 @@ export class AcceptedWebSocket extends EventTarget implements RawWebSocket, WebS
     if (this.#delivery.mode !== "pending") {
       throw new Error(HIBERNATION_ALREADY_ACCEPTED_MESSAGE);
     }
-    if (this.#pairState?.used === true && !this.#pairState.hibernationAccepted) {
+    if (
+      this.#ctx === undefined ||
+      (this.#pairState?.used === true && !this.#pairState.hibernationAccepted)
+    ) {
       throw new Error(HIBERNATION_PAIR_USED_MESSAGE);
     }
     if (this.#pairState !== undefined) {
@@ -360,8 +390,31 @@ export class AcceptedWebSocket extends EventTarget implements RawWebSocket, WebS
     this.#pending = [];
   }
 
-  markPairUsed(): void {
+  markUsedInResponse(): void {
     this.#markPairUsed();
+  }
+
+  /** Move the transport into a host wrapper; actor-retained references become inert. */
+  coupleToHost(): AcceptedWebSocket {
+    if (this.#released) {
+      throw new TypeError("Can't return WebSocket that was already used in a response.");
+    }
+    if (this.#delivery.mode !== "pending") {
+      const method = this.#delivery.mode === "hibernatable" ? "acceptWebSocket" : "accept";
+      throw new TypeError(`Can't return WebSocket in a Response after calling ${method}().`);
+    }
+    const host = new AcceptedWebSocket(undefined, this.#socket, this.#pairState, this.#receiver);
+    host.#pending = this.#pending;
+    host.#readyState = this.#readyState;
+    host.#ownClose = this.#ownClose;
+    host.#peerClose = this.#peerClose;
+    host.#binaryType = this.#binaryType;
+    this.#markPairUsed();
+    this.#released = true;
+    this.#ctx = undefined;
+    this.#pending = [];
+    this.#readyState = AcceptedWebSocket.CLOSED;
+    return host;
   }
 
   #markPairUsed(): void {
@@ -371,7 +424,7 @@ export class AcceptedWebSocket extends EventTarget implements RawWebSocket, WebS
   #enableClassic(): void {
     const delivery: SocketDelivery = {
       mode: "classic",
-      criticalSection: this.#ctx.getCriticalSection(),
+      criticalSection: this.#ctx?.getCriticalSection(),
     };
     this.#delivery = delivery;
     socketMetadata(this).accepted = { mode: "classic" };
@@ -422,23 +475,31 @@ export class AcceptedWebSocket extends EventTarget implements RawWebSocket, WebS
     event: Event,
     criticalSection: CriticalSection | undefined,
   ): void {
-    this.#ctx.addWaitUntil(
-      this.#ctx.run(() => {
-        const delivered = cloneEventFor(type, event);
-        this.dispatchEvent(delivered);
-        const handler = this[`on${type}`] as ((event: Event) => void) | null;
-        handler?.(delivered);
-      }, { input: criticalSection }),
-    );
+    const deliver = (): void => {
+      const delivered = cloneEventFor(type, event);
+      this.dispatchEvent(delivered);
+      const handler = this[`on${type}`] as ((event: Event) => void) | null;
+      handler?.(delivered);
+    };
+    const ctx = this.#ctx;
+    if (ctx === undefined) queueMicrotask(deliver);
+    else ctx.addWaitUntil(ctx.run(deliver, { input: criticalSection }));
   }
 
-  #enqueue(write: () => void): void {
-    const outputLock = this.#ctx.waitForOutputLocks();
+  #enqueue(write: () => void, outputLock?: Promise<void>): void {
+    const ctx = this.#ctx;
+    if (ctx === undefined) {
+      write();
+      return;
+    }
+    const lock = outputLock ?? ctx.waitForOutputLocks();
     this.#pump = this.#pump.then(async () => {
-      await outputLock;
+      await lock;
+      // A constructor can enqueue messages and then fail before the gate releases.
+      if (this.#released || ctx.isAborted()) return;
       write();
     });
-    this.#ctx.addWaitUntil(this.#pump);
+    ctx.addWaitUntil(this.#pump);
   }
 }
 
@@ -510,7 +571,7 @@ export class HibernatableWebSocketRegistry {
     const normalizedTags = normalizeTags(tags);
     if (socket instanceof AcceptedWebSocket) socket.acceptHibernation(this);
     else this.#listenRaw(socket);
-    state.accepted = { mode: "hibernatable", registry: this };
+    state.accepted = { mode: "hibernatable", registry: this, tags: normalizedTags };
     this.#entries.push({ socket, tags: normalizedTags });
     this.#host?.accepted(socket, normalizedTags);
   }
@@ -535,13 +596,7 @@ export class HibernatableWebSocketRegistry {
     if (state.accepted.mode !== "hibernatable") {
       throw new Error("only hibernatable websockets can have tags.");
     }
-    const entry = this.#entries.find((candidate) => candidate.socket === socket);
-    if (entry === undefined) {
-      throw new Error(
-        "you must call 'acceptWebSocket()' before attempting to access the tags of a WebSocket.",
-      );
-    }
-    return [...entry.tags];
+    return [...state.accepted.tags];
   }
 
   setWebSocketAutoResponse(pair?: WebSocketRequestResponsePair): void {
@@ -620,7 +675,11 @@ export class HibernatableWebSocketRegistry {
       if (typeof data === "string" && data === this.#autoResponse?.request) {
         entry.autoResponseTimestamp = this.#ctx.now();
         this.#host?.autoResponseTimestamp?.(socket, entry.autoResponseTimestamp);
-        socket.send(this.#autoResponse.response);
+        if (socket instanceof AcceptedWebSocket) {
+          socket.sendAutoResponse(this.#autoResponse.response);
+        } else if ((socket.readyState ?? AcceptedWebSocket.OPEN) < AcceptedWebSocket.CLOSING) {
+          socket.send(this.#autoResponse.response);
+        }
         return;
       }
       const message = cloneMessageData(data);
@@ -678,7 +737,7 @@ export class HibernatableWebSocketRegistry {
     }
     const tags = normalizeTags(value.tags);
     const state = socketMetadata(socket);
-    state.accepted = { mode: "hibernatable", registry: this };
+    state.accepted = { mode: "hibernatable", registry: this, tags };
     if (value.attachment !== undefined) {
       state.attachment = value.attachment.slice();
     }
@@ -717,7 +776,7 @@ export function acceptWebSocket(ctx: IoContext, socket: RawWebSocket): AcceptedW
 }
 
 export function markWebSocketUsed(socket: RawWebSocket): void {
-  if (socket instanceof AcceptedWebSocket) socket.markPairUsed();
+  if (socket instanceof AcceptedWebSocket) socket.markUsedInResponse();
 }
 
 export function installWebSocketGlobals(

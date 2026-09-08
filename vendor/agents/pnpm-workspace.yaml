@@ -19,6 +19,7 @@ allowBuilds:
   esbuild: true
   workerd: true
   core-js-pure: false
+  msw: false
 minimumReleaseAgeExclude:
   - "@cloudflare/*"
   - "@typescript/*"

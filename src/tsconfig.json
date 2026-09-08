@@ -3,6 +3,7 @@
   "compilerOptions": { "outDir": "../.tsbuild/index" },
   "files": [
     "browser.ts",
+    "browser/async-hooks.ts",
     "browser/alarm-coordinator.ts",
     "browser/message-port-websocket.ts",
     "browser/offscreen-document.ts",

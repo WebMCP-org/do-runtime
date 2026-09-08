@@ -137,6 +137,47 @@ const providers = [
 
 If both `auth` and `token` are configured, `auth` is used. Direct tool-call auth, if supplied, takes precedence over either default.
 
+## Browser OPFS workspace
+
+The browser entry provides a `WorkspaceFsLike` implementation over native OPFS.
+The host selects a dedicated directory; application identities and mounted
+folders stay outside the backend.
+
+```ts
+import { OpfsWorkspace } from "@cloudflare/shell/browser";
+
+const storage = await navigator.storage.getDirectory();
+const root = await storage.getDirectoryHandle("workspace", { create: true });
+const workspace = new OpfsWorkspace({ root });
+
+await workspace.writeFile("/notes/today.md", "Hello from a browser Worker");
+await workspace.symlink("today.md", "/notes/latest.md");
+const text = await workspace.readFile("/notes/latest.md");
+const page = await workspace.readDir("/notes", { limit: 100, offset: 0 });
+const file = await workspace.getNativeFile("/notes/today.md");
+```
+
+This entry requires OPFS and Web Locks in a secure browser context and loads
+without Node shims. The Chromium tests run the built entry in real Workers.
+Separate instances and Workers coordinate through locks derived from the
+selected root's OPFS path. Files live in `data/`; `meta/` stores only symlinks.
+`getDataDirectory()` returns the tree to observe for native file changes.
+
+Writes, appends, and `writeStream(path, stream, signal?)` commit through native
+writable streams; failed writes preserve existing file contents. Appends retain
+the existing file in the staged write, so large append workloads may require a
+journal. Directory copies and moves can leave a partial destination on failure;
+retrying completes it. Regular-file moves require the browser's native
+`FileSystemFileHandle.move` implementation.
+
+`readDir` defaults to 1,000 entries, ordered by type and then UTF-8 name; use
+`offset` and `limit` for additional pages. File MIME types come from filenames
+and the browser, rather than write-time declarations. File creation timestamps
+use the native modification time; directory timestamps are zero. Invalid
+symlink metadata raises `EIO` and is preserved for inspection.
+
+Run `pnpm --filter @cloudflare/shell test:browser` after building the package.
+
 ## Design goals
 
 - Structured state operations instead of shell parsing

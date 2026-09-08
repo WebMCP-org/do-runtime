@@ -414,18 +414,58 @@ export const cache: CacheContext = boundaryObject(CACHE_UNIMPLEMENTED_MESSAGE);
  * object that throws on use took down every `new Agent(...)` in the extension —
  * where an absent one would have degraded exactly as that code intends.
  */
+const SPAN_CONSTRUCTION = Symbol("Span");
+
 class Span {
   /** Always false: nothing in this package collects spans, so no span is sampled. */
   readonly isTraced = false;
-  setAttribute(_name: string, _value: unknown): void {}
+
+  constructor(token?: typeof SPAN_CONSTRUCTION) {
+    if (token !== SPAN_CONSTRUCTION) throw new TypeError("Illegal constructor");
+  }
+
+  setAttribute(_name: string, _value: unknown): this {
+    return this;
+  }
+  setAttributes(_attributes: Record<string, boolean | number | string | undefined>): this {
+    return this;
+  }
+  recordException(_exception: unknown): void {}
   end(): void {}
 }
 
+let activeSpan: Span | undefined;
+
+/**
+ * ← `runSpan`: with no observer, auto-end and manual-end have the same effect.
+ * ponytail: scope is synchronous, like withEnv; async identity needs host AsyncContext support.
+ */
+function runInSpan<T, A extends unknown[]>(
+  _name: string,
+  run: (span: Span, ...args: A) => T,
+  ...args: A
+): T {
+  const previous = activeSpan;
+  const span = new Span(SPAN_CONSTRUCTION);
+  activeSpan = span;
+  try {
+    return run(span, ...args);
+  } finally {
+    activeSpan = previous;
+  }
+}
+
 export const tracing: Tracing = {
-  startActiveSpan<T>(_name: string, run: (span: Span) => T): T {
-    return run(new Span());
+  Span,
+  enterSpan: runInSpan,
+  startActiveSpan: runInSpan,
+  startSpan(_name: string): Span {
+    return new Span(SPAN_CONSTRUCTION);
   },
-} as unknown as Tracing;
+  getActiveSpan(): Span | undefined {
+    return activeSpan;
+  },
+};
 
 // =======================================================================================
 // The Workflow types

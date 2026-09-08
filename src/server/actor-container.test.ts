@@ -15,6 +15,7 @@ import { __gateAwait, __resumeAwait } from "../gate";
 import { DurableObjectClass } from "../api/actor";
 import { FACET_TREE_MAX_DEPTH } from "../api/actor-state";
 import type { AlarmInvocationInfo } from "../api/global-scope";
+import { markWebSocketUsed } from "../api/web-socket";
 import type { Timer } from "../io/io-context";
 import { CanceledError } from "../io/io-gate";
 import type { SqlDatabase, SqlDatabaseProvider } from "../util/sqlite";
@@ -35,7 +36,6 @@ import type {
 } from "./actor-container";
 import {
   createActorContainer,
-  FACET_ALARM_UNIMPLEMENTED_MESSAGE,
   newDatabaseIndexFile,
 } from "./actor-container";
 
@@ -391,6 +391,62 @@ describe("newDatabaseIndexFile", () => {
 });
 
 describe("the composition", () => {
+  test.each([
+    { outcome: "success", fails: false, failure: undefined },
+    { outcome: "Error", fails: true, failure: new Error("constructor failed") },
+    { outcome: "undefined", fails: true, failure: undefined },
+    { outcome: "null", fails: true, failure: null },
+  ])("constructor WebSocket writes require successful initialization: $outcome", async ({
+    fails, failure,
+  }) => {
+    const original = await createActorContainer(options());
+    const retained = await original.start((ctx) => {
+      const pair = new original.globals.WebSocketPair();
+      ctx.acceptWebSocket(pair[1]);
+      return {
+        server: pair[1],
+        client: pair[0],
+      };
+    });
+    const messages: unknown[] = [];
+    const client = retained.client;
+    markWebSocketUsed(client);
+    client.accept();
+    client.addEventListener("message", (event) => messages.push(event.data));
+
+    const container = await createActorContainer(
+      options({ webSockets: [{ socket: retained.server }] }),
+    );
+    const started = container.start((ctx) => {
+      ctx.getWebSockets()[0]!.send("from constructor");
+      if (fails) throw failure;
+      return {};
+    });
+    if (fails) await expect(started).rejects.toBe(failure);
+    else await started;
+
+    await portHop();
+    expect(messages).toEqual(fails ? [] : ["from constructor"]);
+    if (fails) await expect(container.onBroken).rejects.toBe(failure);
+  });
+
+  test("a promised factory result becomes the running actor instance", async () => {
+    const scheduled = 1_000;
+    const configuration = options();
+    const container = await createActorContainer({
+      ...configuration,
+      // A wall-clock deadline can pass before admission; setAlarm then clamps it.
+      ports: { ...configuration.ports, timer: { ...timer, now: () => scheduled } },
+    });
+    const instance = await container.start(async (ctx, env) => {
+      await Promise.resolve();
+      return new Counter(ctx, env);
+    });
+    await container.entry(instance).arm(scheduled);
+    expect(await container.deliverAlarm(scheduled, 0)).toMatchObject({ outcome: "ok" });
+    expect(instance.alarmInfo).toHaveLength(1);
+  });
+
   test("entry types every method call as an asynchronous event", async () => {
     const container = await createActorContainer(options());
     const entry = container.entry({
@@ -791,7 +847,7 @@ describe("assertCanSetAlarm", () => {
     );
     const instance = await facet.start((ctx, env) => new Counter(ctx, env));
     await expect(facet.entry(instance).arm(Date.now() + 1_000)).rejects.toThrow(
-      FACET_ALARM_UNIMPLEMENTED_MESSAGE,
+      "Facets currently cannot set alarms.",
     );
   });
 });
@@ -1475,6 +1531,41 @@ describe("alarms", () => {
     expect(result.retry).toBe(true);
     expect(result.retryCountsAgainstLimit).toBe(true);
     expect(result.errorDescription).toContain("no thanks");
+    expect(result.outcome).toBe("aborted");
+  });
+
+  test.each([false, true])("ctx.abort honors retryAlarm: %s", async (retryAlarm) => {
+    const { container, stub, instance } = await counterContainer();
+    const scheduled = Date.now() + 5;
+    await stub.arm(scheduled);
+    await container.waitOutputLocks();
+
+    vi.spyOn(instance, "alarm").mockImplementationOnce(async () => {
+      void instance.ctx.storage.put("pending", 1);
+      instance.ctx.abort("stop this alarm", { retryAlarm });
+    });
+
+    expect(await container.deliverAlarm(scheduled, 0)).toMatchObject({
+      outcome: "aborted",
+      retry: retryAlarm,
+      retryCountsAgainstLimit: true,
+    });
+  });
+
+  test("ctx.abort remains terminal when the alarm has no outstanding writes", async () => {
+    const { container, stub, instance } = await counterContainer();
+    const scheduled = Date.now() + 5;
+    await stub.arm(scheduled);
+    await container.waitOutputLocks();
+    vi.spyOn(instance, "alarm").mockImplementationOnce(async () => {
+      instance.ctx.abort("stop this alarm", { retryAlarm: false });
+    });
+
+    expect(await container.deliverAlarm(scheduled, 0)).toMatchObject({
+      outcome: "aborted",
+      retry: false,
+      retryCountsAgainstLimit: true,
+    });
   });
 
   test("a class with no alarm handler reports script-not-found and is not retried", async () => {

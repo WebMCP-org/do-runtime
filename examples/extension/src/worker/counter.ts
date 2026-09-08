@@ -13,6 +13,7 @@
  *
  */
 
+import { startMcpProbe, finishMcpProbe } from "./mcp-probe";
 import { McpServer } from "@modelcontextprotocol/server";
 import { Agent, callable, type StreamingResponse } from "agents";
 import type { AgentEmail } from "agents/email";
@@ -201,6 +202,14 @@ export class Counter extends Agent<CounterEnv, CounterState> {
 
   async scheduledSubAgentValue(): Promise<number> {
     return await (await this.subAgent(CounterChild, "scheduled")).currentValue();
+  }
+
+  async startMcpProbe(origin: string) {
+    return await startMcpProbe(this, origin);
+  }
+
+  async finishMcpProbe() {
+    return await finishMcpProbe(this);
   }
 
   async startThink(name: string, text: string): Promise<void> {

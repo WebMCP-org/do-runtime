@@ -780,6 +780,25 @@ it("§1.6 run() refuses to re-enter an aborted context", async () => {
   await expect(ctx.onAbort()).rejects.toThrow("aborted by test");
 });
 
+it("§1.6 an abort while waiting for the input lock prevents entry and releases the acquired lock", async () => {
+  // ← `io-context-abort-test.c++`, added in workerd e7b2192.
+  const { ctx, actor } = newContext();
+  const held = await actor.inputGate.wait();
+  let entered = false;
+  const pending = ctx.run(() => {
+    entered = true;
+  });
+  const aborted = new Error("aborted while waiting for admission");
+  ctx.abort(aborted);
+  held.release();
+
+  await expect(pending).rejects.toBe(aborted);
+  expect(entered).toBe(false);
+  const next = actor.inputGate.wait();
+  expect(await poll(next)).toBe(true);
+  (await next).release();
+});
+
 // =======================================================================================
 // §1.9 — waitUntil touches neither gate.
 

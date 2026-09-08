@@ -1,3 +1,4 @@
+import { MIME_BY_EXTENSION } from "./fs/mime-types";
 import { createHash } from "node:crypto";
 import type {
   StateArchiveEntry,
@@ -610,20 +611,3 @@ function globToRegex(pattern: string): RegExp {
   re += "$";
   return new RegExp(re);
 }
-
-const MIME_BY_EXTENSION: Record<string, string> = {
-  js: "application/javascript",
-  ts: "application/typescript",
-  json: "application/json",
-  html: "text/html",
-  css: "text/css",
-  md: "text/markdown",
-  txt: "text/plain",
-  png: "image/png",
-  jpg: "image/jpeg",
-  jpeg: "image/jpeg",
-  gif: "image/gif",
-  svg: "image/svg+xml",
-  tar: "application/x-tar",
-  gz: "application/gzip"
-};

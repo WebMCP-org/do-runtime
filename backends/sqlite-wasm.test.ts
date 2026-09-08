@@ -52,6 +52,41 @@ test("reset fails closed when the SAH pool does not remove the database", () => 
   expect(opened).toEqual(["/actor.root.sqlite"]);
 });
 
+test.each(["open", "reset"])("%s closes the new handle when SQLite setup fails", async (operation) => {
+  const handles = new Set<SqliteWasmDatabaseHandle>();
+  const host = memoryHost(new Map([["/actor.root.sqlite", new Uint8Array()]]));
+  const provider = createSqliteWasmProvider(
+    {
+      ...host,
+      pool: {
+        ...host.pool,
+        OpfsSAHPoolDb: class extends FakeDatabase {
+          constructor() {
+            super();
+            handles.add(this);
+          }
+          override close(): void {
+            handles.delete(this);
+          }
+        },
+      },
+    },
+    { prefix: "/actor" },
+  );
+  const database = operation === "reset" ? await provider.open("root") : undefined;
+  host.capi.sqlite3_limit = () => {
+    throw new Error("SQLite setup failed");
+  };
+
+  if (database === undefined) {
+    await expect(provider.open("root")).rejects.toThrow("SQLite setup failed");
+  } else {
+    expect(() => database.reset()).toThrow("SQLite setup failed");
+  }
+  expect(handles.size).toBe(0);
+  provider.close();
+});
+
 test("actor storage copies and deletes every database under its prefix", async () => {
   const files = new Map<string, Uint8Array>([
     ["/source.root.sqlite", new Uint8Array([1])],
