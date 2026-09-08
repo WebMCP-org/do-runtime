@@ -1673,8 +1673,9 @@ export class Probe extends DurableObject<ProbeEnv> {
     if (retryAlarm !== undefined) {
       const retryCount = info?.retryCount ?? -1;
       await this.ctx.storage.put("alarmRetry", { retryCount, isRetry: info?.isRetry ?? false });
-      // Commit the observation before abort rolls back the next write.
-      await scheduler.wait(1);
+      // Commit the observation before abort rolls back the next write, and leave
+      // time for polling to see this attempt while the handler is still running.
+      await scheduler.wait(100);
       if (retryCount === 0) {
         void this.ctx.storage.put("abortedWrite", true);
         this.ctx.abort("conformance: alarm abort", { retryAlarm });
