@@ -98,9 +98,11 @@ it.each([false, true])("§1.8 ctx.abort honors retryAlarm: %s", async (retryAlar
     } catch (exception) {
       // Workerd breaks existing stubs when the actor aborts; reconnect by identity.
       expect(String(exception)).toContain("conformance: alarm abort");
+      observed = null;
       probe = await host.respawn(probe);
     }
-  } while ((observed === null || alarm !== null) && Date.now() < deadline);
+    // getAlarm() is also null during delivery, before an abort schedules its retry.
+  } while ((observed?.retryCount !== (retryAlarm ? 1 : 0) || alarm !== null) && Date.now() < deadline);
 
   expect(alarm).toBeNull();
   expect(observed).toEqual({ retryCount: retryAlarm ? 1 : 0, isRetry: retryAlarm });
