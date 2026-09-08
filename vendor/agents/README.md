@@ -16,10 +16,17 @@ pnpm test
 ```
 
 `pnpm test` is the maintained Rook regression gate. It covers the fork's
-recovery, replay, Stop, messenger, model, React, and voice behavior. It does
+recovery, replay, Stop, messenger, model, React, voice, and browser transport behavior. It does
 not run intentionally retired Codemode execution or unrelated upstream apps.
-The native Agents files run serially because their fixed-delay bridge tests
-have a recorded parallel-worker flake; retries remain disabled.
+`pnpm test:browser` builds and exercises the browser messenger leaves in
+Chromium, including native sockets in a real Worker. See
+[the integration guide](docs/think/browser-messengers.md) and
+[the next browser compatibility candidates](docs/browser-compatibility.md).
+
+The native Agents and Think files run serially. Agents has a recorded
+parallel-worker bridge-test flake; Think's expanded suite hit its 60-second
+module-warmup deadline locally when loaded in parallel. All 626 Think cases
+passed with serial file execution; retries remain disabled.
 
 ## Packages
 

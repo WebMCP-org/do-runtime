@@ -82,3 +82,26 @@ it("§1.8 a failed alarm stays visible to getAlarm until a delivery succeeds", a
   expect(seenWhilePending).not.toBeNull();
   expect(await probe.call("readAlarm")).toBeNull();
 });
+
+it.each([false, true])("§1.8 ctx.abort honors retryAlarm: %s", async (retryAlarm) => {
+  let probe = await host.spawn(`alarm-abort-${retryAlarm}`);
+  await probe.call("armAbortingAlarm", retryAlarm);
+
+  const deadline = Date.now() + 8_000;
+  let observed: { retryCount: number; isRetry: boolean } | null = null;
+  let alarm: number | null = null;
+  do {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    try {
+      observed = await probe.call("readAlarmRetry");
+      alarm = await probe.call("readAlarm");
+    } catch (exception) {
+      // Workerd breaks existing stubs when the actor aborts; reconnect by identity.
+      expect(String(exception)).toContain("conformance: alarm abort");
+      probe = await host.respawn(probe);
+    }
+  } while ((observed === null || alarm !== null) && Date.now() < deadline);
+
+  expect(alarm).toBeNull();
+  expect(observed).toEqual({ retryCount: retryAlarm ? 1 : 0, isRetry: retryAlarm });
+}, 10_000);

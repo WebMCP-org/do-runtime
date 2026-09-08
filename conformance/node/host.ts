@@ -509,6 +509,7 @@ const timer = new ControllableTimer();
 type Placement = {
   readonly container: ActorContainer;
   readonly stub: object;
+  readonly storage: ReturnType<typeof createNodeSqlProvider>;
 };
 
 class NodeClientSocket implements LaneClientSocket {
@@ -601,13 +602,14 @@ class NodeFacetHost implements FacetHost {
 
     const started = (async (): Promise<Placement> => {
       const { ActorClass, exports } = await resolveClass(request.className);
+      const storage = createNodeSqlProvider({ directory });
       const container = await createActorContainer({
         id: request.routedId ?? request.name,
         uniqueKey: UNIQUE_KEY,
         exports,
         env: this.#env,
         ports: {
-          sql: createNodeSqlProvider({ directory }),
+          sql: storage,
           // Never reached: a facet container installs `DEFAULT_ALARM_OUTLET` and
           // `assertCanSetAlarm` refuses before anything can call it.
           alarms: { scheduleRun: () => Promise.reject(new Error("facets have no alarm slot")) },
@@ -624,9 +626,10 @@ class NodeFacetHost implements FacetHost {
         // will ever tear it down through `#placements`. Drop it here or a failed start leaks a
         // connection on the actor's directory for every attempt.
         container.abort(exception);
+        storage.close();
         throw exception;
       }
-      const placement: Placement = { container, stub: container.entry(instance) };
+      const placement: Placement = { container, stub: container.entry(instance), storage };
       this.#placements.set(key, placement);
       return placement;
     })();
@@ -654,6 +657,7 @@ class NodeFacetHost implements FacetHost {
     if (placement === undefined) return;
     this.#placements.delete(key);
     placement.container.abort(new Error("Facet placement closed."));
+    placement.storage.close();
   }
 
   async deleteStorage(id: FacetId, subtree: readonly FacetId[]): Promise<void> {
@@ -675,6 +679,7 @@ class NodeFacetHost implements FacetHost {
     for (const [key, placement] of this.#placements) {
       this.#placements.delete(key);
       placement.container.abort(new Error("Facet placement closed."));
+      placement.storage.close();
     }
   }
 
@@ -696,6 +701,7 @@ type Record_ = {
   readonly instance: Probe;
   readonly stub: ActorEntry<Probe>;
   readonly host: NodeFacetHost;
+  readonly storage: ReturnType<typeof createNodeSqlProvider>;
 };
 
 /**
@@ -728,6 +734,7 @@ function alarmScheduler(): Promise<AlarmScheduler> {
 }
 
 const live = new Map<string, Record_>();
+const placing = new Map<string, Promise<Record_>>();
 const socketHosts = new Map<string, HibernationMirror>();
 
 function socketHost(name: string): HibernationMirror {
@@ -739,7 +746,14 @@ function socketHost(name: string): HibernationMirror {
 }
 
 async function placed(name: string): Promise<Record_> {
-  return live.get(name) ?? (await place(name));
+  const record = live.get(name);
+  if (record !== undefined) return record;
+  let pending = placing.get(name);
+  if (pending === undefined) {
+    pending = place(name).finally(() => placing.delete(name));
+    placing.set(name, pending);
+  }
+  return await pending;
 }
 
 function directoryFor(name: string): string {
@@ -751,6 +765,7 @@ async function place(name: string): Promise<Record_> {
   mkdirSync(directory, { recursive: true });
 
   const host = new NodeFacetHost();
+  const storage = createNodeSqlProvider({ directory });
   const hibernation = socketHost(name);
   const scheduler = await alarmScheduler();
   // `LOADER` is filled in below: the binding needs the container's IoContext, exactly as
@@ -769,7 +784,7 @@ async function place(name: string): Promise<Record_> {
     exports: {},
     env,
     ports: {
-      sql: createNodeSqlProvider({ directory }),
+      sql: storage,
       // ← `ActorSqliteHooks` (`server.c++:3199-3219`): one adapter per actor over the namespace's
       // scheduler, which is the whole of how an actor's storage engine reaches it.
       alarms: scheduler.hooks(name),
@@ -793,17 +808,29 @@ async function place(name: string): Promise<Record_> {
   });
   host.attach(directory, treeOf(container), env);
 
-  const instance = await container.start((ctx, workerEnv) =>
-    gated(new Probe(ctx as never, workerEnv as never), container),
-  );
+  let instance: Probe;
+  try {
+    instance = await container.start((ctx, workerEnv) =>
+      gated(new Probe(ctx as never, workerEnv as never), container),
+    );
+  } catch (error) {
+    container.abort(error);
+    host.closeAll();
+    storage.close();
+    throw error;
+  }
   const record: Record_ = {
     name,
     container,
     instance,
     stub: container.entry(instance),
     host,
+    storage,
   };
   live.set(name, record);
+  void container.onBroken.catch(() => {
+    if (live.get(name) === record) teardown(name);
+  });
   return record;
 }
 
@@ -855,7 +882,9 @@ function teardown(name: string): void {
   const record = live.get(name);
   if (record === undefined) return;
   live.delete(name);
+  record.container.abort(new Error("Actor placement closed."));
   record.host.closeAll();
+  record.storage.close();
 }
 
 let probeCounter = 0;
@@ -865,14 +894,14 @@ export const host: ConformanceHost = {
   capabilities: new Set<Capability>(["fake-time", "real-crash"]),
 
   spawn: async (name = `probe-${probeCounter++}`) => {
-    if (!live.has(name)) await place(name);
+    await placed(name);
     return actor(name);
   },
 
   /** Same identity, fresh instance. The directory is the durable half and it stays. */
   respawn: async (previous) => {
     teardown(previous.name);
-    await place(previous.name);
+    await placed(previous.name);
     return actor(previous.name);
   },
 
@@ -888,7 +917,7 @@ export const host: ConformanceHost = {
 
   evict: async (target) => {
     teardown(target.name);
-    await place(target.name);
+    await placed(target.name);
   },
 
   /** Drop the container without letting it flush: the files are all that survives. */

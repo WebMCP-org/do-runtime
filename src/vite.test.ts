@@ -1,9 +1,6 @@
 import { build, parseSync, type Plugin } from "vite";
 import { describe, expect, test } from "vitest";
-import {
-  doRuntimeAwaitTransform,
-  type DoRuntimeAwaitTransformOptions,
-} from "./vite";
+import { doRuntimeAwaitTransform, type DoRuntimeAwaitTransformOptions } from "./vite";
 
 const HEADER =
   '/* @do-runtime-gated */\nimport { __gateAsyncIterable, __gateAwait, __resumeAwait } from "@mcp-b/do-runtime/gate";\n';
@@ -42,6 +39,113 @@ async function transform(
 }
 
 describe("doRuntimeAwaitTransform", () => {
+  test("preserves awaited async-generator cleanup on return and throw, including yield delegation", async () => {
+    const actorId = "/generator.actor.js";
+    const actorSource = `
+      async function* values(events, rejectCleanup) {
+        try { yield 1; yield 2; }
+        finally {
+          events.push("cleanup started");
+          await (rejectCleanup ? Promise.reject(new Error("cleanup rejected")) : Promise.resolve());
+          events.push("cleanup finished");
+        }
+      }
+      async function* delegated(events, rejectCleanup) {
+        return yield* values(events, rejectCleanup);
+      }
+      export async function run(method, delegate, rejectCleanup) {
+        const events = [];
+        const iterator = (delegate ? delegated : values)(events, rejectCleanup);
+        events.push(await iterator.next());
+        try { events.push(await iterator[method](method === "throw" ? new Error("stopped") : 9)); }
+        catch (error) { events.push(error.message); }
+        events.push(await iterator.next());
+        return events;
+      }
+    `;
+    const generated = await build({
+      configFile: false,
+      logLevel: "silent",
+      plugins: [
+        {
+          name: "virtual-generator",
+          resolveId: (id) =>
+            id === "generator-entry"
+              ? actorId
+              : id.startsWith("@mcp-b/do-runtime/")
+                ? `\0${id}`
+                : null,
+          load: (id) =>
+            id === actorId
+              ? actorSource
+              : id === "\0@mcp-b/do-runtime/gate"
+                ? "export const __gateAwait = x => x, __resumeAwait = x => x, __gateAsyncIterable = x => x;"
+                : id === "\0@mcp-b/do-runtime/browser/async-hooks"
+                  ? "export {};"
+                  : null,
+        },
+        doRuntimeAwaitTransform({ include: actorId, asyncContext: true }),
+      ],
+      build: {
+        write: false,
+        minify: false,
+        target: "esnext",
+        rollupOptions: {
+          input: "generator-entry",
+          preserveEntrySignatures: "strict",
+        },
+      },
+    });
+    if (Array.isArray(generated) || !("output" in generated))
+      throw new Error("Expected one bundle");
+    const chunk = generated.output.find((output) => output.type === "chunk");
+    if (!chunk) throw new Error("Expected generated JavaScript");
+    const module = (await import(
+      `data:text/javascript;base64,${Buffer.from(chunk.code).toString("base64")}`
+    )) as {
+      run(method: string, delegate: boolean, rejectCleanup: boolean): Promise<unknown[]>;
+    };
+    for (const delegate of [false, true]) {
+      for (const method of ["return", "throw"]) {
+        expect(await module.run(method, delegate, false)).toEqual([
+          { value: 1, done: false },
+          "cleanup started",
+          "cleanup finished",
+          method === "return" ? { value: 9, done: true } : "stopped",
+          { value: undefined, done: true },
+        ]);
+        expect(await module.run(method, delegate, true)).toEqual([
+          { value: 1, done: false },
+          "cleanup started",
+          "cleanup rejected",
+          { value: undefined, done: true },
+        ]);
+      }
+    }
+  });
+
+  test("requires review when the opt-in Oxc helper correction no longer matches", async () => {
+    const id = "\0@oxc-project+runtime@next/helpers/esm/wrapAsyncGenerator.js";
+    const source = "export default function changedHelper() {}";
+    await expect(transform(source, id)).resolves.toBe(source);
+    await expect(transform(source, id, { asyncContext: true })).rejects.toThrow(
+      "Oxc async-generator helper changed",
+    );
+  });
+
+  test("lowers async functions and generators for browser context while preserving gates", async () => {
+    const output = await transform(
+      "export async function* values() { yield await item; } export const immediate = async () => 1;",
+      "/actor.js",
+      { asyncContext: true },
+    );
+    expect(output).toContain("@mcp-b/do-runtime/browser/async-hooks");
+    expect(output).toContain("helpers/wrapAsyncGenerator");
+    expect(output).toContain("helpers/asyncToGenerator");
+    expect(output).toContain("__gateAwait");
+    expect(output).not.toMatch(/async (function|\()/);
+  });
+
   test("gates a plain await", async () => {
     const source = "async function run() { return await task; }\n";
 
@@ -109,9 +213,9 @@ describe("doRuntimeAwaitTransform", () => {
   test("honors an exclude filter", async () => {
     const source = "const value = await task;\n";
 
-    await expect(transform(source, "/generated/actor.js", { exclude: "**/generated/**" })).resolves.toBe(
-      source,
-    );
+    await expect(
+      transform(source, "/generated/actor.js", { exclude: "**/generated/**" }),
+    ).resolves.toBe(source);
   });
 
   test("excludes do-runtime internals by default", async () => {

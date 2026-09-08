@@ -769,6 +769,9 @@ async function place(): Promise<Live> {
 
   live = { container, entry };
   rootStorage = storage;
+  void container.onBroken.catch(() => {
+    if (live?.container === container) teardown();
+  });
   return live;
 }
 
@@ -790,8 +793,10 @@ function treeOf(container: ActorContainer): FacetTree {
  * `SqliteWasmActorStorage.close()`.
  */
 function teardown(): void {
-  facets.closeAll();
+  const previous = live;
   live = undefined;
+  previous?.container.abort(new Error("Actor placement closed."));
+  facets.closeAll();
   placing = undefined;
   rootStorage?.close();
   rootStorage = undefined;

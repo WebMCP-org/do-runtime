@@ -47,6 +47,7 @@ import {
   ActorGlobalScope,
   AlarmInvocationInfo,
   actorScopeBindings,
+  inspectAlarmException,
   isAlarmFailureUserError,
 } from "../api/global-scope";
 import type {
@@ -62,7 +63,12 @@ import type { AlarmOutlet } from "../io/actor-sqlite";
 import { ActorSqlite, DEFAULT_ALARM_OUTLET } from "../io/actor-sqlite";
 import type { AlarmResult } from "./alarm-scheduler";
 import type { Actor, Timer } from "../io/io-context";
-import { IoContext, captureGateStack, tryCurrentIoContext } from "../io/io-context";
+import {
+  IoContext,
+  captureGateStack,
+  isExceptionFromInputGateBroken,
+  tryCurrentIoContext,
+} from "../io/io-context";
 import type { InputGateHooks, OutputGateHooks } from "../io/io-gate";
 import { InputGate, OutputGate } from "../io/io-gate";
 import type { FacetManager, FacetStartInfo } from "../io/worker";
@@ -639,18 +645,11 @@ const FACET_DELETED_MESSAGE = "Facet was deleted.";
 /**
  * A facet has no alarm slot, and this is where that becomes visible.
  *
- * `server.c++:2864-2877` installs alarm hooks only `if (parent == kj::none)` and
- * gives a facet `ActorSqlite::Hooks::getDefaultHooks()`, whose `scheduleRun`
- * throws — so on workerd a `setAlarm()` inside a facet appears to succeed and
- * then breaks the whole actor asynchronously, which is open bug
- * https://github.com/cloudflare/workerd/issues/6810. This runtime refuses at the
- * call instead, as recorded in §2.7. A deliberate semantic
- * divergence: the observable behaviour is a synchronous throw naming the facet
- * where workerd's is a destroyed actor three turns later.
+ * Workerd 3bb33af installs dedicated `FacetAlarmHooks` with this diagnostic.
+ * This runtime keeps the earlier synchronous refusal, as recorded in §2.7,
+ * rather than letting the failed scheduling hook break the facet's output gate.
  */
-export const FACET_ALARM_UNIMPLEMENTED_MESSAGE =
-  "A facet has no alarm slot. Alarm hooks are installed only on a root Durable Object, so a " +
-  "facet cannot schedule one: record the wake on the root and route the work back down.";
+export const FACET_ALARM_UNIMPLEMENTED_MESSAGE = "Facets currently cannot set alarms.";
 
 // =======================================================================================
 // The tree index, over a database
@@ -1313,13 +1312,7 @@ class ActorContainerImpl implements ActorContainer {
       // Upstream's commit callback exists for a replication layer workerd's local storage has none
       // of; the local commit is already durable when `COMMIT TRANSACTION` returns.
       async () => {},
-      // ← `if (parent == kj::none) ... else getDefaultHooks()` (`server.c++:2864-2877`). A facet
-      // takes upstream's default hooks, whose `scheduleRun` throws.
-      //
-      // Nothing can reach them, because `assertCanSetAlarm` refuses first — so giving a facet a
-      // live outlet here changes nothing observable and survives the whole suite. It is upstream's
-      // own line and it stays: the refusal above it is a divergence, and if the divergence is ever
-      // withdrawn this is what workerd's behaviour falls back to.
+      // Workerd uses FacetAlarmHooks; assertCanSetAlarm() refuses earlier here.
       facet === undefined ? options.ports.alarms : DEFAULT_ALARM_OUTLET,
     );
     this.#actor.actorStorage = this.#cache;
@@ -1422,14 +1415,23 @@ class ActorContainerImpl implements ActorContainer {
     await this.#tree?.recoverDeletions();
 
     this.#actor.classInstance = { kind: "initializing" };
+    // The input gate is held for the constructor's synchronous slice and the microtask
+    // checkpoint that drains after it, which is upstream's own boundary (§1.2).
     try {
-      // The input gate is held for the constructor's synchronous slice and the microtask
-      // checkpoint that drains after it, which is upstream's own boundary (§1.2).
-      const instance = await this.#ctx.run(() => construct(this.state, this.#env));
+      const instance = await this.#ctx.run(() => {
+        try {
+          return construct(this.state, this.#env);
+        } catch (exception) {
+          // Abort before queued WebSocket messages resume at the microtask checkpoint.
+          this.#ctx.abort(exception);
+          throw exception;
+        }
+      });
       this.#actor.classInstance = { kind: "running", instance };
       return instance;
     } catch (exception) {
       this.#actor.classInstance = { kind: "failed", exception };
+      this.#ctx.abort(exception);
       throw exception;
     }
   }
@@ -1456,11 +1458,11 @@ class ActorContainerImpl implements ActorContainer {
                 (value as (...rest: unknown[]) => unknown).apply(subject, args),
               ),
             { signal },
-          );
+          ).catch(this.#throwRpcException);
           // ← the reply being piped through `waitForOutputLocks()`. This is §1.1's whole point:
           // a method that returns without awaiting its own write still must not answer before
           // that write is durable.
-          await this.#ctx.waitForOutputLocks();
+          await this.#ctx.waitForOutputLocks().catch(this.#throwRpcException);
           return result;
         };
         bound.set(property, gated);
@@ -1492,17 +1494,36 @@ class ActorContainerImpl implements ActorContainer {
     );
     const bound = new Map<string | symbol, unknown>();
     return new Proxy(target, {
-      get(subject, property): unknown {
+      get: (subject, property): unknown => {
         const value: unknown = Reflect.get(subject, property, subject);
         if (typeof value !== "function") return value;
         const cached = bound.get(property);
         if (cached !== undefined) return cached;
-        const callback = (...args: unknown[]): Promise<unknown> => invoke(property, args);
+        const callback = (...args: unknown[]): Promise<unknown> =>
+          invoke(property, args).catch(this.#throwRpcException);
         bound.set(property, callback);
         return callback;
       },
     });
   }
+
+  // ← workerd e55b437bf: only root Durable Objects have an RPC diagnostic id;
+  // input-gate failures keep their original provenance.
+  #throwRpcException = (exception: unknown): never => {
+    if (
+      this.#tree !== undefined &&
+      !isExceptionFromInputGateBroken(exception) &&
+      exception !== null &&
+      (typeof exception === "object" || typeof exception === "function")
+    ) {
+      try {
+        Reflect.set(exception, "durableObjectId", this.state.id.toString());
+      } catch {
+        // A user error can have a throwing setter; preserve the original failure.
+      }
+    }
+    throw exception;
+  };
 
   run<T>(event: () => T | PromiseLike<T>, signal?: AbortSignal): Promise<T> {
     return this.#ctx.run(
@@ -1632,7 +1653,11 @@ class ActorContainerImpl implements ActorContainer {
 
       let result: AlarmResult;
       try {
-        await this.#ctx.run(() => this.#runAlarmHandler(scheduledTime, retryCount));
+        // There is no V8 termination here; observe abort even when the handler returns normally.
+        await Promise.race([
+          this.#ctx.run(() => this.#runAlarmHandler(scheduledTime, retryCount)),
+          this.#ctx.onAbort(),
+        ]);
         result = { outcome: "ok", retry: false, retryCountsAgainstLimit: true };
       } catch (exception) {
         // ← the `.catch_` (`global-scope.c++:593-641`). "We assume that exceptions thrown during
@@ -1640,9 +1665,10 @@ class ActorContainerImpl implements ActorContainer {
         // cancelDeferredAlarmDeletion() is called": a handler that failed must not have its alarm
         // deleted, or the retry the scheduler is about to make has nothing to run.
         this.#cache.cancelDeferredAlarmDeletion();
+        const alarmException = inspectAlarmException(exception, this.#ctx);
         result = {
-          outcome: "exception",
-          retry: true,
+          outcome: alarmException.isAbort ? "aborted" : "exception",
+          retry: alarmException.retry,
           retryCountsAgainstLimit: true,
           errorDescription: describeReason(exception),
         };
@@ -1662,9 +1688,10 @@ class ActorContainerImpl implements ActorContainer {
         // the side that keeps the alarm — a deletion written through a gate that has just broken
         // cannot commit, so the only thing at stake is whether a gate that recovers loses it.
         this.#cache.cancelDeferredAlarmDeletion();
+        const alarmException = inspectAlarmException(exception, this.#ctx);
         result = {
-          outcome: "exception",
-          retry: true,
+          outcome: alarmException.isAbort ? "aborted" : "exception",
+          retry: alarmException.retry,
           retryCountsAgainstLimit: isAlarmFailureUserError(exception),
           errorDescription: describeReason(exception),
         };

@@ -36,7 +36,7 @@ enumerates it. Every row is one of:
 | `setTimeout` / `setInterval` | arming captures the critical section; firing re-enters via `ctx.run` | `api/global-scope.ts` |
 | `scheduler.wait()` / `scheduler.yield()` | scoped `Scheduler` over the same timer path | `api/global-scope.ts` |
 | `crypto.subtle.*` | every method's promise gated; sync members pass through | `api/global-scope.ts` |
-| `WebSocket` | classic listener delivery re-enters its captured context; hibernatable frames take fresh input locks and dispatch class methods; `send` carries its own output-gate promise (§1.8) | `api/web-socket.ts` |
+| Accepted `WebSocket` / `WebSocketPair` | classic listener delivery re-enters its captured context; hibernatable frames take fresh input locks; application sends snapshot binary input and wait for output confirmation; automatic replies bypass unrelated storage locks while preserving frame order. A 101 Response transfers its endpoint to the host. | `api/web-socket.ts` |
 | storage / `sql` / alarms / `blockConcurrencyWhile` / `awaitIo` / `makeReentryCallback` / entry and loopback dispatch | the runtime's own primitives | `io/io-context.ts`, `server/actor-container.ts` |
 
 ## Transform
@@ -86,6 +86,7 @@ promise continuations that do not pass through syntax the transform can rewrite.
 | Surface | Why |
 | --- | --- |
 | `getReader({ mode: "byob" })` | `read(view)` returns the caller's own buffer; there is no seam to gate, and a working-but-ungated reader is the silent failure this layer exists to prevent |
+| Actor-global `new WebSocket(url)` | The native constructor starts its handshake immediately, before output confirmation. Refused before construction; hosts supply transports and actor code can use `WebSocketPair`. |
 
 ## Foreign by design
 

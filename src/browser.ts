@@ -1,4 +1,4 @@
-import { markWebSocketUsed, type RawWebSocket } from "./api/web-socket";
+import { AcceptedWebSocket, markWebSocketUsed, type RawWebSocket } from "./api/web-socket";
 
 export type UpgradeWebSocket = EventTarget &
   RawWebSocket & {
@@ -13,6 +13,7 @@ type UpgradeResponse = Response & { readonly webSocket?: UpgradeWebSocket };
 type CloneableRequest = { readonly headers: Headers; clone(): CloneableRequest };
 
 const upgradeRequests = new WeakSet<CloneableRequest>();
+const upgradedSockets = new WeakMap<Response, UpgradeWebSocket>();
 let installed = false;
 
 /** Install the Request/Response half of browser-hosted WebSocket upgrades. */
@@ -47,7 +48,13 @@ export function installWebSocketUpgradeGlobals(): void {
 }
 
 export function upgradeWebSocket(response: Response): UpgradeWebSocket | undefined {
-  return (response as UpgradeResponse).webSocket;
+  const coupled = upgradedSockets.get(response);
+  if (coupled !== undefined) return coupled;
+  const socket = (response as UpgradeResponse).webSocket;
+  if (!(socket instanceof AcceptedWebSocket)) return socket;
+  const host = socket.coupleToHost();
+  upgradedSockets.set(response, host);
+  return host;
 }
 
 /** Preserve the upgrade signal across browser `Request.clone()` calls. */

@@ -62,8 +62,9 @@
  *     `_cf_currentSubAgentBridge` has no such guarantee, which is why it is a
  *     live bug and this is not.
  *
- * Consequence: no async context is required. Do not add a dependency on
- * decision 8 here without re-running the conformance gate suite first.
+ * Consequence: input gating does not require async-local storage. The optional
+ * browser SDK context is captured at callback boundaries below; it does not
+ * select input locks or decide when a continuation can run.
  *
  * The invariant a future simplifier has to re-check: a single slot would pass
  * every test in `io-context.test.ts`, and that was established by trying it,
@@ -103,6 +104,7 @@
  * types with no port, so `waitUntilStatus()` returns the first exception instead.
  */
 
+import { bindAsyncContext } from "../util/async-context";
 import {
   CriticalSection,
   type InputGate,
@@ -471,6 +473,11 @@ const REMOTE_EXCEPTION_PREFIX = "remote.";
  * exception crosses a realm — the mistake decision 18 records capnweb making.
  */
 export const EXCEPTION_IS_USER_ERROR = Symbol.for("workerd.exceptionIsUserError");
+/** ← `jsg::EXCEPTION_DURABLE_OBJECT_ABORT` and `…_NO_RETRY`. */
+export const EXCEPTION_DURABLE_OBJECT_ABORT = Symbol.for("workerd.exceptionDurableObjectAbort");
+export const EXCEPTION_DURABLE_OBJECT_ABORT_NO_RETRY = Symbol.for(
+  "workerd.exceptionDurableObjectAbortNoRetry",
+);
 
 /** ← `error.setDetail(jsg::EXCEPTION_IS_USER_ERROR, kj::heapArray<byte>(0))`. */
 export function setUserErrorDetail(exception: unknown): void {
@@ -558,7 +565,11 @@ class TimeoutManager {
   /** ← `TimeoutManagerImpl::setTimeout` (`io-context.c++:51-67`). */
   setTimeout(ctx: IoContext, params: TimeoutParameters): number {
     const id = this.#nextId++;
-    const state: TimeoutState = { params, isCanceled: false, armed: undefined };
+    const state: TimeoutState = {
+      params: { ...params, callback: params.callback === undefined ? undefined : bindAsyncContext(params.callback) },
+      isCanceled: false,
+      armed: undefined,
+    };
     this.#timeouts.set(id, state);
     this.#arm(ctx, id, state);
     return id;
@@ -941,6 +952,16 @@ export class IoContext {
     return this.#abortPromise;
   }
 
+  /** ← `IoContext::getAbortReason()`: the original exception, before gate propagation. */
+  getAbortReason(): unknown {
+    return this.#abortException?.exception;
+  }
+
+  /** A constructor can abort with `throw undefined`, so the reason alone is not a flag. */
+  isAborted(): boolean {
+    return this.#abortException !== undefined;
+  }
+
   /** Force context abort now. */
   abort(exception: unknown): void {
     if (this.#abortException !== undefined) {
@@ -1059,9 +1080,11 @@ export class IoContext {
     // anyway.
     const aborted = this.#abortException;
     if (aborted !== undefined) {
+      if (options?.input instanceof Lock) options.input.release();
       throw aborted.exception;
     }
 
+    const callback = bindAsyncContext(func);
     const input = options?.input;
     let lock: Lock;
     if (input === undefined) {
@@ -1072,7 +1095,7 @@ export class IoContext {
       lock = input;
     }
 
-    return await this.#runImpl(func, lock);
+    return await this.#runImpl(callback, lock);
   }
 
   /**
@@ -1103,6 +1126,7 @@ export class IoContext {
     // A reentry callback is meant for *re-*entry, so should only be created while already
     // inside the IoContext. Initial entry should just use run().
     this.#requireCurrent();
+    func = bindAsyncContext(func);
     const criticalSection = this.getCriticalSection();
     // Captured once, here, because the fire is a scheduler moment with no user
     // frames — the registration site is the trace a reader can act on.
@@ -1159,6 +1183,7 @@ export class IoContext {
     func: (...args: Args) => Result | PromiseLike<Result>,
   ): (...args: Args) => Promise<Result> {
     this.#requireCurrent();
+    func = bindAsyncContext(func);
     const criticalSection = this.getCriticalSection();
     const shouldSample = this.#transformGateUses++ % 64 === 0 || this.#transformGateStack === undefined;
     if (shouldSample) this.#transformGateStack = captureGateStack();
@@ -1281,6 +1306,13 @@ export class IoContext {
       throw new Error("IoContext::runImpl() was given a lock belonging to another actor");
     }
 
+    // ← workerd e7b2192: the context may abort while admission waits for its lock.
+    const aborted = this.#abortException;
+    if (aborted !== undefined) {
+      lock.release();
+      throw aborted.exception;
+    }
+
     this.#currentInputLocks.push(lock);
     let result: T | PromiseLike<T>;
     // ← `SuppressIoContextScope previousRequest; threadLocalRequest = this;` (`io-context.c++:1208`)
@@ -1340,28 +1372,20 @@ export class IoContext {
 
     this.addTask(
       promiseForExceptionOrT(promise).then(async (outcome) => {
-        try {
-          await this.run((): void => {
-            if (outcome.ok) {
-              // `func` runs under the lock, which is the guarantee that makes it a parameter.
-              try {
-                resolve(func(outcome.value));
-              } catch (exception) {
-                reject(exception);
-              }
-            } else {
-              reject(outcome.exception);
+        // `run()` releases the supplied lock if the context aborted. The result stays
+        // unsettled in that case: the actor is being torn down and onAbort() reports it.
+        await this.run((): void => {
+          if (outcome.ok) {
+            // `func` runs under the lock, which is the guarantee that makes it a parameter.
+            try {
+              resolve(func(outcome.value));
+            } catch (exception) {
+              reject(exception);
             }
-          }, { input: ilOrCs });
-        } catch (exception) {
-          // `run()` refuses to re-enter an aborted context, and both of its throws happen
-          // before the lock reaches the invocation stack. Upstream would destroy the whole
-          // continuation here, releasing the held lock with it; with no destructors it has to
-          // be handed back by name. `result` is deliberately left unsettled, as upstream
-          // leaves it: the actor is being torn down and `onAbort()` is what reports that.
-          if (ilOrCs instanceof Lock) ilOrCs.release();
-          throw exception;
-        }
+          } else {
+            reject(outcome.exception);
+          }
+        }, { input: ilOrCs });
       }),
     );
 
@@ -1376,6 +1400,7 @@ export class IoContext {
     criticalSection: CriticalSection,
     callback: (lock: Lock) => T | PromiseLike<T>,
   ): Promise<T> {
+    callback = bindAsyncContext(callback);
     const inputLock = await criticalSection.wait();
 
     return await this.#runImpl((lock) => {

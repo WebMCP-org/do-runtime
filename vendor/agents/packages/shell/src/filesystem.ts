@@ -1,4 +1,5 @@
 import { channel } from "node:diagnostics_channel";
+import { createGlobMatcher as globToRegex, getGlobPrefix } from "./helpers";
 
 /**
  * Workspace — durable file storage backed by SQLite + optional R2.
@@ -1652,66 +1653,6 @@ function toFileInfo(r: {
 }
 
 // ── Glob helpers ─────────────────────────────────────────────────────
-
-function getGlobPrefix(pattern: string): string {
-  const first = pattern.search(/[*?[{]/);
-  if (first === -1) return pattern;
-  const before = pattern.slice(0, first);
-  const lastSlash = before.lastIndexOf("/");
-  return lastSlash >= 0 ? before.slice(0, lastSlash + 1) : "/";
-}
-
-function globToRegex(pattern: string): RegExp {
-  let i = 0;
-  let re = "^";
-  while (i < pattern.length) {
-    const ch = pattern[i];
-    if (ch === "*") {
-      if (pattern[i + 1] === "*") {
-        i += 2;
-        if (pattern[i] === "/") {
-          re += "(?:.+/)?";
-          i++;
-        } else {
-          re += ".*";
-        }
-      } else {
-        re += "[^/]*";
-        i++;
-      }
-    } else if (ch === "?") {
-      re += "[^/]";
-      i++;
-    } else if (ch === "[") {
-      const close = pattern.indexOf("]", i + 1);
-      if (close === -1) {
-        re += "\\[";
-        i++;
-      } else {
-        re += pattern.slice(i, close + 1);
-        i = close + 1;
-      }
-    } else if (ch === "{") {
-      const close = pattern.indexOf("}", i + 1);
-      if (close === -1) {
-        re += "\\{";
-        i++;
-      } else {
-        const inner = pattern
-          .slice(i + 1, close)
-          .split(",")
-          .join("|");
-        re += `(?:${inner})`;
-        i = close + 1;
-      }
-    } else {
-      re += ch.replace(/[.+^$|\\()]/g, "\\$&");
-      i++;
-    }
-  }
-  re += "$";
-  return new RegExp(re);
-}
 
 // ── Diff helpers ─────────────────────────────────────────────────────
 

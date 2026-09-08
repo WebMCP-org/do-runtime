@@ -59,18 +59,19 @@ function makeCanceledError(): CanceledError {
 
 /**
  * `addEventListener("abort", ...)` never fires for a signal that has already aborted, so a
- * pre-aborted signal would silently hold its lock forever. Every cancellation site goes through
- * here, and every one of them first rejects a pre-aborted wait before touching gate state, so
- * "cancelled" always means "left the gate exactly as it found it".
+ * pre-aborted signal would silently hold its lock forever. A private dependent signal follows
+ * native abort algorithms: synthetic source events cannot cancel a wait, and source listeners
+ * cannot suppress cancellation with `stopImmediatePropagation()`.
  */
-function onAbort(signal: AbortSignal | undefined, run: () => void): () => void {
+export function onAbort(signal: AbortSignal | undefined, run: () => void): () => void {
   if (signal === undefined) return () => {};
   if (signal.aborted) {
     run();
     return () => {};
   }
-  signal.addEventListener("abort", run, { once: true });
-  return () => signal.removeEventListener("abort", run);
+  const cancellation = AbortSignal.any([signal]);
+  cancellation.addEventListener("abort", run, { once: true });
+  return () => cancellation.removeEventListener("abort", run);
 }
 
 /**

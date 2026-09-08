@@ -133,7 +133,7 @@ export function moduleFieldCountMessage(name: string, fieldCount: number): strin
   );
 }
 
-/** ← `JSG_FAIL_REQUIRE` at `worker-loader.c++:261-262`. */
+/** Historical diagnostic, kept for consumers; Python workers now accept JS modules. */
 export function jsModuleInPythonWorkerMessage(name: string): string {
   return `Module "${name}" is a JS module, but the main module is a Python module.`;
 }
@@ -276,8 +276,8 @@ export type Module = {
   readonly json?: unknown;
   /** Python module. */
   readonly py?: string;
-  /** "compiled WASM module" */
-  readonly wasm?: ArrayBuffer | ArrayBufferView;
+  /** Wasm bytes or an already compiled module shared with the loaded worker. */
+  readonly wasm?: ArrayBuffer | ArrayBufferView | WebAssembly.Module;
 };
 
 /** ← `WorkerLoader::WorkerCode` (`worker-loader.h:80-120`). */
@@ -292,7 +292,7 @@ export type WorkerCode = {
    * just a string, an ES module is assumed. If it's an object, the type of module
    * is determined based on which property is set."
    */
-  readonly modules: Record<string, Module | string>;
+  readonly modules: Record<string, Module | string | WebAssembly.Module>;
   /** "Any RPC-serializable value!" */
   readonly env?: unknown;
   /**
@@ -581,9 +581,21 @@ export class WorkerLoader implements globalThis.WorkerLoader {
       if (allowExperimental) throw new Error(ALLOW_EXPERIMENTAL_MESSAGE);
     }
 
+    const compatibilityFlags = [...(code.compatibilityFlags ?? [])];
+    // ← workerd 66db82b: inject before the isolate host compiles implied flags.
+    if (code.mainModule.endsWith(".py")) {
+      if (!compatibilityFlags.includes("python_workers")) compatibilityFlags.push("python_workers");
+      if (
+        !compatibilityFlags.includes("enable_python_external_sdk") &&
+        !compatibilityFlags.includes("disable_python_external_sdk")
+      ) {
+        compatibilityFlags.push("disable_python_external_sdk");
+      }
+    }
+
     return {
       compatibilityDate: code.compatibilityDate,
-      compatibilityFlags: code.compatibilityFlags ?? [],
+      compatibilityFlags,
       allowExperimental,
       dateValidation: this.#options.compatDateValidation,
     };
@@ -625,13 +637,8 @@ function extractSource(code: WorkerCode): WorkerSource {
   // ← `:255`. Whether the Worker is Python is decided by the MAIN module's name alone.
   const isPython = code.mainModule.endsWith(".py");
 
-  // ← `:257-269`. "Disallow Python modules when the main module is a JS module, and vice versa."
+  // ← workerd 78ce789: Python packages may contain arbitrary JS files.
   for (const module of modules) {
-    const isJsModule =
-      module.content.type === "esModule" || module.content.type === "commonJsModule";
-    if (isPython && isJsModule) {
-      throw new TypeError(jsModuleInPythonWorkerMessage(module.name));
-    }
     const isPythonModule = module.content.type === "pythonModule";
     if (!isPython && isPythonModule) {
       throw new TypeError(pythonModuleInJsWorkerMessage(module.name));
@@ -642,8 +649,9 @@ function extractSource(code: WorkerCode): WorkerSource {
 }
 
 /** ← the `KJ_SWITCH_ONEOF(entry.value)` at `worker-loader.c++:179-251`. */
-function moduleContentOf(name: string, value: Module | string): ModuleContent {
+function moduleContentOf(name: string, value: Module | string | WebAssembly.Module): ModuleContent {
   if (typeof value === "string") return stringModuleContentOf(name, value);
+  if (value instanceof WebAssembly.Module) return { type: "wasmModule", body: value };
   return objectModuleContentOf(name, value);
 }
 
@@ -685,7 +693,12 @@ function objectModuleContentOf(name: string, module: Module): ModuleContent {
     return { type: "jsonModule", body: JSON.stringify(module.json) ?? "undefined" };
   }
   if (module.py !== undefined) return { type: "pythonModule", body: module.py };
-  if (module.wasm !== undefined) return { type: "wasmModule", body: copyBytes(module.wasm) };
+  if (module.wasm !== undefined) {
+    return {
+      type: "wasmModule",
+      body: module.wasm instanceof WebAssembly.Module ? module.wasm : copyBytes(module.wasm),
+    };
+  }
 
   // ← `KJ_UNREACHABLE` (`:247`): fieldCount === 1 has already found one of the seven.
   throw new Error("unreachable: exactly one module field is set");

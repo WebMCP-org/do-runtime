@@ -32,3 +32,22 @@ it("§1.12 tracing runs the callback with an untraced span", () => {
   });
   expect(seen).toEqual({ isTraced: false, nested: false });
 });
+
+it("§1.12 untraced spans expose chainable attributes and nested active scopes", () => {
+  expect(tracing.enterSpan("outer", (outer, value) => {
+    expect(outer).toBeInstanceOf(tracing.Span);
+    expect(outer.setAttribute("count", 1)).toBe(outer);
+    expect(outer.setAttributes({ present: true, absent: undefined })).toBe(outer);
+    outer.recordException(new Error("unrecorded"));
+    expect(tracing.getActiveSpan()).toBe(outer);
+    const manual = tracing.startSpan("inactive");
+    expect(manual.isTraced).toBe(false);
+    expect(tracing.getActiveSpan()).toBe(outer);
+    manual.end();
+    tracing.startActiveSpan("inner", (inner) => {
+      expect(tracing.getActiveSpan()).toBe(inner);
+    });
+    expect(tracing.getActiveSpan()).toBe(outer);
+    return value + 1;
+  }, 41)).toBe(42);
+});

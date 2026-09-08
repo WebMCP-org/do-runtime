@@ -15,7 +15,7 @@
  * upstream only exercises from `io-context.h`, which is Section 2.
  */
 
-import { expect, it, vi } from "vitest";
+import { expect, it } from "vitest";
 import {
   CanceledError,
   CriticalSection,
@@ -698,6 +698,33 @@ it("dropping a running critical section is diagnosed as deadlock", async () => {
   await expect(gate.wait()).rejects.toThrow("leads to deadlock");
 });
 
+it("gate cancellation follows signal state independently of dispatched events", async () => {
+  const gate = new InputGate();
+  const lock = await gate.wait();
+  const controller = new AbortController();
+  controller.signal.addEventListener("abort", (event) => {
+    if (controller.signal.aborted) event.stopImmediatePropagation();
+  });
+  const inputWait = gate.wait(controller.signal);
+  const outputGate = new OutputGate();
+  const outputWait = outputGate.lockWhile(neverDone(), controller.signal);
+  const onBroken = outputGate.onBroken();
+  const settled = Promise.allSettled([inputWait, outputWait, onBroken]);
+
+  controller.signal.dispatchEvent(new Event("abort"));
+  expect(await poll(inputWait)).toBe(false);
+  expect(await poll(outputWait)).toBe(false);
+  expect(await poll(onBroken)).toBe(false);
+
+  // Native abort algorithms run even when an event listener stops propagation.
+  controller.abort();
+  await expect(inputWait).rejects.toBeInstanceOf(CanceledError);
+  await expect(outputWait).rejects.toThrow("output lock was canceled before completion");
+  await expect(onBroken).rejects.toThrow("output lock was canceled before completion");
+  await settled;
+  lock.release();
+});
+
 it("a wait cancelled before it starts leaves the gate untouched", async () => {
   // `addEventListener("abort", ...)` does not fire for a signal that already aborted, so without
   // an explicit check a pre-aborted wait would take a lock nothing ever releases. Every arm has
@@ -786,7 +813,6 @@ it("InputGate hooks balance across fulfilled, cancelled and broken waiters", asy
     const first = await gate.wait();
     const second = first.addRef();
     const controller = new AbortController();
-    const removeAbort = vi.spyOn(controller.signal, "removeEventListener");
     const queued = gate.wait(controller.signal);
     expect(counts).toEqual({ locked: 1, released: 0, waiterAdded: 1, waiterRemoved: 0 });
 
@@ -796,7 +822,6 @@ it("InputGate hooks balance across fulfilled, cancelled and broken waiters", asy
 
     second.release();
     (await queued).release();
-    expect(removeAbort).toHaveBeenCalledWith("abort", expect.any(Function));
     controller.abort();
     expect(counts).toEqual({ locked: 2, released: 2, waiterAdded: 1, waiterRemoved: 1 });
   }

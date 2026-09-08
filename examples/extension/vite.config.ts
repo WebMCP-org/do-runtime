@@ -20,11 +20,12 @@ const actorAwaitTransformInclude = [
   "**/node_modules/**/ai/dist/**",
   "**/node_modules/**/chat/dist/**",
   "**/node_modules/**/partyserver/dist/**",
+  "**/node_modules/**/@modelcontextprotocol/**",
 ];
 
 const actorPlugins = () => [
   ...agents(),
-  doRuntimeAwaitTransform({ include: actorAwaitTransformInclude }),
+  doRuntimeAwaitTransform({ include: actorAwaitTransformInclude, asyncContext: true }),
 ];
 
 const facetBanner = (chunk: { name: string }): string =>
@@ -113,8 +114,9 @@ export default defineConfig(({ mode }) => ({
   },
 
   resolve: {
-    ...(mode === "think-probe" ? { conditions: ["worker", ...defaultClientConditions] } : {}),
+    conditions: ["worker", ...defaultClientConditions],
     alias: {
+      "@mcp-b/do-runtime/browser/async-hooks": `${packageRoot}dist/browser/async-hooks.js`,
       "@mcp-b/do-runtime/gate": `${packageRoot}dist/gate.js`,
       /**
        * The specifier a Workers module imports `DurableObject` and `RpcTarget`
@@ -132,7 +134,7 @@ export default defineConfig(({ mode }) => ({
       ...(mode === "think-probe"
         ? {
             "@cloudflare/shell": cloudflareShellModule,
-            async_hooks: unenvNode("async_hooks"),
+            async_hooks: `${packageRoot}dist/browser/async-hooks.js`,
             crypto: unenvNode("crypto"),
             "node:crypto": unenvNode("crypto"),
             "node:events": unenvNode("events"),
@@ -141,7 +143,7 @@ export default defineConfig(({ mode }) => ({
             "node:zlib": unenvNode("zlib"),
           }
         : {}),
-      "node:async_hooks": unenvNode("async_hooks"),
+      "node:async_hooks": `${packageRoot}dist/browser/async-hooks.js`,
       "node:diagnostics_channel": unenvNode("diagnostics_channel"),
       "node:os": unenvNode("os"),
       path: unenvNode("path"),

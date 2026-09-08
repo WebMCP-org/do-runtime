@@ -891,6 +891,19 @@ describe("the retry ladder", () => {
 // Abandoning
 
 describe("abandonAlarm", () => {
+  test("a terminal ctx.abort abandons the alarm without retrying", async () => {
+    // ← workerd 67dd86a, AlarmScheduler's ABORTED outcome branch.
+    const context = await harness();
+    const scheduledTime = context.timer.now();
+    context.actor.results = [{ outcome: "aborted", retry: false, retryCountsAgainstLimit: true }];
+    await fire(context);
+
+    expect(context.actor.abandoned).toEqual([scheduledTime]);
+    expect(context.scheduler.getAlarm("a")).toBeNull();
+    expect((await restart(context)).scheduler.getAlarm("a")).toBeNull();
+    expect(context.timer.delays()).toEqual([]);
+  });
+
   /** Drives an alarm all the way to the abandon block. */
   async function exhaust(context: Harness): Promise<void> {
     context.actor.results = [USER_FAILURE];
@@ -945,7 +958,7 @@ describe("abandonAlarm", () => {
     expect(context.rows()).toEqual([{ actor_id: "a", scheduled_time: 9_000_000 }]);
   });
 
-  test("a failed notification retries abandonment without delivering the alarm again", async () => {
+  test.each([false, true])("a failed notification retries abandonment without redelivery: terminal=%s", async (terminal) => {
     // ← "If the notification fails, we keep the alarm in the scheduler so it is
     // not silently lost" (`:243-250`).
     const projected: { when: number | null; active: number }[] = [];
@@ -956,7 +969,12 @@ describe("abandonAlarm", () => {
     });
     const scheduledTime = context.timer.now();
     context.actor.abandonFails = true;
-    await exhaust(context);
+    if (terminal) {
+      context.actor.results = [{ outcome: "aborted", retry: false, retryCountsAgainstLimit: true }];
+      await fire(context);
+    } else {
+      await exhaust(context);
+    }
 
     expect(context.scheduler.getAlarm("a")).toBe(scheduledTime);
     expect(context.rows()).toEqual([{ actor_id: "a", scheduled_time: scheduledTime }]);
@@ -968,15 +986,13 @@ describe("abandonAlarm", () => {
     await context.timer.advance(2_000);
 
     expect(context.actor.abandoned).toEqual([scheduledTime, scheduledTime]);
-    expect(context.actor.deliveries).toHaveLength(ALARM_RETRY_MAX_TRIES + 1);
+    expect(context.actor.deliveries).toHaveLength(terminal ? 1 : ALARM_RETRY_MAX_TRIES + 1);
     expect(context.rows()).toEqual([]);
     expect(context.timer.delays()).toEqual([]);
     expect(projected.at(-1)).toEqual({ when: null, active: 0 });
   });
 
-  test("an alarm queued while the notification was in flight is promoted, not deleted", async () => {
-    // `deleteAlarm` finds the queued alarm and reschedules for it (`:139-146`),
-    // which is why upstream can ignore what `abandonAlarm` returned.
+  test.each([false, true])("preserves an alarm queued during abandonment: terminal=%s", async (terminal) => {
     const context = await harness();
     const { promise, resolve } = Promise.withResolvers<void>();
     const actor = context.actor;
@@ -985,7 +1001,12 @@ describe("abandonAlarm", () => {
       await promise;
       return null;
     };
-    await exhaust(context);
+    if (terminal) {
+      actor.results = [{ outcome: "aborted", retry: false, retryCountsAgainstLimit: true }];
+      await fire(context);
+    } else {
+      await exhaust(context);
+    }
 
     context.scheduler.setAlarm("a", 8_000_000);
     resolve();
@@ -993,6 +1014,22 @@ describe("abandonAlarm", () => {
 
     expect(context.scheduler.getAlarm("a")).toBe(8_000_000);
     expect(context.rows()).toEqual([{ actor_id: "a", scheduled_time: 8_000_000 }]);
+    expect((await restart(context)).scheduler.getAlarm("a")).toBe(8_000_000);
+  });
+
+  test("late abandonment cannot delete a replacement scheduled after cancellation", async () => {
+    const context = await harness();
+    const cleanup = Promise.withResolvers<number | null>();
+    context.actor.abandonAlarm = () => cleanup.promise;
+    await exhaust(context);
+
+    context.scheduler.deleteAll();
+    context.scheduler.setAlarm("a", 8_000_000);
+    cleanup.resolve(null);
+    await settle();
+
+    expect(context.scheduler.getAlarm("a")).toBe(8_000_000);
+    expect((await restart(context)).scheduler.getAlarm("a")).toBe(8_000_000);
   });
 });
 

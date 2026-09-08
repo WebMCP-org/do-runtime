@@ -14,6 +14,13 @@ async function main() {
       "src/react.tsx",
       "src/messengers/index.ts",
       "src/messengers/telegram.ts",
+      "src/messengers/browser/index.ts",
+      "src/messengers/browser/slack.ts",
+      "src/messengers/browser/discord.ts",
+      "src/messengers/browser/slack-web-api.ts",
+      "src/messengers/browser/slack-socket-mode.ts",
+      "src/messengers/browser/discord-js.ts",
+
       "src/tools/workspace.ts",
       "src/tools/fetch.ts",
       "src/tools/execute.ts",

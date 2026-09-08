@@ -67,7 +67,8 @@ export type DataModule = {
 /** ← `WorkerSource::WasmModule`. "Compiled .wasm file content." */
 export type WasmModule = {
   readonly type: "wasmModule";
-  readonly body: Uint8Array;
+  /** JS cannot recover wire bytes from a compiled module, so carry that module itself. */
+  readonly body: Uint8Array | WebAssembly.Module;
 };
 
 /**
