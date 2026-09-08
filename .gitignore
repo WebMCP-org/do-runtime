@@ -4,3 +4,4 @@ dist/
 .wrangler/
 __screenshots__/
 .DS_Store
+.vitest-attachments/
