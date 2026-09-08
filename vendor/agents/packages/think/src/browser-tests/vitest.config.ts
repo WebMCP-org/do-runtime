@@ -30,6 +30,8 @@ export default defineConfig({
       "@chat-adapter/slack",
       "@chat-adapter/state-memory",
       "chat",
+      "ai",
+      "ai/test",
       "process"
     ]
   },
