@@ -733,7 +733,7 @@ type StateChange =
 
 const NO_CHANGE: StateChange = { kind: "none" };
 
-/** SQLite savepoint names compare case-insensitively, so the stack stores them folded. */
+/** ← `sqlite3_stricmp`: savepoint names fold ASCII letters only. */
 function savepointName(raw: string): string {
   const unquoted =
     (raw.startsWith('"') && raw.endsWith('"')) ||
@@ -743,7 +743,7 @@ function savepointName(raw: string): string {
       : raw.startsWith("[") && raw.endsWith("]")
         ? raw.slice(1, -1)
         : raw;
-  return unquoted.toLowerCase();
+  return unquoted.replace(/[A-Z]/g, (letter) => letter.toLowerCase());
 }
 
 const NAME = String.raw`("[^"]*"|'[^']*'|\`[^\`]*\`|\[[^\]]*\]|[A-Za-z_][A-Za-z0-9_$]*)`;

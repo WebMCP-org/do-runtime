@@ -11,6 +11,7 @@ async function main() {
       "src/index.ts",
       "src/workers.ts",
       "src/state-methods.ts",
+      "src/browser/index.ts",
       "src/git/index.ts"
     ],
     deps: {

@@ -240,9 +240,6 @@ When you want to debug the page as a tab, close the offscreen document first
   here. A supervisor with several actors keeps a registry and routes
   `alice → bob` through itself, which is what `conformance/browser/host.ts` does
   and what the offscreen document would grow into.
-- **Outbound `fetch`.** `ports.fetch` is omitted, which is upstream's
-  `globalOutbound: null` posture: `fetch` inside the actor refuses by name rather
-  than reaching an ungated one that would appear to work.
 - **Worker Loader / Code Mode.** No dynamic isolates.
 
 ## Agents compatibility boundary
@@ -302,3 +299,17 @@ Written down because this example exists partly to find them.
 - **`chrome-types` models `chrome.offscreen.Reason` and
   `chrome.runtime.ContextType` as types, not runtime enums.** The dotted form
   Chrome's own docs use does not compile; string literals do.
+
+## Outbound MCP and browser async context
+
+The e2e driver runs the built Agents MCP client against a local HTTP/OAuth
+provider inside the actual extension CSP. It checks tool discovery and output
+validation, concurrent authorization flows, SQL writes during gated callbacks,
+and overlapping PKCE scopes. No AJV alias or `unsafe-eval` is needed.
+
+Root and facet containers explicitly receive a native fetch outlet. Actor code
+still calls the runtime's fetch wrapper, which owns output and response-body
+gates. The fixture owns no production credentials and sends no external messages.
+
+The Vite configuration enables compiler-assisted browser async context for actor
+and SDK modules. See [setup and limitations](../../docs/browser-async-context.md).

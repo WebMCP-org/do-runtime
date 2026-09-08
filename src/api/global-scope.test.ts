@@ -221,6 +221,27 @@ describe("Scheduler", () => {
     await quiesce();
   });
 
+  test("synthetic abort events cannot cancel or consume scheduler cancellation", async () => {
+    const { ctx, scope } = newScope();
+    const controller = new AbortController();
+    const reason = new Error("caller gave up");
+    controller.signal.addEventListener("abort", (event) => {
+      if (controller.signal.aborted) event.stopImmediatePropagation();
+    });
+    let waited: Promise<void> | undefined;
+    await ctx.run(() => {
+      waited = scope.scheduler.wait(50, { signal: controller.signal });
+    });
+    const settled = Promise.allSettled([waited]);
+
+    controller.signal.dispatchEvent(new Event("abort"));
+    expect(ctx.getTimeoutCount()).toBe(1);
+
+    controller.abort(reason);
+    expect(ctx.getTimeoutCount()).toBe(0);
+    expect(await settled).toEqual([{ status: "rejected", reason }]);
+  });
+
   test("yield() is a zero-delay wait, and it is still gated", async () => {
     // No upstream referent — workerd's `Scheduler` has one method. It exists because
     // Chrome's worker `scheduler` has `yield` and no `wait`, so a scope that dropped it
@@ -396,6 +417,36 @@ describe("the foreign-slice tripwire", () => {
 });
 
 describe("installActorScope", () => {
+  test("outbound WebSocket construction refuses before the host can open a connection", async () => {
+    // ← workerd db27a34 gates the handshake. The substrate cannot defer a native constructor.
+    const NativeWebSocket = globalThis.WebSocket;
+    let connections = 0;
+    globalThis.WebSocket = new Proxy(NativeWebSocket, {
+      construct(): WebSocket {
+        connections += 1;
+        return Object.create(NativeWebSocket.prototype) as WebSocket;
+      },
+    });
+    const write = Promise.withResolvers<void>();
+    try {
+      const { ctx, scope } = newScope();
+      void ctx.lockOutputWhile(write.promise);
+      const bound = actorScopeBindings(() => scope);
+      await ctx.run(() => {
+        for (const Constructor of [scope.WebSocket, bound.WebSocket]) {
+          expect(() => new Constructor("wss://example.com/socket")).toThrow(
+            "new WebSocket(): outbound network connections cannot be gated by this runtime.",
+          );
+        }
+        expect(new scope.WebSocketPair()[0].readyState).toBe(WebSocket.OPEN);
+      });
+      expect(connections).toBe(0);
+    } finally {
+      write.resolve();
+      globalThis.WebSocket = NativeWebSocket;
+    }
+  });
+
   test("the bound scope reads the current external entry without installing it", () => {
     let currentExternalEntry: object | undefined;
     const { scope } = newScope({ currentExternalEntry: () => currentExternalEntry });

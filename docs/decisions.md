@@ -8,8 +8,11 @@ the index the citations resolve to, not a second specification.
 Workerd line citations throughout the source use release `v1.20260713.1`, commit
 `03c396e9b14ea5644dfcfb696086d8df040a4efc` of
 [cloudflare/workerd](https://github.com/cloudflare/workerd). The conformance
-oracle is pinned separately to release `v1.20260820.1`, commit
-`dea490edc7e6fbd7e38d6dbd797b8ff0f2687179`.
+oracle is pinned separately to release `v1.20260907.1`, commit
+`beb7bd5c370d898e5ea81947aaa80ba5f48cd47e`.
+The [September sync audit](workerd-sync.md) records the reviewed changes and
+remaining host-engine differences. New source comments name their upstream
+commit when the July line baseline no longer applies.
 
 A few comments cite `divergence <n>` with n ≥ 100. Those numbers come from the
 mechanical-substitution ledger kept while the port was written; each citation
@@ -91,7 +94,16 @@ accepted sockets through `ports.hibernation` and passes them back through
 `options.webSockets`; they are registered before the next constructor runs.
 Pair construction is not tied to one event—using either half via `accept()` or
 a 101 Response is the boundary. A closed socket leaves `getWebSockets()` before
-its close handler runs.
+its close handler runs, but retains its tags for that handler. Host extraction
+with `upgradeWebSocket(response)` transfers the endpoint into a distinct host
+socket that outlives actor eviction; the actor's retained reference becomes
+inert. Host event delivery stays asynchronous. Application sends snapshot binary data before waiting for output
+locks; automatic responses bypass unrelated output locks while preserving
+earlier queued frame order.
+
+An alarm interrupted by `ctx.abort()` reports `aborted` and normally retries.
+`ctx.abort(reason, { retryAlarm: false })` abandons that alarm; a newer queued
+alarm survives abandonment and restart.
 
 ### §1.9 `waitUntil`
 
@@ -178,6 +190,14 @@ abandonment, including deliveries whose entry was cancelled. Hosts acknowledge
 a consumed wake only after the latest projection is accepted and runtime
 activity has settled; timer-first delivery must leave a wake for worker recovery.
 
+Failed start or completion bookkeeping retries on that same scheduler's timer
+with bounded backoff. A completed handler result stays with the pending cleanup,
+so a failed abandonment notification or metadata write neither redelivers the
+handler nor charges its retry count again. The retained alarm stays due for
+restart recovery until cleanup is durable. Cancellation drops the retry with its
+entry; a queued or replacement alarm keeps its own durable row. The scheduler's
+co-located SQLite tests inject these failures at the target and database boundaries.
+
 ### §2.7 Facet lifecycle
 
 The runtime owns stable ids, depth and name limits, start fencing, abort,
@@ -257,10 +277,13 @@ consumer peer dependencies retain one identity.
 | Workerd owns socket transport retention across eviction internally | A local embedder mirrors socket references, tags, and attachment bytes through `ports.hibernation`, then rehydrates the next container through `options.webSockets` |
 | JavaScript cannot terminate the currently executing slice | `abort()` breaks later storage and entry, but the calling method can still return |
 | No common V8 byte serializer across Node and the browser | A versioned browser-safe structured-clone encoding preserves the public value types and reads legacy JSON rows |
-| The SQLite backends expose no authorizer callbacks | Reserved `_cf_` identifiers are detected from tokenized statement text and may reject more than workerd |
+| The runtime SQL seam omits the engines' native authorizer callbacks | Reserved `_cf_` identifiers are detected from tokenized statement text and may reject more than workerd |
 | The pragma authorizer sees resolved arguments; the text-level port does not | Workerd's pragma allowlist is enforced per statement from tokenized text. A `pragma_*` table-valued function with a string or bound argument is authorized by pragma name only; identifier arguments stay covered by the reserved-name scan |
 | Authorizer decisions that consult no regulator callback arrive with neither the regulator nor the authorizer | `ATTACH`, `DETACH`, the temp schema by keyword and by `temp.` qualifier (the action codes and the `dbName == temp` rule), `VACUUM`, and virtual-table modules outside upstream's four are refused from the leading keyword of each SQLite-decided statement, with workerd's own messages, through SQLite's identifier quoting. A leading `;` counts as trivia, because `node:sqlite` reports an empty first statement as part of the span it compiled. `EXPLAIN` in front of one still compiles, where upstream's authorizer refuses it |
 | The `SQLITE_FUNCTION` allowlist is not ported | Every function the backend compiled is callable, where workerd denies all but 138 names — including build-detail readers such as `sqlite_version()` |
+| The pinned SQLite engines lack workerd's default-expression and internal-function patches | Native callbacks alone cannot enforce these new restrictions; the [sync audit](workerd-sync.md#sqlite-engine-work-still-required) records observed engine behavior and the required follow-up |
+| A native outbound WebSocket handshake cannot wait for storage confirmation | Actor-global `new WebSocket(url)` throws before opening the connection; pairs and host-owned transports remain supported |
+| No tracing observer or generic async span context | Spans are no-ops; active identity is scoped to the synchronous callback and is restored on return or throw |
 | `node:sqlite` exposes no `sqlite3_limit()` | Bound and returned strings and blobs enforce workerd's 4 MiB limit; SQL-computed values that are never returned may exceed it. The browser backend sets the native limit. |
 | A response BYOB reader cannot be re-gated after `read(view)` | BYOB readers throw; callers use a default reader or `arrayBuffer()` |
 | A workerd facet alarm appears to schedule and then breaks asynchronously ([workerd#6810](https://github.com/cloudflare/workerd/issues/6810)) | This runtime refuses facet `setAlarm()` synchronously |

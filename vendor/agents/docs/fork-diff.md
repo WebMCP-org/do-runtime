@@ -5,6 +5,59 @@ shim could not cover it, and whether it is upstreamable. The measured footprint
 lives in [the vendor fork audit](audit/vendor-fork-audit.md); do not duplicate a count
 here that drifts on every refresh.
 
+## 2026-09-07 — Browser async context, outbound MCP and Shell OPFS
+
+- `packages/shell/src/browser/` extracts the generic native filesystem from
+  Rook, accepting a host-selected OPFS directory. Symlink metadata, native error
+  translation, Web Lock coordination and staged write/abort behavior belong to
+  the backend; host mount registries and projections are not included. Shell's
+  `filesystem.ts`, `extras.ts`, `helpers.ts` and `fs/mime-types.ts` share existing
+  path/glob/MIME behavior instead of copying it. This optional browser backend
+  is upstreamable; an application alias cannot add Shell's missing backend.
+- Shell's build/export manifest, README and changeset expose the browser leaf.
+  `packages/shell/src/browser-tests/` verifies real OPFS in dedicated Chromium
+  Workers, including data preservation on failed writes and concurrent clients.
+  The workspace browser gate now builds and tests Shell as well as Think;
+  the regular test/check scripts also run shared Shell regressions and typecheck
+  its source. Think browser tests have a separate ES2024 typecheck configuration.
+- `packages/think/src/browser-tests/async-context*` exercises actual SDK
+  current-Agent and tracing wrappers across overlapping runtime entries and
+  deferred generators. The browser test configuration uses the runtime's
+  compiler-assisted ALS shim; SDK production context code is unchanged.
+- The real MV3 example outside this fork proves the built SDK's outbound MCP
+  client and OAuth provider without an AJV alias. Existing worker-safe schema
+  validation suffices, so no MCP source fork is retained. Migration boundaries,
+  proofs and primary protocol references are in
+  [browser compatibility](browser-compatibility.md).
+
+## 2026-09-07 — Browser messenger transports and adapter shims
+
+- `think/src/messengers/browser/` extracts Rook's native Slack Socket Mode and
+  Discord Gateway clients, bounded fetch WebClient, Node transport refusals,
+  ordinary Slack thread adapter and Discord parent-thread resolver. These are
+  opt-in public package leaves; core Durable Object runtime APIs are unchanged.
+  Host configuration, UI status, Chrome permissions and credential storage stay
+  with the consumer. This is an SDK-owned browser shim, not a private Think
+  runtime rewrite; it is upstreamable as an optional browser integration.
+- Fence stopped/retired sockets and late Slack handshake failures; preserve
+  Slack retry metadata; resume Discord sessions and follow heartbeat ACK/jitter
+  rules. Resolve Discord announcement-thread parents too, and reject failed or
+  malformed parent lookups instead of misrouting a thread as a channel. HTTP
+  and upload failures surface without reporting success or completing failed uploads.
+- Add build/export entries and optional pinned Slack/Discord adapter peers;
+  align Chat and the maintained Telegram fixture to 4.37, the version already
+  used by Rook's adapters. No new core runtime dependency is added.
+- `think/src/browser-tests/` runs in Chromium, including a real Worker using
+  built package exports, native HTTP/WebSockets and actual Chat adapters.
+  Protocol race and upload tests stub only provider boundaries. Enable existing
+  native channel policy/threading/recovery tests in the maintained SDK gate.
+  `pnpm test:browser` joins `pnpm test`, so existing CI runs it. Serialize
+  Think test files: parallel module warmup hit the 60-second setup deadline
+  locally, while all 626 cases passed serially with retries disabled.
+- Limits and the consumer alias recipe are in
+  [browser messengers](think/browser-messengers.md). Tests do not claim live SaaS
+  acceptance, Chrome-specific headers or durable recovery after host loss.
+
 ## 2026-09-05 — Preserve actor identity in built SDK packages
 
 - Every package's `scripts/build.ts` sets the bundler's `keepNames` output

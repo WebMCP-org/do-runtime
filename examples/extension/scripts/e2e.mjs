@@ -11,6 +11,7 @@
  * file is `.mjs` with a dynamic import rather than a dependency of the example.
  */
 
+import { runMcpProbe } from "./mcp-probe.mjs";
 import { spawn, spawnSync } from "node:child_process";
 import { rmSync } from "node:fs";
 import { createServer } from "node:net";
@@ -244,6 +245,7 @@ async function main() {
       timeout: BOOT_TIMEOUT_MS,
     });
     await ensureHost(popup);
+    await runMcpProbe(popup, op);
 
     const invalidOperation = await popup.evaluate(() =>
       chrome.runtime.sendMessage({ type: "host-op", op: "not-an-operation", args: [] }),

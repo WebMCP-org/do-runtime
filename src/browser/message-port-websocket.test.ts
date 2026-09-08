@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
+import { createNodeSqlProvider } from "../../backends/node-sqlite";
+import { createActorContainer, noFacets } from "../server/actor-container";
 import type { UpgradeWebSocket } from "../browser";
+import { installWebSocketUpgradeGlobals, upgradeWebSocket } from "../browser";
 import {
   MessagePortWebSocket,
   bridgeWebSocket,
@@ -113,6 +116,48 @@ describe("MessagePortWebSocket", () => {
 
     runtime.close(1000, "done");
     await vi.waitFor(() => expect(client.readyState).toBe(MessagePortWebSocket.CLOSED));
+  });
+
+  it("delivers state queued before the actor returns its WebSocket upgrade", async () => {
+    const NativeRequest = globalThis.Request;
+    const NativeResponse = globalThis.Response;
+    installWebSocketUpgradeGlobals();
+    const container = await createActorContainer({
+      id: "socket",
+      uniqueKey: "message-port-websocket-test",
+      exports: {},
+      env: {},
+      ports: {
+        sql: createNodeSqlProvider(),
+        facets: noFacets,
+        alarms: { scheduleRun: async () => {} },
+        timer: { now: () => Date.now(), afterDelay: () => new Promise(() => {}) },
+      },
+    });
+    const channel = new MessageChannel();
+    const bridge = new MessagePortWebSocket("ws://actor.test", channel.port1, false);
+    const client = new MessagePortWebSocket("ws://actor.test", channel.port2);
+    try {
+      const response = await container.run(() => {
+        const pair = new container.globals.WebSocketPair();
+        container.state.acceptWebSocket(pair[1]);
+        pair[1].send("initial state");
+        return new Response(null, { status: 101, webSocket: pair[0] });
+      });
+      await container.waitOutputLocks();
+      const runtime = upgradeWebSocket(response)!;
+      const received: MessagePortWebSocketData[] = [];
+      client.addEventListener("message", (event) => received.push(event.data));
+
+      bridgeWebSocket(runtime, bridge);
+      await vi.waitFor(() => expect(received).toEqual(["initial state"]));
+    } finally {
+      bridge.close();
+      client.close();
+      container.abort();
+      globalThis.Request = NativeRequest;
+      globalThis.Response = NativeResponse;
+    }
   });
 
   it("refuses a runtime socket after its MessagePort transport closed", () => {

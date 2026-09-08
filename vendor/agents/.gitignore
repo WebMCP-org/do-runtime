@@ -153,6 +153,7 @@ packages/*/docs
 .react-router
 # Vitest browser test screenshots
 __screenshots__
+.vitest-attachments/
 
 # Playwright test artifacts
 test-results/

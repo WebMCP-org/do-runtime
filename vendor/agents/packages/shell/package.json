@@ -20,6 +20,10 @@
   },
   "types": "dist/index.d.ts",
   "exports": {
+    "./browser": {
+      "types": "./dist/browser/index.d.ts",
+      "import": "./dist/browser/index.js"
+    },
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
@@ -43,6 +47,7 @@
   },
   "scripts": {
     "build": "tsx ./scripts/build.ts",
+    "test:browser": "vitest run -c src/browser-tests/vitest.config.ts --retry=0",
     "test": "vitest run",
     "test:watch": "vitest"
   },

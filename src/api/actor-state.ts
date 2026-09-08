@@ -61,7 +61,12 @@ import type {
   WriteOptions,
 } from "../io/actor-cache";
 import type { IoContext } from "../io/io-context";
-import { requireInputLock, setUserErrorDetail } from "../io/io-context";
+import {
+  EXCEPTION_DURABLE_OBJECT_ABORT,
+  EXCEPTION_DURABLE_OBJECT_ABORT_NO_RETRY,
+  requireInputLock,
+  setUserErrorDetail,
+} from "../io/io-context";
 import type { FacetManager, FacetStartInfo } from "../io/worker";
 import type { SqliteKv, SqliteKvListCursor } from "../util/sqlite-kv";
 import type { SqliteDatabase } from "../util/sqlite";
@@ -1092,7 +1097,7 @@ export class DurableObjectState implements globalThis.DurableObjectState {
    * so the caller's own slice keeps running to its next await, where `IoContext`
    * refuses to re-enter.
    */
-  abort(reason?: string): void {
+  abort(reason?: string, options?: DurableObjectAbortOptions): void {
     const description =
       reason === undefined
         ? "broken.outputGateBroken; jsg.Error: Application called abort() to reset Durable Object."
@@ -1102,6 +1107,10 @@ export class DurableObjectState implements globalThis.DurableObjectState {
     // tells `isAlarmFailureUserError` that this reset was the application's doing, so an alarm
     // handler that aborts is retried a bounded number of times rather than forever.
     setUserErrorDetail(error);
+    Object.defineProperty(error, EXCEPTION_DURABLE_OBJECT_ABORT, { value: true });
+    if (options?.retryAlarm === false) {
+      Object.defineProperty(error, EXCEPTION_DURABLE_OBJECT_ABORT_NO_RETRY, { value: true });
+    }
 
     // "Make sure we _synchronously_ break storage so that there's no chance our promise fulfilling
     // will race against the output gate, possibly allowing writes to complete before being

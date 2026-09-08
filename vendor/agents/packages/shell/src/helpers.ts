@@ -645,3 +645,11 @@ function formatUnified(
 
   return output.join("\n");
 }
+
+export function getGlobPrefix(pattern: string): string {
+  const first = pattern.search(/[*?[{]/);
+  if (first === -1) return pattern;
+  const before = pattern.slice(0, first);
+  const lastSlash = before.lastIndexOf("/");
+  return lastSlash >= 0 ? before.slice(0, lastSlash + 1) : "/";
+}

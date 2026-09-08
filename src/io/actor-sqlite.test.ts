@@ -56,7 +56,13 @@ import type {
   RunAlarmHandler,
   WriteOptions,
 } from "./actor-cache";
-import { ActorSqlite } from "./actor-sqlite";
+import { ActorSqlite, DEFAULT_ALARM_OUTLET } from "./actor-sqlite";
+
+test("unconfigured alarms fail synchronously with the upstream diagnostic", () => {
+  expect(() => DEFAULT_ALARM_OUTLET.scheduleRun(1, Promise.resolve())).toThrow(
+    "Alarms have not been configured for this Durable Object.",
+  );
+});
 
 const oneMs = 1;
 const twoMs = 2;

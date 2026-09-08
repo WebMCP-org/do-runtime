@@ -236,6 +236,7 @@ describe("handler dispatch and close state", () => {
       close: { code: 4001, reason: "bye", wasClean: true },
       readyState: 2,
       listedDuringHandler: false,
+      tagsDuringHandler: ["socket"],
       sendAfterPeerClose: null,
       reciprocalClose: null,
     });
@@ -258,6 +259,7 @@ describe("handler dispatch and close state", () => {
       close: { code: 4002, reason: "server out", wasClean: true },
       readyState: 3,
       listedDuringHandler: false,
+      tagsDuringHandler: ["socket"],
       sendAfterPeerClose: {
         name: "TypeError",
         message: "Can't call WebSocket send() after close().",

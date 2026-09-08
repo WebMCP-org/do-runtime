@@ -88,7 +88,11 @@
       "types": "./dist/conformance/host.d.ts",
       "import": "./dist/conformance.js"
     },
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./browser/async-hooks": {
+      "types": "./dist/src/browser/async-hooks.d.ts",
+      "import": "./dist/browser/async-hooks.js"
+    }
   },
   "scripts": {
     "sdk:setup": "pnpm --dir vendor/agents install --frozen-lockfile --ignore-scripts && pnpm sdk:build",
@@ -137,7 +141,7 @@
     "@arethetypeswrong/cli": "0.18.5",
     "@changesets/cli": "^2.29.8",
     "@cloudflare/vitest-pool-workers": "^0.18.8",
-    "@cloudflare/workers-types": "5.20260820.1",
+    "@cloudflare/workers-types": "5.20260907.1",
     "@sqlite.org/sqlite-wasm": "3.53.0-build1",
     "@types/node": "^26.1.2",
     "@types/ungap__structured-clone": "1.2.0",
@@ -148,7 +152,7 @@
     "publint": "0.3.23",
     "typescript": "^5.9.3",
     "vitest": "4.1.10",
-    "workerd": "1.20260820.1",
+    "workerd": "1.20260907.1",
     "wrangler": "^4.114.0"
   },
   "engines": {

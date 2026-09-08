@@ -825,7 +825,23 @@ test("wasmModules: wasm bytes are carried as a wasmModule", async () => {
   const source = await h.channel.isolates.get("wasm")?.started;
   const content = modulesOf(source as DynamicWorkerSource).modules[1]?.content;
   expect(content?.type).toBe("wasmModule");
-  expect(content?.type === "wasmModule" && [...content.body]).toEqual([...wasm]);
+  expect(content?.type === "wasmModule" && content.body).toEqual(wasm);
+});
+
+test.each([false, true])("compiled Wasm modules are shared with the isolate: nested=%s", async (nested) => {
+  // ← workerd 9cdf380, worker-loader-wasm-test.js: direct and { wasm: module } forms.
+  const h = newHarness();
+  const compiled = new WebAssembly.Module(new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0]));
+  await h.run(() =>
+    h.loader.get("compiled-wasm", () => code({
+      modules: { "foo.js": "", "math.wasm": nested ? { wasm: compiled } : compiled },
+    })),
+  );
+  const source = await h.channel.isolates.get("compiled-wasm")?.started;
+  const content = modulesOf(source as DynamicWorkerSource).modules[1]?.content;
+  expect(content?.type).toBe("wasmModule");
+  expect(content?.type === "wasmModule" && content.body).toBe(compiled);
+  expect(new WebAssembly.Instance(compiled).exports).toEqual({});
 });
 
 test("a string module is an ES module when it ends in .js", async () => {
@@ -962,7 +978,7 @@ test("codeLoaderException: what the callback throws is what the load fails with"
 // =======================================================================================
 // `noMixedJsPythonModules`, its mirror, and the TypeScript suggestion
 
-test("noMixedJsPythonModules: a JS module under a Python main module is refused", async () => {
+test("Python workers can include JS modules from Python packages", async () => {
   const h = newHarness();
   await h.run(() =>
     h.loader.get("mixed", () =>
@@ -973,9 +989,8 @@ test("noMixedJsPythonModules: a JS module under a Python main module is refused"
     ),
   );
 
-  await expect(h.channel.isolates.get("mixed")?.started).rejects.toThrow(
-    jsModuleInPythonWorkerMessage("foo.js"),
-  );
+  const source = await h.channel.isolates.get("mixed")?.started;
+  expect(modulesOf(source as DynamicWorkerSource).modules[1]?.content.type).toBe("esModule");
 });
 
 test("noMixedJsPythonModules2: a Python module under a JS main module is refused", async () => {
@@ -1006,7 +1021,26 @@ test("pythonBasics: a .py main module makes the source Python", async () => {
   const variant = modulesOf(source as DynamicWorkerSource);
   expect(variant.isPython).toBe(true);
   expect(variant.modules[0]?.content.type).toBe("pythonModule");
+  expect(source?.compatibilityFlags.compatibilityFlags).toEqual([
+    "python_workers",
+    "disable_python_external_sdk",
+  ]);
 });
+
+test.each(["enable_python_external_sdk", "disable_python_external_sdk"])(
+  "Python flag injection preserves explicit %s and the caller's flags",
+  async (sdkFlag) => {
+    const h = newHarness();
+    const compatibilityFlags = Object.freeze(["python_workers", sdkFlag]);
+    await h.run(() => h.loader.get("python-flags", () => code({
+      compatibilityFlags,
+      mainModule: "foo.py",
+      modules: { "foo.py": "class Default: pass" },
+    })));
+    const source = await h.channel.isolates.get("python-flags")?.started;
+    expect(source?.compatibilityFlags.compatibilityFlags).toEqual(compatibilityFlags);
+  },
+);
 
 test("suggestWorkerBundlerForTypeScriptModules: all three extensions get the bundler suggestion", async () => {
   for (const mainModule of ["main.ts", "main.tsx", "main.jsx"]) {
@@ -1038,7 +1072,7 @@ test("a string module with an unrecognised extension gets the plain message, NOT
   );
 });
 
-test("a cjs module under a Python main module is refused too", async () => {
+test("Python workers can include CommonJS modules", async () => {
   const h = newHarness();
   await h.run(() =>
     h.loader.get("cjsMixed", () =>
@@ -1049,9 +1083,8 @@ test("a cjs module under a Python main module is refused too", async () => {
     ),
   );
 
-  await expect(h.channel.isolates.get("cjsMixed")?.started).rejects.toThrow(
-    jsModuleInPythonWorkerMessage("helper.cjs"),
-  );
+  const source = await h.channel.isolates.get("cjsMixed")?.started;
+  expect(modulesOf(source as DynamicWorkerSource).modules[1]?.content.type).toBe("commonJsModule");
 });
 
 test("an object py module counts as a Python module wherever it sits", async () => {
@@ -1265,7 +1298,7 @@ test("resizableArrayBufferWasmModule: wasm bytes survive it too", async () => {
 
   const source = await h.channel.anonymous[0]?.started;
   const content = modulesOf(source as DynamicWorkerSource).modules[1]?.content;
-  expect(content?.type === "wasmModule" && [...content.body]).toEqual([...bytes]);
+  expect(content?.type === "wasmModule" && content.body).toEqual(bytes);
 });
 
 test("a view over a larger buffer copies only its own window", async () => {

@@ -72,7 +72,7 @@ import type {
 import { Counter, type CounterEnv } from "./counter";
 
 // =======================================================================================
-// Raw platform timers, captured before anything else in this module can run
+// Raw platform primitives, captured before anything else in this module can run
 //
 // `installActorScope` REPLACES `globalThis.setTimeout` with the container's
 // gated one, and the container's gated one is built ON the `Timer` port below.
@@ -81,13 +81,14 @@ import { Counter, type CounterEnv } from "./counter";
 // → `#arm` — which the runtime measured as `RangeError: Maximum call stack size
 // exceeded` the first time its own primitives were pointed at themselves.
 //
-// The general rule, and it is the reason these two lines are the first
+// The general rule, and it is the reason these captures are the first
 // statements in the file: everything BELOW the runtime in one realm has to reach
 // the platform's timers, either by capturing them here or by running before the
 // scope is installed. `installSubstrate` does the second for sqlite.
 
 const rawSetTimeout = globalThis.setTimeout.bind(globalThis);
 const rawClearTimeout = globalThis.clearTimeout.bind(globalThis);
+const rawFetch = globalThis.fetch.bind(globalThis);
 
 /**
  * The clock and the delay the runtime and the scheduler both run on, over the
@@ -258,6 +259,7 @@ class ExtensionFacetHost implements FacetHost {
           alarms: DEFAULT_ALARM_OUTLET,
           facets: this,
           timer,
+          fetch: rawFetch,
         },
         facet: { depth: request.depth, id: request.id, tree },
       });
@@ -570,9 +572,8 @@ async function place(): Promise<Live> {
       facets,
       timer,
       hibernation,
-      // `ports.fetch` is deliberately omitted, which is upstream's
-      // `globalOutbound: null` posture: `fetch` inside the actor refuses BY NAME
-      // rather than reaching an ungated one that would appear to work.
+      // Actor globals wrap this native outlet to gate outgoing MCP/OAuth I/O.
+      fetch: rawFetch,
     },
     webSockets: hibernation.snapshot(),
   });
@@ -780,6 +781,22 @@ class HostTarget extends RpcTarget implements HostRpc {
 
   async scheduledSubAgentValue(): Promise<number> {
     return await (await placed()).entry.scheduledSubAgentValue();
+  }
+
+  async startMcpProbe(origin: string) {
+    return await (await placed()).entry.startMcpProbe(origin);
+  }
+
+  async finishMcpProbe(): Promise<unknown> {
+    return await (await placed()).entry.finishMcpProbe();
+  }
+
+  async deliverMcpProbeCallback(url: string): Promise<unknown> {
+    const { container, entry } = await placed();
+    const response = await entry.fetch(gateRequestBody(container, new Request(url)));
+    const result: unknown = await response.json();
+    if (!response.ok) throw new Error(`OAuth callback failed: ${JSON.stringify(result)}`);
+    return result;
   }
 
   async startThink(name: string, text: string): Promise<void> {

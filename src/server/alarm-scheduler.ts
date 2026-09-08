@@ -18,11 +18,12 @@
  * below is that adapter, so a host composes the two instead of writing its own
  * ladder.
  *
- * **One deliberate divergence, and it is the table's shape.** Upstream keeps the
- * retry ladder in memory and reloads every alarm with its counters at zero,
- * which is right for a process that lives for hours and is a regression on a
- * service worker Chrome evicts after seconds — see `_cf_ALARM` below and the
- * README's divergence table. Everything else here is upstream's, line for line.
+ * **Deliberate divergences for short-lived hosts.** Retry counters and pending
+ * wakes persist in `_cf_ALARM` so worker eviction does not reset the ladder.
+ * Failed start and completion bookkeeping also retries on the live scheduler's
+ * timer, retaining completed handler results until cleanup succeeds. Abandonment
+ * preserves newer actor alarms and their durable rows. See the implementation
+ * comments below and the README's divergence table for these differences.
  *
  * Spec: §1.8, §2.6, decisions 6, 11 and 16 in
  * docs/decisions.md.
@@ -209,6 +210,7 @@ export type EventOutcome =
   | "canceled"
   | "script-not-found"
   | "exception"
+  | "aborted"
   | "exceeded-cpu"
   | "unknown";
 
@@ -276,7 +278,8 @@ export type AlarmSchedulerOptions = {
    * that projection until completion, retry, or abandonment bookkeeping finishes,
    * even if cancellation removes their entry meanwhile. Their count is reported
    * separately so a host can also wait for deliveries newer than its consumed wake.
-   * Failed bookkeeping leaves the retained alarm projected as due for recovery.
+   * Failed bookkeeping leaves the retained alarm projected as due and retries
+   * its cleanup on the scheduler timer without delivering the handler again.
    * Workerd needs no such seam because its process owns the scheduler timer.
    */
   projectWake?: (scheduledTime: number | null, activeDeliveries: number) => Promise<void> | void;
@@ -321,12 +324,6 @@ type ScheduledAlarm = {
   backoff: number;
   /** Counter for retry attempts that apply to the retry limit. */
   countedRetry: number;
-};
-
-/** ← `AlarmScheduler::RetryInfo` (`alarm-scheduler.h:103-106`). */
-type RetryInfo = {
-  readonly retry: boolean;
-  readonly retryCountsAgainstLimit: boolean;
 };
 
 /**
@@ -622,23 +619,15 @@ export class AlarmScheduler {
     }
   }
 
-  /** ← `runAlarm` (`alarm-scheduler.c++:158-164`). */
-  async #runAlarm(actorId: string, scheduledTime: number, retryCount: number): Promise<RetryInfo> {
-    const result = await this.#getActor(actorId).deliverAlarm(scheduledTime, retryCount);
-    return {
-      retry: result.outcome !== "ok" && result.retry,
-      retryCountsAgainstLimit: result.retryCountsAgainstLimit,
-    };
-  }
-
   /** ← the try/catch lambda around `runAlarm` (`alarm-scheduler.c++:197-211`). */
   async #runAlarmGuarded(
     actorId: string,
     scheduledTime: number,
     retryCount: number,
-  ): Promise<RetryInfo> {
+  ): Promise<AlarmResult> {
     try {
-      return await this.#runAlarm(actorId, scheduledTime, retryCount);
+      const result = await this.#getActor(actorId).deliverAlarm(scheduledTime, retryCount);
+      return { ...result, retry: result.outcome !== "ok" && result.retry };
     } catch (exception) {
       this.#taskFailed(exception);
       return {
@@ -647,12 +636,19 @@ export class AlarmScheduler {
         // the sandbox for any user-caused error. Let's not count this retry attempt against the
         // limit.
         retryCountsAgainstLimit: false,
+        outcome: "exception",
       };
     }
   }
 
   /** ← `makeAlarmTask` (`alarm-scheduler.c++:187-287`). */
-  async #makeAlarmTask(delay: number, entry: ScheduledAlarm, scheduledTime: number): Promise<void> {
+  async #makeAlarmTask(
+    delay: number,
+    entry: ScheduledAlarm,
+    scheduledTime: number,
+    completed?: AlarmResult,
+    bookkeepingBackoff = 0,
+  ): Promise<void> {
     const actorId = entry.actorId;
     await this.#checkTimestamp(delay, scheduledTime, entry.cancel.signal);
 
@@ -660,24 +656,21 @@ export class AlarmScheduler {
     // dropping the entry destroyed this task before it could resume; this is that cancellation.
     if (this.#alarms.get(actorId) !== entry) return;
 
-    // Before the delivery, so that a worker that dies during it leaves the mark behind. A failure
-    // to write it refuses the delivery rather than running one nothing can notice the end of: the
-    // row is untouched, so the alarm is still due and a later scheduler picks it up unchanged. The
-    // entry is left WAITING with no task, which a `setAlarm` re-arms; a metadata database this
-    // scheduler cannot write is already failing every `setAlarm` too.
+    let retryInfo = completed;
     try {
-      this.#db.run(STMT.markRunning, actorId);
-    } catch (exception) {
-      this.#taskFailed(exception);
-      return;
-    }
-
-    entry.status = "STARTED";
-    entry.wakeTime = null;
-    this.#activeDeliveries.add(entry);
-    try {
-      this.#projectNextWake();
-      const retryInfo = await this.#runAlarmGuarded(actorId, scheduledTime, entry.countedRetry);
+      if (retryInfo === undefined) {
+        // Refuse delivery until its running mark is durable. A transient write
+        // failure retries this start, not an unrecorded handler invocation.
+        this.#db.run(STMT.markRunning, actorId);
+        entry.status = "STARTED";
+        entry.wakeTime = null;
+        this.#activeDeliveries.add(entry);
+        this.#projectNextWake();
+        retryInfo = await this.#runAlarmGuarded(actorId, scheduledTime, entry.countedRetry);
+      } else {
+        this.#activeDeliveries.add(entry);
+        this.#projectNextWake();
+      }
 
       // ← `:214`'s second `KJ_ASSERT_NONNULL`, which upstream reaches by way of its outer catch when
       // `deleteAll()` cleared the map during the run.
@@ -701,7 +694,6 @@ export class AlarmScheduler {
         // creating a new alarm and overwriting the old one will reset
         // `status` to WAITING and `queuedAlarm` to null
         this.#replace(entry, this.#scheduleAlarm(this.#timer.now(), actorId, queued));
-        this.#projectNextWake();
         return;
       }
 
@@ -717,55 +709,61 @@ export class AlarmScheduler {
           await this.#abandon(entry, scheduledTime);
           return;
         }
-        if (retryInfo.retryCountsAgainstLimit) {
-          entry.countedRetry += 1;
+        const countedRetry = entry.countedRetry + (retryInfo.retryCountsAgainstLimit ? 1 : 0);
+        let backoff = entry.backoff;
+        if (retryInfo.retryCountsAgainstLimit && !entry.previousRetryCountedAgainstLimit) {
+          // The last retry didn't count against the limit, indicating it was due to some internal
+          // error. However, this retry does, meaning it's due to an error in user code,
+          // most likely a different error. We should reset the retry counter used for
+          // calculating backoff, so user-caused retries don't have an unnecessarily high backoff
+          // time if they come after internal-caused retries.
 
-          if (!entry.previousRetryCountedAgainstLimit) {
-            // The last retry didn't count against the limit, indicating it was due to some internal
-            // error. However, this retry does, meaning it's due to an error in user code,
-            // most likely a different error. We should reset the retry counter used for
-            // calculating backoff, so user-caused retries don't have an unnecessarily high backoff
-            // time if they come after internal-caused retries.
-
-            entry.backoff = 0;
-          }
+          backoff = 0;
         }
-        entry.previousRetryCountedAgainstLimit = retryInfo.retryCountsAgainstLimit;
-
-        entry.backoff = Math.min(RETRY_BACKOFF_MAX, entry.backoff);
-        let retryDelay = alarmRetryDelayMs(entry.backoff);
+        backoff = Math.min(RETRY_BACKOFF_MAX, backoff);
+        let retryDelay = alarmRetryDelayMs(backoff);
 
         retryDelay += this.#jitterMsForDelay(retryDelay);
 
-        entry.backoff += 1;
+        backoff += 1;
         // Persisted before the task is armed, and it also clears `running`, so the two facts a
         // restart needs — that this delivery ended, and where the ladder now stands — are one
-        // write. If it throws, the outer catch records it and the mark stays set, which a later
-        // scheduler reads as an interrupted delivery: the alarm keeps its counters and is retried,
-        // rather than being armed here in memory the process is about to lose.
+        // write. Publish the counters only after it succeeds, so retrying this
+        // bookkeeping cannot charge the same handler result a second time.
         const retryTime = this.#timer.now() + retryDelay;
         this.#db.run(
           STMT.saveRetry,
           retryTime,
-          entry.backoff,
-          entry.countedRetry,
-          entry.previousRetryCountedAgainstLimit ? 1 : 0,
+          backoff,
+          countedRetry,
+          retryInfo.retryCountsAgainstLimit ? 1 : 0,
           actorId,
         );
-
+        entry.backoff = backoff;
+        entry.countedRetry = countedRetry;
+        entry.previousRetryCountedAgainstLimit = retryInfo.retryCountsAgainstLimit;
         entry.wakeTime = retryTime;
         entry.task = this.#makeAlarmTask(retryDelay, entry, scheduledTime);
-        this.#projectNextWake();
       } else {
         if (entry.queuedAlarm !== null) {
           throw new Error("An alarm that will not retry still has an alarm queued behind it.");
         }
-        this.deleteAlarm(actorId);
+        if (retryInfo.outcome === "aborted") await this.#abandon(entry, scheduledTime);
+        else this.deleteAlarm(actorId);
       }
     } catch (exception) {
-      // ← `KJ_LOG(ERROR, "Failed to run alarm and was unable to schedule a retry", exception)`.
       this.#taskFailed(exception);
-      if (this.#alarms.get(actorId) === entry) entry.status = "FINISHED";
+      if (this.#alarms.get(actorId) === entry) {
+        // Unlike workerd's retained-but-unarmed failure path, an MV3 host
+        // needs this owner to make progress while it remains alive. Reuse the
+        // timer with bounded backoff; keep the due projection until cleanup
+        // is durable, and carry the result so the handler is not redelivered.
+        entry.status = retryInfo === undefined ? "WAITING" : "FINISHED";
+        const backoff = Math.min(RETRY_BACKOFF_MAX, bookkeepingBackoff);
+        let retryDelay = alarmRetryDelayMs(backoff);
+        retryDelay += this.#jitterMsForDelay(retryDelay);
+        entry.task = this.#makeAlarmTask(retryDelay, entry, scheduledTime, retryInfo, backoff + 1);
+      }
     } finally {
       this.#activeDeliveries.delete(entry);
       try {
@@ -777,7 +775,7 @@ export class AlarmScheduler {
   }
 
   /**
-   * ← the `countedRetry >= RETRY_MAX_TRIES` block (`alarm-scheduler.c++:237-253`).
+   * ← `AlarmScheduler::abandonAlarm`, shared by exhausted retries and terminal aborts.
    *
    * Its comment, verbatim, because the second half is the whole point: "Notify
    * the actor to clear its in-memory alarm state so getAlarm() reflects the
@@ -789,7 +787,7 @@ export class AlarmScheduler {
    * **Divergence: the returned time is not ignored** (upstream's
    * `.ignoreResult()`, `:244`). Upstream is right that the newer alarm normally
    * arrives on its own — `ActorSqlite` reports it through `scheduleRun`, and it
-   * lands in `queuedAlarm`, which `deleteAlarm` below then reschedules for. But
+   * lands in `queuedAlarm`, which the cleanup below then promotes. But
    * that is a race, not an invariant: `abandonAlarm` reads the actor's committed
    * metadata, and there is a window in which the actor's alarm is newer than
    * anything the scheduler has been told about. In that window upstream's
@@ -797,19 +795,23 @@ export class AlarmScheduler {
    * only comes back if a later commit happens to re-announce it. Re-registering
    * what `abandonAlarm` reports closes the window, is a no-op whenever the
    * queued alarm already covered it, and takes the side that preserves the alarm.
+   * The newer row is retained while its running mark is cleared; deleting it
+   * before rescheduling would make a failed replacement unrecoverable.
    */
   async #abandon(entry: ScheduledAlarm, scheduledTime: number): Promise<void> {
     const actorId = entry.actorId;
-    let newerAlarm: number | null;
-    try {
-      newerAlarm = await this.#getActor(actorId).abandonAlarm(scheduledTime);
-    } catch (exception) {
-      this.#taskFailed(exception);
-      return;
-    }
-    this.deleteAlarm(actorId);
-    if (newerAlarm !== null && !this.#alarms.has(actorId)) {
+    const newerAlarm = await this.#getActor(actorId).abandonAlarm(scheduledTime);
+    // The entry may have been canceled or replaced while cleanup was pending.
+    if (this.#alarms.get(actorId) !== entry) return;
+    if (newerAlarm !== null && entry.queuedAlarm === null) {
       this.setAlarm(actorId, newerAlarm);
+    }
+    if (entry.queuedAlarm !== null) {
+      // Keep the replacement's durable row: deleteAlarm() would erase it.
+      this.#db.run(STMT.clearRunning, actorId);
+      this.#replace(entry, this.#scheduleAlarm(this.#timer.now(), actorId, entry.queuedAlarm));
+    } else {
+      this.deleteAlarm(actorId);
     }
   }
 

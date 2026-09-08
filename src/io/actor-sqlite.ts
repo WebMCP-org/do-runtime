@@ -106,7 +106,7 @@ export interface AlarmOutlet {
 /** ← `ActorSqlite::Hooks::DEFAULT`, whose `scheduleRun` refuses. */
 export const DEFAULT_ALARM_OUTLET: AlarmOutlet = {
   scheduleRun(): Promise<void> {
-    throw new Error("alarms are not yet implemented for SQLite-backed Durable Objects");
+    throw new Error("Alarms have not been configured for this Durable Object.");
   },
 };
 

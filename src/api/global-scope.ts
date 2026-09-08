@@ -43,11 +43,14 @@
  */
 
 import {
+  EXCEPTION_DURABLE_OBJECT_ABORT,
+  EXCEPTION_DURABLE_OBJECT_ABORT_NO_RETRY,
   hasUserErrorDetail,
   isExceptionFromInputGateBroken,
   tryCurrentSlice,
   type IoContext,
 } from "../io/io-context";
+import { onAbort } from "../io/io-gate";
 import { gateResponseBody } from "./http";
 import {
   installWebSocketGlobals,
@@ -119,6 +122,20 @@ export function isAlarmFailureUserError(exception: unknown): boolean {
   return false;
 }
 
+/** ← `inspectAlarmException`: a gate failure may hide the original abort details. */
+export function inspectAlarmException(
+  exception: unknown,
+  context: IoContext,
+): { isAbort: boolean; retry: boolean } {
+  const errors = [exception, context.getAbortReason()].filter(
+    (value): value is Record<symbol, unknown> => typeof value === "object" && value !== null,
+  );
+  return {
+    isAbort: errors.some((error) => error[EXCEPTION_DURABLE_OBJECT_ABORT] === true),
+    retry: !errors.some((error) => error[EXCEPTION_DURABLE_OBJECT_ABORT_NO_RETRY] === true),
+  };
+}
+
 // =======================================================================================
 // The async primitives an application reaches
 
@@ -166,10 +183,11 @@ export class Scheduler {
     }
 
     // ← the `signal` branch below `paf`: aborting clears the timeout and rejects.
-    options?.signal?.addEventListener("abort", () => {
+    const removeAbort = onAbort(options?.signal, () => {
       this.#scope.clearTimeout(id);
-      reject(abortReasonOf(options.signal));
+      reject(abortReasonOf(options?.signal));
     });
+    void promise.then(removeAbort, removeAbort);
 
     return promise;
   }
@@ -318,6 +336,10 @@ export type ActorGlobalScopeOptions = {
 export const NO_GLOBAL_OUTBOUND_MESSAGE =
   "fetch(): this actor has no global outbound, so an ambient fetch cannot be gated.";
 
+export const OUTBOUND_WEBSOCKET_UNGATABLE_MESSAGE =
+  "new WebSocket(): outbound network connections cannot be gated by this runtime. " +
+  "Supply a host-owned RawWebSocket or use WebSocketPair.";
+
 /**
  * The message a scope answers with when it is reached from another actor's
  * slice. Exported because the failure it names is the one thing about this layer
@@ -352,6 +374,11 @@ export class ActorGlobalScope {
     this.#fetch = options.fetch;
     this.#readCurrentExternalEntry = options.currentExternalEntry;
     installWebSocketGlobals(this, options.webSockets.WebSocketPair);
+    this.WebSocket = new Proxy(this.WebSocket, {
+      construct(): never {
+        throw new Error(OUTBOUND_WEBSOCKET_UNGATABLE_MESSAGE);
+      },
+    });
     this.scheduler = new Scheduler(this);
     this.crypto = new GatedCrypto(
       (op) => {
@@ -540,7 +567,9 @@ export function actorScopeBindings(resolve: () => ActorGlobalScope): ActorScopeB
     },
     fetch: (input, init) => resolve().fetch(input, init),
     crypto: scopeCrypto(resolve),
-    WebSocket: globalThis.WebSocket,
+    WebSocket: new Proxy(globalThis.WebSocket, {
+      construct: (_target, args) => Reflect.construct(resolve().WebSocket, args),
+    }),
     WebSocketPair: BoundWebSocketPair,
     WebSocketRequestResponsePair,
     get currentExternalEntry(): object | undefined {
