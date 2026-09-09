@@ -1,3 +1,6 @@
+import { streamText, tool, type LanguageModel } from "ai";
+import { z } from "zod";
+import { bindInferenceContext } from "../inference-context";
 import {
   IoContext,
   tryCurrentIoContext,
@@ -127,5 +130,81 @@ export async function tracedStream(context: IoContext) {
           return { values, consumer: currentRequest() };
         })
       )
+  };
+}
+
+export function inferenceInvocation(
+  name: string,
+  model: LanguageModel,
+  streaming: boolean
+) {
+  const observations: Array<{ phase: string; request: string | undefined }> =
+    [];
+  const observe = (phase: string) =>
+    observations.push({ phase, request: currentRequest() });
+  const started = Promise.withResolvers<void>();
+  const resume = Promise.withResolvers<void>();
+  const options = inInvocation({}, name, () =>
+    bindInferenceContext({
+      model,
+      prompt: "report progress",
+      tools: {
+        report: tool({
+          inputSchema: z.object({}),
+          execute: streaming
+            ? async function* () {
+                try {
+                  observe("execute");
+                  started.resolve();
+                  await resume.promise;
+                  observe("resumed");
+                  yield "snapshot";
+                  await Promise.resolve();
+                  yield "milestone";
+                } finally {
+                  await Promise.resolve();
+                  observe("cleanup");
+                }
+              }
+            : async () => {
+                observe("execute");
+                started.resolve();
+                await resume.promise;
+                observe("resumed");
+                return "milestone";
+              }
+        })
+      },
+      prepareStep: async () => {
+        await Promise.resolve();
+        observe("prepareStep");
+      },
+      onChunk: async () => {
+        await Promise.resolve();
+        observe("onChunk");
+      },
+      onStepFinish: async () => {
+        await Promise.resolve();
+        observe("onStepFinish");
+      },
+      onFinish: async () => {
+        await Promise.resolve();
+        observe("onFinish");
+      }
+    })
+  );
+  // The consumer starts outside the originating invocation, like native streams.
+  const result = streamText(options);
+  const finished = result.consumeStream({
+    onError: (error) => {
+      throw error;
+    }
+  });
+  return {
+    started: started.promise,
+    resume: resume.resolve,
+    finished,
+    observations,
+    result
   };
 }
