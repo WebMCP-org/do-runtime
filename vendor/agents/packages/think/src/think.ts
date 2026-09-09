@@ -83,6 +83,7 @@
  * ```
  */
 
+import { bindInferenceContext } from "./inference-context";
 import { AsyncLocalStorage } from "node:async_hooks";
 import * as aiSdk from "ai";
 import type {
@@ -6233,13 +6234,14 @@ export class Think<
       crossMajorOptions[agentsAISDKInvocationBounded] = true;
     }
 
+    const boundStreamTextOptions = bindInferenceContext(streamTextOptions);
     const inferenceStreamText = wrapAISDK(aiSdk, {
       storeMessages: this.storeMessages,
       storeTools: this.storeTools
     }).streamText;
 
     return () => {
-      const result = inferenceStreamText(streamTextOptions);
+      const result = inferenceStreamText(boundStreamTextOptions);
 
       const outputPromise = wantsStructuredOutput
         ? // Structured workflow result = the `final_answer` tool call's INPUT

@@ -5,6 +5,21 @@ shim could not cover it, and whether it is upstreamable. The measured footprint
 lives in [the vendor fork audit](audit/vendor-fork-audit.md); do not duplicate a count
 here that drifts on every refresh.
 
+## 2026-09-07 — Bind inference callbacks to their admitted turn
+
+- `packages/think/src/inference-context.ts` and `think.ts` capture the admitted
+  turn when inference options are prepared, then restore it around AI SDK
+  callbacks and tool iterator operations. Native browser streams invoke tools
+  outside their creator's async scope; compiler-assisted awaits alone cannot
+  recover a scope missing at callback entry. This is upstreamable SDK ownership:
+  a host cannot bind Think's private inference callbacks or admitted-turn store.
+- `packages/think/src/browser-tests/async-context*` runs real AI SDK streams
+  with the mock model, overlapping turns and ordinary/streaming tools. It checks
+  model hooks, tool progress context, cleanup and absence of leaked context.
+  Both new cases fail without the binding. Pre-optimize the AI test dependencies
+  in `vitest.config.ts` so discovery cannot reload an active regression.
+- The Think changeset and browser compatibility guide record the boundary.
+
 ## 2026-09-07 — Browser async context, outbound MCP and Shell OPFS
 
 - `packages/shell/src/browser/` extracts the generic native filesystem from
