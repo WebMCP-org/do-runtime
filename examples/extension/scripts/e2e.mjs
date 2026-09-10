@@ -566,6 +566,48 @@ async function main() {
     check("the Think model completed once", completedThinkStatus.inferenceCompletions, 1);
     check("the Think turn left no recovery fiber", completedThinkStatus.fiberRows, 0);
 
+    const toolTurn = await op(popup, "submitThink", ["tools", "Create a checkpoint", "tool-turn"]);
+    const toolStatus = await pollOp(popup, "thinkStatus", ["tools"], (status) =>
+      status.submissions.some(
+        (submission) =>
+          submission.submissionId === toolTurn.submissionId && submission.status === "completed",
+      ),
+    );
+    check(
+      "model-selected action stored its title",
+      toolStatus.checkpointTitle,
+      "Model-created checkpoint",
+    );
+    check("model-selected action created exactly one schedule", toolStatus.checkpoints.length, 1);
+    check(
+      "model received a successful action result",
+      toolStatus.toolResults[0]?.state,
+      "output-available",
+    );
+    check(
+      "model received the persisted schedule id",
+      toolStatus.toolResults[0]?.output?.scheduleId,
+      toolStatus.checkpoints[0]?.id,
+    );
+    await worker.evaluate(async () => chrome.offscreen.closeDocument());
+    await ensureHost(popup);
+    const restoredTools = await op(popup, "thinkStatus", ["tools"]);
+    check(
+      "action title survives full host recreation",
+      restoredTools.checkpointTitle,
+      toolStatus.checkpointTitle,
+    );
+    check(
+      "action schedule survives without duplication",
+      JSON.stringify(restoredTools.checkpoints),
+      JSON.stringify(toolStatus.checkpoints),
+    );
+    check(
+      "successful tool result survives recreation",
+      JSON.stringify(restoredTools.toolResults),
+      JSON.stringify(toolStatus.toolResults),
+    );
+
     const stoppedThink = await op(popup, "submitThink", [
       "stopped",
       "Stop this deterministic turn partway through.",

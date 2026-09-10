@@ -67,6 +67,9 @@ export type ThinkProbeSubmission = {
 };
 
 export type ThinkProbeStatus = {
+  readonly checkpointTitle: string | null;
+  readonly checkpoints: readonly { id: string; payload: unknown }[];
+  readonly toolResults: readonly unknown[];
   readonly assistantMessages: number;
   readonly assistantText: string;
   readonly emittedChunks: number;
