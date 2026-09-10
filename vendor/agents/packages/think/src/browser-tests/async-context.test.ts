@@ -1,6 +1,8 @@
+import { MockLanguageModelV3 } from "ai/test";
 import { describe, expect, it } from "vitest";
 import {
   currentRequest,
+  inferenceInvocation,
   newContext,
   startInvocation,
   tracedStream
@@ -72,3 +74,71 @@ describe("browser SDK async context", () => {
     }
   );
 });
+
+it.each([false, true])(
+  "binds deferred model callbacks to overlapping turns with streaming=%s",
+  async (streaming) => {
+    const model = () =>
+      new MockLanguageModelV3({
+        doStream: async () => ({
+          stream: new ReadableStream({
+            start(controller) {
+              controller.enqueue({ type: "stream-start", warnings: [] });
+              controller.enqueue({
+                type: "tool-call",
+                toolCallId: "report-1",
+                toolName: "report",
+                input: "{}"
+              });
+              controller.enqueue({
+                type: "finish",
+                finishReason: { unified: "tool-calls", raw: "tool_calls" },
+                usage: {
+                  inputTokens: {
+                    total: 1,
+                    noCache: 1,
+                    cacheRead: 0,
+                    cacheWrite: 0
+                  },
+                  outputTokens: { total: 1, text: 1, reasoning: 0 }
+                }
+              });
+              controller.close();
+            }
+          })
+        })
+      });
+    const first = inferenceInvocation("first", model(), streaming);
+    const second = inferenceInvocation("second", model(), streaming);
+    await Promise.all([first.started, second.started]);
+    expect(currentRequest()).toBeUndefined();
+    second.resume();
+    await second.finished;
+    first.resume();
+    await first.finished;
+    for (const [name, invocation] of [
+      ["first", first],
+      ["second", second]
+    ] as const) {
+      const phases = invocation.observations.map(({ phase }) => phase);
+      expect(phases).toEqual(
+        expect.arrayContaining([
+          "prepareStep",
+          "execute",
+          "resumed",
+          "onChunk",
+          "onStepFinish",
+          "onFinish"
+        ])
+      );
+      if (streaming) expect(phases).toContain("cleanup");
+      expect(
+        invocation.observations.every(({ request }) => request === `/${name}`)
+      ).toBe(true);
+      expect(
+        (await invocation.result.toolResults).map(({ output }) => output)
+      ).toEqual(["milestone"]);
+    }
+    expect(currentRequest()).toBeUndefined();
+  }
+);

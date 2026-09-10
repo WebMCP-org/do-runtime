@@ -19,12 +19,16 @@ these package exports; its current release pins are unchanged by this work.
 static snapshots. The opt-in Vite await transform lowers async functions and
 generators so continuations can capture those scopes; native browser `await`
 cannot be shimmed by replacing `Promise.then` alone. Runtime admission, reentry,
-critical sections and timers preserve callback context.
+critical sections and timers preserve callback context. Think also snapshots its
+admitted turn when preparing inference options and binds model callbacks and
+tool iterator operations: native stream callbacks can begin outside that scope.
 
 The Think Chromium suite overlaps entries in one actor and separate actors,
 checks `getCurrentAgent()` after suspension/rejection, and consumes traced
 async generators from a different scope, including awaited early-return cleanup.
-The native test caller checks that no actor context leaks out. See
+Real AI SDK mock-model streams also overlap ordinary and streaming tool turns,
+checking inference hooks and resumed tool bodies. The native test caller checks
+that no actor context leaks out. See
 [the runtime setup and limits](../../../docs/browser-async-context.md).
 
 ## Outbound MCP and OAuth
