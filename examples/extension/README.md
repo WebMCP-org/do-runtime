@@ -123,7 +123,11 @@ cd examples/extension && node scripts/e2e.mjs
 
 It builds first, launches a headless Chromium with a throwaway profile in
 `.e2e-profile/`, loads `dist/` as an unpacked extension, and prints a `PASS`/`FAIL`
-line per assertion. It also runs a deterministic Think model through normal
+line per assertion. It also proves a streamed model-selected action receives its tool-call identity,
+stores a title and creates a schedule, returns a successful tool result, and
+retains that result and schedule across complete offscreen-host recreation.
+The model is a provider-boundary stub; action execution and storage are real.
+It also runs a deterministic Think model through normal
 completion, Stop, later reuse, and offscreen Worker teardown/recovery. It exits
 non-zero if any assertion fails.
 
