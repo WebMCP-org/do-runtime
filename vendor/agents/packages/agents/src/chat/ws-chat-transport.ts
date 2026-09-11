@@ -617,7 +617,12 @@ export class WebSocketChatTransport<
         }
       };
 
-      const done = (value: ReadableStream<UIMessageChunk> | null) => {
+      const done = (
+        value:
+          | ReadableStream<UIMessageChunk>
+          | Promise<ReadableStream<UIMessageChunk>>
+          | null
+      ) => {
         if (resolved) return;
         resolved = true;
         clearOwnedCallbacks();
@@ -939,7 +944,15 @@ export class WebSocketChatTransport<
   private _createResumeStream(
     requestId: string,
     resumeAcknowledged = false
-  ): ReadableStream<UIMessageChunk> {
+  ): Promise<ReadableStream<UIMessageChunk>> {
+    // AI SDK snapshots the hydrated assistant after reconnectToStream resolves.
+    // Wait for the first frame so the hook can clear a matching chunk-0 replay
+    // before that snapshot; clearing the visible messages later cannot reset
+    // AI SDK's private streaming buffer.
+    let resolveReady: (stream: ReadableStream<UIMessageChunk>) => void;
+    const ready = new Promise<ReadableStream<UIMessageChunk>>((resolve) => {
+      resolveReady = resolve;
+    });
     // Read agent at resolve time (not when reconnectToStream was called)
     // so chunk listener attaches to the latest socket after _pk changes.
     const agent = this.agent;
@@ -973,6 +986,7 @@ export class WebSocketChatTransport<
         activeIds?.delete(requestId);
       }
       chunkController.abort();
+      resolveReady(stream);
     };
 
     let streamController: ReadableStreamDefaultController<UIMessageChunk> | null =
@@ -998,7 +1012,7 @@ export class WebSocketChatTransport<
     };
     this._detachResumeStream = detachResumeStream;
 
-    return new ReadableStream<UIMessageChunk>({
+    const stream = new ReadableStream<UIMessageChunk>({
       start(controller) {
         streamController = controller;
         const batch = new ReplayChunkBatch(controller);
@@ -1036,6 +1050,7 @@ export class WebSocketChatTransport<
             }
 
             applyChatResponseFrame(batch, data);
+            resolveReady(stream);
 
             if (data.done) {
               finish(() => controller.close());
@@ -1073,5 +1088,6 @@ export class WebSocketChatTransport<
         }
       }
     });
+    return ready;
   }
 }

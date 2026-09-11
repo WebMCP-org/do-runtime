@@ -127,6 +127,79 @@ function requireChat(chat: AgentChatResult | null): AgentChatResult {
 }
 
 describe("reconnect-driven stream resume", () => {
+  it("rebuilds a hydrated running assistant before the AI SDK snapshots its parts", async () => {
+    const { agent, target, sentMessages } = createFakeAgent({
+      name: "hydrated-replay",
+      url: "ws://localhost:3000/agents/chat/hydrated-replay"
+    });
+    let chat: AgentChatResult | null = null;
+    function TestComponent() {
+      chat = useAgentChat({
+        agent,
+        getInitialMessages: null,
+        messages: [
+          {
+            id: "a1",
+            role: "assistant",
+            parts: [
+              { type: "reasoning", text: "Inspecting", state: "done" },
+              {
+                type: "tool-execute",
+                toolCallId: "tool-1",
+                state: "input-available",
+                input: {}
+              }
+            ]
+          }
+        ]
+      });
+      return null;
+    }
+    await render(
+      <StrictMode>
+        <TestComponent />
+      </StrictMode>
+    );
+    await vi.waitFor(() =>
+      expect(countType(sentMessages, RESUME_REQUEST)).toBeGreaterThan(0)
+    );
+    dispatch(target, { type: RESUMING, id: "s1" });
+    // The ACK crosses a socket: the offer and replay arrive in separate tasks.
+    await sleep(20);
+    for (const chunk of [
+      { type: "start", messageId: "a1" },
+      { type: "reasoning-start", id: "r1" },
+      { type: "reasoning-delta", id: "r1", delta: "Inspecting" },
+      { type: "reasoning-end", id: "r1" },
+      {
+        type: "tool-input-available",
+        toolCallId: "tool-1",
+        toolName: "execute",
+        input: {}
+      }
+    ])
+      dispatch(target, {
+        type: CHAT_RESPONSE,
+        id: "s1",
+        body: JSON.stringify(chunk),
+        done: false,
+        replay: true
+      });
+    dispatch(target, {
+      type: CHAT_RESPONSE,
+      id: "s1",
+      body: "",
+      done: false,
+      replayComplete: true
+    });
+    await vi.waitFor(() => {
+      expect(requireChat(chat).status).toBe("streaming");
+      expect(requireChat(chat).messages[0].parts).toHaveLength(2);
+    });
+    expect(countType(sentMessages, RESUME_ACK)).toBe(1);
+    dispatch(target, { type: CHAT_RESPONSE, id: "s1", body: "", done: true });
+  });
+
   let errorSpy: ReturnType<typeof vi.spyOn>;
   let warnSpy: ReturnType<typeof vi.spyOn>;
 
