@@ -1389,11 +1389,17 @@ export class Probe extends DurableObject<ProbeEnv> {
     };
     return {
       code999: attempt(999),
+      code1004: attempt(1004),
       code1005: attempt(1005),
       code1006: attempt(1006),
+      code1015: attempt(1015),
       code5000: attempt(5000),
       longReason: attempt(1000, "é".repeat(62)),
       code1000: attempt(1000),
+      code1001: attempt(1001),
+      code1002: attempt(1002),
+      code1008: attempt(1008),
+      code1011: attempt(1011),
       code3000: attempt(3000),
       code4999: attempt(4999),
     };

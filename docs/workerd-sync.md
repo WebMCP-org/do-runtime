@@ -24,6 +24,16 @@ and restorations. Commit author dates alone do not establish release inclusion.
 
 The [September 7 release diff](https://github.com/cloudflare/workerd/compare/v1.20260906.1...v1.20260907.1) adds only the release stamp and raises the maximum compatibility date from September 13 to September 14. All behavioral changes below were present in the September 6 tree.
 
+## WebSocket close-code correction (September 10)
+
+The server socket validator had copied the browser-only `pedantic_wpt` branch.
+The pinned oracle does not enable that opt-in flag: `1001`, `1002`, `1008`,
+and `1011` all close successfully. The shared `D6-D7` conformance probe now
+checks those codes plus reserved `1004` and `1015` in every lane. It passed
+workerd and reproduced `InvalidAccessError` in Node before the validator fix.
+The runtime now accepts 1000–4999 except 1004, 1005, 1006 and 1015, matching
+[the pinned workerd implementation](https://github.com/cloudflare/workerd/blob/beb7bd5c370d898e5ea81947aaa80ba5f48cd47e/src/workerd/api/web-socket.c%2B%2B).
+
 ## Changes brought into this runtime
 
 | Area / upstream change | Local result and regression evidence |
