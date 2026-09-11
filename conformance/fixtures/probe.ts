@@ -120,7 +120,10 @@ export class Probe extends DurableObject<ProbeEnv> {
   #clients = new Map<string, WebSocket>();
   #servers = new Map<string, WebSocket>();
   #clientMessages = new Map<string, (string | ArrayBuffer)[]>();
-  #clientCloses = new Map<string, { code: number; reason: string; wasClean: boolean }[]>();
+  #clientCloses = new Map<
+    string,
+    { code: number; reason: string; wasClean: boolean }[]
+  >();
   #handlerEvents: Record<string, unknown>[] = [];
   #handlerTrace: string[] = [];
   #handlerTimes: { event: string; at: number }[] = [];
@@ -129,10 +132,7 @@ export class Probe extends DurableObject<ProbeEnv> {
   #capacityClients: WebSocket[] = [];
   #throwNextMessage = false;
 
-  #child(
-    slot = "c",
-    className = "Child",
-  ): Record<string, (...args: unknown[]) => Promise<unknown>> {
+  #child(slot = "c", className = "Child"): Record<string, (...args: unknown[]) => Promise<unknown>> {
     const loader = this.env.LOADER;
     const loaded = loader.get("probe-child", async () => ({
       compatibilityDate: "2026-07-01",
@@ -749,9 +749,9 @@ export class Probe extends DurableObject<ProbeEnv> {
   /** Experimental compatibility wrapper: callable, reusable, and wearing `sql.Statement`. */
   sqlPrepare(): Record<string, unknown> {
     const sql = this.ctx.storage.sql as SqlStorage & {
-      prepare(
-        query: string,
-      ): (...bindings: unknown[]) => SqlStorageCursor<Record<string, SqlStorageValue>>;
+      prepare(query: string): (
+        ...bindings: unknown[]
+      ) => SqlStorageCursor<Record<string, SqlStorageValue>>;
     };
     sql.exec("CREATE TABLE IF NOT EXISTS prepare_probe(id INTEGER)");
     sql.exec("DELETE FROM prepare_probe");
@@ -793,7 +793,9 @@ export class Probe extends DurableObject<ProbeEnv> {
     const sql = this.ctx.storage.sql;
     sql.exec("CREATE TABLE IF NOT EXISTS returning_probe(id INTEGER)");
     sql.exec("DELETE FROM returning_probe");
-    const inserted = sql.exec("INSERT INTO returning_probe VALUES (1), (2), (3) RETURNING id");
+    const inserted = sql.exec(
+      "INSERT INTO returning_probe VALUES (1), (2), (3) RETURNING id",
+    );
     const rows = inserted.toArray();
     const selected = sql.exec("SELECT id FROM returning_probe ORDER BY id");
     selected.toArray();
@@ -900,8 +902,12 @@ export class Probe extends DurableObject<ProbeEnv> {
   sqliteRtree(): Record<string, unknown> {
     const sql = this.ctx.storage.sql;
     sql.exec("DROP TABLE IF EXISTS rtree_probe");
-    sql.exec("CREATE VIRTUAL TABLE rtree_probe USING rtree(id, minX, maxX, minY, maxY)");
-    sql.exec("INSERT INTO rtree_probe VALUES (1, -1, 1, -1, 1), (2, 10, 12, 10, 12)");
+    sql.exec(
+      "CREATE VIRTUAL TABLE rtree_probe USING rtree(id, minX, maxX, minY, maxY)",
+    );
+    sql.exec(
+      "INSERT INTO rtree_probe VALUES (1, -1, 1, -1, 1), (2, 10, 12, 10, 12)",
+    );
     return {
       ids: sql
         .exec(
@@ -1288,8 +1294,7 @@ export class Probe extends DurableObject<ProbeEnv> {
         bigint: typeof richResult.bigint,
         bytes: richResult.bytes instanceof Uint8Array,
         cyclic:
-          (richResult.cyclic as { self?: unknown }).self ===
-          (richResult.cyclic as { self?: unknown }),
+          (richResult.cyclic as { self?: unknown }).self === (richResult.cyclic as { self?: unknown }),
       },
       functionError,
       symbolError,
@@ -1453,10 +1458,11 @@ export class Probe extends DurableObject<ProbeEnv> {
     return {
       value: first === null ? null : { request: first.request, response: first.response },
       fresh: first !== second,
-      timestamp:
-        this.ctx.getWebSocketAutoResponseTimestamp(this.#requireServer(id))?.getTime() ?? null,
+      timestamp: this.ctx.getWebSocketAutoResponseTimestamp(this.#requireServer(id))?.getTime() ?? null,
       unacceptedTimestamp: this.ctx.getWebSocketAutoResponseTimestamp(socketPair()[1]),
-      badTimestamp: captureError(() => this.ctx.getWebSocketAutoResponseTimestamp({} as WebSocket)),
+      badTimestamp: captureError(() =>
+        this.ctx.getWebSocketAutoResponseTimestamp({} as WebSocket),
+      ),
       nullSetter: captureError(() => this.ctx.setWebSocketAutoResponse(null as never)),
     };
   }
@@ -1485,7 +1491,9 @@ export class Probe extends DurableObject<ProbeEnv> {
     this.ctx.setHibernatableWebSocketEventTimeout("42" as never);
     const coerced = this.ctx.getHibernatableWebSocketEventTimeout();
     const negative = captureError(() => this.ctx.setHibernatableWebSocketEventTimeout(-1));
-    const outOfRange = captureError(() => this.ctx.setHibernatableWebSocketEventTimeout(2 ** 32));
+    const outOfRange = captureError(() =>
+      this.ctx.setHibernatableWebSocketEventTimeout(2 ** 32),
+    );
     const sevenDays = captureError(() =>
       this.ctx.setHibernatableWebSocketEventTimeout(604_800_001),
     );
@@ -1515,21 +1523,17 @@ export class Probe extends DurableObject<ProbeEnv> {
       json: JSON.stringify(pair),
       hasSetter: requestDescriptor?.set !== undefined,
       withoutNew: captureError(() =>
-        Reflect.apply(WebSocketRequestResponsePair as unknown as () => unknown, undefined, [
-          "a",
-          "b",
-        ]),
+        Reflect.apply(WebSocketRequestResponsePair as unknown as () => unknown, undefined, ["a", "b"]),
       ),
-      badCoercion: captureError(
-        () =>
-          new WebSocketRequestResponsePair(
-            {
-              toString(): never {
-                throw new Error("coercion failed");
-              },
-            } as never,
-            "b",
-          ),
+      badCoercion: captureError(() =>
+        new WebSocketRequestResponsePair(
+          {
+            toString(): never {
+              throw new Error("coercion failed");
+            },
+          } as never,
+          "b",
+        ),
       ),
     };
   }
@@ -1567,7 +1571,10 @@ export class Probe extends DurableObject<ProbeEnv> {
   }
 
   async readExternalObservation(): Promise<Record<string, unknown> | null> {
-    return (await this.ctx.storage.get<Record<string, unknown>>("externalObservation")) ?? null;
+    return (
+      (await this.ctx.storage.get<Record<string, unknown>>("externalObservation")) ??
+      null
+    );
   }
 
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
@@ -1625,9 +1632,7 @@ export class Probe extends DurableObject<ProbeEnv> {
 
   webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean): void {
     let tags: string[] = [];
-    const tagsError = captureError(() => {
-      tags = this.ctx.getTags(ws);
-    });
+    const tagsError = captureError(() => { tags = this.ctx.getTags(ws); });
     const event: Record<string, unknown> = {
       id: this.#socketId(ws),
       close: { code, reason, wasClean },
@@ -1649,9 +1654,9 @@ export class Probe extends DurableObject<ProbeEnv> {
   }
 
   #socketId(socket: WebSocket): string {
-    const attachment = WebSocket.prototype.deserializeAttachment.call(socket) as {
-      id?: unknown;
-    } | null;
+    const attachment = WebSocket.prototype.deserializeAttachment.call(socket) as
+      | { id?: unknown }
+      | null;
     return typeof attachment?.id === "string"
       ? attachment.id
       : ([...this.#servers].find(([, candidate]) => candidate === socket)?.[0] ?? "unknown");
@@ -1707,6 +1712,8 @@ export class Probe extends DurableObject<ProbeEnv> {
     }
     await push(`exit:${depth}`);
   }
+
+
 }
 
 export default {

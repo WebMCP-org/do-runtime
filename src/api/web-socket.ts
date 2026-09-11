@@ -56,16 +56,14 @@ class WebSocketRequestResponsePairImpl implements WebSocketRequestResponsePair {
   }
 }
 
-const RuntimeWebSocketRequestResponsePair: typeof WebSocketRequestResponsePair = new Proxy(
-  WebSocketRequestResponsePairImpl,
-  {
+const RuntimeWebSocketRequestResponsePair: typeof WebSocketRequestResponsePair =
+  new Proxy(WebSocketRequestResponsePairImpl, {
     apply(): never {
       throw new TypeError(
         "Failed to construct 'WebSocketRequestResponsePair': Please use the 'new' operator, this DOM object constructor cannot be called as a function.",
       );
     },
-  },
-);
+  });
 
 export { RuntimeWebSocketRequestResponsePair as WebSocketRequestResponsePair };
 
@@ -541,9 +539,7 @@ export class HibernatableWebSocketRegistry {
     this.#host = host;
     const pair = host?.autoResponsePair;
     if (pair != null) {
-      this.setWebSocketAutoResponse(
-        new RuntimeWebSocketRequestResponsePair(pair.request, pair.response),
-      );
+      this.setWebSocketAutoResponse(new RuntimeWebSocketRequestResponsePair(pair.request, pair.response));
     }
     for (const value of rehydrated) this.#rehydrate(value);
   }
@@ -701,7 +697,9 @@ export class HibernatableWebSocketRegistry {
     if (type === "close") {
       this.#remove(entry);
       const close = event as CloseEvent;
-      this.#schedule(() => this.#dispatch.close(socket, close.code, close.reason, close.wasClean));
+      this.#schedule(() =>
+        this.#dispatch.close(socket, close.code, close.reason, close.wasClean),
+      );
       return;
     }
     if (type === "error") this.#schedule(() => this.#dispatch.error(socket, event));
@@ -816,7 +814,9 @@ function normalizeTags(tags: unknown): string[] {
   const normalized = [...new Set(tags.map(String))];
   for (const tag of normalized) {
     if (tag.length > MAX_TAG_LENGTH) {
-      throw new Error(`"${tag}" is longer than the max tag length (${MAX_TAG_LENGTH} characters).`);
+      throw new Error(
+        `"${tag}" is longer than the max tag length (${MAX_TAG_LENGTH} characters).`,
+      );
     }
   }
   return normalized;
