@@ -1699,7 +1699,7 @@ export class AIChatAgent<
 
   /** @internal Delegate to _resumableStream. Also advances the recovery
    *  progress counter at production time (see `_maybeBumpRecoveryProgress`). */
-  protected async _storeStreamChunk(streamId: string, body: string) {
+  protected _storeStreamChunk(streamId: string, body: string) {
     this._resumableStream.storeChunk(streamId, body);
     let type: string | undefined;
     try {
@@ -1707,7 +1707,7 @@ export class AIChatAgent<
     } catch {
       // non-JSON chunk body — nothing to credit
     }
-    await this._maybeBumpRecoveryProgress(type);
+    return this._maybeBumpRecoveryProgress(type);
   }
 
   /** Per-isolate throttle for crediting recovery progress from mid-segment
@@ -2034,7 +2034,7 @@ export class AIChatAgent<
     continuation: boolean
   ) {
     const body = JSON.stringify(event);
-    await this._storeStreamChunk(streamId, body);
+    const progressStored = this._storeStreamChunk(streamId, body);
     this._broadcastChatMessage({
       body,
       done: false,
@@ -2042,6 +2042,7 @@ export class AIChatAgent<
       type: MessageType.CF_AGENT_USE_CHAT_RESPONSE,
       ...(continuation && { continuation: true })
     });
+    await progressStored;
   }
 
   private _loadMessagesFromDb(): UIMessage[] {
@@ -6469,9 +6470,9 @@ export class AIChatAgent<
               };
             }
 
-            // Store chunk for replay and broadcast to clients
+            // Store + broadcast before yielding so resume cannot duplicate the chunk.
             const chunkBody = JSON.stringify(eventToSend);
-            await this._storeStreamChunk(streamId, chunkBody);
+            const progressStored = this._storeStreamChunk(streamId, chunkBody);
             this._broadcastChatMessage({
               body: chunkBody,
               done: false,
@@ -6479,6 +6480,7 @@ export class AIChatAgent<
               type: MessageType.CF_AGENT_USE_CHAT_RESPONSE,
               ...(continuation && { continuation: true })
             });
+            await progressStored;
           } catch (_error) {
             // Skip malformed JSON lines silently
           }

@@ -126,6 +126,79 @@ function closeWS(ws: WebSocket): Promise<void> {
 }
 
 describe("Think — onConnect broadcast policy", () => {
+  it.each(["rpc", "websocket"])(
+    "does not duplicate a %s chunk on resume during its progress write",
+    async (transport) => {
+      const room = crypto.randomUUID();
+      const agent = await freshAgent(room);
+      const { ws } = await connectWS(room);
+      await collectMessages(ws, 20);
+      await agent.holdStreamProgressReadForTest();
+      const turn =
+        transport === "rpc"
+          ? agent.testChat("resume while storing")
+          : Promise.resolve();
+      if (transport === "websocket")
+        ws.send(
+          JSON.stringify({
+            type: "cf_agent_use_chat_request",
+            id: "atomic-chunk",
+            init: {
+              method: "POST",
+              body: JSON.stringify({
+                messages: [
+                  {
+                    id: "u1",
+                    role: "user",
+                    parts: [{ type: "text", text: "resume while storing" }]
+                  }
+                ]
+              })
+            }
+          })
+        );
+      try {
+        await expect
+          .poll(() => agent.isStreamProgressReadHeldForTest())
+          .toBe(true);
+        const active = await agent.waitForActiveResumableStreamForTest();
+        if (!active) throw new Error("no active stream");
+        const received: Array<Record<string, unknown>> = [];
+        ws.addEventListener("message", (event: MessageEvent) => {
+          const frame = JSON.parse(event.data as string) as Record<
+            string,
+            unknown
+          >;
+          if (frame.type === MSG_CHAT_RESPONSE) received.push(frame);
+        });
+        ws.send(
+          JSON.stringify({ type: MSG_STREAM_RESUME_ACK, id: active.requestId })
+        );
+        await expect
+          .poll(() => received.some((frame) => frame.replayComplete))
+          .toBe(true);
+        await agent.releaseStreamProgressReadForTest();
+        await turn;
+        await expect
+          .poll(() => received.some((frame) => frame.done))
+          .toBe(true);
+        const chunks = received
+          .filter((frame) => frame.body)
+          .map((frame) => JSON.parse(frame.body as string) as { type: string });
+        expect(
+          chunks.filter((chunk) => chunk.type === "text-start")
+        ).toHaveLength(1);
+        expect(
+          chunks.filter((chunk) => chunk.type === "text-end")
+        ).toHaveLength(1);
+      } finally {
+        await agent.releaseStreamProgressReadForTest();
+        await turn;
+        await closeWS(ws);
+      }
+    }
+  );
+
   it("replays a duplicate completed request id without admitting a second turn", async () => {
     const room = crypto.randomUUID();
     const agent = await freshAgent(room);
