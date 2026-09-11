@@ -5,6 +5,20 @@ shim could not cover it, and whether it is upstreamable. The measured footprint
 lives in [the vendor fork audit](audit/vendor-fork-audit.md); do not duplicate a count
 here that drifts on every refresh.
 
+## 2026-09-10 — Resume hydrated messages without duplicating parts
+
+- `packages/agents/src/chat/ws-chat-transport.ts` resolves a resumed stream
+  after its first response frame reaches the hook. AI SDK snapshots the last
+  assistant after the transport resolves; resolving on the resume offer let it
+  copy persisted parts before the replay-start handler cleared them. Replaying
+  then appended duplicate reasoning and tool parts to that private buffer.
+  Closing, cancelling or failing before the first chunk also settles the wait.
+  This is upstreamable shared SDK behavior; a host or renderer cannot reset AI
+  SDK's private streaming state through `setMessages`.
+- `resume-overlap-race.test.tsx` reproduces an asynchronous replay over a
+  hydrated assistant using the real React hook in Chromium. The transport's
+  outbox regression now waits for response data before consuming the stream.
+
 ## 2026-09-07 — Bind inference callbacks to their admitted turn
 
 - `packages/think/src/inference-context.ts` and `think.ts` capture the admitted
