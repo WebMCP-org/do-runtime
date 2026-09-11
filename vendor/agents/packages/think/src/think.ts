@@ -12679,7 +12679,9 @@ export class Think<
           this._alignStreamStartId(streamChunk, action, accumulator, false);
 
           const chunkBody = JSON.stringify(streamChunk);
-          await this._storeChunkDurably(
+          // Keep store + broadcast synchronous: resume must not replay this
+          // chunk before its live broadcast, or the client receives it twice.
+          const progressStored = this._storeChunkDurably(
             streamId,
             streamChunk,
             chunkBody,
@@ -12691,6 +12693,7 @@ export class Think<
             body: chunkBody,
             done: false
           });
+          await progressStored;
           await callback.onEvent(chunkBody);
         }
         if (!aborted && abortSignal?.aborted) {
@@ -13207,7 +13210,9 @@ export class Think<
           );
 
           const chunkBody = JSON.stringify(streamChunk);
-          await this._storeChunkDurably(
+          // Keep store + broadcast synchronous: resume must not replay this
+          // chunk before its live broadcast, or the client receives it twice.
+          const progressStored = this._storeChunkDurably(
             streamId,
             streamChunk,
             chunkBody,
@@ -13220,6 +13225,7 @@ export class Think<
             done: false,
             ...(continuation && { continuation: true })
           });
+          await progressStored;
         }
         streamDrainedNaturally = !(
           streamAborted ||
