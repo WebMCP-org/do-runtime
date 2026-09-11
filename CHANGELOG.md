@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.1
+
+### Patch Changes
+
+- 43fafe5: Accept workerd server WebSocket close codes such as 1001, 1002, 1008 and 1011. The browser-only 1000/3000–4999 restriction caused Agent rejection and port-replacement shutdowns to throw instead of closing. Continue rejecting reserved wire codes and oversized reasons; shared workerd, Node and Chromium conformance tests verify the exact contract.
+
 ## 0.8.0
 
 ### Minor Changes
