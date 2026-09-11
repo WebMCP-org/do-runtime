@@ -56,14 +56,16 @@ class WebSocketRequestResponsePairImpl implements WebSocketRequestResponsePair {
   }
 }
 
-const RuntimeWebSocketRequestResponsePair: typeof WebSocketRequestResponsePair =
-  new Proxy(WebSocketRequestResponsePairImpl, {
+const RuntimeWebSocketRequestResponsePair: typeof WebSocketRequestResponsePair = new Proxy(
+  WebSocketRequestResponsePairImpl,
+  {
     apply(): never {
       throw new TypeError(
         "Failed to construct 'WebSocketRequestResponsePair': Please use the 'new' operator, this DOM object constructor cannot be called as a function.",
       );
     },
-  });
+  },
+);
 
 export { RuntimeWebSocketRequestResponsePair as WebSocketRequestResponsePair };
 
@@ -539,7 +541,9 @@ export class HibernatableWebSocketRegistry {
     this.#host = host;
     const pair = host?.autoResponsePair;
     if (pair != null) {
-      this.setWebSocketAutoResponse(new RuntimeWebSocketRequestResponsePair(pair.request, pair.response));
+      this.setWebSocketAutoResponse(
+        new RuntimeWebSocketRequestResponsePair(pair.request, pair.response),
+      );
     }
     for (const value of rehydrated) this.#rehydrate(value);
   }
@@ -697,9 +701,7 @@ export class HibernatableWebSocketRegistry {
     if (type === "close") {
       this.#remove(entry);
       const close = event as CloseEvent;
-      this.#schedule(() =>
-        this.#dispatch.close(socket, close.code, close.reason, close.wasClean),
-      );
+      this.#schedule(() => this.#dispatch.close(socket, close.code, close.reason, close.wasClean));
       return;
     }
     if (type === "error") this.#schedule(() => this.#dispatch.error(socket, event));
@@ -814,9 +816,7 @@ function normalizeTags(tags: unknown): string[] {
   const normalized = [...new Set(tags.map(String))];
   for (const tag of normalized) {
     if (tag.length > MAX_TAG_LENGTH) {
-      throw new Error(
-        `"${tag}" is longer than the max tag length (${MAX_TAG_LENGTH} characters).`,
-      );
+      throw new Error(`"${tag}" is longer than the max tag length (${MAX_TAG_LENGTH} characters).`);
     }
   }
   return normalized;
@@ -832,7 +832,12 @@ function validateAutoResponseSize(side: "Request" | "Response", value: string): 
 }
 
 function validateClose(code: number | undefined, reason: string): void {
-  if (code !== undefined && code !== 1000 && (code < 3000 || code > 4999)) {
+  // Match the pinned workerd oracle without the opt-in pedantic_wpt flag.
+  // Server policy/restart codes are valid; only reserved wire codes are excluded.
+  if (
+    code !== undefined &&
+    (code < 1000 || code >= 5000 || [1004, 1005, 1006, 1015].includes(code))
+  ) {
     throw new DOMException(`Invalid WebSocket close code: ${code}.`, "InvalidAccessError");
   }
   if (textEncoder.encode(reason).byteLength > MAX_CLOSE_REASON_BYTES) {

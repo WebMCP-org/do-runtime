@@ -38,11 +38,13 @@ describe("acceptWebSocket and getWebSockets", () => {
     expect(await actor.call("acceptanceSemantics")).toEqual({
       doubleHibernation: {
         name: "Error",
-        message: "Cannot call `acceptWebSocket()` if the WebSocket was already accepted via `accept()`",
+        message:
+          "Cannot call `acceptWebSocket()` if the WebSocket was already accepted via `accept()`",
       },
       classicThenHibernation: {
         name: "Error",
-        message: "Cannot call `acceptWebSocket()` if the WebSocket was already accepted via `accept()`",
+        message:
+          "Cannot call `acceptWebSocket()` if the WebSocket was already accepted via `accept()`",
       },
       hibernationThenClassic: {
         name: "TypeError",
@@ -273,14 +275,20 @@ describe("handler dispatch and close state", () => {
     });
     expect(await actor.call("closeValidation")).toEqual({
       code999: invalidCode(999),
+      code1004: invalidCode(1004),
       code1005: invalidCode(1005),
       code1006: invalidCode(1006),
+      code1015: invalidCode(1015),
       code5000: invalidCode(5000),
       longReason: {
         name: "SyntaxError",
         message: "WebSocket close reason must not be longer than 123 bytes when UTF-8 encoded.",
       },
       code1000: null,
+      code1001: null,
+      code1002: null,
+      code1008: null,
+      code1011: null,
       code3000: null,
       code4999: null,
     });
@@ -373,10 +381,20 @@ describe("auto-response, timeout, pair, and tags", () => {
 
     await actor.call("sendSelf", "socket", "Ping");
     await actor.call("sendSelfBinary", "socket", [...new TextEncoder().encode("ping")]);
-    await eventually(() => journal(actor), (value) => value.events.length === 2);
+    await eventually(
+      () => journal(actor),
+      (value) => value.events.length === 2,
+    );
     await actor.call("clearAutoResponse");
     await actor.call("sendSelf", "socket", "ping");
-    expect((await eventually(() => journal(actor), (value) => value.events.length === 3)).events).toHaveLength(3);
+    expect(
+      (
+        await eventually(
+          () => journal(actor),
+          (value) => value.events.length === 3,
+        )
+      ).events,
+    ).toHaveLength(3);
   });
 
   it("E6 bounds each auto-response side at 2048 UTF-8 bytes", async () => {
@@ -430,7 +448,9 @@ describe("auto-response, timeout, pair, and tags", () => {
     expect(result.values).toEqual(["123", "null"]);
     expect(result.json).toBe("{}");
     expect(result.hasSetter).toBe(false);
-    expect(result.withoutNew.message).toContain("Failed to construct 'WebSocketRequestResponsePair'");
+    expect(result.withoutNew.message).toContain(
+      "Failed to construct 'WebSocketRequestResponsePair'",
+    );
     expect(result.badCoercion).toEqual({ name: "Error", message: "coercion failed" });
   });
 
