@@ -1699,7 +1699,7 @@ export class AIChatAgent<
 
   /** @internal Delegate to _resumableStream. Also advances the recovery
    *  progress counter at production time (see `_maybeBumpRecoveryProgress`). */
-  protected async _storeStreamChunk(streamId: string, body: string) {
+  protected _storeStreamChunk(streamId: string, body: string) {
     this._resumableStream.storeChunk(streamId, body);
     let type: string | undefined;
     try {
@@ -1707,7 +1707,7 @@ export class AIChatAgent<
     } catch {
       // non-JSON chunk body — nothing to credit
     }
-    await this._maybeBumpRecoveryProgress(type);
+    return this._maybeBumpRecoveryProgress(type);
   }
 
   /** Per-isolate throttle for crediting recovery progress from mid-segment

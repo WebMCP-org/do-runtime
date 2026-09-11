@@ -12973,7 +12973,7 @@ export class Think<
    * tool-call-level recovery durability (recovery loses at most the in-flight
    * step, never an already-completed tool call).
    */
-  private async _storeChunkDurably(
+  private _storeChunkDurably(
     streamId: string,
     chunk: StreamChunkData,
     chunkBody: string,
@@ -13010,8 +13010,9 @@ export class Think<
         now: Date.now()
       })
     ) {
-      await this._bumpChatRecoveryProgress();
+      return this._bumpChatRecoveryProgress();
     }
+    return Promise.resolve();
   }
 
   /** Per-isolate throttle for crediting recovery progress from mid-segment
