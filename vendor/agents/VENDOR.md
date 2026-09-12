@@ -16,5 +16,6 @@ The package versions match the 0.22 release:
 
 This fork contains only the package closure used by Rook. Compare future
 upstream releases against the commit above, reconcile
-[the fork ledger](docs/fork-diff.md), then run `pnpm build && pnpm check &&
+[current divergences](docs/fork-diff.md), update each affected row in place
+(remove retired rows; Git preserves history), then run `pnpm build && pnpm check &&
 pnpm test` here and the runtime's example gate.
