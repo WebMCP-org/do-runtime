@@ -11631,17 +11631,14 @@ export class Think<
       }
 
       if (this._resumableStream.hasActiveStream()) {
-        // A stream is still in flight. The resume flow is the
-        // authoritative source of state: `_notifyStreamResuming` tells
-        // the client to send `STREAM_RESUME_ACK`, after which the
-        // server replays buffered chunks and delivers a final
-        // `MSG_CHAT_MESSAGES` broadcast once the turn completes.
-        //
-        // Sending `MSG_CHAT_MESSAGES` here would clobber the in-progress
-        // assistant the client rebuilds from the replayed chunks,
-        // because `this.messages` at this point still only contains
-        // the user message — the assistant message is not persisted
-        // until the stream finishes.
+        if (this._resumableStream.isContinuation) {
+          // Refresh the canonical prefix before replay: the client may have
+          // missed the previous continuation's terminal snapshot while offline.
+          connection.send(
+            JSON.stringify({ type: MSG_CHAT_MESSAGES, messages: this.messages })
+          );
+        }
+        // Ordinary streams rebuild their unpersisted assistant from replay.
         this._notifyStreamResuming(connection);
       } else {
         // No active stream. If a turn is accepted but its stream hasn't started

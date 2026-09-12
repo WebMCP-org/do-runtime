@@ -876,6 +876,13 @@ export class AIChatAgent<
 
       // Notify client about active streams that can be resumed
       if (this._resumableStream.hasActiveStream()) {
+        if (this._resumableStream.isContinuation) {
+          // The client may have missed a prior terminal snapshot while offline.
+          this._sendDirectMessage(connection, {
+            type: MessageType.CF_AGENT_CHAT_MESSAGES,
+            messages: this._messagesForClientSync()
+          });
+        }
         this._notifyStreamResuming(connection);
       } else if (this._preStream.park(connection)) {
         // A turn is accepted but its stream hasn't started yet (#1784): park

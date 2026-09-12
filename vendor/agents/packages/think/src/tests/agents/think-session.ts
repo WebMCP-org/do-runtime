@@ -1307,8 +1307,11 @@ export class ThinkTestAgent extends Think {
    * suspended state lets a fresh WebSocket observe what the server
    * sends on connect mid-stream.
    */
-  async testStartResumableStream(requestId: string): Promise<string> {
-    return this._resumableStream.start(requestId);
+  async testStartResumableStream(
+    requestId: string,
+    continuation = false
+  ): Promise<string> {
+    return this._resumableStream.start(requestId, { continuation });
   }
 
   async testStoreResumableChunk(streamId: string, body: string): Promise<void> {

@@ -2422,6 +2422,11 @@ export function useAgentChat<
       socketIsOpen = true;
       if (!sawClose) return;
       sawClose = false;
+      // The replacement socket can refresh the canonical transcript before
+      // offering its current stream. A prior stream's accumulator/protection
+      // must not overwrite content that arrived while we were disconnected.
+      streamStateRef.current = { status: "idle" };
+      protectedStreamingAssistantRef.current = null;
       reconnectProbePendingRef.current = true;
       tryPendingReconnectProbe();
     }

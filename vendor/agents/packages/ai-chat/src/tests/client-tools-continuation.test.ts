@@ -38,6 +38,92 @@ async function waitForMessage(
 }
 
 describe("Client tools continuation", () => {
+  it("sends the canonical transcript before offering an active continuation", async () => {
+    const room = crypto.randomUUID();
+    const { ws } = await connectChatWS(`/agents/test-chat-agent/${room}`);
+    const stub = await getAgentByName(env.TestChatAgent, room);
+    await stub.persistMessages([
+      {
+        id: "offline-prefix",
+        role: "assistant",
+        parts: [
+          { type: "text", text: "History completed offline", state: "done" },
+          {
+            type: "tool-search",
+            toolCallId: "offline-tool",
+            state: "input-available",
+            input: {}
+          }
+        ]
+      }
+    ]);
+    await stub.setTestBody({
+      reasoningContinuation: true,
+      delayContinuationChunks: true
+    });
+    const initial = collectMessages(ws);
+    ws.addEventListener("message", (event: MessageEvent) => {
+      const frame = JSON.parse(event.data as string) as Record<string, unknown>;
+      if (frame.type === MessageType.CF_AGENT_STREAM_RESUMING)
+        ws.send(
+          JSON.stringify({
+            type: MessageType.CF_AGENT_STREAM_RESUME_ACK,
+            id: frame.id
+          })
+        );
+    });
+    let returning: WebSocket | undefined;
+    try {
+      ws.send(
+        JSON.stringify({
+          type: MessageType.CF_AGENT_TOOL_RESULT,
+          toolCallId: "offline-tool",
+          toolName: "search",
+          output: "found",
+          autoContinue: true
+        })
+      );
+      expect(
+        await waitForMessage(
+          initial,
+          (frame) =>
+            frame.type === MessageType.CF_AGENT_USE_CHAT_RESPONSE &&
+            !!frame.body
+        )
+      ).toBeDefined();
+      returning = (await connectChatWS(`/agents/test-chat-agent/${room}`)).ws;
+      const frames = collectMessages(returning);
+      expect(
+        await waitForMessage(
+          frames,
+          (frame) => frame.type === MessageType.CF_AGENT_STREAM_RESUMING
+        )
+      ).toBeDefined();
+      const snapshot = frames.findIndex(
+        (frame) => frame.type === MessageType.CF_AGENT_CHAT_MESSAGES
+      );
+      const offer = frames.findIndex(
+        (frame) => frame.type === MessageType.CF_AGENT_STREAM_RESUMING
+      );
+      expect(snapshot).toBeGreaterThanOrEqual(0);
+      expect(snapshot).toBeLessThan(offer);
+      expect(frames[snapshot].messages).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            id: "offline-prefix",
+            parts: expect.arrayContaining([
+              { type: "text", text: "History completed offline", state: "done" }
+            ])
+          })
+        ])
+      );
+    } finally {
+      await stub.waitUntilStableForTest({ timeout: 3000 });
+      returning?.close(1000);
+      ws.close(1000);
+    }
+  });
+
   it("replays an SSE continuation of an interrupted text part through the AI SDK", async () => {
     const room = crypto.randomUUID();
     const { ws } = await connectChatWS(`/agents/test-chat-agent/${room}`);
