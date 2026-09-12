@@ -1264,6 +1264,43 @@ export class ThinkTestAgent extends Think {
   // ── Test-specific public methods ───────────────────────────────
   // These are callable via DurableObject RPC stubs (no @callable needed).
 
+  private _releaseProgressRead: (() => void) | null = null;
+
+  /** Hold the storage boundary after a chunk is stored, while resume can run. */
+  holdStreamProgressReadForTest(): void {
+    const storage = this.ctx.storage;
+    const get = storage.get.bind(storage);
+    const agent = this;
+    storage.get = (async (
+      key: string | string[],
+      options?: DurableObjectGetOptions
+    ) => {
+      const value =
+        typeof key === "string"
+          ? await get(key, options)
+          : await get(key, options);
+      if (
+        key === "cf:chat-recovery:progress" &&
+        agent._resumableStream.hasActiveStream()
+      ) {
+        storage.get = get;
+        await new Promise<void>((resolve) => {
+          agent._releaseProgressRead = resolve;
+        });
+      }
+      return value;
+    }) as typeof storage.get;
+  }
+
+  isStreamProgressReadHeldForTest(): boolean {
+    return this._releaseProgressRead !== null;
+  }
+
+  releaseStreamProgressReadForTest(): void {
+    this._releaseProgressRead?.();
+    this._releaseProgressRead = null;
+  }
+
   /**
    * Simulate an in-flight resumable stream without actually running a
    * turn. Used by the `onConnect` broadcast regression tests — the

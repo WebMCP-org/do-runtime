@@ -5,6 +5,23 @@ shim could not cover it, and whether it is upstreamable. The measured footprint
 lives in [the vendor fork audit](audit/vendor-fork-audit.md); do not duplicate a count
 here that drifts on every refresh.
 
+## 2026-09-11 — Atomic replay storage and live chunk delivery
+
+- Think's WebSocket and callback streaming paths and AI Chat's SSE/plain-text
+  paths now broadcast each stored chunk before awaiting recovery progress.
+  Yielding between storage and broadcast let a resume ACK replay the chunk and
+  then receive its delayed live copy; a repeated `text-end` made AI SDK report
+  a missing text part, while deltas could duplicate text.
+- Reproduced in Rook CI [34621546448](https://github.com/WebMCP-org/rook/actions/runs/34621546448)
+  and locally with real Chrome during new-conversation attachment. The capture
+  contains a replayed `text-end`, `replayComplete`, then the same live `text-end`.
+- `think/src/tests/onconnect-broadcast.test.ts` holds the storage read at the
+  progress boundary and resumes a real turn over WebSocket. Both callback and
+  WebSocket producers deliver each part once. The unchanged test fails with two
+  `text-start` chunks before the fix; recovery bookkeeping is still awaited.
+- This belongs in the SDK: the host cannot repair duplicated wire chunks after
+  they reach the AI SDK consumer. No protocol, migration, or runtime API changes.
+
 ## 2026-09-10 — Resume hydrated messages without duplicating parts
 
 - `packages/agents/src/chat/ws-chat-transport.ts` resolves a resumed stream
