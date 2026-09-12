@@ -1625,6 +1625,26 @@ export class ThinkTestAgent extends Think {
     await writeFileBytes.call(workspace, path, new Uint8Array(bytes), mimeType);
   }
 
+  async testChatWithReactiveOverflow(): Promise<TestChatResult> {
+    this.contextOverflow = { reactive: true };
+    this.getModel = () =>
+      new MockLanguageModelV3({
+        doStream: async () => ({
+          stream: new ReadableStream({
+            start(controller) {
+              controller.enqueue({ type: "stream-start", warnings: [] });
+              controller.enqueue({
+                type: "error",
+                error: new Error("context_length_exceeded")
+              });
+              controller.close();
+            }
+          })
+        })
+      });
+    return this.testChat("trigger context overflow");
+  }
+
   async testChatWithError(errorMessage?: string): Promise<TestChatResult> {
     this._errorConfig = {
       afterChunks: 2,

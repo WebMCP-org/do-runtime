@@ -43,6 +43,7 @@ import {
   aiSdkRecoveryCodec,
   ResumeHandshake,
   isReplayChunk,
+  createContinuationStart,
   sanitizeMessage,
   enforceRowSizeLimit,
   parseProtocolMessage,
@@ -2028,6 +2029,11 @@ export class AIChatAgent<
   private async _broadcastTextEvent(
     streamId: string,
     event:
+      | {
+          type: "start";
+          id: string;
+          continuationStart: ReturnType<typeof createContinuationStart>;
+        }
       | { type: "text-start"; id: string }
       | { type: "text-delta"; id: string; delta: string }
       | { type: "text-end"; id: string },
@@ -6050,6 +6056,9 @@ export class AIChatAgent<
     abortSignal?: AbortSignal
   ): Promise<StreamResultStatus> {
     streamCompleted.value = false;
+    const continuationStart = continuation
+      ? createContinuationStart(message)
+      : undefined;
 
     // During continuation, the first text-start and reasoning-start from the
     // model should merge into existing parts (from the cloned message) rather
@@ -6176,7 +6185,9 @@ export class AIChatAgent<
                     break;
                   }
                 }
-                if (continuationTextResumed) continue;
+                // Reuse the server's partial part, but each client stream still
+                // needs text-start to register its own active text-part ID.
+                skipServerApply = continuationTextResumed;
               }
               if (
                 !continuationReasoningResumed &&
@@ -6432,12 +6443,12 @@ export class AIChatAgent<
             //    UIMessageStreamPart messageMetadata format (#677).
             let eventToSend: unknown = data;
             if (data.type === "start") {
-              if (continuation && "messageId" in data) {
+              if (continuationStart) {
                 const { messageId: _, ...rest } = data as {
-                  messageId: unknown;
+                  messageId?: unknown;
                   [key: string]: unknown;
                 };
-                eventToSend = rest;
+                eventToSend = { ...rest, continuationStart };
               } else if (!continuation) {
                 // Most providers (e.g. Workers AI) emit no `start.messageId`,
                 // so the client's AI SDK would build the streaming assistant
@@ -6515,6 +6526,17 @@ export class AIChatAgent<
     continuation = false,
     abortSignal?: AbortSignal
   ): Promise<StreamResultStatus> {
+    if (continuation) {
+      await this._broadcastTextEvent(
+        streamId,
+        {
+          type: "start",
+          id,
+          continuationStart: createContinuationStart(message)
+        },
+        true
+      );
+    }
     // During continuation, if the last text part was still streaming
     // (interrupted mid-generation), reuse it so the resumed content
     // stays in the same block.
@@ -6534,16 +6556,15 @@ export class AIChatAgent<
       }
     }
 
-    if (textPart) {
-      // Skip broadcasting text-start — the client already has this part
-    } else {
-      // if not AI SDK SSE format, we need to inject text-start and text-end events ourselves
-      await this._broadcastTextEvent(
-        streamId,
-        { type: "text-start", id },
-        continuation
-      );
+    // Every stream needs its own text-start, including a replay consumed by
+    // a fresh client whose AI SDK has no active text-part registry yet.
+    await this._broadcastTextEvent(
+      streamId,
+      { type: "text-start", id },
+      continuation
+    );
 
+    if (!textPart) {
       // Use a single text part and accumulate into it, so the persisted message
       // has one text part regardless of how many network chunks the response spans.
       textPart = { type: "text", text: "", state: "streaming" };

@@ -762,6 +762,7 @@ describe("Think — auto-continuation", () => {
       )
     ).toBe(true);
 
+    const prefix = ((await agent.getMessages()) as UIMessage[]).at(-1)!;
     const continuationDone = waitForDone(ws, 15000);
     ws.send(
       JSON.stringify({
@@ -790,6 +791,20 @@ describe("Think — auto-continuation", () => {
     expect(await agent.getServerApprovalToolExecutions()).toBe(1);
     expect(outputUpdateFrame).toBeDefined();
     expect(continuationComplete?.continuation).toBe(true);
+    const start = continuationFrames
+      .filter((frame) => frame.type === MSG_CHAT_RESPONSE && frame.body)
+      .map(
+        (frame) => JSON.parse(frame.body as string) as Record<string, unknown>
+      )
+      .find((chunk) => chunk.type === "start");
+    expect(start?.continuationStart).toEqual({
+      messageId: prefix.id,
+      parts: prefix.parts.map((part) =>
+        part.type === "text" || part.type === "reasoning"
+          ? part.text.length
+          : null
+      )
+    });
 
     const messages = (await agent.getMessages()) as UIMessage[];
     const toolPart = messages

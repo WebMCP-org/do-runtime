@@ -176,6 +176,7 @@ import {
   enforceRowSizeLimit,
   isReplayChunk,
   StreamAccumulator,
+  createContinuationStart,
   CHAT_MESSAGE_TYPES,
   TurnQueue,
   ResumableStream,
@@ -5363,7 +5364,12 @@ export class Think<
     if (!this._overflowReactiveEnabled) return false;
     // DX guard: enabling recovery without teaching Think which errors are
     // overflows silently does nothing. Warn once instead of failing quietly.
-    if (this.classifyChatError === Think.prototype.classifyChatError) {
+    if (
+      !this._isAgentMethodOverride(
+        this.classifyChatError,
+        Think.prototype.classifyChatError
+      )
+    ) {
       if (!this._warnedMissingClassifier) {
         this._warnedMissingClassifier = true;
         console.warn(
@@ -13053,10 +13059,14 @@ export class Think<
     }
     const parentId = options?.parentId;
     let continuationSeedParts: UIMessage["parts"] | undefined;
+    let continuationStart:
+      | ReturnType<typeof createContinuationStart>
+      | undefined;
     if (continuation) {
       for (let i = this.messages.length - 1; i >= 0; i--) {
         if (this.messages[i].role === "assistant") {
           continuationSeedParts = this.messages[i].parts;
+          continuationStart = createContinuationStart(this.messages[i]);
           break;
         }
       }
@@ -13209,6 +13219,9 @@ export class Think<
             accumulator,
             continuation
           );
+          if (streamChunk.type === "start" && continuationStart) {
+            streamChunk.continuationStart = continuationStart;
+          }
 
           const chunkBody = JSON.stringify(streamChunk);
           // Keep store + broadcast synchronous: resume must not replay this
