@@ -561,6 +561,92 @@ describe("useAgent RPC robustness", () => {
       expect(terminalAgent.shouldReconnect).toBe(false);
     });
 
+    it("starts identity comparison over when the requested address changes", async () => {
+      const { host, protocol } = getTestWorkerHost();
+      let latestAgent: TestAgent | null = null;
+      let setOptions: ((options: UseAgentOptions<unknown>) => void) | null =
+        null;
+      const onIdentityChange = vi.fn();
+      const onIdentity = vi.fn();
+      const baseOptions: UseAgentOptions<unknown> = {
+        agent: "TestCallableAgent",
+        name: `identity-a-${crypto.randomUUID()}`,
+        host,
+        protocol,
+        onIdentity,
+        onIdentityChange
+      };
+      await render(
+        <ControlledAgentComponent
+          initialOptions={baseOptions}
+          onAgent={(agent) => {
+            latestAgent = agent;
+          }}
+          exposeSetOptions={(fn) => {
+            setOptions = fn;
+          }}
+        />
+      );
+      await vi.waitFor(() =>
+        expect(onIdentity).toHaveBeenCalledWith(
+          baseOptions.name,
+          "test-callable-agent"
+        )
+      );
+      for (const name of [
+        `identity-b-${crypto.randomUUID()}`,
+        baseOptions.name
+      ]) {
+        onIdentity.mockClear();
+        setOptions!({ ...baseOptions, name });
+        await vi.waitFor(() =>
+          expect(onIdentity).toHaveBeenCalledWith(name, "test-callable-agent")
+        );
+        await expect(latestAgent!.call("add", [2, 3])).resolves.toBe(5);
+      }
+      expect(onIdentityChange).not.toHaveBeenCalled();
+    });
+
+    it("still detects server identity changes at the same requested address", async () => {
+      const { host, protocol } = getTestWorkerHost();
+      let setOptions: ((options: UseAgentOptions<unknown>) => void) | null =
+        null;
+      const onIdentityChange = vi.fn();
+      const onIdentity = vi.fn();
+      const firstUser = `identity-user-a-${crypto.randomUUID()}`;
+      const secondUser = `identity-user-b-${crypto.randomUUID()}`;
+      const baseOptions: UseAgentOptions<unknown> = {
+        agent: "TestStateAgent",
+        basePath: "user",
+        host,
+        protocol,
+        query: { user: firstUser },
+        onIdentity,
+        onIdentityChange
+      };
+      await render(
+        <ControlledAgentComponent
+          initialOptions={baseOptions}
+          onAgent={() => {}}
+          exposeSetOptions={(fn) => {
+            setOptions = fn;
+          }}
+        />
+      );
+      await vi.waitFor(() =>
+        expect(onIdentity).toHaveBeenCalledWith(firstUser, "test-state-agent")
+      );
+      setOptions!({ ...baseOptions, query: { user: secondUser } });
+      await vi.waitFor(() =>
+        expect(onIdentityChange).toHaveBeenCalledWith(
+          firstUser,
+          secondUser,
+          "test-state-agent",
+          "test-state-agent"
+        )
+      );
+    });
+
     it("rejects queued calls when the agent address changes (destination guard)", async () => {
       const { host, protocol } = getTestWorkerHost();
       let latestAgent: TestAgent | null = null;

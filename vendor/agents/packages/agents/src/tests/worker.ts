@@ -359,7 +359,7 @@ export default {
     // Custom basePath routing with simulated auth - routes /user to TestStateAgent with "auth-user" instance
     if (url.pathname === "/user" || url.pathname.startsWith("/user?")) {
       // Simulate server-side auth that determines the instance name
-      const simulatedUserId = "auth-user";
+      const simulatedUserId = url.searchParams.get("user") ?? "auth-user";
       const agent = await getAgentByName(env.TestStateAgent, simulatedUserId);
       return agent.fetch(request);
     }
