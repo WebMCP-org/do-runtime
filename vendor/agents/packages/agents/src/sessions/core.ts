@@ -70,6 +70,9 @@ function parseStoredDate(value: unknown): Date | undefined {
     return Number.isNaN(value.getTime()) ? undefined : value;
   }
   if (typeof value !== "string" && typeof value !== "number") return undefined;
+  // The legacy lift stores 0 for a `created_at` strftime could not parse;
+  // that is "unknown", not the epoch.
+  if (value === 0) return undefined;
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? undefined : date;
 }

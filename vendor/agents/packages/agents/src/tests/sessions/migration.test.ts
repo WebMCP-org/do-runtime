@@ -154,6 +154,37 @@ describe("Sessions legacy migration", () => {
     });
   });
 
+  it("reads a lifted row with an unparsable creation time as undated", async () => {
+    // Vendor divergence: the lift stores 0 for a legacy `created_at` that
+    // strftime cannot parse. The decode that restores `createdAt` (2026-08-12
+    // "Session and turn timing reach chat metadata") must read that as "no
+    // timestamp", not as the epoch.
+    const stub = env.SessionHarnessObject.getByName(crypto.randomUUID());
+
+    await runInDurableObject(stub, async (instance: SessionHarnessObject) => {
+      instance.seedLegacy([
+        ...legacySchema(),
+        `INSERT INTO assistant_messages
+          (id, session_id, parent_id, role, content, created_at)
+         VALUES ('dated', '', NULL, 'user', ${sqlLiteral(
+           JSON.stringify(message("dated", "dated question", "user"))
+         )}, '2026-01-02 03:04:05')`,
+        `INSERT INTO assistant_messages
+          (id, session_id, parent_id, role, content, created_at)
+         VALUES ('undated', '', 'dated', 'assistant', ${sqlLiteral(
+           JSON.stringify(message("undated", "undated answer", "assistant"))
+         )}, 'not a date')`
+      ]);
+
+      const history = await instance.sessions.session().getHistory();
+      expect(history.map((item) => item.id)).toEqual(["dated", "undated"]);
+      expect(history[0].createdAt).toEqual(
+        new Date("2026-01-02T03:04:05.000Z")
+      );
+      expect(history[1].createdAt).toBeUndefined();
+    });
+  });
+
   it("keeps a lifted source when a row did not copy faithfully", async () => {
     const stub = env.SessionHarnessObject.getByName(crypto.randomUUID());
 
