@@ -119,10 +119,6 @@ upstream-owned. The unchanged browser runtime remains `@mcp-b/do-runtime@0.8.1`.
 - `agents/src/sessions/core.ts` restores `SessionMessage.createdAt` from JSON
   or its SQL creation time; an invalid lifted timestamp remains undated.
   `sessions/migration.test.ts` checks the one-way lift and undated fallback.
-- `Agent.webSockets` exposes the installed physical-socket capability to
-  subclasses after Lifecycle stopped exposing connections. Rook's delegated
-  facet probe determines whether its former broadcast override needs it;
-  virtual connections remain owned by DynamicAgents.
 - `agents/src/chat/react.tsx` memoizes the existing approval response command.
   `default-throttle.test.tsx` verifies one identity across streamed messages;
   retire when upstream returns the same stable command.
@@ -132,3 +128,8 @@ restoring pre-upgrade actor databases, not only package pins.
 [The migration guide](rook-0.23-migration.md) records each lift and the Rook
 backup/canary requirements. Completed-request receipts now survive until the
 next stream starts, rather than a timed completed-buffer window.
+
+The provisional protected `Agent.webSockets` getter was removed before release:
+Rook's 17 real browser delegation/Stop checks proved delegated facets have zero
+physical sockets. Inherited virtual-connection broadcast already covers them;
+the host override is deleted as well.

@@ -34,13 +34,13 @@ use the gates below.
 
 | Package   | Changed source files | Added lines | Removed lines |
 | --------- | -------------------: | ----------: | ------------: |
-| Agents    |                   33 |       2,821 |           641 |
+| Agents    |                   33 |       2,807 |           641 |
 | AI Chat   |                    1 |         164 |            42 |
 | Think     |                   15 |       2,718 |         1,191 |
 | Voice     |                    0 |           0 |             0 |
 | Shell     |                    9 |       1,917 |            80 |
 | Codemode  |                    0 |           0 |             0 |
-| **Total** |               **58** |   **7,620** |     **1,954** |
+| **Total** |               **58** |   **7,606** |     **1,954** |
 
 These are textual differences, not a count of independent patches or removable
 code. Thirteen new browser-messenger/OPFS files account for 2,631 added lines;
@@ -138,3 +138,8 @@ The test provider now holds EOF until the client observes replay, then releases
 completion and retains every AI SDK/persisted text assertion. Both files pass
 (18 tests, retries disabled). This is deterministic storage-lifetime adaptation
 to upstream #2216, not a timeout increase or a production retention change.
+
+Rook's Q5 real-browser probe passed all 17 delegation and Stop tests with zero
+physical facet sockets throughout. The unused protected `Agent.webSockets`
+getter and its changeset are therefore deleted before release; virtual
+broadcast remains upstream-owned.

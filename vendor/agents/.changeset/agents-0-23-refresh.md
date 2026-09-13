@@ -38,12 +38,8 @@ wrapper, so `@cloudflare/voice{,/client,/react,/errors}` should move to
 main to pinned source, or applies an await transform to it, must re-point at
 `packages/agents/src/voice/**`.
 
-Two fork-owned repairs ride along. `SessionMessage.createdAt` is declared on the
+A fork-owned repair rides along. `SessionMessage.createdAt` is declared on the
 public type but never populated by 0.23's decode, so Sessions restores it —
 the creation time in the stored JSON wins, the row's `created_at` column is the
 fallback, and a stored `0` (what the legacy lift writes for an unparsable
-timestamp) reads as no timestamp at all. And because
-`Lifecycle.broadcast`/`Lifecycle.getConnections` were removed with the
-WebSockets capability, `Agent` exposes its installed WebSockets capability to
-subclasses as a protected `webSockets` getter for hosts whose facets accept
-their own physical sockets.
+timestamp) reads as no timestamp at all.

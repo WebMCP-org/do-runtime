@@ -339,73 +339,20 @@ node contract test. `Sessions` reads `this.lifecycle.storage.sql`
 Anything Rook wants to assert at the Sessions level now belongs in the browser
 integration lane, not in `vitest.contract.config.ts`.
 
-### 2.4 `delegated-run-agent.ts`'s `broadcast` override
+### 2.4 Delete the delegated-run broadcast override
 
-0.23 moved WebSockets out of Lifecycle into an opt-in capability
-([#2169](https://github.com/cloudflare/agents/pull/2169)). `Lifecycle` no longer
-has `broadcast` / `getConnection` / `getConnections`
-(`src/lifecycle/durable-object-lifecycle.ts`). The fork restores the missing
-capability as a protected accessor (`fda2bdf3`,
-`.changeset/facet-websockets-accessor.md`):
+The integrated release settles the original guide's Q5 probe. Rook's real
+browser delegation and Stop suites pass 17/17 with the delegated facet's
+physical connection count equal to zero at completed drill-in, mid-stream
+drill-in and post-Stop drill-in, plus a nonzero rejection on each broadcast.
+Delegated connections are virtual and the inherited `Agent.broadcast()`
+already forwards them through the parent.
 
-```ts
-// vendor/agents/packages/agents/src/index.ts:1225-1227
-protected get webSockets(): WebSockets {
-  return this._webSockets;
-}
-```
-
-`WebSockets` has no `broadcast()`; it exposes `getConnections(tag?)` and
-`getConnection(id)` (`src/websockets/websockets.ts:188-197`). So the mechanical
-translation is a loop:
-
-```ts
-// delegated-run-agent.ts:91-94 — before
-override broadcast(message: string | ArrayBuffer | ArrayBufferView, without?: string[]): void {
-  super.broadcast(message, without);
-  this.lifecycle.broadcast(message, without);
-}
-// after
-override broadcast(message: string | ArrayBuffer | ArrayBufferView, without?: string[]): void {
-  super.broadcast(message, without);
-  for (const connection of this.webSockets.getConnections()) {
-    if (without?.includes(connection.id)) continue;
-    connection.send(message);
-  }
-}
-```
-
-**Verify first, and prefer deleting the override.** The second broadcast only
-earns its place if Rook's host puts a _physical_ socket on a delegated-run
-facet. Evidence that it does not:
-
-- The supervisor refuses to place any worker address whose last class is not the
-  conversation class, and says why: "Delegated runs and messenger state are
-  in-realm facets now, so they never reach a worker address at all"
-  (`packages/extension/src/offscreen/host.ts:1240-1245`).
-- `runtimePortAddress()` parses only the root and conversation class names out
-  of a connect URL (`host.ts:1248-1258`); a delegated-run class is not a
-  possible parse.
-- The worker's only socket entry point is
-  `connectWebSocketToAgent(live.env, socket, message.url)`
-  (`think-host.worker.ts:1075-1078`), which routes through `routeAgentRequest`
-  on the worker-address agent (`worker/host/transport.ts:14-17`). A `/sub/` hop
-  from there reaches a facet as a _virtual_ bridged connection, and virtual
-  connections are served by `Agent.getConnections()`, whose facet branch yields
-  `this._dynamicAgents.getVirtualConnections(tag)` (`src/index.ts:5358-5373`),
-  not `this._webSockets.getConnections()`.
-
-The set is nonetheless real on this host: every facet container is built with
-its own `webSockets: hibernation.snapshot()` (`think-host.worker.ts:315`), which
-is why the accessor is meaningful here and inert on workerd.
-
-The verification step, once the branch typechecks: add a temporary probe to
-`BrowserThinkDelegatedRun` that returns `[...this.webSockets.getConnections()].length`,
-run `agent-tool-delegation.integration.test.ts` and
-`agent-tool-stop.integration.test.ts`, and assert it stays 0 across a full
-delegated run including a Stop. If it does, delete the whole override and let
-`Agent.broadcast`'s facet branch (`src/index.ts:5325-5328`, which routes to the
-parent) stand alone. Do not keep a loop that never sends.
+Delete Rook's whole `BrowserThinkDelegatedRun.broadcast()` override. Its
+former `this.lifecycle.broadcast()` call addressed an empty physical-socket
+set. The provisional protected `Agent.webSockets` accessor introduced by
+`fda2bdf3` is removed before release because this probe disproved its only
+proposed consumer. No new connection loop replaces it.
 
 ### 2.5 The compaction boundary constants compile again
 
@@ -1171,9 +1118,9 @@ interaction with the fallback ordering has not been exercised. Settled by: the
 browser lane, specifically `agent-tool-delegation` and `root-agent-reentry`.
 
 **Q5. Is the delegated-run local broadcast reachable at all?**
-§2.4 gives strong static evidence that it is not, and a probe that would settle
-it in one run. Until that probe runs, the safe move is the mechanical
-translation (keep the loop); once it runs, delete the override.
+Settled: no physical sockets were present in the 17-test browser delegation
+and Stop probe described in §2.4. Both the Rook override and the provisional
+SDK accessor are removed from the integrated release.
 
 **Q6. Should `conversation-agent.ts:582-583`'s "second resolution" comment
 change?**
