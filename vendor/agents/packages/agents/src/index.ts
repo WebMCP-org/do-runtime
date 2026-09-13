@@ -1213,6 +1213,19 @@ export class Agent<
       this.getConnectionTags(connection, ctx)
   });
 
+  /**
+   * Vendor divergence: the installed WebSockets capability, for hosts whose
+   * facets accept their own physical sockets. A browser host delivers a
+   * client socket addressed to a facet to that facet's lifecycle, so a facet
+   * must be able to broadcast to its own connections as well as through its
+   * parent; `Lifecycle.broadcast` provided that until 0.22. The SDK's own
+   * facet paths never read it: on workerd a facet's sockets belong to the
+   * root (see `getConnection`).
+   */
+  protected get webSockets(): WebSockets {
+    return this._webSockets;
+  }
+
   /** Run user initialization after lifecycle components have started. */
   onStart(_props?: Props): void | Promise<void> {}
 

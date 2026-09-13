@@ -283,6 +283,14 @@ export interface CompactOptions {
    * protected head are summarized into one overlay. Default 20,000.
    */
   keepRecentTokens?: number;
+  // Vendor divergence: 0.22 exposed both floors and hosts tuned them. Rook
+  // keeps head 1 / tail 1 because one code-execution turn is a single
+  // enormous assistant row; at head 3 / tail 2 the compressible middle is
+  // empty and compaction returns null forever while the window fills.
+  /** Head messages kept verbatim so the conversation's opening survives. Default 3. */
+  protectHead?: number;
+  /** Tail messages kept verbatim regardless of the token budget. Default 2. */
+  minTailMessages?: number;
 }
 
 /**
@@ -311,17 +319,20 @@ export interface CompactOptions {
  */
 export function createCompactFunction(opts: CompactOptions) {
   const keepRecentTokens = opts.keepRecentTokens ?? 20_000;
+  // Vendor divergence: see CompactOptions.
+  const protectHead = opts.protectHead ?? PROTECT_HEAD;
+  const minTailMessages = opts.minTailMessages ?? MIN_TAIL_MESSAGES;
 
   return async (messages: SessionMessage[]): Promise<CompactResult | null> => {
-    if (messages.length <= PROTECT_HEAD + MIN_TAIL_MESSAGES) return null;
+    if (messages.length <= protectHead + minTailMessages) return null;
 
     // 1. Find compression boundaries
-    const compressStart = alignBoundaryForward(messages, PROTECT_HEAD);
+    const compressStart = alignBoundaryForward(messages, protectHead);
     const compressEnd = findTailCutByTokens(
       messages,
       compressStart,
       keepRecentTokens,
-      MIN_TAIL_MESSAGES
+      minTailMessages
     );
 
     if (compressEnd <= compressStart) {

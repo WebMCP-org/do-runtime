@@ -37,6 +37,22 @@ describe("createCompactFunction", () => {
     expect(await compact(conversation(5))).toBeNull();
   });
 
+  it("honours protectHead and minTailMessages overrides", async () => {
+    // Vendor divergence: Rook compacts one enormous code-execution turn at a
+    // time, so the head and tail floors must be tunable below the defaults.
+    const compact = createCompactFunction({
+      summarize: async () => "the summary",
+      keepRecentTokens: 1,
+      protectHead: 1,
+      minTailMessages: 1
+    });
+    expect(await compact(conversation(3))).toEqual({
+      fromMessageId: "m1",
+      toMessageId: "m1",
+      summary: "the summary"
+    });
+  });
+
   it("summarizes the middle and protects the head and tail", async () => {
     let prompt = "";
     const compact = createCompactFunction({
