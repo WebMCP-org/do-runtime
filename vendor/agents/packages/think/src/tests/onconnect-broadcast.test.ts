@@ -137,10 +137,22 @@ describe("Think — session compaction frames", () => {
           ? await connectSubAgentWS(room, "compaction-child")
           : await connectWS(room);
       await collectMessages(ws, 20);
-      const received = collectMessages(ws, 20);
+      const frames: Array<Record<string, unknown>> = [];
+      ws.addEventListener("message", (event: MessageEvent) => {
+        frames.push(
+          JSON.parse(event.data as string) as Record<string, unknown>
+        );
+      });
       try {
         const result = await agent.testCompactionFrames(mode);
-        const frames = await received;
+        await expect
+          .poll(() =>
+            frames.some(
+              (frame) =>
+                frame.type === "cf_agent_session" && frame.phase === "idle"
+            )
+          )
+          .toBe(true);
         const status = frames.filter(
           (frame) => frame.type === "cf_agent_session"
         );
