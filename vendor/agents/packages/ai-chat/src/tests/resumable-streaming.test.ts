@@ -133,9 +133,19 @@ describe("Resumable Streaming", () => {
       // capture at stream start.
       const row = await agentStub.getStartedStreamMetadata("req-wiring");
       expect(row).toBeDefined();
-      // And once persisted, the stream is gone: nothing left to sweep.
+      // And once persisted, the stream itself is gone: nothing left to sweep.
+      // Vendor divergence (2026-08-14 ledger entry): upstream asserts no row
+      // at all for the request. The fork settles the turn with a chunkless
+      // duplicate-request receipt — the cutover discarded the row that used
+      // to answer a replayed request id, and admission still has to recognise
+      // it. The discard is pinned instead by the receipt's shape: no message
+      // id and no stored chunks, so the stream's own row is provably gone.
       const after = await agentStub.getAllStreamMetadata();
-      expect(after.find((m) => m.request_id === "req-wiring")).toBeUndefined();
+      const remaining = after.filter((m) => m.request_id === "req-wiring");
+      expect(remaining).toEqual([
+        expect.objectContaining({ message_id: null, status: "completed" })
+      ]);
+      expect(await agentStub.getStreamChunks(remaining[0].id)).toEqual([]);
       // The wiring: the metadata records the SAME id the assistant message was
       // persisted under (the allocated id, since no provider id was emitted).
       expect(row?.message_id).toBeTruthy();
@@ -976,7 +986,17 @@ describe("Resumable Streaming", () => {
       ws.close(1000);
     });
 
-    it("does not replay stored chunks from an errored stream after a late ACK", async () => {
+    // Vendor divergence: upstream titles this "does not replay stored chunks
+    // from an errored stream after a late ACK" and expects a bare `done`
+    // frame. The fork's `ResumeHandshake.handleResumeAck` has an extra
+    // `hasErroredRequest` branch (in `agents/chat`, unchanged by the 0.23
+    // refresh — it is on `main` at 0.22 too): a client that ACKs after the
+    // stream errored gets the pre-error content it missed, then the terminal
+    // error frame, rather than an empty `done` it would render as a silently
+    // truncated turn. Upstream reaches the same replay only when a durable
+    // terminal record exists (`errored-stream-replay.test.ts`, #1575); the
+    // fork does not require one. Pinned here, not weakened.
+    it("replays an errored stream's stored chunks and terminal after a late ACK", async () => {
       const room = crypto.randomUUID();
       const requestId = "req-late-ack-error";
 
@@ -984,7 +1004,7 @@ describe("Resumable Streaming", () => {
       const streamId = await agentStub.testStartStream(requestId);
       await agentStub.testStoreStreamChunk(
         streamId,
-        '{"type":"text-delta","delta":"should not replay"}'
+        '{"type":"text-delta","delta":"partial before error"}'
       );
       await agentStub.testFlushChunkBuffer();
 
@@ -1014,16 +1034,20 @@ describe("Resumable Streaming", () => {
       );
 
       const responseMessages = messages.filter(isUseChatResponseMessage);
-      expect(
-        responseMessages.some((message) =>
-          message.body?.includes("should not replay")
-        )
-      ).toBe(false);
       expect(responseMessages).toEqual([
         expect.objectContaining({
           type: MessageType.CF_AGENT_USE_CHAT_RESPONSE,
           id: requestId,
+          body: '{"type":"text-delta","delta":"partial before error"}',
+          done: false,
+          replay: true
+        }),
+        expect.objectContaining({
+          type: MessageType.CF_AGENT_USE_CHAT_RESPONSE,
+          id: requestId,
+          body: "",
           done: true,
+          error: true,
           replay: true
         })
       ]);
@@ -1877,7 +1901,20 @@ describe("Resumable Streaming", () => {
         ).some((m) => m.role === "assistant")
       );
       // The cutover deleted the stream with the message write; no alarm.
-      expect(await agentStub.getAllStreamMetadata()).toEqual([]);
+      // Vendor divergence (2026-08-14 ledger entry): upstream expects an empty
+      // table. The fork's settle leaves a chunkless duplicate-request receipt
+      // for the answered id — it replaces the retention the cutover's discard
+      // took away, and it is reclaimed by the next stream start, not by an
+      // alarm (there is none to arm, before or after).
+      const rows = await agentStub.getAllStreamMetadata();
+      expect(rows).toEqual([
+        expect.objectContaining({
+          request_id: "req-no-alarm",
+          message_id: null,
+          status: "completed"
+        })
+      ]);
+      expect(await agentStub.getStreamChunks(rows[0].id)).toEqual([]);
       expect(await agentStub.testCountStreamCleanupSchedules()).toBe(0);
       ws.close(1000);
     });
@@ -1929,7 +1966,19 @@ describe("Resumable Streaming", () => {
       // The override dropped the internal options, yet the message write
       // still ran inside the cutover: a plain persist would have left the
       // finished stream's row (settled, not discarded) until the next turn.
-      expect(await agentStub.getAllStreamMetadata()).toEqual([]);
+      // Vendor divergence (2026-08-14 ledger entry): the only row left is the
+      // fork's chunkless duplicate-request receipt, so the cutover's discard
+      // is pinned by its shape — no message id, no chunks — rather than by an
+      // empty table as upstream asserts.
+      const rows = await agentStub.getAllStreamMetadata();
+      expect(rows).toEqual([
+        expect.objectContaining({
+          request_id: "req-override",
+          message_id: null,
+          status: "completed"
+        })
+      ]);
+      expect(await agentStub.getStreamChunks(rows[0].id)).toEqual([]);
       ws.close(1000);
     });
 
