@@ -5,6 +5,20 @@ shim could not cover it, and whether it is upstreamable. The measured footprint
 lives in [the vendor fork audit](audit/vendor-fork-audit.md); do not duplicate a count
 here that drifts on every refresh.
 
+## 2026-09-12 — Compare reconnect identity within the requested address
+
+- `packages/agents/src/react.tsx` clears its previous identity when the caller
+  changes the requested agent address. Switching conversations previously
+  reported each intentional change as an unexpected reconnect identity.
+  Same-address reconnects retain the comparison and warning/callback.
+- `src/react-tests/rpc-robustness.test.tsx` switches A → B → A through real
+  Workers and verifies identities and RPC replies without change callbacks.
+  A query-selected identity on the existing `/user` test route still reports
+  a server change at the same address. The maintained React gate includes
+  that suite.
+- Upstreamable: yes. The private comparison ref belongs to `useAgent`; a
+  consumer callback would only mask the incorrect reconnect classification.
+
 ## 2026-09-11 — Atomic replay storage and live chunk delivery
 
 - Think's WebSocket and callback streaming paths and AI Chat's SSE/plain-text
