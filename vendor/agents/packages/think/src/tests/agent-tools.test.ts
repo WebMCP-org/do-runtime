@@ -4,7 +4,7 @@ import {
   AGENT_TOOL_PROGRESS_PART,
   getAgentByName
 } from "agents";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { ThinkAgentToolParent, ThinkTestAgent } from "./agents";
 import type {
   AgentToolEventMessage,
@@ -29,6 +29,11 @@ type ThinkAgentToolTestStub = {
   setAgentToolOutputForTest(runId: string, output: unknown): Promise<void>;
   clearAgentToolOutputForTest(runId: string): Promise<void>;
   setStripTextResponseForTest(strip: boolean): Promise<void>;
+  holdBeforeStepForTest(): Promise<void>;
+  hasEnteredBeforeStepForTest(): Promise<boolean>;
+  releaseBeforeStepForTest(): Promise<void>;
+  // Vendor divergence: the abortable model hold, kept for the cancellation
+  // case upstream's `beforeStep` gate cannot drive (see below).
   holdAgentToolModelForTest(): Promise<void>;
   getBeforeStepLog(): ReturnType<ThinkTestAgent["getBeforeStepLog"]>;
   resetTurnStateForTest(): Promise<void>;
@@ -94,6 +99,10 @@ type ThinkAgentToolParentStub = DurableObjectStub & {
     errorText: string,
     runId?: string
   ): Promise<NonNullable<AgentToolInspection>>;
+  readCompletedChildChunksForTest(
+    input: string,
+    runId?: string
+  ): Promise<{ status: string; chunks: number }>;
   reconcileCompletedThinkChildForTest(
     input: string,
     runId?: string
@@ -199,18 +208,18 @@ async function waitForAgentToolRun(
   agent: ThinkAgentToolTestStub,
   runId: string
 ): Promise<AgentToolInspection> {
-  for (let attempt = 0; attempt < 20; attempt++) {
-    const inspection = await agent.inspectAgentToolRun(runId);
-    if (
-      inspection?.status === "completed" ||
-      inspection?.status === "error" ||
-      inspection?.status === "aborted"
-    ) {
+  // The child turn runs detached (`startAgentToolRun` returns immediately),
+  // so terminal status is only observable by polling. Use a long deadline —
+  // it costs nothing when the run is fast, and fails with a clear timeout
+  // instead of handing callers a misleading non-terminal snapshot.
+  return vi.waitFor(
+    async () => {
+      const inspection = await agent.inspectAgentToolRun(runId);
+      expect(["completed", "error", "aborted"]).toContain(inspection?.status);
       return inspection;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-  return agent.inspectAgentToolRun(runId);
+    },
+    { timeout: 8000, interval: 25 }
+  );
 }
 
 describe("Think agent tools", () => {
@@ -348,11 +357,25 @@ describe("Think agent tools", () => {
     const agent = await freshAgent();
     const runId = crypto.randomUUID();
 
-    await agent.holdAgentToolModelForTest();
+    // Park the child turn inside `beforeStep` on a promise gate so the reset
+    // deterministically lands while the turn is in flight (a wall-clock sleep
+    // here could lose the race and observe a completed turn instead).
+    await agent.holdBeforeStepForTest();
     await agent.startAgentToolRun("skipped probe", { runId });
+    // Vendor divergence: held work is always cancelled in `finally`, so a
+    // failed expectation cannot leave the child parked for the next case
+    // (2026-09-05 "Synchronize Agent-tool cancellation tests with execution").
     try {
-      await expect.poll(() => agent.getBeforeStepLog()).not.toHaveLength(0);
+      await vi.waitFor(
+        async () => {
+          expect(await agent.hasEnteredBeforeStepForTest()).toBe(true);
+        },
+        { timeout: 8000, interval: 25 }
+      );
       await agent.resetTurnStateForTest();
+      // Release AFTER the reset so the resumed turn observes the generation
+      // bump and seals the child run promptly.
+      await agent.releaseBeforeStepForTest();
 
       const inspection = await waitForAgentToolRun(agent, runId);
       expect(inspection).toMatchObject({
@@ -369,15 +392,28 @@ describe("Think agent tools", () => {
     const agent = await freshAgent();
     const runId = crypto.randomUUID();
 
+    // Vendor divergence: this case holds the child on its MODEL, not on
+    // upstream's `beforeStep` gate. The gate is not abort-aware, so a turn
+    // parked in it cannot finish shutting down and `cancelAgentToolRun` never
+    // reaches a confirmed `childStillRunning: false` — the assertion below,
+    // which is what proves an unconfirmed Stop is not reported as success
+    // (2026-08-30 "Delegated work cancellation"), needs an abortable hold.
+    // The held model stream also ends the turn on abort, so the finalizer
+    // runs on its own and the seal is re-checked after it, covering upstream's
+    // release-then-re-assert property without a release.
     await agent.holdAgentToolModelForTest();
     await agent.startAgentToolRun("cancelled probe", { runId });
+    // Held work is always cancelled in `finally` (2026-09-05 "Synchronize
+    // Agent-tool cancellation tests with execution").
     try {
       await expect.poll(() => agent.getBeforeStepLog()).not.toHaveLength(0);
       await expect(agent.cancelAgentToolRun(runId, "stop")).resolves.toEqual({
         childStillRunning: false
       });
 
-      // Only the runner's finalizer removes its abort controller.
+      // Only the runner's finalizer removes its abort controller, so an empty
+      // map proves the finish path ran to the end; the guarded UPDATE must
+      // not have clobbered the aborted seal.
       await expect
         .poll(() => agent.getAgentToolCleanupMapSizesForTest())
         .toEqual({
@@ -561,6 +597,21 @@ describe("Think agent tools", () => {
 
     expect(resolved.running).toBe(runId);
     expect(resolved.unknown).toBeNull();
+  });
+
+  it("keeps a completed Think child's stored chunks for a parent attaching afterwards", async () => {
+    const parent = await freshParent();
+    const runId = crypto.randomUUID();
+
+    // The child's cutover used to discard its stream rows with its message,
+    // so a parent re-attaching after completion (recovery, a late tail)
+    // replayed nothing. The rows now outlive the cutover, as in ai-chat.
+    const result = await parent.readCompletedChildChunksForTest(
+      "late attach",
+      runId
+    );
+    expect(result.status).toBe("completed");
+    expect(result.chunks).toBeGreaterThan(0);
   });
 
   it("recovers completed Think child runs into terminal parent rows", async () => {

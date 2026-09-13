@@ -57,6 +57,23 @@ const NEWEST_FIRST_WINDOW_ROWS = 8;
  */
 const MAX_PATH_DEPTH = 10_000;
 
+/**
+ * Vendor divergence: coerce a stored creation time (an epoch-millisecond
+ * column, or the ISO string a writer put in the row's JSON) into the typed
+ * `SessionMessage.createdAt`. Invalid values decode to `undefined` rather
+ * than an `Invalid Date`, so a corrupt row reads as "no timestamp" instead
+ * of a poisoned one (2026-08-12 "Session and turn timing reach chat
+ * metadata").
+ */
+function parseStoredDate(value: unknown): Date | undefined {
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? undefined : value;
+  }
+  if (typeof value !== "string" && typeof value !== "number") return undefined;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? undefined : date;
+}
+
 /** What a hydration window needs from a path row: its id, and its stored size when the window is byte-bounded. */
 type PathRow = { id: string; bytes: number };
 
@@ -348,16 +365,33 @@ export class SessionsCore {
     return joined;
   }
 
-  /** Reassemble one stored row, reading continuations only when it has any. */
-  #content(sessionId: string, id: string): string | null {
-    const rows = this.io.sql<{ content: string; content_chunks: number }>(
-      "SELECT content, content_chunks FROM cf_agents_session_messages WHERE session_id = ? AND id = ?",
+  /**
+   * Reassemble one stored row, reading continuations only when it has any.
+   *
+   * Vendor divergence: the row's `created_at` comes back with its content so
+   * a decoded message can carry the typed `SessionMessage.createdAt` the
+   * public type declares (2026-08-12 "Session and turn timing reach chat
+   * metadata"). Upstream selects content only and drops the column.
+   */
+  #content(
+    sessionId: string,
+    id: string
+  ): { content: string; createdAt: number } | null {
+    const rows = this.io.sql<{
+      content: string;
+      content_chunks: number;
+      created_at: number;
+    }>(
+      "SELECT content, content_chunks, created_at FROM cf_agents_session_messages WHERE session_id = ? AND id = ?",
       [sessionId, id]
     );
     if (rows.length === 0) return null;
     const row = rows[0];
-    if (row.content_chunks === 0) return row.content;
-    return row.content + (this.#continuations(sessionId, [id]).get(id) ?? "");
+    const content =
+      row.content_chunks === 0
+        ? row.content
+        : row.content + (this.#continuations(sessionId, [id]).get(id) ?? "");
+    return { content, createdAt: row.created_at };
   }
 
   #hasParent(sessionId: string, id: string): boolean {
@@ -378,8 +412,9 @@ export class SessionsCore {
   }
 
   getMessage(sessionId: string, id: string): SessionMessage | null {
-    const content = this.#content(sessionId, id);
-    const parsed = content === null ? null : this.#parse(content);
+    const row = this.#content(sessionId, id);
+    const parsed =
+      row === null ? null : this.#parse(row.content, row.createdAt);
     return parsed && this.#inline(parsed);
   }
 
@@ -433,8 +468,9 @@ export class SessionsCore {
       id: string;
       content: string;
       content_chunks: number;
+      created_at: number;
     }>(
-      `SELECT id, content, content_chunks FROM cf_agents_session_messages
+      `SELECT id, content, content_chunks, created_at FROM cf_agents_session_messages
        WHERE session_id = ? AND parent_id = ? ORDER BY seq ASC`,
       [sessionId, messageId]
     );
@@ -447,7 +483,8 @@ export class SessionsCore {
       const parsed = this.#parse(
         row.content_chunks === 0
           ? row.content
-          : row.content + (continued.get(row.id) ?? "")
+          : row.content + (continued.get(row.id) ?? ""),
+        row.created_at
       );
       if (parsed) result.push(this.#inline(parsed));
     }
@@ -561,8 +598,9 @@ export class SessionsCore {
       id: string;
       content: string;
       content_chunks: number;
+      created_at: number;
     }>(
-      `SELECT id, content, content_chunks FROM cf_agents_session_messages
+      `SELECT id, content, content_chunks, created_at FROM cf_agents_session_messages
        WHERE session_id = ? AND id IN (SELECT value FROM json_each(?))`,
       [sessionId, JSON.stringify(rows.map((row) => row.id))]
     );
@@ -574,7 +612,8 @@ export class SessionsCore {
       const parsed = this.#parse(
         row.content_chunks === 0
           ? row.content
-          : row.content + (continued.get(row.id) ?? "")
+          : row.content + (continued.get(row.id) ?? ""),
+        row.created_at
       );
       if (parsed) result.set(row.id, this.#inline(parsed));
     }
@@ -706,8 +745,9 @@ export class SessionsCore {
         parent_id: string | null;
         content: string;
         content_chunks: number;
+        created_at: number;
       }>(
-        `SELECT parent_id, content, content_chunks FROM cf_agents_session_messages
+        `SELECT parent_id, content, content_chunks, created_at FROM cf_agents_session_messages
          WHERE session_id = ? AND id = ?`,
         [sessionId, next]
       );
@@ -717,7 +757,7 @@ export class SessionsCore {
           ? row.content
           : row.content +
             (this.#continuations(sessionId, [next]).get(next) ?? "");
-      const parsed = this.#parse(json);
+      const parsed = this.#parse(json, row.created_at);
       if (parsed) yield this.#inline(parsed);
       next = row.parent_id;
       depth++;
@@ -1342,7 +1382,16 @@ export class SessionsCore {
     return resolveAttachments(message, (hash) => this.#attachments.get(hash));
   }
 
-  #parse(json: string): SessionMessage | null {
+  /**
+   * Vendor divergence: decode restores the typed `SessionMessage.createdAt`
+   * (2026-08-12 "Session and turn timing reach chat metadata"). A `createdAt`
+   * the stored JSON carries wins — that is the writer's own authoritative
+   * stamp — and the row's SQL `created_at` is the fallback, so a message
+   * written straight through the Session handle still reads back with the
+   * time it was stored. Upstream declares the field and never populates it,
+   * so the timestamp was lost on every hydration.
+   */
+  #parse(json: string, storedCreatedAt?: number): SessionMessage | null {
     try {
       const message = JSON.parse(json);
       if (
@@ -1350,7 +1399,12 @@ export class SessionsCore {
         typeof message?.role === "string" &&
         Array.isArray(message?.parts)
       ) {
-        return message;
+        const createdAt =
+          parseStoredDate(message.createdAt) ??
+          (storedCreatedAt === undefined
+            ? undefined
+            : parseStoredDate(storedCreatedAt));
+        return createdAt ? { ...message, createdAt } : message;
       }
     } catch {
       /* skip unparseable rows, matching legacy behavior */

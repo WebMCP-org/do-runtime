@@ -671,7 +671,15 @@ describe("Sessions capability", () => {
           expect(row.bytes).toBeLessThanOrEqual(MAX_INLINE_ROW_BYTES);
         }
 
-        expect(await session.getMessage("img")).toEqual(original);
+        // Vendor divergence: a read restores the row's stored creation time as the
+        // typed `SessionMessage.createdAt` (2026-08-12 "Session and turn timing
+        // reach chat metadata"), so the round-trip is the original PLUS that
+        // field. Upstream asserts `toEqual(original)`; the content equality it
+        // pins is unchanged.
+        expect(await session.getMessage("img")).toEqual({
+          ...original,
+          createdAt: expect.any(Date)
+        });
       });
     });
 
@@ -686,7 +694,12 @@ describe("Sessions capability", () => {
         expect(instance.contentChunks("", "big-text")).toBe(3);
         const stored = await session.getMessage("big-text");
         expect(stored?.parts[0].text).toBe(body);
-        expect(stored).toEqual(original);
+        // Vendor divergence: a read restores the row's stored creation time as the
+        // typed `SessionMessage.createdAt` (2026-08-12 "Session and turn timing
+        // reach chat metadata"), so the round-trip is the original PLUS that
+        // field. Upstream asserts `toEqual(original)`; the content equality it
+        // pins is unchanged.
+        expect(stored).toEqual({ ...original, createdAt: expect.any(Date) });
       });
     });
 
@@ -711,7 +724,15 @@ describe("Sessions capability", () => {
         await session.appendMessage(original);
 
         expect(instance.contentChunks("", "tool-out")).toBeGreaterThan(0);
-        expect(await session.getMessage("tool-out")).toEqual(original);
+        // Vendor divergence: a read restores the row's stored creation time as the
+        // typed `SessionMessage.createdAt` (2026-08-12 "Session and turn timing
+        // reach chat metadata"), so the round-trip is the original PLUS that
+        // field. Upstream asserts `toEqual(original)`; the content equality it
+        // pins is unchanged.
+        expect(await session.getMessage("tool-out")).toEqual({
+          ...original,
+          createdAt: expect.any(Date)
+        });
       });
     });
 
@@ -829,7 +850,13 @@ describe("Sessions capability", () => {
         });
 
         expect(instance.contentChunks("", "i-media")).toBeGreaterThan(0);
-        expect(await session.getMessage("i-media")).toEqual(original);
+        // Vendor divergence: the restored `createdAt` is the row's stored time —
+        // here the one `importMessage` was given (2026-08-12). Upstream asserts
+        // `toEqual(original)`.
+        expect(await session.getMessage("i-media")).toEqual({
+          ...original,
+          createdAt: new Date(1000)
+        });
       });
     });
 
@@ -992,7 +1019,13 @@ describe("Sessions capability", () => {
           createdAt: 1000
         });
 
-        expect(await session.getMessage("i-media")).toEqual(original);
+        // Vendor divergence: the restored `createdAt` is the row's stored time —
+        // here the one `importMessage` was given (2026-08-12). Upstream asserts
+        // `toEqual(original)`.
+        expect(await session.getMessage("i-media")).toEqual({
+          ...original,
+          createdAt: new Date(1000)
+        });
       });
     });
   });
