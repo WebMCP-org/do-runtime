@@ -2529,7 +2529,7 @@ export class ThinkTestAgent extends Think {
   }
 
   async testCompactionFrames(
-    mode: "manual" | "automatic" | "noop" | "error" | "facet"
+    mode: "manual" | "automatic" | "overlay" | "facet"
   ) {
     for (const id of ["compact-a", "compact-b"]) {
       await this.session.appendMessage({
@@ -2539,8 +2539,6 @@ export class ThinkTestAgent extends Think {
       });
     }
     this.session.onCompaction(async (messages) => {
-      if (mode === "error") throw new Error("compaction failed for test");
-      if (mode === "noop") return null;
       return {
         summary: "compressed history",
         fromMessageId: messages[0].id,
@@ -2554,6 +2552,10 @@ export class ThinkTestAgent extends Think {
         role: "user",
         parts: [{ type: "text", text: "automatic" }]
       });
+    } else if (mode === "overlay") {
+      await this.sessions
+        .session()
+        .addCompaction("compressed history", "compact-a", "compact-b");
     } else {
       await this.session.compact();
     }

@@ -122,9 +122,9 @@ function closeWS(ws: WebSocket): Promise<void> {
   });
 }
 
-describe("Think — session compaction frames", () => {
-  it.each(["manual", "automatic", "noop", "error", "facet"] as const)(
-    "settles %s compaction through the existing session frames",
+describe("Think — compaction synchronizes canonical history", () => {
+  it.each(["manual", "automatic", "overlay", "facet"] as const)(
+    "pushes %s compaction through chat messages without legacy session frames",
     async (mode) => {
       const room = crypto.randomUUID();
       const parent = await freshAgent(room);
@@ -136,7 +136,6 @@ describe("Think — session compaction frames", () => {
         mode === "facet"
           ? await connectSubAgentWS(room, "compaction-child")
           : await connectWS(room);
-      await collectMessages(ws, 20);
       const frames: Array<Record<string, unknown>> = [];
       ws.addEventListener("message", (event: MessageEvent) => {
         frames.push(
@@ -144,42 +143,26 @@ describe("Think — session compaction frames", () => {
         );
       });
       try {
-        const result = await agent.testCompactionFrames(mode);
+        const messages = await agent.testCompactionFrames(mode);
         await expect
           .poll(() =>
-            frames.some(
-              (frame) =>
-                frame.type === "cf_agent_session" && frame.phase === "idle"
+            JSON.stringify(
+              frames.find(
+                (frame) =>
+                  frame.type === MSG_CHAT_MESSAGES &&
+                  JSON.stringify(frame.messages).includes("compressed history")
+              )?.messages
             )
           )
-          .toBe(true);
-        const status = frames.filter(
-          (frame) => frame.type === "cf_agent_session"
-        );
-        expect(status.map((frame) => frame.phase)).toEqual([
-          "compacting",
-          "idle"
-        ]);
-        if (mode === "noop" || mode === "error") {
-          expect(status[1].compacted).toBeUndefined();
-          expect(JSON.stringify(result)).not.toContain("compressed history");
-        } else {
-          expect(status[1].compacted).toEqual({
-            tokensBefore: status[0].tokenEstimate
-          });
-          expect(status[1].tokenEstimate).toBeLessThan(
-            status[0].tokenEstimate as number
-          );
-          expect(JSON.stringify(result)).toContain("compressed history");
-        }
-        const errors = frames.filter(
-          (frame) => frame.type === "cf_agent_session_error"
-        );
-        expect(errors).toEqual(
-          mode === "error"
-            ? [expect.objectContaining({ error: "compaction failed for test" })]
-            : []
-        );
+          .toBe(JSON.stringify(messages));
+        expect(JSON.stringify(messages)).not.toContain("long history");
+        expect(
+          frames.filter(
+            (frame) =>
+              frame.type === "cf_agent_session" ||
+              frame.type === "cf_agent_session_error"
+          )
+        ).toEqual([]);
       } finally {
         await closeWS(ws);
       }

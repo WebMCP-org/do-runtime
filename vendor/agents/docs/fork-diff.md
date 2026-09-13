@@ -134,21 +134,18 @@ Rook's 17 real browser delegation/Stop checks proved delegated facets have zero
 physical sockets. Inherited virtual-connection broadcast already covers them;
 the host override is deleted as well.
 
-## Session compaction client status
+## Compaction chat synchronization
 
-`agents/src/sessions/handle.ts` emits operation status and uses its existing
-error event; Agent's lifecycle sink forwards them through the already exported
-`CF_AGENT_SESSION` / `CF_AGENT_SESSION_ERROR` wire types. The 0.23 extraction
-left these constants and their shared UI consumer in place but deleted the
-producer. Without the completion frame Rook's transcript stayed stale after
-`/compact`, despite a correctly persisted overlay. Successful idle follows all
-change listeners, including Think's cache refresh. Concurrent calls share only
-an in-flight count and a completed estimate; native compaction execution is
-unchanged. Direct overlay writes acquire no invented running phase.
+Think's Sessions change listener broadcasts its refreshed history through the
+existing chat-message frame after `compact` and direct `compaction` writes.
+Upstream 0.23 and main `46760e6` only refresh the server cache. The native
+socket regressions reproduce stale connected history without these two calls,
+including automatic compaction and virtual facets. Native React tests verify
+that canonical overlays replace old history during sending and observing
+streams without dropping reasoning, tool results, or subsequent text.
 
-Native Think socket tests cover manual, automatic, no-op, error and virtual
-facet delivery. Sessions capability tests cover overlapping calls, listener
-ordering and direct-overlay behavior. The existing shared UI defers transcript
-reload until chat is ready, preserving active streamed parts and phase/error/
-size notices. Retire this bridge when upstream restores equivalent client
-status; do not replace it with an extension-specific polling shim.
+The former session status/error bridge is removed. Sessions' handle and Agent's
+lifecycle sink again follow upstream; the design system consumes chat updates
+and its existing manual command result. Retire the two broadcasts when upstream
+Think synchronizes these writes itself. Configurable head/tail floors remain
+independently justified by the small-row-count compaction regression above.

@@ -2,11 +2,7 @@ import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { SessionHarnessObject } from "../capabilities/sessions";
-import type {
-  CompactResult,
-  SessionChangeEvent,
-  SessionMessage
-} from "../../sessions";
+import type { SessionChangeEvent, SessionMessage } from "../../sessions";
 import { MAX_INLINE_ROW_BYTES, splitContent } from "../../sessions/chunking";
 
 /**
@@ -62,83 +58,6 @@ async function collect(
 }
 
 describe("Sessions capability", () => {
-  it("keeps overlapping compactions busy until change listeners and both calls settle", async () => {
-    const stub = env.SessionHarnessObject.getByName(crypto.randomUUID());
-    await runInDurableObject(stub, async (instance: SessionHarnessObject) => {
-      const session = instance.sessions.session();
-      await session.appendMessage(
-        text("compact-a", "long history ".repeat(100))
-      );
-      await session.appendMessage(
-        text("compact-b", "long history ".repeat(100))
-      );
-      let markStarted!: () => void;
-      const started = new Promise<void>((resolve) => {
-        markStarted = resolve;
-      });
-      const held: Array<(result: CompactResult | null) => void> = [];
-      session.onCompaction(
-        () =>
-          new Promise((resolve) => {
-            held.push(resolve);
-            if (held.length === 2) markStarted();
-          })
-      );
-      let listenerFinished = false;
-      instance.sessions.subscribe(async (event) => {
-        if (event.type !== "compact") return;
-        expect(
-          instance
-            .eventsOfType("session:status")
-            .every(({ payload }) => payload.phase === "compacting")
-        ).toBe(true);
-        await Promise.resolve();
-        listenerFinished = true;
-      });
-      const first = session.compact();
-      const second = session.compact();
-      try {
-        await started;
-        held[0]({
-          summary: "small",
-          fromMessageId: "compact-a",
-          toMessageId: "compact-b"
-        });
-        await first;
-        expect(listenerFinished).toBe(true);
-        expect(
-          instance
-            .eventsOfType("session:status")
-            .map(({ payload }) => payload.phase)
-        ).toEqual(["compacting", "compacting"]);
-        held[1](null);
-        await second;
-        const events = instance.eventsOfType("session:status");
-        expect(events.map(({ payload }) => payload.phase)).toEqual([
-          "compacting",
-          "compacting",
-          "idle"
-        ]);
-        expect(events[2].payload.compacted).toEqual({
-          tokensBefore: events[0].payload.tokenEstimate
-        });
-      } finally {
-        for (const resolve of held) resolve(null);
-        await Promise.all([first, second]);
-      }
-    });
-  });
-
-  it("does not invent a running phase for a direct compaction overlay", async () => {
-    const stub = env.SessionHarnessObject.getByName(crypto.randomUUID());
-    await runInDurableObject(stub, async (instance: SessionHarnessObject) => {
-      const session = instance.sessions.session();
-      await session.appendMessage(text("direct", "original"));
-      await session.addCompaction("summary", "direct", "direct");
-      expect(instance.eventsOfType("session:status")).toEqual([]);
-    });
-  });
-
   it("appends a chain, follows the latest leaf, and round-trips content", async () => {
     const stub = env.SessionHarnessObject.getByName(crypto.randomUUID());
     await runInDurableObject(stub, async (instance: SessionHarnessObject) => {

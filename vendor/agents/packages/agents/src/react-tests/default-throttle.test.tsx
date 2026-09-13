@@ -361,6 +361,94 @@ describe("default chat throttle", () => {
     expect(h.sentMessages[h.sentMessages.length - 1]).toContain('"id":"a1"');
   });
 
+  it.each(["sender", "observer"] as const)(
+    "applies compacted history during a live %s stream without losing parts",
+    async (role) => {
+      const h = await mount(`compaction-${role}`, 0);
+      await vi.waitFor(() =>
+        expect(countType(h.sentMessages, RESUME_REQUEST)).toBe(1)
+      );
+      dispatch(h.target, {
+        type: "cf_agent_stream_resume_none",
+        reason: "idle"
+      });
+      await vi.waitFor(() => expect(h.chat().status).toBe("ready"));
+      let requestId = "other-panel";
+      let turn: Promise<void> | undefined;
+      if (role === "sender") {
+        turn = h.chat().sendMessage({ text: "continue" });
+        await vi.waitFor(() =>
+          expect(countType(h.sentMessages, "cf_agent_use_chat_request")).toBe(1)
+        );
+        requestId = JSON.parse(
+          h.sentMessages.find(
+            (frame) => JSON.parse(frame).type === "cf_agent_use_chat_request"
+          )!
+        ).id;
+      }
+      const chunk = (body: Record<string, unknown>) =>
+        dispatch(h.target, {
+          type: CHAT_RESPONSE,
+          id: requestId,
+          body: JSON.stringify(body),
+          done: false
+        });
+      chunk({ type: "start", messageId: "asst-1" });
+      chunk({ type: "start-step" });
+      chunk({ type: "reasoning-start", id: "r" });
+      chunk({ type: "reasoning-delta", id: "r", delta: "thinking" });
+      chunk({ type: "reasoning-end", id: "r" });
+      chunk({
+        type: "tool-input-available",
+        toolCallId: "call",
+        toolName: "search",
+        input: { q: "query" }
+      });
+      chunk({
+        type: "tool-output-available",
+        toolCallId: "call",
+        output: "found"
+      });
+      chunk({ type: "text-start", id: "t" });
+      chunk({ type: "text-delta", id: "t", delta: "live answer" });
+      const assistant = () =>
+        h.chat().messages.find((message) => message.id === "asst-1");
+      await vi.waitFor(() =>
+        expect(JSON.stringify(assistant())).toContain("live answer")
+      );
+      const liveParts = structuredClone(assistant()!.parts);
+      const summary: UIMessage = {
+        id: "compaction_test",
+        role: "assistant",
+        parts: [{ type: "text", text: "summary" }]
+      };
+      dispatch(h.target, { type: CHAT_MESSAGES, messages: [summary] });
+      await vi.waitFor(() =>
+        expect(h.read("message-ids")).toBe("compaction_test,asst-1")
+      );
+      expect(assistant()!.parts).toEqual(liveParts);
+      chunk({ type: "text-delta", id: "t", delta: " continued" });
+      chunk({ type: "text-end", id: "t" });
+      chunk({ type: "finish-step" });
+      chunk({ type: "finish" });
+      dispatch(h.target, {
+        type: CHAT_RESPONSE,
+        id: requestId,
+        body: "",
+        done: true
+      });
+      await turn;
+      await vi.waitFor(() =>
+        expect(JSON.stringify(assistant())).toContain("live answer continued")
+      );
+      expect(
+        h.chat().messages.filter((message) => message.id === "compaction_test")
+      ).toHaveLength(1);
+      expect(JSON.stringify(assistant())).toContain("thinking");
+      expect(JSON.stringify(assistant())).toContain("found");
+    }
+  );
+
   it("preserves Chat store parts newer than the rendered snapshot", async () => {
     const h = await mount("current-store-snapshot", 200);
     await vi.waitFor(() =>
