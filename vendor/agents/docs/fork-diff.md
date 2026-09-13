@@ -133,3 +133,22 @@ The provisional protected `Agent.webSockets` getter was removed before release:
 Rook's 17 real browser delegation/Stop checks proved delegated facets have zero
 physical sockets. Inherited virtual-connection broadcast already covers them;
 the host override is deleted as well.
+
+## Session compaction client status
+
+`agents/src/sessions/handle.ts` emits operation status and uses its existing
+error event; Agent's lifecycle sink forwards them through the already exported
+`CF_AGENT_SESSION` / `CF_AGENT_SESSION_ERROR` wire types. The 0.23 extraction
+left these constants and their shared UI consumer in place but deleted the
+producer. Without the completion frame Rook's transcript stayed stale after
+`/compact`, despite a correctly persisted overlay. Successful idle follows all
+change listeners, including Think's cache refresh. Concurrent calls share only
+an in-flight count and a completed estimate; native compaction execution is
+unchanged. Direct overlay writes acquire no invented running phase.
+
+Native Think socket tests cover manual, automatic, no-op, error and virtual
+facet delivery. Sessions capability tests cover overlapping calls, listener
+ordering and direct-overlay behavior. The existing shared UI defers transcript
+reload until chat is ready, preserving active streamed parts and phase/error/
+size notices. Retire this bridge when upstream restores equivalent client
+status; do not replace it with an extension-specific polling shim.

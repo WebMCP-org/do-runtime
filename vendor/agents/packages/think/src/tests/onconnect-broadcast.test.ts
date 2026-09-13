@@ -122,6 +122,59 @@ function closeWS(ws: WebSocket): Promise<void> {
   });
 }
 
+describe("Think — session compaction frames", () => {
+  it.each(["manual", "automatic", "noop", "error", "facet"] as const)(
+    "settles %s compaction through the existing session frames",
+    async (mode) => {
+      const room = crypto.randomUUID();
+      const parent = await freshAgent(room);
+      const agent =
+        mode === "facet"
+          ? await getSubAgentByName(parent, ThinkTestAgent, "compaction-child")
+          : parent;
+      const { ws } =
+        mode === "facet"
+          ? await connectSubAgentWS(room, "compaction-child")
+          : await connectWS(room);
+      await collectMessages(ws, 20);
+      const received = collectMessages(ws, 20);
+      try {
+        const result = await agent.testCompactionFrames(mode);
+        const frames = await received;
+        const status = frames.filter(
+          (frame) => frame.type === "cf_agent_session"
+        );
+        expect(status.map((frame) => frame.phase)).toEqual([
+          "compacting",
+          "idle"
+        ]);
+        if (mode === "noop" || mode === "error") {
+          expect(status[1].compacted).toBeUndefined();
+          expect(JSON.stringify(result)).not.toContain("compressed history");
+        } else {
+          expect(status[1].compacted).toEqual({
+            tokensBefore: status[0].tokenEstimate
+          });
+          expect(status[1].tokenEstimate).toBeLessThan(
+            status[0].tokenEstimate as number
+          );
+          expect(JSON.stringify(result)).toContain("compressed history");
+        }
+        const errors = frames.filter(
+          (frame) => frame.type === "cf_agent_session_error"
+        );
+        expect(errors).toEqual(
+          mode === "error"
+            ? [expect.objectContaining({ error: "compaction failed for test" })]
+            : []
+        );
+      } finally {
+        await closeWS(ws);
+      }
+    }
+  );
+});
+
 describe("Think — onConnect broadcast policy", () => {
   it.each(["rpc", "websocket"])(
     "does not duplicate a %s chunk on a mid-stream resume",

@@ -150,3 +150,14 @@ format/lint/typecheck, 81 React tests, 309 chat primitives, 386 Agents native,
 retries disabled (1,816 SDK regressions). Root typecheck, 938 runtime unit
 tests and package validation passed. The final CI gate additionally runs
 workerd/Node/browser conformance and both example E2E lanes.
+
+## Compaction status regression after consumer E2E
+
+Rook's first full extension lane against the released 0.23 closure passed
+149/150 tests; `/compact` persisted its overlay but the mounted transcript
+never refreshed. Native tracing found that the Sessions extraction retained
+server cache change listeners and the session frame constants while removing
+the frame producer consumed by the shared design system. Five real Think
+socket regressions reproduced missing status/error frames before the fix and
+pass after restoring the producer at Sessions/Agent. The application adapter
+and its safe end-of-turn reload remain unchanged.
