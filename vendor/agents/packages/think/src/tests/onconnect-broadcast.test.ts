@@ -3,11 +3,8 @@ import { describe, expect, it } from "vitest";
 import { getAgentByName, getSubAgentByName } from "agents";
 import { ThinkTestAgent } from "./agents/think-session";
 
-// Covers the Think server's `onConnect` broadcast policy. The server must
-// not send `cf_agent_chat_messages` while a resumable stream is in flight,
-// because the client is about to rebuild the in-progress assistant message
-// from the resume stream and a state broadcast here would clobber it.
-// See the onConnect block in `packages/think/src/think.ts` for details.
+// Ordinary streams rebuild their unpersisted assistant from replay; continuations
+// first refresh the canonical prefix that may have advanced while disconnected.
 
 const MSG_CHAT_MESSAGES = "cf_agent_chat_messages";
 const MSG_CHAT_RESPONSE = "cf_agent_use_chat_response";
@@ -257,6 +254,35 @@ describe("Think — onConnect broadcast policy", () => {
     expect(types).not.toContain(MSG_STREAM_RESUMING);
 
     await closeWS(ws);
+  });
+
+  it("sends the canonical continuation prefix before the resume offer", async () => {
+    const room = crypto.randomUUID();
+    const agent = await freshAgent(room);
+    await agent.testChat("completed while the client was offline");
+    const prefix = await agent.getMessages();
+    const streamId = await agent.testStartResumableStream(
+      "continued-offline",
+      true
+    );
+    const { ws } = await connectWS(room);
+    try {
+      const messages = await collectMessages(ws);
+      const snapshot = messages.findIndex(
+        (frame) => frame.type === MSG_CHAT_MESSAGES
+      );
+      const offer = messages.findIndex(
+        (frame) => frame.type === MSG_STREAM_RESUMING
+      );
+      expect(snapshot).toBeGreaterThanOrEqual(0);
+      expect(snapshot).toBeLessThan(offer);
+      expect(messages[snapshot].messages).toEqual(
+        JSON.parse(JSON.stringify(prefix))
+      );
+    } finally {
+      await closeWS(ws);
+      await agent.testCompleteResumableStream(streamId);
+    }
   });
 
   it("suppresses CHAT_MESSAGES on connect while a resumable stream is active", async () => {

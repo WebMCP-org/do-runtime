@@ -15,6 +15,7 @@ import { isToolUIPart, type UIMessage } from "ai";
 import {
   applyChunkToParts,
   dedupePartsByToolCallId,
+  restoreContinuationMessage,
   type StreamChunkData
 } from "./message-builder";
 
@@ -209,13 +210,17 @@ export class StreamAccumulator {
   }
 
   /** Restart a replay from the immutable continuation seed, once available. */
-  restartFromSeed(): StreamAccumulator {
+  restartFromSeed(continuation = this._isContinuation): StreamAccumulator {
     return new StreamAccumulator({
       messageId: this.messageId,
-      continuation: this._isContinuation,
+      continuation,
       existingParts:
-        this._pendingContinuationChunks === null ? this.seedParts : undefined,
-      existingMetadata: this.seedMetadata
+        this._pendingContinuationChunks === null &&
+        continuation === this._isContinuation
+          ? this.seedParts
+          : undefined,
+      existingMetadata:
+        continuation === this._isContinuation ? this.seedMetadata : undefined
     });
   }
 
@@ -253,12 +258,18 @@ export class StreamAccumulator {
     if (this._pendingContinuationChunks !== null) {
       const pendingChunks = this._pendingContinuationChunks;
       this._pendingContinuationChunks = null;
+      const existing =
+        existingIdx >= 0
+          ? restoreContinuationMessage(
+              messages[existingIdx],
+              pendingChunks.find((chunk) => chunk.type === "start")
+                ?.continuationStart
+            )
+          : undefined;
       this.seedParts.splice(
         0,
         this.seedParts.length,
-        ...(existingIdx >= 0
-          ? messages[existingIdx].parts.map((part) => ({ ...part }))
-          : [])
+        ...(existing ? existing.parts.map((part) => ({ ...part })) : [])
       );
       this.parts.splice(
         0,

@@ -1,5 +1,6 @@
 export {
   applyChunkToParts,
+  createContinuationStart,
   isReplayChunk,
   normalizeToolInput,
   type MessageParts,

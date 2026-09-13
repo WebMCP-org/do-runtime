@@ -451,6 +451,26 @@ describe("Think — core", () => {
 // ── Error handling + partial persistence ─────────────────────────
 
 describe("Think — error handling", () => {
+  it("warns once when reactive overflow recovery has no classifier override", async () => {
+    const agent = await freshAgent(`overflow-default-${crypto.randomUUID()}`);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      for (let turn = 0; turn < 2; turn++) {
+        const result = await agent.testChatWithReactiveOverflow();
+        expect(result.done).toBe(false);
+        expect(result.error).toContain("context_length_exceeded");
+      }
+      const warnings = warn.mock.calls.filter(([message]) =>
+        String(message).includes(
+          "contextOverflow.reactive is enabled but classifyChatError() is not overridden"
+        )
+      );
+      expect(warnings).toHaveLength(1);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it("should handle errors and return error message", async () => {
     const agent = await freshAgent("err-basic");
 

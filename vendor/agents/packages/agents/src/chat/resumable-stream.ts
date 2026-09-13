@@ -478,6 +478,10 @@ export class ResumableStream {
     return this._activeRequestId;
   }
 
+  get isContinuation(): boolean {
+    return this._activeIsContinuation;
+  }
+
   hasActiveStream(): boolean {
     return this._activeStreamId !== null;
   }

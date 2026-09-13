@@ -21,7 +21,7 @@ not run intentionally retired Codemode execution or unrelated upstream apps.
 `pnpm test:browser` builds and exercises the browser messenger leaves in
 Chromium, including native sockets in a real Worker. See
 [the integration guide](docs/think/browser-messengers.md) and
-[the next browser compatibility candidates](docs/browser-compatibility.md).
+[current browser integrations](docs/browser-compatibility.md).
 
 The native Agents and Think files run serially. Agents has a recorded
 parallel-worker bridge-test flake; Think's expanded suite hit its 60-second

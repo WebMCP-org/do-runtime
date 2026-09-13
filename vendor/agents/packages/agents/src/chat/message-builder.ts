@@ -58,6 +58,60 @@ export function dedupePartsByToolCallId(parts: MessageParts): MessageParts {
   return deduped;
 }
 
+/** The existing assistant prefix before a continuation starts appending. */
+export interface ContinuationStart {
+  messageId: string;
+  /** One entry per prefix part; text/reasoning entries retain their original length. */
+  parts: Array<number | null>;
+}
+
+export function createContinuationStart(message: UIMessage): ContinuationStart {
+  return {
+    messageId: message.id,
+    parts: message.parts.map((part) =>
+      part.type === "text" || part.type === "reasoning"
+        ? part.text.length
+        : null
+    )
+  };
+}
+
+/** Restore only a proven continuation prefix; legacy starts leave it unchanged. */
+export function restoreContinuationMessage<Message extends UIMessage>(
+  message: Message,
+  start: unknown
+): Message {
+  if (!start || typeof start !== "object") return message;
+  const boundary = start as Partial<ContinuationStart>;
+  if (
+    boundary.messageId !== message.id ||
+    !Array.isArray(boundary.parts) ||
+    !boundary.parts.every((length, index) => {
+      if (length === null) return true;
+      const part = message.parts[index];
+      return (
+        Number.isSafeInteger(length) &&
+        length >= 0 &&
+        (part?.type === "text" || part?.type === "reasoning") &&
+        length <= part.text.length
+      );
+    }) ||
+    boundary.parts.length > message.parts.length
+  )
+    return message;
+  const lengths = boundary.parts;
+  return {
+    ...message,
+    parts: message.parts.slice(0, lengths.length).map((part, index) => {
+      const length = lengths[index];
+      return length !== null &&
+        (part.type === "text" || part.type === "reasoning")
+        ? { ...part, text: part.text.slice(0, length) }
+        : part;
+    })
+  };
+}
+
 /**
  * Parsed chunk data from an AI SDK stream event.
  * This is the JSON-parsed body of a CF_AGENT_USE_CHAT_RESPONSE message,
