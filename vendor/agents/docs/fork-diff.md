@@ -14,6 +14,13 @@ The [current audit](audit/vendor-fork-audit.md) owns measured costs, upstream
 issue findings and unresolved coverage questions. Test names below describe
 inspected coverage; fresh follow-up results are identified explicitly in the audit.
 
+## React commands and connection identity
+
+| Boundary                                                                                      | Proof                                                                                                                                                            | Ownership and retirement                                                                                                                                                  |
+| --------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `useAgent` reconnect identity comparison resets when the requested address changes.           | Real-worker A → B → A RPC/identity regression and same-address identity-change regression in `rpc-robustness.test.tsx`.                                          | The comparison ref is private to the SDK; a host callback would mask the wrong classification. Retire with equivalent upstream address handling.                          |
+| `useAgentChat` memoizes its approval response wrapper over the existing command dependencies. | A real tool-heavy replay checks approval callback identity in `default-throttle.test.tsx`; Rook's built-package audit checks saved-message controls remain idle. | The wrapper belongs to the SDK; it still reads the current Chat store and notifies the server before the local update. Retire with equivalent upstream command stability. |
+
 ## Ownership map
 
 Rook's `ThreadApp` keeps the conversation socket and Agent-tool subscription
