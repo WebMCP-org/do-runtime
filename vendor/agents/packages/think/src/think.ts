@@ -3233,6 +3233,7 @@ export class Think<
                   break;
                 case "compaction":
                   await this._syncMessages();
+                  // Vendor divergence: synchronize open transcripts after overlays.
                   this._broadcastMessages();
                   break;
                 case "update":
@@ -3253,6 +3254,7 @@ export class Think<
                   break;
                 case "compact":
                   await this._syncMessages();
+                  // Vendor divergence: synchronize open transcripts after compaction.
                   this._broadcastMessages();
                   await this.#contextBlocks?.refreshSystemPrompt();
                   break;
