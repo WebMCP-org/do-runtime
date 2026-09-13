@@ -131,10 +131,23 @@ page.on("console", (message) => {
 
 const preview = () => page.frameLocator("#preview");
 const file = (path) => page.locator(`#files button[data-path="${path}"]`);
-const builtOk = () =>
-  page.waitForFunction(() => /^built in \d+ms$/.test(document.querySelector("#status").textContent), {
-    timeout: TIMEOUT,
-  });
+// Register before the action: the build status updates before srcdoc navigation commits.
+const builtOk = async (run) => {
+  const [frame] = await Promise.all([
+    page.waitForEvent("framenavigated", {
+      predicate: (frame) => frame.parentFrame() === page.mainFrame() && frame.url() === "about:srcdoc",
+      timeout: TIMEOUT,
+    }),
+    run(),
+  ]);
+  // The bridge is installed before #root is parsed; no CDN resources are needed.
+  await frame.locator("#root").waitFor({ state: "attached", timeout: TIMEOUT });
+  await page.waitForFunction(
+    () => /^built in \d+ms$/.test(document.querySelector("#status").textContent),
+    undefined,
+    { timeout: TIMEOUT },
+  );
+};
 
 const previewApi = (method = "GET") =>
   preview()
@@ -156,7 +169,7 @@ let exportDirectory;
 try {
   // 1 -----------------------------------------------------------------------
   await step("page loads and the actor seeded its starter files", async () => {
-    await page.goto(url, { waitUntil: "domcontentloaded" });
+    await builtOk(() => page.goto(url, { waitUntil: "domcontentloaded" }));
     for (const seeded of [
       "/server/agent.ts",
       "/src/main.tsx",
@@ -200,8 +213,7 @@ try {
 
   // 3 -----------------------------------------------------------------------
   await step("build & run bundles the workspace out of the Durable Object", async () => {
-    await page.locator("#build").click();
-    await builtOk();
+    await builtOk(() => page.locator("#build").click());
   });
 
   await step("the seeded front-end reaches the user Agent through /api/*", async () => {
@@ -248,8 +260,7 @@ try {
     agentSourceForExport = source.replace("a quiet hello", "a cheerful hello");
     if (agentSourceForExport === source) throw new Error("agent edit marker was missing");
     await page.locator("#editor").fill(agentSourceForExport);
-    await page.locator("#save").click();
-    await builtOk();
+    await builtOk(() => page.locator("#save").click());
     await page.waitForFunction(
       () => document.querySelector("#log").textContent.includes("agent restarted; storage intact"),
       undefined,
@@ -277,8 +288,7 @@ try {
     }
 
     await page.locator("#editor").fill(agentSourceForExport);
-    await page.locator("#save").click();
-    await builtOk();
+    await builtOk(() => page.locator("#save").click());
     const state = await previewApi();
     if (state.visits !== 1) throw new Error(`visit count after recovery is ${String(state.visits)}`);
   });
@@ -302,8 +312,7 @@ try {
     );
 
     await page.locator("#editor").fill(agentSourceForExport);
-    await page.locator("#save").click();
-    await builtOk();
+    await builtOk(() => page.locator("#save").click());
     const state = await previewApi();
     if (state.visits !== 1) {
       throw new Error(`visit count after constructor recovery is ${String(state.visits)}`);
@@ -321,8 +330,7 @@ try {
     );
     const source = await editor.inputValue();
     await editor.fill(source.replace(TITLE_BEFORE, TITLE_AFTER));
-    await page.locator("#save").click();
-    await builtOk();
+    await builtOk(() => page.locator("#save").click());
   });
 
   if (!online) {
@@ -338,8 +346,7 @@ try {
 
   // 6 -----------------------------------------------------------------------
   await step("the edit survives a page reload (OPFS persistence)", async () => {
-    await page.reload({ waitUntil: "domcontentloaded" });
-    await builtOk();
+    await builtOk(() => page.reload({ waitUntil: "domcontentloaded" }));
     await file("/src/App.tsx").waitFor({ timeout: TIMEOUT });
     await file("/src/App.tsx").click();
     await page.waitForFunction(
