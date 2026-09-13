@@ -5,12 +5,13 @@
  */
 export {
   LifecycleCapability,
-  type LifecycleAlarms,
   type LifecycleEvents,
   type LifecycleRouteAddress,
   type LifecycleRouteContext,
+  type LifecycleHostContextScope,
   type LifecycleRoutes,
-  type LifecycleServices
+  type LifecycleServices,
+  type LifecycleSockets
 } from "./capability";
 export {
   getCurrentAgent,
@@ -19,7 +20,14 @@ export {
 } from "./current-agent";
 export {
   Lifecycle,
-  type AlarmContribution,
+  type LifecycleOptions,
+  type LifecycleUseOptions,
+  type MemoryLimitContext,
+  type LifecycleJobContext,
+  type LifecycleJobs,
+  type LifecycleJob,
+  type LifecycleJobOutcome,
+  type LifecycleJobPushOptions,
   type Connection,
   type ConnectionContext,
   type ConnectionSetStateFn,
@@ -27,6 +35,7 @@ export {
   type DurableObjectCapability,
   type CapabilityRequestContext,
   type CapabilityStartContext,
+  type CapabilityWebSocketUpgradeContext,
   type LifecycleEvent,
   type WSMessage
 } from "./durable-object-lifecycle";
