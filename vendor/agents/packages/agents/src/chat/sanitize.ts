@@ -1,135 +1,45 @@
 /**
- * Message sanitization and row-size enforcement utilities.
+ * Row-size enforcement for chat tables that are NOT session storage.
  *
- * Shared by @cloudflare/ai-chat and @cloudflare/think to ensure persistence
- * hygiene: stripping ephemeral provider metadata and compacting
- * oversized messages before writing to SQLite.
+ * Sessions offloads oversized payloads losslessly and never truncates. Hosts
+ * that write messages into their own SQLite tables (Think's submission queue,
+ * for one) have no payload store behind them, so they still need a guard that
+ * makes a row fit. Message hygiene itself lives in `agents/sessions`.
  */
 
-import type { ProviderMetadata, ReasoningUIPart, UIMessage } from "ai";
+import type { UIMessage } from "ai";
+import {
+  byteLength,
+  sanitizeMessage as sanitizeMessageParts
+} from "../sessions/sanitize";
 import { dedupePartsByToolCallId } from "./message-builder";
 import { truncateToolOutput } from "./tool-output-truncation";
 
-const textEncoder = new TextEncoder();
-
-/** Maximum serialized message size before compaction (bytes). 1.8MB with headroom below SQLite's 2MB limit. */
-export const ROW_MAX_BYTES = 1_800_000;
-
-/** Measure UTF-8 byte length of a string. */
-export function byteLength(s: string): number {
-  return textEncoder.encode(s).byteLength;
-}
+export { byteLength };
 
 /**
- * Sanitize a message for persistence by removing ephemeral provider-specific
- * data that should not be stored or sent back in subsequent requests.
+ * Sanitize a message for persistence.
  *
- * 1. Strips OpenAI ephemeral fields (itemId, reasoningEncryptedContent),
- *    except on reasoning parts
- * 2. Filters truly empty reasoning parts (no text, no remaining providerMetadata)
+ * Vendor divergence: on top of `agents/sessions` message hygiene, keep one
+ * tool part per `toolCallId` — a continuation replayed by the provider or a
+ * reconnect can hand the same call back in an earlier state, and a second
+ * stored copy renders as a duplicate card forever.
  */
 export function sanitizeMessage(message: UIMessage): UIMessage {
-  const strippedParts = message.parts.map((part) => {
-    let sanitizedPart = part;
-
-    // Vendor divergence: reasoning parts keep itemId/reasoningEncryptedContent.
-    // Our responses paths all run `store: false`, where itemId is only a
-    // client-side grouping key (never sent as an item_reference) and the
-    // encrypted content is what lets the next turn replay reasoning instead
-    // of the provider skipping it with a "Non-OpenAI reasoning parts" warning.
-    if (part.type === "reasoning") return part;
-
-    if (
-      "providerMetadata" in sanitizedPart &&
-      sanitizedPart.providerMetadata &&
-      typeof sanitizedPart.providerMetadata === "object" &&
-      "openai" in sanitizedPart.providerMetadata
-    ) {
-      sanitizedPart = stripOpenAIMetadata(sanitizedPart, "providerMetadata");
-    }
-
-    if (
-      "callProviderMetadata" in sanitizedPart &&
-      sanitizedPart.callProviderMetadata &&
-      typeof sanitizedPart.callProviderMetadata === "object" &&
-      "openai" in sanitizedPart.callProviderMetadata
-    ) {
-      sanitizedPart = stripOpenAIMetadata(
-        sanitizedPart,
-        "callProviderMetadata"
-      );
-    }
-
-    return sanitizedPart;
-  }) as UIMessage["parts"];
-
-  const filteredParts = strippedParts.filter((part) => {
-    if (part.type === "reasoning") {
-      const reasoningPart = part as ReasoningUIPart;
-      if (!reasoningPart.text || reasoningPart.text.trim() === "") {
-        if (
-          "providerMetadata" in reasoningPart &&
-          reasoningPart.providerMetadata &&
-          typeof reasoningPart.providerMetadata === "object" &&
-          Object.keys(reasoningPart.providerMetadata).length > 0
-        ) {
-          return true;
-        }
-        return false;
-      }
-    }
-    return true;
-  });
-
-  const sanitizedParts = dedupePartsByToolCallId(filteredParts);
-  const removed = filteredParts.length - sanitizedParts.length;
+  const sanitized = sanitizeMessageParts(message);
+  const parts = dedupePartsByToolCallId(sanitized.parts);
+  const removed = sanitized.parts.length - parts.length;
   if (removed > 0) {
     console.warn(
       `[agents/chat] Message ${message.id} contained ${removed} duplicate ` +
         "tool part(s); deduplicated before persistence."
     );
   }
-
-  return { ...message, parts: sanitizedParts };
+  return { ...sanitized, parts };
 }
 
-function stripOpenAIMetadata<T extends UIMessage["parts"][number]>(
-  part: T,
-  metadataKey: "providerMetadata" | "callProviderMetadata"
-): T {
-  const metadata = (part as Record<string, unknown>)[metadataKey] as {
-    openai?: Record<string, unknown>;
-    [key: string]: unknown;
-  };
-
-  if (!metadata?.openai) return part;
-
-  const {
-    itemId: _itemId,
-    reasoningEncryptedContent: _rec,
-    ...restOpenai
-  } = metadata.openai;
-
-  const hasOtherOpenaiFields = Object.keys(restOpenai).length > 0;
-  const { openai: _openai, ...restMetadata } = metadata;
-
-  let newMetadata: ProviderMetadata | undefined;
-  if (hasOtherOpenaiFields) {
-    newMetadata = { ...restMetadata, openai: restOpenai } as ProviderMetadata;
-  } else if (Object.keys(restMetadata).length > 0) {
-    newMetadata = restMetadata as ProviderMetadata;
-  }
-
-  const { [metadataKey]: _oldMeta, ...restPart } = part as Record<
-    string,
-    unknown
-  >;
-
-  if (newMetadata) {
-    return { ...restPart, [metadataKey]: newMetadata } as T;
-  }
-  return restPart as T;
-}
+/** Maximum serialized message size before compaction (bytes). 1.8MB with headroom below SQLite's 2MB limit. */
+export const ROW_MAX_BYTES = 1_800_000;
 
 /** Optional hooks for {@link enforceRowSizeLimit}. */
 export interface EnforceRowSizeLimitOptions {

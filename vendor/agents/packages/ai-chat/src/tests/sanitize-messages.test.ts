@@ -197,15 +197,24 @@ describe("Message Sanitization", () => {
     ws.close(1000);
   });
 
-  it("removes empty OpenAI reasoning placeholders after stripping metadata", async () => {
+  // Vendor divergence (2026-07-24 ledger entry, "reasoning parts keep OpenAI
+  // replay fields"): upstream strips `itemId`/`reasoningEncryptedContent` from
+  // every part and then drops the now-empty reasoning placeholder, so its
+  // version of this case asserts zero reasoning parts. The fork exempts
+  // reasoning parts from the strip — every host responses path runs
+  // `store: false`, where the encrypted content is what lets the next turn
+  // replay the reasoning instead of the provider skipping it with a
+  // "Non-OpenAI reasoning parts" warning — so the placeholder survives with
+  // its replay fields. Pinned here rather than weakened: the assertion states
+  // the fork's guarantee.
+  it("retains an empty OpenAI reasoning placeholder with its replay fields", async () => {
     const room = crypto.randomUUID();
     const { ws } = await connectChatWS(`/agents/test-chat-agent/${room}`);
     await new Promise((r) => setTimeout(r, 50));
 
     const agentStub = await getAgentByName(env.TestChatAgent, room);
 
-    // OpenAI returns empty reasoning parts with only ephemeral metadata.
-    // After stripping OpenAI fields, these should be filtered out entirely.
+    // OpenAI returns empty reasoning parts carrying only the replay fields.
     const messageWithOpenAIReasoning: ChatMessage = {
       id: "msg-sanitize-openai-reasoning",
       role: "assistant",
@@ -230,11 +239,23 @@ describe("Message Sanitization", () => {
     const persisted = (await agentStub.getPersistedMessages()) as ChatMessage[];
     expect(persisted.length).toBe(1);
 
-    // The empty reasoning part should be gone (OpenAI metadata stripped, then empty part filtered)
+    // The reasoning part keeps its OpenAI replay fields, so the empty-part
+    // filter (which drops a text-less reasoning part only when no metadata
+    // remains) keeps it.
     const reasoningParts = persisted[0].parts.filter(
       (p) => p.type === "reasoning"
     );
-    expect(reasoningParts.length).toBe(0);
+    expect(reasoningParts.length).toBe(1);
+
+    const reasoningPart = reasoningParts[0] as {
+      text: string;
+      providerMetadata?: Record<string, unknown>;
+    };
+    expect(reasoningPart.text).toBe("");
+    expect(reasoningPart.providerMetadata?.openai).toEqual({
+      itemId: "item_reasoning_1",
+      reasoningEncryptedContent: "encrypted-blob"
+    });
 
     // Text part should be preserved
     const textParts = persisted[0].parts.filter((p) => p.type === "text");

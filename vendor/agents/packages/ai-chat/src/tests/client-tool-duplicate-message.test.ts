@@ -819,9 +819,24 @@ describe("Client-side tool duplicate message prevention", () => {
     const assistantMessage = messages.find((m) => m.role === "assistant");
 
     expect(assistantMessage).toBeDefined();
-    // Empty reasoning part should have been filtered out
-    expect(assistantMessage!.parts.length).toBe(1);
-    expect(assistantMessage!.parts[0].type).toBe("text");
+    // Vendor divergence (2026-07-24 ledger entry, "reasoning parts keep OpenAI
+    // replay fields"): the fork does not strip OpenAI metadata from reasoning
+    // parts, so `providerMetadata.openai` survives and the empty-part filter —
+    // which only drops a text-less reasoning part with no metadata left —
+    // keeps this one. Upstream strips first and is left with the text part
+    // alone. Pinned to the fork's behaviour, not weakened.
+    expect(assistantMessage!.parts.length).toBe(2);
+    expect(assistantMessage!.parts[0].type).toBe("reasoning");
+    expect(
+      (
+        assistantMessage!.parts[0] as {
+          providerMetadata?: {
+            openai?: { reasoningEncryptedContent?: unknown };
+          };
+        }
+      ).providerMetadata?.openai
+    ).toEqual({ reasoningEncryptedContent: null });
+    expect(assistantMessage!.parts[1].type).toBe("text");
 
     ws.close(1000);
   });
@@ -884,8 +899,11 @@ describe("Client-side tool duplicate message prevention", () => {
       };
     };
     expect(reasoningPart.text).toBe("Let me think about this carefully...");
-    // itemId should still be stripped
-    expect(reasoningPart.providerMetadata?.openai?.itemId).toBeUndefined();
+    // Vendor divergence (2026-07-24 ledger entry): upstream strips `itemId`
+    // here. The fork keeps it on reasoning parts — every host responses path
+    // runs `store: false`, where the item id is a client-side grouping key and
+    // the encrypted content is what lets the next turn replay the reasoning.
+    expect(reasoningPart.providerMetadata?.openai?.itemId).toBe("reason_123");
 
     ws.close(1000);
   });
