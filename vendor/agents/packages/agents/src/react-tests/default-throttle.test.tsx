@@ -132,6 +132,10 @@ async function mount(
 
   let chatApi: ReturnType<typeof useAgentChat>;
 
+  const approvalCallbacks = new Set<
+    ReturnType<typeof useAgentChat>["addToolApprovalResponse"]
+  >();
+
   function TestComponent() {
     const chat = useAgentChat({
       agent,
@@ -149,6 +153,7 @@ async function mount(
     }
     chatApi = chat;
     setChatMessages = chat.setMessages;
+    approvalCallbacks.add(chat.addToolApprovalResponse);
     const assistantText = chat.messages
       .filter((m) => m.role === "assistant")
       .flatMap((m) => m.parts)
@@ -172,6 +177,7 @@ async function mount(
     read: (id: string) =>
       container.querySelector(`[data-testid="${id}"]`)?.textContent ?? null,
     sentMessages,
+    approvalCallbacks,
     chat: () => chatApi,
     setMessages: (...args: Parameters<NonNullable<typeof setChatMessages>>) => {
       if (!setChatMessages) {
@@ -326,6 +332,13 @@ describe("default chat throttle", () => {
     await vi.waitFor(() => expect(h.chat().messages).toEqual([]));
     h.setMessages([pending]);
     await vi.waitFor(() => expect(h.chat().messages).toEqual([pending]));
+  });
+
+  it("keeps approval controls stable while streamed messages change", async () => {
+    const h = await mount("stable-approval-controls");
+    await replayTurn(h);
+    expect(h.read("chars")).toBe(String(expectedChars));
+    expect(h.approvalCallbacks.size).toBe(1);
   });
 
   it("resolves functional updates against the current Chat store", async () => {
