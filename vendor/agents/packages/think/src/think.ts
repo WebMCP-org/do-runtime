@@ -271,10 +271,7 @@ import type {
   ChatFiberSnapshot,
   OrphanPersistStore
 } from "agents/chat";
-// Vendor divergence: `TruncateOptions` rides upstream's import so the
-// `CONTEXT_TRUNCATION` pin below can be typed (2026-07-26 "Read-time
-// truncation sized for one-message turns").
-import { truncateOlderMessages, type TruncateOptions } from "agents/chat";
+import { truncateOlderMessages } from "agents/chat";
 import {
   Sessions,
   isCompactionMessage,
@@ -299,25 +296,9 @@ import {
  * - media eviction never rewrites messages inside it (the
  *   `keepRecentMessages` clamp), so the rows the model replays at full
  *   fidelity are never stripped.
- *
- * Vendor divergence: this fork does not use that default — the span actually
- * replayed at full fidelity is {@link CONTEXT_TRUNCATION}'s `keepRecent` (see
- * `_assembleModelMessages`). Both bounds stay correct as long as it is no
- * larger than this window.
  */
 const MODEL_RECENT_WINDOW = 4;
 
-/**
- * Read-time truncation for `_assembleModelMessages`: messages older than
- * `keepRecent` replay with capped tool outputs and text. Stored history is
- * never modified.
- *
- * Host pin — rationale in docs/upstream-diff.md. One whole tool turn
- * persists here as ONE assistant message, so upstream's `keepRecent` of 4
- * replays the last two entire tool loops; two keeps the preceding turn intact
- * and caps every turn before it.
- */
-const CONTEXT_TRUNCATION: TruncateOptions = { keepRecent: 2 };
 const DEFAULT_ACTION_TIMEOUT_MS = 30_000;
 
 /** Whether a workspace can receive raw bytes, which skills projection needs. */
@@ -6233,10 +6214,7 @@ export class Think<
     const providerSafeHistory = history.map(
       toProviderSafeExecutionOutcomeMessage
     );
-    const truncated = truncateOlderMessages(
-      providerSafeHistory,
-      CONTEXT_TRUNCATION
-    ) as UIMessage[];
+    const truncated = truncateOlderMessages(providerSafeHistory) as UIMessage[];
     // `_repairTranscriptForProvider` above already heals orphan tool calls
     // (flipping them to errored results, preserving the record). This is the
     // last-line backstop: if any incomplete tool call still slips through
