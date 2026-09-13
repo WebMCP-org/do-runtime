@@ -34,13 +34,13 @@ use the gates below.
 
 | Package   | Changed source files | Added lines | Removed lines |
 | --------- | -------------------: | ----------: | ------------: |
-| Agents    |                   33 |       2,807 |           641 |
+| Agents    |                   33 |       2,808 |           641 |
 | AI Chat   |                    1 |         164 |            42 |
 | Think     |                   15 |       2,718 |         1,191 |
 | Voice     |                    0 |           0 |             0 |
 | Shell     |                    9 |       1,917 |            80 |
 | Codemode  |                    0 |           0 |             0 |
-| **Total** |               **58** |   **7,606** |     **1,954** |
+| **Total** |               **58** |   **7,607** |     **1,954** |
 
 These are textual differences, not a count of independent patches or removable
 code. Thirteen new browser-messenger/OPFS files account for 2,631 added lines;
@@ -143,3 +143,10 @@ Rook's Q5 real-browser probe passed all 17 delegation and Stop tests with zero
 physical facet sockets throughout. The unused protected `Agent.webSockets`
 getter and its changeset are therefore deleted before release; virtual
 broadcast remains upstream-owned.
+
+Local merged verification: all six package builds and exports, full SDK
+format/lint/typecheck, 81 React tests, 309 chat primitives, 386 Agents native,
+85 AI Chat, 670 Think, 21 Voice, 193 Shell and 71 browser tests passed with
+retries disabled (1,816 SDK regressions). Root typecheck, 938 runtime unit
+tests and package validation passed. The final CI gate additionally runs
+workerd/Node/browser conformance and both example E2E lanes.
