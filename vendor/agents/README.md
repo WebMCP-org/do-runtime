@@ -30,12 +30,12 @@ passed with serial file execution; retries remain disabled.
 
 ## Packages
 
-- `agents@0.22.0`
-- `@cloudflare/ai-chat@0.11.0`
-- `@cloudflare/think@0.17.0`
-- `@cloudflare/voice@0.4.0`
+- `agents@0.23.0`
+- `@cloudflare/ai-chat@0.12.0`
+- `@cloudflare/think@0.18.0`
+- `@cloudflare/voice@0.5.0`
 - `@cloudflare/shell@0.4.3`
-- `@cloudflare/codemode@0.5.1`
+- `@cloudflare/codemode@0.5.2`
 
 Rook consumes these built packages. `@mcp-b/do-runtime` remains a lower
 layer and has no dependency on the SDK.

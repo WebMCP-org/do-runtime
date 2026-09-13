@@ -2557,41 +2557,44 @@ export function useAgentChat<
   // in place with the existing ID, rather than relying on ID resolution
   // when sendMessage() is called later.
   const addToolApprovalResponseAndNotifyServer: typeof addToolApprovalResponse =
-    (args) => {
-      const { id: approvalId, approved } = args;
+    useCallback(
+      (args) => {
+        const { id: approvalId, approved } = args;
 
-      // Find the toolCallId from the approval ID
-      // The approval ID is stored on the tool part's approval.id field
-      let toolCallId: string | undefined;
-      setMessages((currentMessages: ChatMessage[]) => {
-        for (const msg of currentMessages) {
-          for (const part of msg.parts) {
-            if (
-              "toolCallId" in part &&
-              "approval" in part &&
-              (part.approval as { id?: string })?.id === approvalId
-            ) {
-              toolCallId = part.toolCallId as string;
-              return currentMessages;
+        // Find the toolCallId from the approval ID
+        // The approval ID is stored on the tool part's approval.id field
+        let toolCallId: string | undefined;
+        setMessages((currentMessages: ChatMessage[]) => {
+          for (const msg of currentMessages) {
+            for (const part of msg.parts) {
+              if (
+                "toolCallId" in part &&
+                "approval" in part &&
+                (part.approval as { id?: string })?.id === approvalId
+              ) {
+                toolCallId = part.toolCallId as string;
+                return currentMessages;
+              }
             }
           }
+          return currentMessages;
+        });
+
+        if (toolCallId) {
+          // Send approval to server first (server updates message in place)
+          sendToolApprovalToServer(toolCallId, approved);
+        } else {
+          console.warn(
+            `[useAgentChat] addToolApprovalResponse: Could not find toolCallId for approval ID "${approvalId}". ` +
+              "Server will not be notified, which may cause duplicate messages."
+          );
         }
-        return currentMessages;
-      });
 
-      if (toolCallId) {
-        // Send approval to server first (server updates message in place)
-        sendToolApprovalToServer(toolCallId, approved);
-      } else {
-        console.warn(
-          `[useAgentChat] addToolApprovalResponse: Could not find toolCallId for approval ID "${approvalId}". ` +
-            "Server will not be notified, which may cause duplicate messages."
-        );
-      }
-
-      // Call AI SDK's addToolApprovalResponse for local state update
-      addToolApprovalResponse(args);
-    };
+        // Call AI SDK's addToolApprovalResponse for local state update
+        addToolApprovalResponse(args);
+      },
+      [setMessages, sendToolApprovalToServer, addToolApprovalResponse]
+    );
 
   // Fix for issue #728: Merge client-side tool results with messages
   // so tool parts show output-available immediately after execution

@@ -110,6 +110,7 @@ describe("Plain text response handling", () => {
       { id: "u1", role: "user", parts: [{ type: "text", text: "Search" }] },
       prefix
     ]);
+    await stub.setTestBody({ holdResponseForReplay: true });
     const frames: Array<Record<string, unknown>> = [];
     ws.addEventListener("message", (event: MessageEvent) => {
       const frame = JSON.parse(event.data as string) as Record<string, unknown>;
@@ -133,6 +134,18 @@ describe("Plain text response handling", () => {
           autoContinue: true
         })
       );
+      await vi.waitFor(() =>
+        expect(
+          frames.some(
+            (frame) =>
+              frame.type === MessageType.CF_AGENT_USE_CHAT_RESPONSE &&
+              frame.replay === true &&
+              typeof frame.body === "string" &&
+              frame.body.includes("text-delta")
+          )
+        ).toBe(true)
+      );
+      await stub.releaseResponseForTest();
       await vi.waitFor(() =>
         expect(
           frames.some(
@@ -185,6 +198,7 @@ describe("Plain text response handling", () => {
         { type: "text", text: "Partial Hello from chat agent!", state: "done" }
       ]);
     } finally {
+      await stub.releaseResponseForTest();
       ws.close(1000);
     }
   });

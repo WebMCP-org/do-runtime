@@ -124,13 +124,13 @@ function closeWS(ws: WebSocket): Promise<void> {
 
 describe("Think — onConnect broadcast policy", () => {
   it.each(["rpc", "websocket"])(
-    "does not duplicate a %s chunk on resume during its progress write",
+    "does not duplicate a %s chunk on a mid-stream resume",
     async (transport) => {
       const room = crypto.randomUUID();
       const agent = await freshAgent(room);
       const { ws } = await connectWS(room);
       await collectMessages(ws, 20);
-      await agent.holdStreamProgressReadForTest();
+      await agent.holdStreamAfterFirstChunkForTest();
       const turn =
         transport === "rpc"
           ? agent.testChat("resume while storing")
@@ -156,7 +156,7 @@ describe("Think — onConnect broadcast policy", () => {
         );
       try {
         await expect
-          .poll(() => agent.isStreamProgressReadHeldForTest())
+          .poll(() => agent.isStreamHeldAfterFirstChunkForTest())
           .toBe(true);
         const active = await agent.waitForActiveResumableStreamForTest();
         if (!active) throw new Error("no active stream");
@@ -174,7 +174,7 @@ describe("Think — onConnect broadcast policy", () => {
         await expect
           .poll(() => received.some((frame) => frame.replayComplete))
           .toBe(true);
-        await agent.releaseStreamProgressReadForTest();
+        await agent.releaseStreamAfterFirstChunkForTest();
         await turn;
         await expect
           .poll(() => received.some((frame) => frame.done))
@@ -189,7 +189,7 @@ describe("Think — onConnect broadcast policy", () => {
           chunks.filter((chunk) => chunk.type === "text-end")
         ).toHaveLength(1);
       } finally {
-        await agent.releaseStreamProgressReadForTest();
+        await agent.releaseStreamAfterFirstChunkForTest();
         await turn;
         await closeWS(ws);
       }

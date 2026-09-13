@@ -13,14 +13,35 @@ export default defineConfig({
   resolve: {
     alias: [
       // Think's runtime seams must exercise the edited SDK, not stale dist.
-      {
-        find: /^agents$/,
-        replacement: path.join(testsDir, "../../../agents/src/index.ts")
-      },
-      {
-        find: /^agents\/chat$/,
-        replacement: path.join(testsDir, "../../../agents/src/chat/index.ts")
-      },
+      //
+      // EVERY `agents/*` entry point Think imports has to be aliased, not just
+      // the ones whose behaviour is under test: a subpath left on `dist` loads
+      // a SECOND copy of the package's module graph, and 0.23's Lifecycle
+      // capabilities carry identity across it (`use()` binds services only
+      // `if (capability instanceof LifecycleCapability)`, and the installed-
+      // services registry is a module-level WeakMap). A dist-resolved
+      // `agents/sessions` therefore installs nothing and every turn fails with
+      // "Sessions must be installed with Lifecycle.use() before use".
+      ...[
+        ["agents", "index.ts"],
+        ["agents/chat", "chat/index.ts"],
+        ["agents/chat-sdk", "chat-sdk/index.ts"],
+        ["agents/sessions", "sessions/index.ts"],
+        ["agents/streams", "streams/index.ts"],
+        ["agents/tasks", "tasks/index.ts"],
+        ["agents/context", "context/index.ts"],
+        ["agents/lifecycle", "lifecycle/index.ts"],
+        ["agents/skills", "skills/index.ts"],
+        ["agents/agent-tools", "agent-tools.ts"],
+        ["agents/workflows", "workflows.ts"],
+        ["agents/observability", "observability/index.ts"],
+        ["agents/observability/ai", "observability/ai/index.ts"],
+        ["agents/browser", "browser/index.ts"],
+        ["agents/browser/ai", "browser/ai.ts"]
+      ].map(([specifier, entry]) => ({
+        find: new RegExp(`^${specifier.replace(/\//g, "\\/")}$`),
+        replacement: path.join(testsDir, "../../../agents/src", entry)
+      })),
       {
         find: /^@cloudflare\/codemode\/ai$/,
         replacement: workspaceRequire.resolve("@cloudflare/codemode/ai")

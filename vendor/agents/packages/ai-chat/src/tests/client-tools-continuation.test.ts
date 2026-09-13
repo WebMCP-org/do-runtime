@@ -149,7 +149,10 @@ describe("Client tools continuation", () => {
       },
       prefix
     ]);
-    await stub.setTestBody({ sseWithoutMessageId: true });
+    await stub.setTestBody({
+      sseWithoutMessageId: true,
+      holdResponseForReplay: true
+    });
     const frames = collectMessages(ws);
     ws.addEventListener("message", (event: MessageEvent) => {
       const frame = JSON.parse(event.data as string) as Record<string, unknown>;
@@ -181,8 +184,8 @@ describe("Client tools continuation", () => {
             frame.body.includes("text-end")
         )
       ).toBeDefined();
-      // Server completion may reach this socket before its ACK replay. Wait
-      // for the replayed text-end above before reading the captured chunks.
+      await stub.releaseResponseForTest();
+      // Replay completed before EOF lets the 0.23 persist cutover drop its row.
       await stub.waitUntilStableForTest({ timeout: 3000 });
       const chunks = frames
         .filter(
@@ -221,6 +224,7 @@ describe("Client tools continuation", () => {
           .join("")
       ).toBe("Partial SSE reply");
     } finally {
+      await stub.releaseResponseForTest();
       ws.close(1000);
     }
   });
