@@ -1801,61 +1801,69 @@ describe("Think — row size enforcement", () => {
 // ── Model message conversion ─────────────────────────────────────
 
 describe("Think — model message conversion", () => {
-  it("replays truncated workspace text read outputs as text", async () => {
-    const agent = await freshAgent("model-conversion-truncated-read");
-    const largeContent = "read-output ".repeat(100);
+  it.each([1, 2, 3])(
+    "replays workspace read output with %i newer stored messages",
+    async (recent) => {
+      const agent = await freshAgent(
+        `model-conversion-truncated-read-${recent}`
+      );
+      const largeContent = "read-output ".repeat(100);
 
-    await agent.persistTestMessage({
-      id: "u-read-text",
-      role: "user",
-      parts: [{ type: "text", text: "Read /large.txt" }]
-    });
-    await agent.persistTestMessage({
-      id: "a-read-text",
-      role: "assistant",
-      parts: [
-        {
-          type: "tool-read",
-          toolCallId: "tc-read-text",
-          state: "output-available",
-          input: { path: "/large.txt" },
-          output: {
-            path: "/large.txt",
-            content: largeContent,
-            totalLines: 1
-          }
-        } as UIMessage["parts"][number]
-      ]
-    });
-    for (let i = 0; i < 4; i++) {
       await agent.persistTestMessage({
-        id: `recent-${i}`,
+        id: "u-read-text",
         role: "user",
-        parts: [{ type: "text", text: `recent ${i}` }]
+        parts: [{ type: "text", text: "Read /large.txt" }]
       });
-    }
+      await agent.persistTestMessage({
+        id: "a-read-text",
+        role: "assistant",
+        parts: [
+          {
+            type: "tool-read",
+            toolCallId: "tc-read-text",
+            state: "output-available",
+            input: { path: "/large.txt" },
+            output: {
+              path: "/large.txt",
+              content: largeContent,
+              totalLines: 1
+            }
+          } as UIMessage["parts"][number]
+        ]
+      });
+      for (let i = 0; i < recent; i++) {
+        await agent.persistTestMessage({
+          id: `recent-${i}`,
+          role: "user",
+          parts: [{ type: "text", text: `recent ${i}` }]
+        });
+      }
 
-    const result = await agent.testChat("follow up");
+      const result = await agent.testChat("follow up");
 
-    expect(result.error).toBeUndefined();
-    const messagesJson = await agent.getLastBeforeTurnMessagesJson();
-    expect(messagesJson).not.toBeNull();
-    const messages = JSON.parse(messagesJson!) as Array<{
-      role: string;
-      content?: Array<{
-        output?: {
-          type: string;
-          value?: string;
-        };
+      expect(result.error).toBeUndefined();
+      const messagesJson = await agent.getLastBeforeTurnMessagesJson();
+      expect(messagesJson).not.toBeNull();
+      const messages = JSON.parse(messagesJson!) as Array<{
+        role: string;
+        content?: Array<{
+          output?: {
+            type: string;
+            value?: string;
+          };
+        }>;
       }>;
-    }>;
-    const toolOutput = messages
-      .find((message) => message.role === "tool")
-      ?.content?.find((part) => part.output?.type === "text")?.output;
+      const toolOutput = messages
+        .find((message) => message.role === "tool")
+        ?.content?.find((part) => part.output?.type === "text")?.output;
 
-    expect(toolOutput?.value).toContain("[truncated");
-    expect(toolOutput?.value).toContain("read-output");
-  });
+      // testChat appends one more user message: these exercise the third,
+      // fourth and fifth newest messages at Think's model conversion boundary.
+      if (recent < 3) expect(toolOutput?.value).toBe(largeContent);
+      else expect(toolOutput?.value).toContain("[truncated");
+      expect(toolOutput?.value).toContain("read-output");
+    }
+  );
 
   it("replays legacy raw-string workspace read outputs as text", async () => {
     const agent = await freshAgent("model-conversion-string-read");
