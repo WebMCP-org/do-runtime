@@ -1,17 +1,17 @@
-# Browser compatibility extraction candidates
+# Current browser integrations
 
 Keep DO/Agents/Shell behavior and its browser regressions here; keep Rook's
 configuration, UI, workspace identities and Chrome policy in the host. Prefer
 an upstream implementation plus a measured browser shim over a copied runtime.
 
-## Implemented first: channels
+## Channels
 
 [Browser messengers](think/browser-messengers.md) extracts the native Slack and
 Discord clients and their adapter shims. The tests cover socket retirement,
 reconnect/resume, token checks, thread parents, HTTP failures, attachments and
 real Worker module loading. Think continues to own channel policy and delivery.
-Rook can replace its local implementations when it adopts a release containing
-these package exports; its current release pins are unchanged by this work.
+Consumers import the browser leaves directly. Host configuration and live
+Chrome resources remain in Rook; these transports have no Chrome dependency.
 
 ## Async context
 
@@ -42,9 +42,10 @@ The host explicitly supplies its outbound fetch port; actor fetches retain gate
 and response-body handling.
 
 The SDK already selects its worker-safe JSON Schema validator. No AJV-provider
-alias is needed here, and the fixture runs under the extension's ordinary CSP
-without `unsafe-eval`. Rook can remove its old `mcp-ajv-provider` alias when it
-adopts this SDK build; this task does not change the sibling host's release pins.
+alias is needed by this outbound client fixture, which runs under ordinary MV3
+CSP without `unsafe-eval`. This does not prove that every other import of the MCP
+SDK avoids AJV: audit each consumer's reachable server and sandbox modules
+before removing an alias.
 
 References: [Chrome MV3 CSP](https://developer.chrome.com/docs/extensions/reference/manifest/content-security-policy),
 [MCP tool output validation](https://modelcontextprotocol.io/specification/2025-06-18/server/tools),

@@ -176,6 +176,7 @@ import {
   enforceRowSizeLimit,
   isReplayChunk,
   StreamAccumulator,
+  createContinuationStart,
   CHAT_MESSAGE_TYPES,
   TurnQueue,
   ResumableStream,
@@ -5363,7 +5364,12 @@ export class Think<
     if (!this._overflowReactiveEnabled) return false;
     // DX guard: enabling recovery without teaching Think which errors are
     // overflows silently does nothing. Warn once instead of failing quietly.
-    if (this.classifyChatError === Think.prototype.classifyChatError) {
+    if (
+      !this._isAgentMethodOverride(
+        this.classifyChatError,
+        Think.prototype.classifyChatError
+      )
+    ) {
       if (!this._warnedMissingClassifier) {
         this._warnedMissingClassifier = true;
         console.warn(
@@ -11625,17 +11631,14 @@ export class Think<
       }
 
       if (this._resumableStream.hasActiveStream()) {
-        // A stream is still in flight. The resume flow is the
-        // authoritative source of state: `_notifyStreamResuming` tells
-        // the client to send `STREAM_RESUME_ACK`, after which the
-        // server replays buffered chunks and delivers a final
-        // `MSG_CHAT_MESSAGES` broadcast once the turn completes.
-        //
-        // Sending `MSG_CHAT_MESSAGES` here would clobber the in-progress
-        // assistant the client rebuilds from the replayed chunks,
-        // because `this.messages` at this point still only contains
-        // the user message — the assistant message is not persisted
-        // until the stream finishes.
+        if (this._resumableStream.isContinuation) {
+          // Refresh the canonical prefix before replay: the client may have
+          // missed the previous continuation's terminal snapshot while offline.
+          connection.send(
+            JSON.stringify({ type: MSG_CHAT_MESSAGES, messages: this.messages })
+          );
+        }
+        // Ordinary streams rebuild their unpersisted assistant from replay.
         this._notifyStreamResuming(connection);
       } else {
         // No active stream. If a turn is accepted but its stream hasn't started
@@ -13053,10 +13056,14 @@ export class Think<
     }
     const parentId = options?.parentId;
     let continuationSeedParts: UIMessage["parts"] | undefined;
+    let continuationStart:
+      | ReturnType<typeof createContinuationStart>
+      | undefined;
     if (continuation) {
       for (let i = this.messages.length - 1; i >= 0; i--) {
         if (this.messages[i].role === "assistant") {
           continuationSeedParts = this.messages[i].parts;
+          continuationStart = createContinuationStart(this.messages[i]);
           break;
         }
       }
@@ -13209,6 +13216,9 @@ export class Think<
             accumulator,
             continuation
           );
+          if (streamChunk.type === "start" && continuationStart) {
+            streamChunk.continuationStart = continuationStart;
+          }
 
           const chunkBody = JSON.stringify(streamChunk);
           // Keep store + broadcast synchronous: resume must not replay this

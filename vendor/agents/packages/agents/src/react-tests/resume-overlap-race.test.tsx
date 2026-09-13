@@ -200,6 +200,349 @@ describe("reconnect-driven stream resume", () => {
     dispatch(target, { type: CHAT_RESPONSE, id: "s1", body: "", done: true });
   });
 
+  it.each([true, false])(
+    "replays a running continuation once after remount (transport resume: %s)",
+    async (resume) => {
+      const { agent, target, sentMessages } = createFakeAgent({
+        name: "continuation-remount",
+        url: "ws://localhost:3000/agents/chat/continuation-remount"
+      });
+      let chat: AgentChatResult | null = null;
+      const baseline: UIMessage[] = [
+        {
+          id: "a1",
+          role: "assistant",
+          parts: [
+            { type: "text", text: "Before continuation", state: "done" },
+            { type: "reasoning", text: "Prior reasoning", state: "done" },
+            {
+              type: "tool-execute",
+              toolCallId: "prior-tool",
+              state: "output-available",
+              input: {},
+              output: "prior result"
+            }
+          ]
+        }
+      ];
+      function Chat({ messages }: { messages: UIMessage[] }) {
+        chat = useAgentChat({ agent, getInitialMessages: null, messages });
+        return (
+          <div>
+            {chat.messages
+              .flatMap((message) => message.parts)
+              .filter((part) => part.type === "text")
+              .map((part) => part.text)
+              .join("|")}
+          </div>
+        );
+      }
+      const screen = await render(<Chat messages={baseline} />);
+      await vi.waitFor(() =>
+        expect(countType(sentMessages, RESUME_REQUEST)).toBe(1)
+      );
+      if (!resume)
+        dispatch(target, {
+          type: RESUME_NONE,
+          reason: "idle",
+          probeId: lastFrameOfType(sentMessages, RESUME_REQUEST).probeId
+        });
+      dispatch(target, { type: RESUMING, id: "continuation" });
+      await vi.waitFor(() =>
+        expect(countType(sentMessages, RESUME_ACK)).toBe(1)
+      );
+      const chunks = [
+        {
+          type: "start",
+          continuationStart: { messageId: "a1", parts: [19, 15, null] }
+        },
+        { type: "reasoning-start", id: "continued-reasoning" },
+        {
+          type: "reasoning-delta",
+          id: "continued-reasoning",
+          delta: "Prior reasoning"
+        },
+        { type: "reasoning-end", id: "continued-reasoning" },
+        {
+          type: "tool-input-available",
+          toolCallId: "continued-tool",
+          toolName: "execute",
+          input: {}
+        },
+        {
+          type: "tool-output-available",
+          toolCallId: "continued-tool",
+          output: "continued result"
+        },
+        { type: "text-start", id: "suffix" },
+        { type: "text-delta", id: "suffix", delta: "Live suffix" }
+      ];
+      const deliver = (replay: boolean) => {
+        for (const chunk of chunks)
+          dispatch(target, {
+            type: CHAT_RESPONSE,
+            id: "continuation",
+            continuation: true,
+            body: JSON.stringify(chunk),
+            done: false,
+            replay
+          });
+        dispatch(target, {
+          type: CHAT_RESPONSE,
+          id: "continuation",
+          continuation: true,
+          body: "",
+          done: false,
+          replayComplete: true
+        });
+      };
+      deliver(true);
+      await expect
+        .element(
+          screen.getByText("Before continuation|Live suffix", { exact: true })
+        )
+        .toBeVisible();
+      // An obsolete replay has no ownership of this active assistant.
+      dispatch(target, {
+        type: CHAT_RESPONSE,
+        id: "obsolete",
+        continuation: true,
+        replay: true,
+        done: false,
+        body: JSON.stringify({
+          type: "start",
+          continuationStart: { messageId: "a1", parts: [] }
+        })
+      });
+      dispatch(target, {
+        type: CHAT_RESPONSE,
+        id: "obsolete",
+        continuation: true,
+        replay: true,
+        replayComplete: true,
+        done: false,
+        body: ""
+      });
+      const nextDelta = {
+        type: "text-delta",
+        id: "suffix",
+        delta: " still live"
+      };
+      chunks.push(nextDelta);
+      dispatch(target, {
+        type: CHAT_RESPONSE,
+        id: "continuation",
+        continuation: true,
+        body: JSON.stringify(nextDelta),
+        done: false
+      });
+      await vi.waitFor(() =>
+        expect(screen.container.textContent).toBe(
+          "Before continuation|Live suffix still live"
+        )
+      );
+      const hydrated = structuredClone(requireChat(chat).messages);
+      await screen.rerender(<></>);
+      await screen.rerender(<Chat messages={hydrated} />);
+      await vi.waitFor(() =>
+        expect(countType(sentMessages, RESUME_REQUEST)).toBe(2)
+      );
+      if (!resume)
+        dispatch(target, {
+          type: RESUME_NONE,
+          reason: "idle",
+          probeId: lastFrameOfType(sentMessages, RESUME_REQUEST).probeId
+        });
+      dispatch(target, { type: RESUMING, id: "continuation" });
+      await vi.waitFor(() =>
+        expect(countType(sentMessages, RESUME_ACK)).toBe(2)
+      );
+      deliver(true);
+      dispatch(target, {
+        type: CHAT_RESPONSE,
+        id: "continuation",
+        continuation: true,
+        body: JSON.stringify({
+          type: "text-delta",
+          id: "suffix",
+          delta: " after remount"
+        }),
+        done: false
+      });
+      await expect
+        .element(
+          screen.getByText(
+            "Before continuation|Live suffix still live after remount",
+            { exact: true }
+          )
+        )
+        .toBeVisible();
+      expect(requireChat(chat).messages[0].parts).toHaveLength(6);
+      expect(requireChat(chat).messages[0].parts.slice(0, 3)).toEqual(
+        baseline[0].parts
+      );
+      dispatch(target, {
+        type: CHAT_RESPONSE,
+        id: "continuation",
+        continuation: true,
+        body: JSON.stringify({ type: "text-end", id: "suffix" }),
+        done: false
+      });
+      dispatch(target, {
+        type: CHAT_RESPONSE,
+        id: "continuation",
+        body: "",
+        done: true
+      });
+    }
+  );
+
+  it.each([false, true])(
+    "replays a later continuation after missing the prior canonical snapshot (missed terminal: %s)",
+    async (missedTerminal) => {
+      const { agent, target, sentMessages } = createFakeAgent({
+        name: "split-prefix-reconnect",
+        url: "ws://localhost:3000/agents/chat/split-prefix-reconnect"
+      });
+      let chat: AgentChatResult | null = null;
+      const prefix: UIMessage[] = [
+        {
+          id: "a1",
+          role: "assistant",
+          parts: [{ type: "text", text: "Partial ", state: "streaming" }]
+        }
+      ];
+      function Chat({ messages }: { messages: UIMessage[] }) {
+        chat = useAgentChat({ agent, getInitialMessages: null, messages });
+        return (
+          <div>
+            {chat.messages
+              .flatMap((message) => message.parts)
+              .filter((part) => part.type === "text")
+              .map((part) => part.text)
+              .join("")}
+          </div>
+        );
+      }
+      const screen = await render(<Chat messages={prefix} />);
+      const offer = async (id: string, count: number) => {
+        await vi.waitFor(() =>
+          expect(countType(sentMessages, RESUME_REQUEST)).toBe(count)
+        );
+        dispatch(target, { type: RESUMING, id });
+        await vi.waitFor(() =>
+          expect(countType(sentMessages, RESUME_ACK)).toBe(count)
+        );
+      };
+      const replay = (id: string, baselineLength: number, text: string) => {
+        for (const chunk of [
+          {
+            type: "start",
+            continuationStart: { messageId: "a1", parts: [baselineLength] }
+          },
+          { type: "text-start", id: "text" },
+          { type: "text-delta", id: "text", delta: text }
+        ])
+          dispatch(target, {
+            type: CHAT_RESPONSE,
+            id,
+            continuation: true,
+            replay: true,
+            body: JSON.stringify(chunk),
+            done: false
+          });
+        dispatch(target, {
+          type: CHAT_RESPONSE,
+          id,
+          continuation: true,
+          body: "",
+          done: false,
+          replayComplete: true
+        });
+      };
+      if (missedTerminal) {
+        await vi.waitFor(() =>
+          expect(countType(sentMessages, RESUME_REQUEST)).toBe(1)
+        );
+        dispatch(target, { type: RESUME_NONE, reason: "idle" });
+        await vi.waitFor(() => expect(requireChat(chat).status).toBe("ready"));
+      }
+      await offer("first", 1);
+      replay("first", 8, "answer");
+      await vi.waitFor(() =>
+        expect(screen.container.textContent).toBe("Partial answer")
+      );
+      dispatch(target, {
+        type: CHAT_RESPONSE,
+        id: "first",
+        continuation: true,
+        body: JSON.stringify({ type: "text-end", id: "text" }),
+        done: false
+      });
+      if (!missedTerminal) {
+        dispatch(target, {
+          type: CHAT_RESPONSE,
+          id: "first",
+          body: "",
+          done: true
+        });
+        await vi.waitFor(() => expect(requireChat(chat).status).toBe("ready"));
+      }
+      expect(requireChat(chat).messages[0].parts).toHaveLength(2);
+      // AIChat persists one merged text part, but this socket disconnects before
+      // its terminal transcript snapshot. A second continuation starts offline.
+      close(target);
+      open(target);
+      // AIChat refreshes its canonical transcript on the replacement socket
+      // before offering the active continuation. It also includes content this
+      // client missed entirely while disconnected.
+      dispatch(target, {
+        type: CHAT_MESSAGES,
+        messages: [
+          {
+            id: "a1",
+            role: "assistant",
+            parts: [
+              { type: "text", text: "Partial answer offline", state: "done" }
+            ]
+          }
+        ]
+      });
+      await offer("second", 2);
+      replay("second", 22, " follow-up");
+      await vi.waitFor(() =>
+        expect(screen.container.textContent).toBe(
+          "Partial answer offline follow-up"
+        )
+      );
+      // Reopening the conversation during that second continuation hydrates the
+      // repaired prefix plus the new live suffix, which replay must replace.
+      const hydrated = structuredClone(requireChat(chat).messages);
+      await screen.rerender(<></>);
+      await screen.rerender(<Chat messages={hydrated} />);
+      await offer("second", 3);
+      replay("second", 22, " follow-up");
+      dispatch(target, {
+        type: CHAT_RESPONSE,
+        id: "second",
+        continuation: true,
+        body: JSON.stringify({ type: "text-delta", id: "text", delta: " end" }),
+        done: false
+      });
+      await vi.waitFor(() =>
+        expect(screen.container.textContent).toBe(
+          "Partial answer offline follow-up end"
+        )
+      );
+      dispatch(target, {
+        type: CHAT_RESPONSE,
+        id: "second",
+        body: "",
+        done: true
+      });
+    }
+  );
+
   let errorSpy: ReturnType<typeof vi.spyOn>;
   let warnSpy: ReturnType<typeof vi.spyOn>;
 

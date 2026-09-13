@@ -22,6 +22,7 @@ import {
   type AgentConnection
 } from "./ws-chat-transport";
 import { _drainAgentChatReplayFrames } from "../react";
+import { restoreContinuationMessage } from "./message-builder";
 
 export { WebSocketChatTransport } from "./ws-chat-transport";
 export type {
@@ -2119,7 +2120,23 @@ export function useAgentChat<
                 const chunkData = JSON.parse(data.body) as {
                   messageId?: string;
                   type?: string;
+                  continuationStart?: unknown;
                 };
+                if (
+                  data.replay &&
+                  data.continuation &&
+                  chunkData.type === "start"
+                ) {
+                  // Restore the producer's prefix before AI SDK snapshots it.
+                  setMessages((messages: ChatMessage[]) =>
+                    messages.map((message) =>
+                      restoreContinuationMessage(
+                        message,
+                        chunkData.continuationStart
+                      )
+                    )
+                  );
+                }
                 if (
                   chunkData.type === "start" &&
                   typeof chunkData.messageId === "string"
@@ -2204,7 +2221,8 @@ export function useAgentChat<
           let chunkData: unknown;
           if (
             data.replay &&
-            streamStateRef.current.status !== "observing" &&
+            (streamStateRef.current.status !== "observing" ||
+              streamStateRef.current.streamId !== data.id) &&
             !pendingReplayResumeRequestIdsRef.current.has(data.id)
           ) {
             return;
@@ -2404,6 +2422,11 @@ export function useAgentChat<
       socketIsOpen = true;
       if (!sawClose) return;
       sawClose = false;
+      // The replacement socket can refresh the canonical transcript before
+      // offering its current stream. A prior stream's accumulator/protection
+      // must not overwrite content that arrived while we were disconnected.
+      streamStateRef.current = { status: "idle" };
+      protectedStreamingAssistantRef.current = null;
       reconnectProbePendingRef.current = true;
       tryPendingReconnectProbe();
     }
@@ -2598,8 +2621,6 @@ export function useAgentChat<
 
   // Cleanup stale entries from clientToolResults when messages change
   // to prevent memory leak in long conversations.
-  // Note: We intentionally exclude clientToolResults from deps to avoid infinite loops.
-  // The functional update form gives us access to the previous state.
   useEffect(() => {
     // Collect all current toolCallIds from messages
     const currentToolCallIds = new Set<string>();
@@ -2611,30 +2632,16 @@ export function useAgentChat<
       }
     }
 
-    // Use functional update to check and clean stale entries atomically
-    setClientToolResults((prev) => {
-      if (prev.size === 0) return prev;
-
-      // Check if any entries are stale
-      let hasStaleEntries = false;
-      for (const toolCallId of prev.keys()) {
-        if (!currentToolCallIds.has(toolCallId)) {
-          hasStaleEntries = true;
-          break;
-        }
-      }
-
-      // Only create new Map if there are stale entries to remove
-      if (!hasStaleEntries) return prev;
-
-      const newMap = new Map<string, unknown>();
-      for (const [id, output] of prev) {
-        if (currentToolCallIds.has(id)) {
-          newMap.set(id, output);
-        }
-      }
-      return newMap;
-    });
+    // Returning prev inside an unconditional dispatch still queues work while
+    // streaming. Only dispatch when this committed map actually needs pruning.
+    if (
+      [...clientToolResults.keys()].some((id) => !currentToolCallIds.has(id))
+    ) {
+      setClientToolResults((prev) => {
+        const retained = [...prev].filter(([id]) => currentToolCallIds.has(id));
+        return retained.length === prev.size ? prev : new Map(retained);
+      });
+    }
 
     // Also cleanup processedToolCalls to prevent issues in long conversations
     for (const toolCallId of processedToolCalls.current) {
@@ -2642,8 +2649,7 @@ export function useAgentChat<
         processedToolCalls.current.delete(toolCallId);
       }
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [chatMessages]);
+  }, [chatMessages, clientToolResults]);
 
   // Create addToolOutput function for external use
   const addToolOutput = useCallback(

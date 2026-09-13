@@ -121,20 +121,33 @@ function toolTurnBodies() {
 
 const expectedChars = TOOL_STEPS * WORDS_PER_STEP * "word ".length;
 
-async function mount(name: string, throttle?: number | false) {
+async function mount(
+  name: string,
+  throttle?: number | false,
+  renderCostMs = 0
+) {
   const { agent, sentMessages, target } = createFakeAgent(name);
   let setChatMessages: ReturnType<typeof useAgentChat>["setMessages"] | null =
     null;
 
+  let chatApi: ReturnType<typeof useAgentChat>;
+
   function TestComponent() {
     const chat = useAgentChat({
       agent,
+      autoContinueAfterToolResult: false,
       getInitialMessages: null,
       messages: [
         { id: "u1", parts: [{ text: "hi", type: "text" }], role: "user" }
       ] as UIMessage[],
       throttle
     });
+    // Model a busy transcript while queued socket tasks keep arriving.
+    const renderDeadline = performance.now() + renderCostMs;
+    while (performance.now() < renderDeadline) {
+      /* synchronous render work */
+    }
+    chatApi = chat;
     setChatMessages = chat.setMessages;
     const assistantText = chat.messages
       .filter((m) => m.role === "assistant")
@@ -159,6 +172,7 @@ async function mount(name: string, throttle?: number | false) {
     read: (id: string) =>
       container.querySelector(`[data-testid="${id}"]`)?.textContent ?? null,
     sentMessages,
+    chat: () => chatApi,
     setMessages: (...args: Parameters<NonNullable<typeof setChatMessages>>) => {
       if (!setChatMessages) {
         throw new Error("Default throttle test chat is not mounted");
@@ -223,6 +237,95 @@ describe("default chat throttle", () => {
       error: "",
       status: "ready"
     });
+  });
+
+  it("streams a long turn without exhausting React's update depth", async () => {
+    const h = await mount("live-tool-result-prune", false, 3);
+    await vi.waitFor(() =>
+      expect(countType(h.sentMessages, RESUME_REQUEST)).toBe(1)
+    );
+    dispatch(h.target, { id: "req-live", type: RESUMING });
+    const frames = [
+      { messageId: "asst-1", type: "start" },
+      { type: "start-step" },
+      { id: "t1", type: "text-start" },
+      ...Array.from({ length: 120 }, () => ({
+        delta: "word ",
+        id: "t1",
+        type: "text-delta"
+      })),
+      { id: "t1", type: "text-end" },
+      { type: "finish-step" }
+    ];
+    // Each frame is its own queued socket task. Awaiting between frames
+    // would drain React's pending work and hide the cleanup dispatch bug.
+    await new Promise<void>((resolve) => {
+      for (const [index, frame] of frames.entries()) {
+        setTimeout(() => {
+          dispatch(h.target, {
+            body: JSON.stringify(frame),
+            done: false,
+            id: "req-live",
+            type: CHAT_RESPONSE
+          });
+          if (index === frames.length - 1) resolve();
+        }, 0);
+      }
+    });
+    dispatch(h.target, {
+      body: "",
+      done: true,
+      id: "req-live",
+      type: CHAT_RESPONSE
+    });
+    await vi.waitFor(() =>
+      expect({
+        chars: h.read("chars"),
+        error: h.read("error"),
+        status: h.read("status")
+      }).toEqual({ chars: "600", error: "", status: "ready" })
+    );
+  });
+
+  it("retains visible tool results and prunes them after history removes the call", async () => {
+    const h = await mount("tool-result-lifetime");
+    const pending: UIMessage = {
+      id: "a1",
+      role: "assistant",
+      parts: [
+        {
+          type: "tool-search",
+          toolCallId: "call-1",
+          state: "input-available",
+          input: { query: "hi" }
+        }
+      ]
+    };
+    h.setMessages([pending]);
+    await vi.waitFor(() => expect(h.chat().messages).toEqual([pending]));
+    h.chat().addToolOutput({
+      toolName: "search",
+      toolCallId: "call-1",
+      output: "found"
+    });
+    await vi.waitFor(() =>
+      expect(h.chat().messages[0].parts[0]).toMatchObject({
+        state: "output-available",
+        output: "found"
+      })
+    );
+    // An older snapshot must keep the client's result while its call exists.
+    h.setMessages([pending]);
+    await vi.waitFor(() =>
+      expect(h.chat().messages[0].parts[0]).toMatchObject({
+        state: "output-available",
+        output: "found"
+      })
+    );
+    h.setMessages([]);
+    await vi.waitFor(() => expect(h.chat().messages).toEqual([]));
+    h.setMessages([pending]);
+    await vi.waitFor(() => expect(h.chat().messages).toEqual([pending]));
   });
 
   it("resolves functional updates against the current Chat store", async () => {

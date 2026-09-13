@@ -1,7 +1,12 @@
 import { env } from "cloudflare:workers";
 import { describe, it, expect } from "vitest";
 import { MessageType } from "../types";
-import type { UIMessage as ChatMessage } from "ai";
+import {
+  readUIMessageStream,
+  type UIMessage as ChatMessage,
+  type UIMessageChunk
+} from "ai";
+import { restoreContinuationMessage } from "../../../agents/src/chat/message-builder";
 import { connectChatWS } from "./test-utils";
 import { getAgentByName } from "agents";
 
@@ -33,6 +38,193 @@ async function waitForMessage(
 }
 
 describe("Client tools continuation", () => {
+  it("sends the canonical transcript before offering an active continuation", async () => {
+    const room = crypto.randomUUID();
+    const { ws } = await connectChatWS(`/agents/test-chat-agent/${room}`);
+    const stub = await getAgentByName(env.TestChatAgent, room);
+    await stub.persistMessages([
+      {
+        id: "offline-prefix",
+        role: "assistant",
+        parts: [
+          { type: "text", text: "History completed offline", state: "done" },
+          {
+            type: "tool-search",
+            toolCallId: "offline-tool",
+            state: "input-available",
+            input: {}
+          }
+        ]
+      }
+    ]);
+    await stub.setTestBody({
+      reasoningContinuation: true,
+      delayContinuationChunks: true
+    });
+    const initial = collectMessages(ws);
+    ws.addEventListener("message", (event: MessageEvent) => {
+      const frame = JSON.parse(event.data as string) as Record<string, unknown>;
+      if (frame.type === MessageType.CF_AGENT_STREAM_RESUMING)
+        ws.send(
+          JSON.stringify({
+            type: MessageType.CF_AGENT_STREAM_RESUME_ACK,
+            id: frame.id
+          })
+        );
+    });
+    let returning: WebSocket | undefined;
+    try {
+      ws.send(
+        JSON.stringify({
+          type: MessageType.CF_AGENT_TOOL_RESULT,
+          toolCallId: "offline-tool",
+          toolName: "search",
+          output: "found",
+          autoContinue: true
+        })
+      );
+      expect(
+        await waitForMessage(
+          initial,
+          (frame) =>
+            frame.type === MessageType.CF_AGENT_USE_CHAT_RESPONSE &&
+            !!frame.body
+        )
+      ).toBeDefined();
+      returning = (await connectChatWS(`/agents/test-chat-agent/${room}`)).ws;
+      const frames = collectMessages(returning);
+      expect(
+        await waitForMessage(
+          frames,
+          (frame) => frame.type === MessageType.CF_AGENT_STREAM_RESUMING
+        )
+      ).toBeDefined();
+      const snapshot = frames.findIndex(
+        (frame) => frame.type === MessageType.CF_AGENT_CHAT_MESSAGES
+      );
+      const offer = frames.findIndex(
+        (frame) => frame.type === MessageType.CF_AGENT_STREAM_RESUMING
+      );
+      expect(snapshot).toBeGreaterThanOrEqual(0);
+      expect(snapshot).toBeLessThan(offer);
+      expect(frames[snapshot].messages).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            id: "offline-prefix",
+            parts: expect.arrayContaining([
+              { type: "text", text: "History completed offline", state: "done" }
+            ])
+          })
+        ])
+      );
+    } finally {
+      await stub.waitUntilStableForTest({ timeout: 3000 });
+      returning?.close(1000);
+      ws.close(1000);
+    }
+  });
+
+  it("replays an SSE continuation of an interrupted text part through the AI SDK", async () => {
+    const room = crypto.randomUUID();
+    const { ws } = await connectChatWS(`/agents/test-chat-agent/${room}`);
+    const stub = await getAgentByName(env.TestChatAgent, room);
+    const prefix: ChatMessage = {
+      id: "assistant-sse-tail",
+      role: "assistant",
+      parts: [
+        {
+          type: "tool-search",
+          toolCallId: "search-tail",
+          state: "input-available",
+          input: {}
+        },
+        { type: "text", text: "Partial ", state: "streaming" }
+      ]
+    };
+    await stub.persistMessages([
+      {
+        id: "user-tail",
+        role: "user",
+        parts: [{ type: "text", text: "Search" }]
+      },
+      prefix
+    ]);
+    await stub.setTestBody({ sseWithoutMessageId: true });
+    const frames = collectMessages(ws);
+    ws.addEventListener("message", (event: MessageEvent) => {
+      const frame = JSON.parse(event.data as string) as Record<string, unknown>;
+      if (frame.type === MessageType.CF_AGENT_STREAM_RESUMING) {
+        ws.send(
+          JSON.stringify({
+            type: MessageType.CF_AGENT_STREAM_RESUME_ACK,
+            id: frame.id
+          })
+        );
+      }
+    });
+    try {
+      ws.send(
+        JSON.stringify({
+          type: MessageType.CF_AGENT_TOOL_RESULT,
+          toolCallId: "search-tail",
+          toolName: "search",
+          output: "found",
+          autoContinue: true
+        })
+      );
+      expect(
+        await waitForMessage(
+          frames,
+          (frame) =>
+            frame.type === MessageType.CF_AGENT_USE_CHAT_RESPONSE &&
+            typeof frame.body === "string" &&
+            frame.body.includes("text-end")
+        )
+      ).toBeDefined();
+      // Server completion may reach this socket before its ACK replay. Wait
+      // for the replayed text-end above before reading the captured chunks.
+      await stub.waitUntilStableForTest({ timeout: 3000 });
+      const chunks = frames
+        .filter(
+          (frame) =>
+            frame.type === MessageType.CF_AGENT_USE_CHAT_RESPONSE && frame.body
+        )
+        .map((frame) => JSON.parse(frame.body as string) as UIMessageChunk);
+      const start = chunks.find(
+        (chunk) => chunk.type === "start"
+      ) as UIMessageChunk & { continuationStart: unknown };
+      expect(start.continuationStart).toEqual({
+        messageId: prefix.id,
+        parts: [null, 8]
+      });
+      const persisted = (await stub.getPersistedMessages()) as ChatMessage[];
+      const hydrated = persisted.find((message) => message.id === prefix.id)!;
+      expect(hydrated.parts.filter((part) => part.type === "text")).toEqual([
+        { type: "text", text: "Partial SSE reply", state: "done" }
+      ]);
+      let replayed: ChatMessage | undefined;
+      for await (const message of readUIMessageStream({
+        message: restoreContinuationMessage(hydrated, start.continuationStart),
+        terminateOnError: true,
+        stream: new ReadableStream<UIMessageChunk>({
+          start(controller) {
+            for (const chunk of chunks) controller.enqueue(chunk);
+            controller.close();
+          }
+        })
+      }))
+        replayed = message;
+      expect(
+        replayed?.parts
+          .filter((part) => part.type === "text")
+          .map((part) => part.text)
+          .join("")
+      ).toBe("Partial SSE reply");
+    } finally {
+      ws.close(1000);
+    }
+  });
+
   it("should pass client tools to onChatMessage during auto-continuation", async () => {
     const room = crypto.randomUUID();
     const { ws } = await connectChatWS(`/agents/test-chat-agent/${room}`);
@@ -620,6 +812,20 @@ describe("Client tools continuation", () => {
             message.body.length > 0
         )
         .map((message) => JSON.parse(message.body as string).type as string);
+
+      const start = receivedMessages
+        .filter(
+          (frame) =>
+            frame.type === MessageType.CF_AGENT_USE_CHAT_RESPONSE && frame.body
+        )
+        .map(
+          (frame) => JSON.parse(frame.body as string) as Record<string, unknown>
+        )
+        .find((chunk) => chunk.type === "start");
+      expect(start?.continuationStart).toEqual({
+        messageId: "assistant-issue-1480",
+        parts: ["initial reasoning".length, null]
+      });
 
       const reasoningStartIndex = chunkTypes.indexOf("reasoning-start");
       const reasoningDeltaIndex = chunkTypes.indexOf("reasoning-delta");
