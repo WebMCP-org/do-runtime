@@ -3233,6 +3233,7 @@ export class Think<
                   break;
                 case "compaction":
                   await this._syncMessages();
+                  this._broadcastMessages();
                   break;
                 case "update":
                   if (
@@ -3252,6 +3253,7 @@ export class Think<
                   break;
                 case "compact":
                   await this._syncMessages();
+                  this._broadcastMessages();
                   await this.#contextBlocks?.refreshSystemPrompt();
                   break;
               }

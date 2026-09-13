@@ -151,13 +151,11 @@ retries disabled (1,816 SDK regressions). Root typecheck, 938 runtime unit
 tests and package validation passed. The final CI gate additionally runs
 workerd/Node/browser conformance and both example E2E lanes.
 
-## Compaction status regression after consumer E2E
+## Compaction synchronization
 
-Rook's first full extension lane against the released 0.23 closure passed
-149/150 tests; `/compact` persisted its overlay but the mounted transcript
-never refreshed. Native tracing found that the Sessions extraction retained
-server cache change listeners and the session frame constants while removing
-the frame producer consumed by the shared design system. Five real Think
-socket regressions reproduced missing status/error frames before the fix and
-pass after restoring the producer at Sessions/Agent. The application adapter
-and its safe end-of-turn reload remain unchanged.
+The legacy session status/error bridge was removed after the sole consumer
+adopted native chat updates. Think now broadcasts canonical history at its two
+compaction change-listener cases. Native socket tests cover manual, automatic,
+direct-overlay and virtual-facet delivery; React tests preserve active sender
+and observer parts through that replacement. See the
+[current divergence](../fork-diff.md#compaction-chat-synchronization).
