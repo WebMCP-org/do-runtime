@@ -1,19 +1,20 @@
 # Current SDK fork audit
 
-Audited 2026-09-11 (Pacific), including the fixes below. The footprint compares
-the current source against the released upstream baseline in
-[VENDOR.md](../../VENDOR.md). Three parallel reviews traced Rook browser seams,
-SDK chat/delegation, and SDK platform/integration changes through real callers
-and existing tests. The [current inventory](../fork-diff.md) records each live
-behavior once. Historical measurements and release-by-release reasoning remain
-in [Git history](https://github.com/WebMCP-org/do-runtime/blob/ff87e9ef1d38f8beaa579b3a53d445e62df96837/vendor/agents/docs/audit/vendor-fork-audit.md).
+Audited 2026-09-12 (Pacific), after merging Agents 0.23 / Think 0.18 with
+[the released continuation fixes](https://github.com/WebMCP-org/do-runtime/pull/61),
+[reconnect identity](https://github.com/WebMCP-org/do-runtime/pull/62) and Rook's
+stable React approval command. The original refresh checkout was left untouched;
+the integration and gates use an isolated worktree.
+[VENDOR.md](../../VENDOR.md) owns provenance and the
+[current inventory](../fork-diff.md) records retained owners and retirement
+conditions. Historical audits remain in Git.
 
 ## Findings
 
 The ledgers overstated the live surface by retaining removed implementations
-and superseding corrections. No retained correctness patch was proved safely
-deletable from the **currently pinned** SDK. That is not proof every patch is
-minimal: the audit found a missed sibling caller, an inherited React cleanup
+and superseding corrections. The 0.23 refresh retired experimental-memory projections and role-update
+repairs, per-chunk progress KV updates and the old stream/recovery substrate.
+The remaining prior correctness fixes survived reconciliation: the audit found a missed sibling caller, an inherited React cleanup
 failure and a continuation replay gap. All three now have failing-before,
 passing-after regressions and fixes at their existing SDK owners.
 
@@ -22,7 +23,7 @@ passing-after regressions and fixes at their existing SDK owners.
 | Method identity — fixed        | The real native `chat()` regression emits two provider errors with reactive recovery enabled and the inherited default classifier. Before the fix, the expected one-time warning never fires. [#2165](https://github.com/cloudflare/agents/issues/2165#issuecomment-5629567318) describes the same sibling comparison.                          | Both skills and reactive overflow now use `_isAgentMethodOverride`. The regression and all 209 native Think Session tests pass with retries disabled; no second wrapper strategy.                                                                                                                                                                                                                                                                                                                                                                    |
 | React cleanup dispatch — fixed | A long unthrottled stream, one queued socket task per frame, and a busy transcript reproduce `Maximum update depth exceeded` through the real hook. The unconditional cleanup dispatch remains in the audited upstream; [#2217](https://github.com/cloudflare/agents/issues/2217) supplies the exact lead.                                      | Check the committed map before dispatch and include it in effect dependencies. The functional updater filters current state, preserving concurrent results still in history. The long-stream and public result-retention/pruning checks pass; all 11 related React tests pass. The replay-burst check waits for the replayed prefix before live data instead of requiring a 20 ms paint; throttle is unchanged.                                                                                                                                      |
 | Continuation replay — fixed    | A real hook remount reproduced duplicate live text, reasoning and tool parts through both transport resume and observer replay. Native Think and AI Chat tests verify the producer boundary; a stale replay also reproduced transcript loss. [#1951](https://github.com/cloudflare/agents/issues/1951) describes the same continuation overlap. | Refresh canonical history before offering an active continuation on reconnect, releasing the prior socket’s replay state. Store the assistant ID and original part lengths in the existing continuation start chunk. Restore that prefix at the transport snapshot or accumulator seed boundary, after request ownership checks. Plaintext and SSE consumers need a text-start even when server persistence reuses a text part. Legacy chunks without the descriptor remain readable with their prior behavior; no row rewrite or storage migration. |
-| Upstream owner simplification  | Agents 0.23 / Think 0.18 introduce Streams, Tasks recovery, Sessions and derived progress. The old per-chunk KV progress counter disappears upstream.                                                                                                                                                                                           | Upgrade the package closure coherently, then run retained replay/Stop/storage tests against the new owners and remove replaced mechanisms. Preserve store/broadcast ordering; the new producer still awaits an async helper.                                                                                                                                                                                                                                                                                                                         |
+| Upstream owner simplification  | Agents 0.23 / Think 0.18 introduce Streams, Tasks recovery, Sessions and derived progress. The old per-chunk KV progress counter disappears upstream.                                                                                                                                                                                           | The package closure now uses those upstream owners and removes their old equivalents. Run retained replay/Stop/storage tests against these owners. Preserve store/broadcast ordering; the new producer still awaits an async helper.                                                                                                                                                                                                                                                                                                                 |
 | Product default in SDK         | Think hardcodes `keepRecent: 2`, versus upstream's 4. The old objection about adding a typed option predates consumption of built fork packages.                                                                                                                                                                                                | Expose a narrow upstreamable option and let Rook select 2 when changing this policy. Keep head/tail truncation separate from opaque provider-output correctness.                                                                                                                                                                                                                                                                                                                                                                                     |
 
 The fixes stay in the SDK owners. They add no Rook shim, transcript store or
@@ -33,13 +34,13 @@ use the gates below.
 
 | Package   | Changed source files | Added lines | Removed lines |
 | --------- | -------------------: | ----------: | ------------: |
-| Agents    |                   26 |       2,640 |           598 |
-| AI Chat   |                    1 |          92 |            39 |
-| Think     |                   15 |       2,518 |         1,141 |
-| Voice     |                    3 |          75 |            27 |
+| Agents    |                   33 |       2,821 |           641 |
+| AI Chat   |                    1 |         164 |            42 |
+| Think     |                   15 |       2,718 |         1,191 |
+| Voice     |                    0 |           0 |             0 |
 | Shell     |                    9 |       1,917 |            80 |
 | Codemode  |                    0 |           0 |             0 |
-| **Total** |               **54** |   **7,242** |     **1,885** |
+| **Total** |               **58** |   **7,620** |     **1,954** |
 
 These are textual differences, not a count of independent patches or removable
 code. Thirteen new browser-messenger/OPFS files account for 2,631 added lines;
@@ -50,11 +51,11 @@ counts as a source difference. The six-package build/export configuration
 remains part of the maintained surface even though it is excluded here.
 
 Measured with `git diff --no-index --numstat`, one file at a time, between
-upstream `676b3d35a82db3147c7aa1505f7f2d5ef48f359b` and this fork. Include
+upstream `5f7ad7e4edac2ec8dd1d6a31758f251cb52373fa` and this fork. Include
 `.ts`, `.tsx`, `.js`, `.jsx`, `.mjs` under the six `packages/*/src` trees;
 exclude paths with `test` or `fixture` in any component and `__mocks__`.
 Count files present on only one side against `/dev/null`. This classification
-was independently recounted and cross-checked against all retained source rows.
+counts added browser files as well as edits; Voice moved into Agents.
 For refreshes, compare against the exact release, not a moving `main`.
 
 ## Upstream research
@@ -76,8 +77,8 @@ release inclusion to the retained behavior.
 | [#2217 React cleanup](https://github.com/cloudflare/agents/issues/2217), [contributor change](https://github.com/Konan69/agents/commit/ce283f35)                                                                                                                                          | Open; the reporter identifies unconditional cleanup dispatch. A queued-task long-stream reproduction confirms the same failure in our real hook.                                   | Fixed with a pre-dispatch stale-entry check, a functional updater over current results and complete dependencies. The regression verifies stream completion; a public-hook check preserves visible results and prunes removed calls. |
 | [#2166 terminal snapshot](https://github.com/cloudflare/agents/issues/2166)                                                                                                                                                                                                               | Open; suggests a text-prefix mitigation for accumulator/replay overlap.                                                                                                            | Do not add it: text prefixes cannot establish reasoning/tool identity. Prevent duplicate producers and test terminal reconciliation.                                                                                                 |
 | [#1983 optimistic user snapshot](https://github.com/cloudflare/agents/issues/1983)                                                                                                                                                                                                        | Open; visible optimistic messages can be erased by reconnect snapshots.                                                                                                            | A trailing-user merge concerns UI reconciliation, not server request acceptance; it cannot replace the outbox.                                                                                                                       |
-| [#2132](https://github.com/cloudflare/agents/issues/2132), [#2196 Sessions](https://github.com/cloudflare/agents/pull/2196)                                                                                                                                                               | Closed via the new released Sessions change feed; comments separate additional sync/reparent cases.                                                                                | Evaluate the new owner. Do not import private `_syncMessages`/`_broadcastMessages` overrides into Rook.                                                                                                                              |
-| [#2173 Streams](https://github.com/cloudflare/agents/pull/2173), [#2194 Tasks recovery](https://github.com/cloudflare/agents/pull/2194), [#2216 atomic cutover](https://github.com/cloudflare/agents/pull/2216), [#2223 derived progress](https://github.com/cloudflare/agents/pull/2223) | Released structural replacements for stream/session/recovery storage and bookkeeping.                                                                                              | Real opportunity to remove old machinery on a coherent upgrade. Keep acceptance, replay ordering and cancellation regressions as the contract.                                                                                       |
+| [#2132](https://github.com/cloudflare/agents/issues/2132), [#2196 Sessions](https://github.com/cloudflare/agents/pull/2196)                                                                                                                                                               | Closed via the new released Sessions change feed; comments separate additional sync/reparent cases.                                                                                | Adopted the new owner. Do not import private `_syncMessages`/`_broadcastMessages` overrides into Rook.                                                                                                                               |
+| [#2173 Streams](https://github.com/cloudflare/agents/pull/2173), [#2194 Tasks recovery](https://github.com/cloudflare/agents/pull/2194), [#2216 atomic cutover](https://github.com/cloudflare/agents/pull/2216), [#2223 derived progress](https://github.com/cloudflare/agents/pull/2223) | Released structural replacements for stream/session/recovery storage and bookkeeping.                                                                                              | Adopted; the old stream/session/recovery machinery is removed. Keep acceptance, replay ordering and cancellation regressions as the contract.                                                                                        |
 | [#2165 method identity](https://github.com/cloudflare/agents/issues/2165)                                                                                                                                                                                                                 | Open; discussion identifies both the skills warning and reactive-overflow sibling comparison. The native regression confirms the missing warning.                                  | Fixed both callers with the existing original-method helper; no second wrapper layer. All 209 Think Session tests pass.                                                                                                              |
 | [#2206 / #2233 facet connect state](https://github.com/cloudflare/agents/pull/2233)                                                                                                                                                                                                       | Released fix waits queued connection operations after `onConnect`.                                                                                                                 | Keep that fix on upgrade. It replaces none of our refusal, deleted-child, cleanup or no-resurrection guards; those move to `DynamicAgentsInternal`.                                                                                  |
 | [#1677 native facet history](https://github.com/cloudflare/agents/issues/1677)                                                                                                                                                                                                            | Later comments confirm upstream #1679 fixed the original reproduction, before our baseline.                                                                                        | Do not revive earlier suggestions to write internal SQL, clear context or defer mounting the socket.                                                                                                                                 |
@@ -116,3 +117,16 @@ Those runs establish the pre-fix tested baseline. The SDK
 fixes have the local red/green checks described above; publishing
 them still requires the owning package gates. Documentation edits require
 formatting and link checks.
+
+## Integration release verification
+
+The release joins refresh commits `c947880a` through `3f8f444b`, PR #61,
+PR #62, and the stable-command change from `efc45034`. The continuation merge
+keeps 0.23 Sessions sanitization imports and combines both migration and
+continuation regression lanes. Root lockfile resolution follows the built
+0.23 manifests. No source aliases or runtime package changes are introduced.
+
+The source fixture guide's earlier measurements excluded entirely new files;
+the table above consistently includes them. The original guide's recorded gate
+results apply to its refresh commit only; this merged release reruns the full
+SDK and runtime CI on its exact source commit before packing release assets.
