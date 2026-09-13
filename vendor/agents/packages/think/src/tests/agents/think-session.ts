@@ -2528,6 +2528,38 @@ export class ThinkTestAgent extends Think {
     }
   }
 
+  async testCompactionFrames(
+    mode: "manual" | "automatic" | "noop" | "error" | "facet"
+  ) {
+    for (const id of ["compact-a", "compact-b"]) {
+      await this.session.appendMessage({
+        id,
+        role: "user",
+        parts: [{ type: "text", text: "long history ".repeat(100) }]
+      });
+    }
+    this.session.onCompaction(async (messages) => {
+      if (mode === "error") throw new Error("compaction failed for test");
+      if (mode === "noop") return null;
+      return {
+        summary: "compressed history",
+        fromMessageId: messages[0].id,
+        toMessageId: messages.at(-1)!.id
+      };
+    });
+    if (mode === "automatic") {
+      this.session.compactAfter(1);
+      await this.session.appendMessage({
+        id: "compact-auto",
+        role: "user",
+        parts: [{ type: "text", text: "automatic" }]
+      });
+    } else {
+      await this.session.compact();
+    }
+    return this.messages;
+  }
+
   async enableCompactionForTest(): Promise<void> {
     this.session
       .onCompaction(async (messages) => {

@@ -37,6 +37,8 @@ export class Session {
 
   #compactionFn: CompactionFunction | null = null;
   #tokenThreshold: number | undefined;
+  #compactionsPending = 0;
+  #compactedTokensBefore: number | undefined;
 
   /** @internal Constructed by the Sessions capability only. */
   constructor(
@@ -404,43 +406,73 @@ export class Session {
         "No compaction function registered. Call onCompaction() first."
       );
     }
-    const history = await this.#core.getHistory(this.sessionId, { leafId });
-
-    let result: CompactResult | null;
+    const tokensBefore = this.#core.tokenEstimate(this.sessionId);
+    this.#compactionsPending++;
+    this.#core.io.emit("session:status", {
+      sessionId: this.sessionId,
+      phase: "compacting",
+      tokenEstimate: tokensBefore,
+      tokenThreshold: this.#tokenThreshold ?? null
+    });
     try {
-      result = await fn(history);
-    } catch (error) {
-      this.#core.io.emit("session:error", {
-        sessionId: this.sessionId,
-        error: error instanceof Error ? error.message : String(error)
-      });
-      return null;
-    }
-    if (!result) return null;
+      const history = await this.#core.getHistory(this.sessionId, { leafId });
 
-    const historyIds = new Set(history.map((message) => message.id));
-    if (!historyIds.has(result.toMessageId)) return null;
+      let result: CompactResult | null;
+      try {
+        result = await fn(history);
+      } catch (error) {
+        this.#core.io.emit("session:error", {
+          sessionId: this.sessionId,
+          error: error instanceof Error ? error.message : String(error)
+        });
+        return null;
+      }
+      if (!result) return null;
 
-    // Iterative compaction extends only an overlay visible on this branch.
-    const existing = this.#core
-      .getCompactions(this.sessionId)
-      .filter(
-        (compaction) =>
-          historyIds.has(`${COMPACTION_PREFIX}${compaction.id}`) ||
-          (historyIds.has(compaction.fromMessageId) &&
-            historyIds.has(compaction.toMessageId))
+      const historyIds = new Set(history.map((message) => message.id));
+      if (!historyIds.has(result.toMessageId)) return null;
+
+      // Iterative compaction extends only an overlay visible on this branch.
+      const existing = this.#core
+        .getCompactions(this.sessionId)
+        .filter(
+          (compaction) =>
+            historyIds.has(`${COMPACTION_PREFIX}${compaction.id}`) ||
+            (historyIds.has(compaction.fromMessageId) &&
+              historyIds.has(compaction.toMessageId))
+        );
+      const fromId =
+        existing.length > 0 ? existing[0].fromMessageId : result.fromMessageId;
+
+      this.#core.addCompaction(
+        this.sessionId,
+        result.summary,
+        fromId,
+        result.toMessageId
       );
-    const fromId =
-      existing.length > 0 ? existing[0].fromMessageId : result.fromMessageId;
-
-    this.#core.addCompaction(
-      this.sessionId,
-      result.summary,
-      fromId,
-      result.toMessageId
-    );
-    await this.#core.notify({ type: "compact", sessionId: this.sessionId });
-    return { ...result, fromMessageId: fromId };
+      await this.#core.notify({ type: "compact", sessionId: this.sessionId });
+      this.#compactedTokensBefore ??= tokensBefore;
+      return { ...result, fromMessageId: fromId };
+    } finally {
+      // Change listeners refresh host caches before clients receive idle.
+      // Concurrent calls retain their native execution order; only the last
+      // completion ends the shared session's in-flight status.
+      if (--this.#compactionsPending === 0) {
+        const completedTokensBefore = this.#compactedTokensBefore;
+        this.#compactedTokensBefore = undefined;
+        this.#core.io.emit("session:status", {
+          sessionId: this.sessionId,
+          phase: "idle",
+          tokenEstimate: this.#core.tokenEstimate(this.sessionId),
+          tokenThreshold: this.#tokenThreshold ?? null,
+          ...(completedTokensBefore === undefined
+            ? {}
+            : {
+                compacted: { tokensBefore: completedTokensBefore }
+              })
+        });
+      }
+    }
   }
 
   // ── Internal ─────────────────────────────────────────────────────────────

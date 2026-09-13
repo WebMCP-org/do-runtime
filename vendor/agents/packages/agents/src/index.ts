@@ -1942,6 +1942,18 @@ export class Agent<
         !Array.isArray(event.payload)
           ? (event.payload as Record<string, unknown>)
           : { value: event.payload };
+      // Sessions is transport-independent; Agent carries its existing client
+      // status/error contract over physical and virtual facet connections.
+      if (event.source === "sessions") {
+        const frameType =
+          event.type === "session:status"
+            ? MessageType.CF_AGENT_SESSION
+            : event.type === "session:error"
+              ? MessageType.CF_AGENT_SESSION_ERROR
+              : undefined;
+        if (frameType)
+          this.broadcast(JSON.stringify({ type: frameType, ...payload }));
+      }
       // Lifecycle events are open-ended; Agent's installed capabilities emit
       // event names represented by the observability union.
       this._emit(event.type as ObservabilityEvent["type"], payload);
