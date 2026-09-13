@@ -100,3 +100,7 @@ fetch-predicate export, `prepareRun`, or a Voice readiness shim. The baseline
 already includes replay batching, default chat throttle, resume/finalizer fixes,
 and native facet routing. History records their removal; the live inventory
 must not keep them as work to maintain.
+
+## Reconnect identity
+
+`agents/src/react.tsx` clears the previous server identity when the requested Agent address changes. Reconnects at the same address still detect server identity changes. `rpc-robustness.test.tsx` covers A → B → A and a changed server identity at one address; retire when upstream passes both regressions.
