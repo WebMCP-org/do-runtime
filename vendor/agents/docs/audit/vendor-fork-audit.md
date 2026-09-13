@@ -34,13 +34,13 @@ use the gates below.
 
 | Package   | Changed source files | Added lines | Removed lines |
 | --------- | -------------------: | ----------: | ------------: |
-| Agents    |                   33 |       2,808 |           641 |
+| Agents    |                   34 |       2,887 |           676 |
 | AI Chat   |                    1 |         164 |            42 |
 | Think     |                   15 |       2,718 |         1,191 |
 | Voice     |                    0 |           0 |             0 |
 | Shell     |                    9 |       1,917 |            80 |
 | Codemode  |                    0 |           0 |             0 |
-| **Total** |               **58** |   **7,607** |     **1,954** |
+| **Total** |               **59** |   **7,686** |     **1,989** |
 
 These are textual differences, not a count of independent patches or removable
 code. Thirteen new browser-messenger/OPFS files account for 2,631 added lines;

@@ -2,7 +2,11 @@ import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { SessionHarnessObject } from "../capabilities/sessions";
-import type { SessionChangeEvent, SessionMessage } from "../../sessions";
+import type {
+  CompactResult,
+  SessionChangeEvent,
+  SessionMessage
+} from "../../sessions";
 import { MAX_INLINE_ROW_BYTES, splitContent } from "../../sessions/chunking";
 
 /**
@@ -68,26 +72,18 @@ describe("Sessions capability", () => {
       await session.appendMessage(
         text("compact-b", "long history ".repeat(100))
       );
-      const started = Promise.withResolvers<void>();
-      const held: Array<
-        ReturnType<
-          typeof Promise.withResolvers<{
-            summary: string;
-            fromMessageId: string;
-            toMessageId: string;
-          } | null>
-        >
-      > = [];
-      session.onCompaction(async () => {
-        const pending = Promise.withResolvers<{
-          summary: string;
-          fromMessageId: string;
-          toMessageId: string;
-        } | null>();
-        held.push(pending);
-        if (held.length === 2) started.resolve();
-        return pending.promise;
+      let markStarted!: () => void;
+      const started = new Promise<void>((resolve) => {
+        markStarted = resolve;
       });
+      const held: Array<(result: CompactResult | null) => void> = [];
+      session.onCompaction(
+        () =>
+          new Promise((resolve) => {
+            held.push(resolve);
+            if (held.length === 2) markStarted();
+          })
+      );
       let listenerFinished = false;
       instance.sessions.subscribe(async (event) => {
         if (event.type !== "compact") return;
@@ -102,8 +98,8 @@ describe("Sessions capability", () => {
       const first = session.compact();
       const second = session.compact();
       try {
-        await started.promise;
-        held[0].resolve({
+        await started;
+        held[0]({
           summary: "small",
           fromMessageId: "compact-a",
           toMessageId: "compact-b"
@@ -115,7 +111,7 @@ describe("Sessions capability", () => {
             .eventsOfType("session:status")
             .map(({ payload }) => payload.phase)
         ).toEqual(["compacting", "compacting"]);
-        held[1].resolve(null);
+        held[1](null);
         await second;
         const events = instance.eventsOfType("session:status");
         expect(events.map(({ payload }) => payload.phase)).toEqual([
@@ -127,7 +123,7 @@ describe("Sessions capability", () => {
           tokensBefore: events[0].payload.tokenEstimate
         });
       } finally {
-        for (const pending of held) pending.resolve(null);
+        for (const resolve of held) resolve(null);
         await Promise.all([first, second]);
       }
     });
