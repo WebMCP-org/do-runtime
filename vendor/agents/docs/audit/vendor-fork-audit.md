@@ -130,3 +130,11 @@ The source fixture guide's earlier measurements excluded entirely new files;
 the table above consistently includes them. The original guide's recorded gate
 results apply to its refresh commit only; this merged release reruns the full
 SDK and runtime CI on its exact source commit before packing release assets.
+
+The merged gate initially failed two imported AI Chat continuation regressions:
+their immediate provider response reached the 0.23 persist cutover before
+the socket ACK, so the old post-completion chunk replay no longer existed.
+The test provider now holds EOF until the client observes replay, then releases
+completion and retains every AI SDK/persisted text assertion. Both files pass
+(18 tests, retries disabled). This is deterministic storage-lifetime adaptation
+to upstream #2216, not a timeout increase or a production retention change.

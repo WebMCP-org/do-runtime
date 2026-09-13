@@ -167,6 +167,30 @@ export class TestChatAgent extends AIChatAgent<Env> {
   // Store captured requestId from onChatMessage options for testing
   private _capturedRequestId: string | undefined = undefined;
   private _chatMessageCallCount = 0;
+  private _releaseResponseForTest: (() => void) | undefined;
+
+  releaseResponseForTest(): void {
+    this._releaseResponseForTest?.();
+    this._releaseResponseForTest = undefined;
+  }
+
+  private _holdResponseForTest(response: Response): Response {
+    if (!this._capturedBody?.holdResponseForReplay) return response;
+    const { promise, resolve } = Promise.withResolvers<void>();
+    this._releaseResponseForTest = resolve;
+    // 0.23 drops chunks at persist cutover (#2216). Hold EOF until the
+    // test has ACKed and received replay, rather than replaying a dead row.
+    return new Response(
+      response.body!.pipeThrough(
+        new TransformStream({
+          async flush() {
+            await promise;
+          }
+        })
+      ),
+      response
+    );
+  }
 
   async onChatMessage(
     _onFinish: GenerateTextOnFinishCallback<ToolSet>,
@@ -236,13 +260,15 @@ export class TestChatAgent extends AIChatAgent<Env> {
     // Mirrors the common provider (e.g. Workers AI) that emits a `start`
     // chunk WITHOUT a messageId, so the server must stamp its allocated id.
     if (options?.body?.sseWithoutMessageId === true) {
-      return makeSSEChunkResponse([
-        { type: "start" },
-        { type: "text-start", id: "sse-t" },
-        { type: "text-delta", id: "sse-t", delta: "SSE reply" },
-        { type: "text-end", id: "sse-t" },
-        { type: "finish" }
-      ]);
+      return this._holdResponseForTest(
+        makeSSEChunkResponse([
+          { type: "start" },
+          { type: "text-start", id: "sse-t" },
+          { type: "text-delta", id: "sse-t", delta: "SSE reply" },
+          { type: "text-end", id: "sse-t" },
+          { type: "finish" }
+        ])
+      );
     }
 
     const continuationStreamError = options?.body?.continuationStreamError;
@@ -328,9 +354,11 @@ export class TestChatAgent extends AIChatAgent<Env> {
     }
 
     // Simple echo response for testing
-    return new Response("Hello from chat agent!", {
-      headers: { "Content-Type": "text/plain" }
-    });
+    return this._holdResponseForTest(
+      new Response("Hello from chat agent!", {
+        headers: { "Content-Type": "text/plain" }
+      })
+    );
   }
 
   // Test helper: directly invoke the protected _applyToolResult so tests
