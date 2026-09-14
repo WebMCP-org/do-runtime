@@ -19,15 +19,15 @@
     "url": "https://github.com/cloudflare/agents/issues"
   },
   "dependencies": {
-    "nanoid": "^5.1.16"
+    "nanoid": "^6.0.1"
   },
   "devDependencies": {
-    "@playwright/test": "^1.61.1",
-    "@types/react": "^19.2.17",
+    "@playwright/test": "^1.63.0",
+    "@types/react": "^19.3.0",
     "agents": "workspace:*",
     "ai": "^7.0.0",
-    "react": "^19.2.7",
-    "zod": "^4.5.4"
+    "react": "^19.3.0",
+    "zod": "^4.6.4"
   },
   "peerDependencies": {
     "@ai-sdk/react": "^3.0.0 || ^4.0.0",

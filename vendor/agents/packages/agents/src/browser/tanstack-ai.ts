@@ -1,5 +1,5 @@
 import { toolDefinition } from "@tanstack/ai";
-import type { ServerTool } from "@tanstack/ai";
+import type { AnyServerTool } from "@tanstack/ai";
 import type { ProxyToolOutput } from "@cloudflare/codemode";
 import { z } from "zod";
 import { createBrowserRuntime, type CreateBrowserToolsOptions } from "./ai";
@@ -39,7 +39,7 @@ export type { CreateBrowserToolsOptions } from "./ai";
  */
 export function createBrowserTools(
   options: CreateBrowserToolsOptions
-): ServerTool[] {
+): AnyServerTool[] {
   // This wrapper only surfaces `browser_execute`, so don't build the default-on
   // Quick Action tools just to discard them.
   const { tools } = createBrowserRuntime({ ...options, quickActions: false });

@@ -623,10 +623,7 @@ function createSecureReplyEmailResolver<Env>(
 ): EmailResolver<Env>;
 
 type SignatureFailureReason =
-  | "missing_headers"
-  | "expired"
-  | "invalid"
-  | "malformed_timestamp";
+  "missing_headers" | "expired" | "invalid" | "malformed_timestamp";
 ```
 
 Creates a resolver for routing email replies with signature verification.

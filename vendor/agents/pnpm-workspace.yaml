@@ -10,11 +10,11 @@ peerDependencyRules:
     # declares only Babel 8. The maintained browser suite exercises this pair.
     "@babel/core": "^7.29.0"
     # The 0.22 source pin typechecks against this Workers contract.
-    "@cloudflare/workers-types": "5.20260729.1"
+    "@cloudflare/workers-types": "5.20260914.1"
     # Think supports AI SDK 6 and 7; Chat's stale peer range names only 6.
     ai: "^7.0.0"
 patchedDependencies:
-  vitest-browser-react@2.2.0: patches/vitest-browser-react+2.2.0.patch
+  vitest-browser-react@2.3.0: patches/vitest-browser-react+2.3.0.patch
 allowBuilds:
   esbuild: true
   workerd: true

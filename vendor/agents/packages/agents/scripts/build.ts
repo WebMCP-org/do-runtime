@@ -86,10 +86,8 @@ async function main() {
     dts: true,
     target: "es2021",
     entry: entries,
-    deps: {
-      skipNodeModulesBundle: true,
-      neverBundle: ["cloudflare:workers", "cloudflare:email"]
-    },
+    deps: { neverBundle: true },
+    inputOptions: { external: ["cloudflare:workers", "cloudflare:email"] },
     format: "esm",
     outputOptions: { keepNames: true },
     sourcemap: true,
