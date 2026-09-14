@@ -13464,7 +13464,6 @@ export class Think<
         // Vendor divergence: the terminal message is on the row, so the
         // catch/finally fallback below must not write it a second time.
         terminalMessagePersisted = true;
-        this._broadcastMessages();
       }
       // Nothing to persist (or the persist threw): settle the finished stream.
       this._resumableStream.finalizePending();
@@ -13477,6 +13476,9 @@ export class Think<
         done: true
       });
       doneSent = true;
+      // The observer accumulator clears at done; publish terminal metadata
+      // afterwards so its final merge cannot replace the persisted snapshot.
+      if (terminalMessagePersisted) this._broadcastMessages();
 
       if (terminalStatus === "error") {
         await this._fireResponseHook({
@@ -14127,12 +14129,12 @@ export class Think<
               assistantMsg,
               parentId
             );
-            this._broadcastMessages();
           }
           // Nothing to persist (or the persist threw): settle the finished
           // stream so it is not mistaken for an interrupted turn.
           this._resumableStream.finalizePending();
           if (!doneSent) sendDone();
+          if (accumulator.parts.length > 0) this._broadcastMessages();
 
           await this._fireResponseHook({
             message: assistantMsg,

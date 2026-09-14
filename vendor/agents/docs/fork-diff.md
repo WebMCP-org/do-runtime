@@ -22,6 +22,11 @@ inspected coverage; fresh follow-up results are identified explicitly in the aud
   outlive the message transaction; deleting its stream in that transaction made
   a cold wake continue an already-completed answer. This supersedes the 0.23
   refresh's immediate-discard behavior and its resume-specific discard policy.
+- Wire order remains completion, then canonical transcript. Sending the snapshot
+  while an observer accumulator is still active makes its terminal merge replace
+  persisted duration/status metadata. The native broadcast regression asserts
+  both durability at completion and this frame order; Rook's real Chrome stopped
+  activity-label test covers the rendered result.
 - No new storage shape, migration, timer, or recovery protocol. The existing
   `discard: false` cutover and start-time reclaim bound retention to the previous
   turn, as already used for agent-tool tailing and reconnect replay.

@@ -1404,6 +1404,10 @@ describe("Think — onChatResponse", () => {
         await agent.runChannelTurnForTest({ input: "Hello!" });
       }
       expect(await agent.getAssistantRowsAtDoneForTest()).toEqual([1]);
+      expect(await agent.getCompletionFramesForTest()).toEqual([
+        "done",
+        "messages"
+      ]);
     }
   );
 
