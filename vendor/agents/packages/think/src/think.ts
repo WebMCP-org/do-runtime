@@ -13448,13 +13448,6 @@ export class Think<
         this._finishResumableStream(streamId);
       }
       streamFinalized = true;
-      this._broadcastChat({
-        type: MSG_CHAT_RESPONSE,
-        id: requestId,
-        body: "",
-        done: true
-      });
-      doneSent = true;
 
       terminalStatus = streamError
         ? "error"
@@ -13467,12 +13460,7 @@ export class Think<
         startedAt
       );
       if (accumulator.parts.length > 0) {
-        await this._persistAssistantMessageWithCutover(
-          streamId,
-          assistantMsg,
-          undefined,
-          { discard: this._discardStreamAtCutover(requestId) }
-        );
+        await this._persistAssistantMessageWithCutover(streamId, assistantMsg);
         // Vendor divergence: the terminal message is on the row, so the
         // catch/finally fallback below must not write it a second time.
         terminalMessagePersisted = true;
@@ -13480,6 +13468,15 @@ export class Think<
       }
       // Nothing to persist (or the persist threw): settle the finished stream.
       this._resumableStream.finalizePending();
+
+      // Completion is observable only after the message and stream commit.
+      this._broadcastChat({
+        type: MSG_CHAT_RESPONSE,
+        id: requestId,
+        body: "",
+        done: true
+      });
+      doneSent = true;
 
       if (terminalStatus === "error") {
         await this._fireResponseHook({
@@ -13787,14 +13784,20 @@ export class Think<
     let streamAborted = false;
     let streamError: string | undefined;
     let output: unknown;
-    // Vendor divergence: the cutover's discard decision has to be taken while
-    // connections are still parked on the resume handshake — by the time the
-    // cutover runs, every terminal path has already released them. Memoized
-    // at the first release; see `_discardStreamAtCutover`.
-    let discardStream: boolean | undefined;
     const releaseResumeConnections = (): void => {
-      discardStream ??= this._discardStreamAtCutover(requestId);
       this._pendingResumeConnections.clear();
+    };
+    const sendDone = (): void => {
+      // Reconnecting clients replay the committed buffer before terminal.
+      this._broadcastChat({
+        type: MSG_CHAT_RESPONSE,
+        id: requestId,
+        body: "",
+        done: true,
+        ...(continuation && { continuation: true })
+      });
+      releaseResumeConnections();
+      doneSent = true;
     };
     // Set when an in-stream overflow error is recoverable (opt-in): suppresses
     // terminal delivery so the driver can compact and re-run the turn.
@@ -13812,368 +13815,357 @@ export class Think<
     // the abandoned tee branch.
     let streamDrainedNaturally = false;
     try {
-      this._insideInferenceLoop = true;
       try {
-        const guardedStream = iterateWithStallWatchdog(
-          result.toUIMessageStream({
-            onError: streamErrorToString,
-            messageMetadata: turnMessageMetadata(startedAt)
-          }),
-          stallTimeoutMs,
-          () => {
-            this._emit("chat:stream:stalled", {
-              requestId,
-              timeoutMs: stallTimeoutMs
-            });
-            // Tear down the upstream model stream so a hung provider/transport
-            // is released; the watchdog's throw drives the terminal error below.
-            this.abortRequest(
-              requestId,
-              new Error("chat stream stalled: inactivity watchdog fired")
-            );
-          }
-        );
-        for await (const chunk of guardedStream) {
-          if (abortSignal?.aborted) {
-            streamAborted = true;
-            break;
-          }
-
-          const rawChunk = chunk as unknown as StreamChunkData;
-          if (
-            continuationSeedParts &&
-            isReplayChunk(continuationSeedParts, rawChunk)
-          ) {
-            continue;
-          }
-          const streamChunk = this._annotateActionApprovalChunk(
-            requestId,
-            rawChunk,
-            pendingActionCalls,
-            accumulator.parts
+        this._insideInferenceLoop = true;
+        try {
+          const guardedStream = iterateWithStallWatchdog(
+            result.toUIMessageStream({
+              onError: streamErrorToString,
+              messageMetadata: turnMessageMetadata(startedAt)
+            }),
+            stallTimeoutMs,
+            () => {
+              this._emit("chat:stream:stalled", {
+                requestId,
+                timeoutMs: stallTimeoutMs
+              });
+              // Tear down the upstream model stream so a hung provider/transport
+              // is released; the watchdog's throw drives the terminal error below.
+              this.abortRequest(
+                requestId,
+                new Error("chat stream stalled: inactivity watchdog fired")
+              );
+            }
           );
-          const { action } = accumulator.applyChunk(streamChunk);
-          this._applyActionApprovalDescriptorToParts(
-            streamChunk,
-            accumulator.parts
-          );
-
-          // Approved server tools execute during a continuation stream, but
-          // their original tool part lives in an earlier assistant message.
-          // The accumulator can only own this turn's new content, so it
-          // surfaces a terminal result for a prior message as a
-          // `cross-message-tool-update`. Persist + broadcast it directly so
-          // the approved result reaches clients and durable storage. The
-          // update builder is first-write-wins (replay-safe) and preserves a
-          // streamed `preliminary` flag; `_applyToolUpdateToMessages` skips
-          // the write/broadcast when the matched part is already settled.
-          if (action?.type === "cross-message-tool-update") {
-            await this._applyToolUpdateToMessages(
-              crossMessageToolResultUpdate(
-                action.toolCallId,
-                action.updateType,
-                action.output,
-                action.errorText,
-                action.preliminary
-              )
-            );
-          }
-
-          if (action?.type === "error") {
-            streamError = action.error;
-            // Recoverable context overflow (opt-in): don't terminalize. Persist
-            // the partial after the loop, then signal the driver to compact and
-            // re-run. No `message:error`/`chat:request:failed`/error frame here.
-            if (
-              options?.overflowRecovery &&
-              this._isRecoverableContextOverflow(streamError, requestId)
-            ) {
-              overflowRetry = true;
+          for await (const chunk of guardedStream) {
+            if (abortSignal?.aborted) {
+              streamAborted = true;
               break;
             }
-            if (options?.captureProgrammaticStreamError) {
-              this._programmaticStreamErrors.set(requestId, streamError);
+
+            const rawChunk = chunk as unknown as StreamChunkData;
+            if (
+              continuationSeedParts &&
+              isReplayChunk(continuationSeedParts, rawChunk)
+            ) {
+              continue;
             }
-            this._emit("message:error", { error: streamError });
-            // An AI-SDK error surfaces as a stream error part (not a thrown
-            // exception), so it lands here rather than in the `catch` below.
-            // Bridge it to `chat:request:failed` too — observers shouldn't have
-            // to know whether the failure threw or arrived as a chunk (the
-            // post-`beforeTurn`, in-stream provider 400 class), and turn-count
-            // telemetry needs the failed signal to balance `turn.started`.
-            this._emit("chat:request:failed", {
+            const streamChunk = this._annotateActionApprovalChunk(
               requestId,
-              stage: "stream",
-              messagesPersisted: true,
-              error: streamError
-            });
+              rawChunk,
+              pendingActionCalls,
+              accumulator.parts
+            );
+            const { action } = accumulator.applyChunk(streamChunk);
+            this._applyActionApprovalDescriptorToParts(
+              streamChunk,
+              accumulator.parts
+            );
+
+            // Approved server tools execute during a continuation stream, but
+            // their original tool part lives in an earlier assistant message.
+            // The accumulator can only own this turn's new content, so it
+            // surfaces a terminal result for a prior message as a
+            // `cross-message-tool-update`. Persist + broadcast it directly so
+            // the approved result reaches clients and durable storage. The
+            // update builder is first-write-wins (replay-safe) and preserves a
+            // streamed `preliminary` flag; `_applyToolUpdateToMessages` skips
+            // the write/broadcast when the matched part is already settled.
+            if (action?.type === "cross-message-tool-update") {
+              await this._applyToolUpdateToMessages(
+                crossMessageToolResultUpdate(
+                  action.toolCallId,
+                  action.updateType,
+                  action.output,
+                  action.errorText,
+                  action.preliminary
+                )
+              );
+            }
+
+            if (action?.type === "error") {
+              streamError = action.error;
+              // Recoverable context overflow (opt-in): don't terminalize. Persist
+              // the partial after the loop, then signal the driver to compact and
+              // re-run. No `message:error`/`chat:request:failed`/error frame here.
+              if (
+                options?.overflowRecovery &&
+                this._isRecoverableContextOverflow(streamError, requestId)
+              ) {
+                overflowRetry = true;
+                break;
+              }
+              if (options?.captureProgrammaticStreamError) {
+                this._programmaticStreamErrors.set(requestId, streamError);
+              }
+              this._emit("message:error", { error: streamError });
+              // An AI-SDK error surfaces as a stream error part (not a thrown
+              // exception), so it lands here rather than in the `catch` below.
+              // Bridge it to `chat:request:failed` too — observers shouldn't have
+              // to know whether the failure threw or arrived as a chunk (the
+              // post-`beforeTurn`, in-stream provider 400 class), and turn-count
+              // telemetry needs the failed signal to balance `turn.started`.
+              this._emit("chat:request:failed", {
+                requestId,
+                stage: "stream",
+                messagesPersisted: true,
+                error: streamError
+              });
+              this._broadcastChat({
+                type: MSG_CHAT_RESPONSE,
+                id: requestId,
+                body: action.error,
+                done: false,
+                error: true,
+                ...(continuation && { continuation: true })
+              });
+              break;
+            }
+
+            this._alignStreamStartId(
+              streamChunk,
+              action,
+              accumulator,
+              continuation
+            );
+            if (streamChunk.type === "start" && continuationStart) {
+              streamChunk.continuationStart = continuationStart;
+            }
+
+            const chunkBody = JSON.stringify(streamChunk);
+            // Vendor divergence: keep store + broadcast synchronous — a resume
+            // must not replay this chunk before its live broadcast, or the
+            // client receives it twice (2026-09-11 "Atomic replay storage and
+            // live chunk delivery").
+            this._storeChunkDurably(
+              streamId,
+              streamChunk,
+              chunkBody,
+              flushState
+            );
             this._broadcastChat({
               type: MSG_CHAT_RESPONSE,
               id: requestId,
-              body: action.error,
+              body: chunkBody,
               done: false,
-              error: true,
               ...(continuation && { continuation: true })
             });
-            break;
           }
-
-          this._alignStreamStartId(
-            streamChunk,
-            action,
-            accumulator,
-            continuation
+          streamDrainedNaturally = !(
+            streamAborted ||
+            overflowRetry ||
+            streamError !== undefined
           );
-          if (streamChunk.type === "start" && continuationStart) {
-            streamChunk.continuationStart = continuationStart;
+          // A cancel that lands after the final chunk (the persist/settle
+          // window) never hits the in-loop check above, so without this the
+          // turn reports "completed" to the response hook — and hosts that
+          // gate auto/goal continuations on that status would start the very
+          // turn the user just stopped.
+          if (!streamAborted && abortSignal?.aborted) {
+            streamAborted = true;
           }
+        } finally {
+          this._insideInferenceLoop = false;
+          // Only early exits leave an abandoned tee branch; a naturally
+          // exhausted stream needs no drain (consumeStream is not free — it
+          // tees the base stream and traverses the buffered branch). A thrown
+          // exit (stall watchdog) never reaches the assignment above, so it
+          // drains too.
+          if (!streamDrainedNaturally) {
+            this._drainInferenceStream(result);
+          }
+        }
 
-          const chunkBody = JSON.stringify(streamChunk);
-          // Vendor divergence: keep store + broadcast synchronous — a resume
-          // must not replay this chunk before its live broadcast, or the
-          // client receives it twice (2026-09-11 "Atomic replay storage and
-          // live chunk delivery").
-          this._storeChunkDurably(streamId, streamChunk, chunkBody, flushState);
+        // Recoverable context overflow: discard the partial, close this stream
+        // segment WITHOUT a terminal frame, and hand control back to the driver
+        // via `onRetry`. The inline retry runs in this same invocation and owns
+        // the terminal outcome, so we must NOT emit a `done` frame here — and
+        // `doneSent = true` keeps the outer `finally` from emitting one (it would
+        // otherwise prematurely terminate the client's stream mid-recovery and
+        // mark the segment errored).
+        //
+        // The partial is intentionally NOT persisted: the driver re-runs the turn
+        // from scratch (`continuation: false`) against the compacted history, so
+        // the retry produces a fresh assistant message. Persisting the truncated
+        // partial would leave an orphan beside the recovered answer — and any tool
+        // work it captured would be re-issued by the retry, duplicating records.
+        // The live-streamed chunks already reached clients; the retry's
+        // `_broadcastMessages()` reconciles them to the real answer.
+        if (overflowRetry && options?.overflowRecovery) {
+          this._completeResumableStream(streamId);
+          releaseResumeConnections();
+          doneSent = true;
+          options.overflowRecovery.onRetry(streamError);
+          this._streamingAssistant = null;
+          return { status: "aborted" };
+        }
+
+        if (streamError) {
+          this._errorResumableStream(streamId);
+        } else {
+          this._finishResumableStream(streamId);
+        }
+      } catch (error) {
+        // #1626: a stream-stall watchdog abort is a recoverable interruption, not
+        // a terminal error. Persist the settled partial (so the continuation
+        // re-anchors without re-running completed tool calls), then route into
+        // bounded recovery; only fall through to the terminal path below once the
+        // budget is exhausted.
+        if (error instanceof ChatStreamStalledError) {
+          let targetAssistantId: string | undefined;
+          const partialMsg = accumulator.toMessage();
+          if (
+            this._historyGeneration === clearGen &&
+            accumulator.parts.length > 0
+          ) {
+            await this._persistAssistantMessage(partialMsg, parentId);
+            this._broadcastMessages();
+            targetAssistantId = partialMsg.id;
+          }
+          const outcome = await this._routeStallToBoundedRecovery({
+            requestId,
+            streamId,
+            partialParts: partialMsg.parts,
+            targetAssistantId
+          });
+          if (outcome === "scheduled") {
+            // Recovering: close the stream cleanly (no terminal error frame); the
+            // scheduled continuation drives the turn to completion. Report
+            // `aborted` so the caller does not terminalize the turn.
+            this._completeResumableStream(streamId);
+            if (!doneSent) {
+              this._broadcastChat({
+                type: MSG_CHAT_RESPONSE,
+                id: requestId,
+                body: "",
+                done: true,
+                ...(continuation && { continuation: true })
+              });
+              doneSent = true;
+            }
+            releaseResumeConnections();
+            // `aborted` (not `error`): this attempt was aborted by the watchdog;
+            // the scheduled continuation owns the real terminal outcome. No
+            // response hook fires here (the continuation fires it), mirroring how
+            // a deploy-interrupted attempt is superseded by its continuation.
+            // Plain clear (no auto-continuation re-check): recovery re-runs the
+            // turn and its own stream finalize re-triggers the held barrier.
+            this._streamingAssistant = null;
+            return { status: "aborted" };
+          }
+          if (outcome === "exhausted") {
+            // `_routeStallToBoundedRecovery` already delivered the terminal UX
+            // (configured `terminalMessage` + done/error frame + `onExhausted` +
+            // submission interrupted), identical to deploy-recovery exhaustion.
+            // Finalize the stream and report `aborted` (not `error`) so the caller
+            // does not re-run the generic terminal path on top of it.
+            this._errorResumableStream(streamId);
+            releaseResumeConnections();
+            doneSent = true;
+            this._streamingAssistant = null;
+            return { status: "aborted" };
+          }
+        }
+        streamError = error instanceof Error ? error.message : "Stream error";
+        if (options?.captureProgrammaticStreamError) {
+          this._programmaticStreamErrors.set(requestId, streamError);
+        }
+        this._errorResumableStream(streamId);
+        if (!doneSent) {
           this._broadcastChat({
             type: MSG_CHAT_RESPONSE,
             id: requestId,
-            body: chunkBody,
-            done: false,
+            body: streamError,
+            done: true,
+            error: true,
             ...(continuation && { continuation: true })
           });
-        }
-        streamDrainedNaturally = !(
-          streamAborted ||
-          overflowRetry ||
-          streamError !== undefined
-        );
-        // A cancel that lands after the final chunk (the persist/settle
-        // window) never hits the in-loop check above, so without this the
-        // turn reports "completed" to the response hook — and hosts that
-        // gate auto/goal continuations on that status would start the very
-        // turn the user just stopped.
-        if (!streamAborted && abortSignal?.aborted) {
-          streamAborted = true;
-        }
-      } finally {
-        this._insideInferenceLoop = false;
-        // Only early exits leave an abandoned tee branch; a naturally
-        // exhausted stream needs no drain (consumeStream is not free — it
-        // tees the base stream and traverses the buffered branch). A thrown
-        // exit (stall watchdog) never reaches the assignment above, so it
-        // drains too.
-        if (!streamDrainedNaturally) {
-          this._drainInferenceStream(result);
-        }
-      }
-
-      // Recoverable context overflow: discard the partial, close this stream
-      // segment WITHOUT a terminal frame, and hand control back to the driver
-      // via `onRetry`. The inline retry runs in this same invocation and owns
-      // the terminal outcome, so we must NOT emit a `done` frame here — and
-      // `doneSent = true` keeps the outer `finally` from emitting one (it would
-      // otherwise prematurely terminate the client's stream mid-recovery and
-      // mark the segment errored).
-      //
-      // The partial is intentionally NOT persisted: the driver re-runs the turn
-      // from scratch (`continuation: false`) against the compacted history, so
-      // the retry produces a fresh assistant message. Persisting the truncated
-      // partial would leave an orphan beside the recovered answer — and any tool
-      // work it captured would be re-issued by the retry, duplicating records.
-      // The live-streamed chunks already reached clients; the retry's
-      // `_broadcastMessages()` reconciles them to the real answer.
-      if (overflowRetry && options?.overflowRecovery) {
-        this._completeResumableStream(streamId);
-        releaseResumeConnections();
-        doneSent = true;
-        options.overflowRecovery.onRetry(streamError);
-        this._streamingAssistant = null;
-        return { status: "aborted" };
-      }
-
-      if (streamError) {
-        this._errorResumableStream(streamId);
-      } else {
-        this._finishResumableStream(streamId);
-      }
-      // A reconnecting client must receive replay before terminal. Keep it
-      // excluded until this broadcast; its ACK replays the completed buffer.
-      this._broadcastChat({
-        type: MSG_CHAT_RESPONSE,
-        id: requestId,
-        body: "",
-        done: true,
-        ...(continuation && { continuation: true })
-      });
-      releaseResumeConnections();
-      doneSent = true;
-    } catch (error) {
-      // #1626: a stream-stall watchdog abort is a recoverable interruption, not
-      // a terminal error. Persist the settled partial (so the continuation
-      // re-anchors without re-running completed tool calls), then route into
-      // bounded recovery; only fall through to the terminal path below once the
-      // budget is exhausted.
-      if (error instanceof ChatStreamStalledError) {
-        let targetAssistantId: string | undefined;
-        const partialMsg = accumulator.toMessage();
-        if (
-          this._historyGeneration === clearGen &&
-          accumulator.parts.length > 0
-        ) {
-          await this._persistAssistantMessage(partialMsg, parentId);
-          this._broadcastMessages();
-          targetAssistantId = partialMsg.id;
-        }
-        const outcome = await this._routeStallToBoundedRecovery({
-          requestId,
-          streamId,
-          partialParts: partialMsg.parts,
-          targetAssistantId
-        });
-        if (outcome === "scheduled") {
-          // Recovering: close the stream cleanly (no terminal error frame); the
-          // scheduled continuation drives the turn to completion. Report
-          // `aborted` so the caller does not terminalize the turn.
-          this._completeResumableStream(streamId);
-          if (!doneSent) {
-            this._broadcastChat({
-              type: MSG_CHAT_RESPONSE,
-              id: requestId,
-              body: "",
-              done: true,
-              ...(continuation && { continuation: true })
-            });
-            doneSent = true;
-          }
-          releaseResumeConnections();
-          // `aborted` (not `error`): this attempt was aborted by the watchdog;
-          // the scheduled continuation owns the real terminal outcome. No
-          // response hook fires here (the continuation fires it), mirroring how
-          // a deploy-interrupted attempt is superseded by its continuation.
-          // Plain clear (no auto-continuation re-check): recovery re-runs the
-          // turn and its own stream finalize re-triggers the held barrier.
-          this._streamingAssistant = null;
-          return { status: "aborted" };
-        }
-        if (outcome === "exhausted") {
-          // `_routeStallToBoundedRecovery` already delivered the terminal UX
-          // (configured `terminalMessage` + done/error frame + `onExhausted` +
-          // submission interrupted), identical to deploy-recovery exhaustion.
-          // Finalize the stream and report `aborted` (not `error`) so the caller
-          // does not re-run the generic terminal path on top of it.
-          this._errorResumableStream(streamId);
-          releaseResumeConnections();
           doneSent = true;
-          this._streamingAssistant = null;
-          return { status: "aborted" };
+        }
+        releaseResumeConnections();
+      }
+
+      if (
+        options?.captureOutput &&
+        result.output &&
+        !streamError &&
+        !streamAborted
+      ) {
+        try {
+          output = await result.output;
+        } catch (error) {
+          streamError =
+            error instanceof Error ? error.message : "Structured output error";
+          if (options.captureProgrammaticStreamError) {
+            this._programmaticStreamErrors.set(requestId, streamError);
+          }
         }
       }
-      streamError = error instanceof Error ? error.message : "Stream error";
-      if (options?.captureProgrammaticStreamError) {
-        this._programmaticStreamErrors.set(requestId, streamError);
+      if (!streamAborted && abortSignal?.aborted) {
+        streamAborted = true;
       }
-      this._errorResumableStream(streamId);
-      if (!doneSent) {
-        this._broadcastChat({
-          type: MSG_CHAT_RESPONSE,
-          id: requestId,
-          body: streamError,
-          done: true,
-          error: true,
-          ...(continuation && { continuation: true })
-        });
-        doneSent = true;
+      if (output !== undefined) {
+        this._persistAgentToolOutputForRequest(requestId, output);
       }
-      releaseResumeConnections();
+
+      if (this._historyGeneration === clearGen) {
+        try {
+          const status: ThinkTerminalMessageStatus = streamError
+            ? "error"
+            : streamAborted
+              ? "aborted"
+              : "completed";
+          const assistantMsg = withTerminalMessageTiming(
+            accumulator.toMessage(),
+            status,
+            startedAt
+          );
+
+          if (accumulator.parts.length > 0) {
+            await this._persistAssistantMessageWithCutover(
+              streamId,
+              assistantMsg,
+              parentId
+            );
+            this._broadcastMessages();
+          }
+          // Nothing to persist (or the persist threw): settle the finished
+          // stream so it is not mistaken for an interrupted turn.
+          this._resumableStream.finalizePending();
+          if (!doneSent) sendDone();
+
+          await this._fireResponseHook({
+            message: assistantMsg,
+            requestId,
+            continuation,
+            status,
+            error: streamError
+          });
+        } catch (e) {
+          console.error("Failed to persist assistant message:", e);
+        }
+      }
+      this._resumableStream.finalizePending();
+
+      if (!doneSent) sendDone();
+
+      // The message is now persisted (or the turn was cleared), so subsequent
+      // tool results resolve against storage; stop exposing the accumulator and
+      // re-check any continuation the stream-active barrier held (#1650).
+      this._onStreamingTurnFinalized();
+
+      return streamError
+        ? { status: "error", error: streamError }
+        : {
+            status: streamAborted ? "aborted" : "completed",
+            ...(output !== undefined && { output })
+          };
     } finally {
       if (!doneSent) {
         this._errorResumableStream(streamId);
-        this._broadcastChat({
-          type: MSG_CHAT_RESPONSE,
-          id: requestId,
-          body: "",
-          done: true,
-          ...(continuation && { continuation: true })
-        });
-        releaseResumeConnections();
+        sendDone();
       }
     }
-
-    if (
-      options?.captureOutput &&
-      result.output &&
-      !streamError &&
-      !streamAborted
-    ) {
-      try {
-        output = await result.output;
-      } catch (error) {
-        streamError =
-          error instanceof Error ? error.message : "Structured output error";
-        if (options.captureProgrammaticStreamError) {
-          this._programmaticStreamErrors.set(requestId, streamError);
-        }
-      }
-    }
-    if (!streamAborted && abortSignal?.aborted) {
-      streamAborted = true;
-    }
-    if (output !== undefined) {
-      this._persistAgentToolOutputForRequest(requestId, output);
-    }
-
-    if (this._historyGeneration === clearGen) {
-      try {
-        const status: ThinkTerminalMessageStatus = streamError
-          ? "error"
-          : streamAborted
-            ? "aborted"
-            : "completed";
-        const assistantMsg = withTerminalMessageTiming(
-          accumulator.toMessage(),
-          status,
-          startedAt
-        );
-
-        if (accumulator.parts.length > 0) {
-          await this._persistAssistantMessageWithCutover(
-            streamId,
-            assistantMsg,
-            parentId,
-            {
-              discard: discardStream ?? this._discardStreamAtCutover(requestId)
-            }
-          );
-          this._broadcastMessages();
-        }
-        // Nothing to persist (or the persist threw): settle the finished
-        // stream so it is not mistaken for an interrupted turn.
-        this._resumableStream.finalizePending();
-
-        await this._fireResponseHook({
-          message: assistantMsg,
-          requestId,
-          continuation,
-          status,
-          error: streamError
-        });
-      } catch (e) {
-        console.error("Failed to persist assistant message:", e);
-      }
-    }
-    this._resumableStream.finalizePending();
-
-    // The message is now persisted (or the turn was cleared), so subsequent
-    // tool results resolve against storage; stop exposing the accumulator and
-    // re-check any continuation the stream-active barrier held (#1650).
-    this._onStreamingTurnFinalized();
-
-    return streamError
-      ? { status: "error", error: streamError }
-      : {
-          status: streamAborted ? "aborted" : "completed",
-          ...(output !== undefined && { output })
-        };
   }
 
   // ── Session-backed persistence ──────────────────────────────────
@@ -14208,16 +14200,14 @@ export class Think<
 
   /**
    * The cutover: persist the finished turn's assistant message, settle its
-   * resumable stream and delete the stream's rows in ONE SQLite transaction,
-   * so a crash leaves either the live stream (recovery rebuilds the message
-   * from it) or the message — never neither, never both. The session
+   * resumable stream in ONE SQLite transaction, so a crash leaves either the
+   * live stream or the message with terminal recovery evidence. The session
    * change feed and auto-compaction run once the transaction has committed.
    */
   private async _persistAssistantMessageWithCutover(
     streamId: string,
     msg: UIMessage,
-    parentId?: string,
-    options: { discard?: boolean } = {}
+    parentId?: string
   ): Promise<void> {
     const toPersist = this._strippedForPersist(msg);
     if (toPersist === null) return;
@@ -14254,7 +14244,10 @@ export class Think<
             source: "server"
           }).after;
         },
-        { discard: options.discard ?? true }
+        // The enclosing recovery task may still be running when this message
+        // commits. Keep its terminal evidence until the next stream starts;
+        // deleting it here makes a cold wake continue an already-finished turn.
+        { discard: false }
       );
     } catch (error) {
       // The settle transaction rolled back: the row never landed, but the
@@ -14263,27 +14256,6 @@ export class Think<
       throw error;
     }
     await after?.();
-  }
-
-  /**
-   * Whether this turn's stream rows can go with its cutover. An agent-tool
-   * child turn keeps them: the parent tails the stored chunks after the
-   * child completes (`getAgentToolChunks`), so the rows are reclaimed by
-   * the child's next `start()` instead, as `AIChatAgent` does.
-   *
-   * Vendor divergence: a turn with connections parked on the resume handshake
-   * keeps them too. Those clients were deliberately excluded from the live
-   * terminal broadcast so their queued ACK replays the completed buffer and
-   * its terminal frame (2026-08-11 "Reconnecting streams receive replay
-   * before terminal"); the ACK is processed AFTER this cutover, so discarding
-   * the rows here leaves it nothing to replay — the client would receive a
-   * bare `done` with none of the turn's content and, for a continuation, no
-   * `continuation: true` (2026-08-30 "Think retains continuation metadata on
-   * resume"). Call this BEFORE `_pendingResumeConnections.clear()`.
-   */
-  private _discardStreamAtCutover(requestId: string): boolean {
-    if (this._agentToolRunsByRequestId.get(requestId)) return false;
-    return this._pendingResumeConnections.size === 0;
   }
 
   /**
