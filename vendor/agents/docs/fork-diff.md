@@ -14,6 +14,32 @@ The [current audit](audit/vendor-fork-audit.md) owns measured costs, upstream
 issue findings and unresolved coverage questions. Test names below describe
 inspected coverage; fresh follow-up results are identified explicitly in the audit.
 
+## 2026-09-14 — Preserve completion across a cold restart
+
+- `packages/think/src/think.ts`: both chat streaming paths persist the assistant
+  before broadcasting completion. The cutover retains the existing terminal
+  stream record until the next stream start reclaims it. A recovery task can
+  outlive the message transaction; deleting its stream in that transaction made
+  a cold wake continue an already-completed answer. This supersedes the 0.23
+  refresh's immediate-discard behavior and its resume-specific discard policy.
+- Wire order remains completion, then canonical transcript. Sending the snapshot
+  while an observer accumulator is still active makes its terminal merge replace
+  persisted duration/status metadata. The native broadcast regression asserts
+  both durability at completion and this frame order; Rook's real Chrome stopped
+  activity-label test covers the rendered result.
+- No new storage shape, migration, timer, or recovery protocol. The existing
+  `discard: false` cutover and start-time reclaim bound retention to the previous
+  turn, as already used for agent-tool tailing and reconnect replay.
+- Reproduced while validating [Rook #166](https://github.com/WebMCP-org/rook/pull/166):
+  upgrading the published 1.1.0.509 profile, completing a second turn, and cold
+  restarting could issue a third model request and duplicate the answer.
+- `packages/think/src/tests/think-session.test.ts` observes durable assistant rows
+  at terminal broadcast on both paths and recovers a real completed turn whose
+  enclosing run survived cutover. Each regression failed before the fix.
+  `stream-cleanup.test.ts` checks that the next turn reclaims terminal evidence.
+- Why no host shim: completion and stream-to-message transactions are private
+  Think internals, shared by browser and Worker consumers. Upstreamable: yes.
+
 ## Ownership map
 
 Rook's `ThreadApp` keeps the conversation socket and Agent-tool subscription

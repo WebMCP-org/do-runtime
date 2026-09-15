@@ -4,8 +4,8 @@ import { getAgentByName } from "agents";
 import type { ThinkRecoveryTestAgent } from "./agents/think-session";
 
 // Resumable-stream buffers are reclaimed without an alarm: the cutover
-// deletes a finished stream's rows in the transaction that persists its
-// message, and the next stream start reclaims anything a crash left behind —
+// settles a finished stream in the transaction that persists its message,
+// and the next stream start reclaims the terminal recovery evidence —
 // finished streams of any age and in-flight rows abandoned past the stale
 // window. Uses ThinkRecoveryTestAgent, which carries the stream test helpers.
 
@@ -107,11 +107,17 @@ describe("Think — stream reclaim (no cleanup alarm)", () => {
     expect(snapshot?.chunkCount).toBeGreaterThan(0);
   });
 
-  it("a real turn leaves no stream rows behind", async () => {
+  it("a real turn retains completion evidence until the next stream starts", async () => {
     const agent = await freshAgent();
     const result = await agent.testChat("Cut over");
     expect(result.done).toBe(true);
-    expect(await agent.getLatestStreamSnapshot()).toBeNull();
+    const completed = await agent.getLatestStreamSnapshot();
+    expect(completed?.status).toBe("completed");
+    await agent.startStreamForTest("next-turn");
+    expect(await agent.runStreamCleanupForTest()).toBe(0);
+    expect((await agent.getLatestStreamSnapshot())?.requestId).toBe(
+      "next-turn"
+    );
     expect(
       await agent.getScheduledChatRecoveryCountForTest(CLEANUP_CALLBACK)
     ).toBe(0);

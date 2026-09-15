@@ -604,6 +604,46 @@ class TestCollectingCallback implements StreamCallback {
 // _transformInferenceResult (error injection).
 
 export class ThinkTestAgent extends Think {
+  private _assistantRowsAtDone: number[] = [];
+  private _completionFrames: string[] = [];
+
+  override broadcast(
+    msg: string | ArrayBuffer | ArrayBufferView,
+    without?: string[]
+  ): void {
+    if (typeof msg === "string") {
+      const frame = JSON.parse(msg) as {
+        type?: string;
+        done?: boolean;
+        messages?: UIMessage[];
+      };
+      if (
+        frame.type === "cf_agent_chat_messages" &&
+        frame.messages?.some((message) => message.role === "assistant")
+      ) {
+        this._completionFrames.push("messages");
+      }
+      if (frame.type === "cf_agent_use_chat_response" && frame.done) {
+        this._completionFrames.push("done");
+        this._assistantRowsAtDone.push(
+          this.sql<{ count: number }>`
+            SELECT COUNT(*) AS count FROM cf_agents_session_messages
+            WHERE role = 'assistant'
+          `[0].count
+        );
+      }
+    }
+    super.broadcast(msg, without);
+  }
+
+  getAssistantRowsAtDoneForTest(): number[] {
+    return this._assistantRowsAtDone;
+  }
+
+  getCompletionFramesForTest(): string[] {
+    return this._completionFrames;
+  }
+
   private _response = "Hello from the assistant!";
   private _nextSubAgentConnectionSendDelayMs = 0;
   private _chatErrorLog: string[] = [];
@@ -7737,6 +7777,7 @@ export class ThinkRecoveryTestAgent extends Think {
     await this.chat(message, cb);
     return {
       events: cb.events,
+      requestId: cb.requestId,
       done: cb.doneCalled,
       error: cb.errorMessage,
       interruptedCalls: cb.interruptedCalls

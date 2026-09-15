@@ -1394,6 +1394,23 @@ describe("Think — getConfig inside configureSession", () => {
 // ── onChatResponse hook ──────────────────────────────────────────
 
 describe("Think — onChatResponse", () => {
+  it.each(["rpc", "stream"] as const)(
+    "persists the assistant before announcing %s completion",
+    async (transport) => {
+      const agent = await freshAgent(`persist-before-done-${transport}`);
+      if (transport === "rpc") {
+        await agent.runChatTurnForTest({ input: "Hello!" });
+      } else {
+        await agent.runChannelTurnForTest({ input: "Hello!" });
+      }
+      expect(await agent.getAssistantRowsAtDoneForTest()).toEqual([1]);
+      expect(await agent.getCompletionFramesForTest()).toEqual([
+        "done",
+        "messages"
+      ]);
+    }
+  );
+
   it("should fire onChatResponse after successful chat turn", async () => {
     const agent = await freshAgent("hook-success");
 
@@ -2653,18 +2670,16 @@ describe("Think — chatRecovery", () => {
     expect(fibers).toHaveLength(0);
   });
 
-  it("chat() discards the stream once its message is persisted", async () => {
+  it("chat() retains terminal stream evidence after its message is persisted", async () => {
     const agent = await freshRecoveryAgent("chat-stream-metadata");
 
     const result = await agent.testChat("Record the stream");
     expect(result.done).toBe(true);
 
-    // The stream's rows were the recovery evidence while the turn was in
-    // flight; once the assistant message is durable they are redundant and
-    // are dropped in place, leaving nothing for the retention sweep.
-    // Interrupted turns keep their rows (covered by the recovery tests).
+    // Recovery can outlive the message commit; its terminal stream must still
+    // distinguish a completed turn from an interrupted one until the next turn.
     const snapshot = await agent.getLatestStreamSnapshot();
-    expect(snapshot).toBeNull();
+    expect(snapshot?.status).toBe("completed");
     const messages = (await agent.getStoredMessages()) as UIMessage[];
     expect(messages.at(-1)?.role).toBe("assistant");
   });
@@ -4592,6 +4607,23 @@ describe("Think — onChatRecovery", () => {
     // not a duplicate — and the completed content is never lost.
     expect(assistants).toHaveLength(1);
     expect(assistants[0].id).toBe("a-dup");
+  });
+
+  it("does not recover a real completed turn whose recovery task outlived cutover", async () => {
+    const agent = await freshRecoveryAgent("completed-cutover-recovery");
+    const result = await agent.testChat("Finish before restart");
+    expect(result.done).toBe(true);
+    expect(result.requestId).toBeTruthy();
+    // A crash after the message commit can leave the enclosing recovery run.
+    await agent.insertInterruptedFiber(
+      `__cf_internal_chat_turn:${result.requestId}`
+    );
+    expect(await agent.triggerFiberRecovery()).toEqual({
+      scheduledContinueCount: 0,
+      scheduledRetryCount: 0
+    });
+    expect(await agent.getTurnCallCount()).toBe(1);
+    expect(await agent.getStoredMessages()).toHaveLength(2);
   });
 
   it("does not continue a recovered chat fiber whose stream already completed", async () => {
