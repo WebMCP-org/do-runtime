@@ -268,7 +268,7 @@ export class AcceptedWebSocket extends EventTarget implements RawWebSocket, WebS
   #delivery: SocketDelivery = { mode: "pending" };
   #pump: Promise<void> = Promise.resolve();
   #pending: { type: SocketEvent; event: Event }[] = [];
-  #readyState: number = AcceptedWebSocket.OPEN;
+  #readyState: WebSocket["readyState"] = AcceptedWebSocket.OPEN;
   #ownClose = false;
   #peerClose = false;
   #binaryType: "blob" | "arraybuffer" = "blob";
@@ -301,7 +301,7 @@ export class AcceptedWebSocket extends EventTarget implements RawWebSocket, WebS
     }
   }
 
-  get readyState(): number {
+  get readyState(): WebSocket["readyState"] {
     return this.#readyState;
   }
 

@@ -866,9 +866,7 @@ Extensions can subscribe to `beforeTurn`, `beforeToolCall`, `afterToolCall`, `on
 ```js
 // extension source
 ({
-  tools: {
-    /* ... */
-  },
+  tools: {/* ... */},
   hooks: {
     beforeTurn: async (snapshot, host) => {
       /* may return TurnConfig */

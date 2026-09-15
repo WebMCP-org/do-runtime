@@ -28,10 +28,8 @@ async function main() {
       "src/tools/browser.ts",
       "src/tools/sandbox.ts"
     ],
-    deps: {
-      skipNodeModulesBundle: true,
-      neverBundle: ["cloudflare:workers"]
-    },
+    deps: { neverBundle: true },
+    inputOptions: { external: ["cloudflare:workers"] },
     format: "esm",
     outputOptions: { keepNames: true },
     sourcemap: true,

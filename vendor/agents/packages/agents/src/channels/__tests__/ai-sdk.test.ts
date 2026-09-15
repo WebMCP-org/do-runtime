@@ -30,12 +30,10 @@ function host(deliver = vi.fn(async () => ({ status: "delivered" as const }))) {
 
 describe("AI SDK message adapter", () => {
   it("adapts a Host-resolved surface to a caller-described tool", async () => {
-    const deliver = vi.fn(
-      async (): Promise<DeliveryResult> => ({
-        status: "delivered",
-        reference: "message-1"
-      })
-    );
+    const deliver = vi.fn(async (): Promise<DeliveryResult> => ({
+      status: "delivered",
+      reference: "message-1"
+    }));
     const { channelHost } = host(deliver);
 
     const messageTool = createSendMessageTool(channelHost, surface, {

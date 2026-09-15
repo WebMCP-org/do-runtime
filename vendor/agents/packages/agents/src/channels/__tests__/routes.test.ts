@@ -94,8 +94,9 @@ describe("routes", () => {
   it("delegates the exact arguments to any fallback when no user is linked", async () => {
     const raw = { provider: "raw" };
     const context = { findUser: vi.fn(async () => null) };
-    const fallback = vi.fn((_event: ChannelInboundMessage, value: typeof raw) =>
-      value.provider === "raw" ? "fallback-route" : null
+    const fallback = vi.fn(
+      (_event: ChannelInboundMessage, value: typeof raw) =>
+        value.provider === "raw" ? "fallback-route" : null
     );
     const route = routes.byUser(fallback);
 
