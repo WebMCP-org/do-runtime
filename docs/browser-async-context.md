@@ -13,10 +13,10 @@ its caller's scope in `finally`; it never leaves one mutable store active while
 a promise is pending. Actor entry, reentry, critical sections and timer callbacks
 capture that scope before the runtime waits for its input lock.
 
-`installActorScope` also installs the native `TransformStream` constructor with
-actor callback binding. A transformer created inside an actor retains its actor
-and async stores when network chunks arrive later. Transform, flush and cancel
-callbacks re-enter through the existing input gate; start remains synchronous.
+`installActorScope` also binds native `ReadableStream` and `TransformStream`
+callbacks. Sources and transformers created inside an actor retain its actor
+and async stores when later demand or network chunks arrive. Pull, transform,
+flush and cancel re-enter through the existing input gate; start remains synchronous.
 Streams constructed outside an actor retain native behavior. This covers the
 AI SDK's streamed tool execution, whose callbacks bypass transformed awaits.
 

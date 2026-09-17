@@ -532,6 +532,7 @@ export type ActorScopeBindings = {
   readonly WebSocket: typeof globalThis.WebSocket;
   readonly WebSocketPair: WebSocketPairConstructor;
   readonly WebSocketRequestResponsePair: typeof WebSocketRequestResponsePair;
+  readonly ReadableStream: typeof globalThis.ReadableStream;
   readonly TransformStream: typeof globalThis.TransformStream;
   readonly currentExternalEntry?: object | undefined;
 };
@@ -574,6 +575,7 @@ export function actorScopeBindings(resolve: () => ActorGlobalScope): ActorScopeB
     }),
     WebSocketPair: BoundWebSocketPair,
     WebSocketRequestResponsePair,
+    ReadableStream: ActorReadableStream,
     TransformStream: ActorTransformStream,
     get currentExternalEntry(): object | undefined {
       return resolve().currentExternalEntry;
@@ -616,37 +618,44 @@ function scopeCrypto(resolve: () => ActorGlobalScope): Crypto {
 /** Captured at import, before any host installs a scope over it. */
 const platformCrypto = globalThis.crypto;
 
-// Native stream machinery invokes transformer callbacks without going through
-// getReader() or a transformed await. Capture the creating actor here, before
-// network input arrives on a later task. Streams created outside actors remain
-// native, and the constructor/prototype/brand and callback receiver are retained.
-const ActorTransformStream = new Proxy(globalThis.TransformStream, {
-  construct(target, args, newTarget) {
-    const context = tryCurrentIoContext();
-    const [transformer, ...strategies] = args;
-    if (
-      !context || transformer == null ||
-      (typeof transformer !== "object" && typeof transformer !== "function")
-    ) {
-      return Reflect.construct(target, args, newTarget);
-    }
-    const callbacks = new Proxy({}, {
-      get(_target, name) {
-        const callback = Reflect.get(transformer, name, transformer);
-        if (typeof callback !== "function") return callback;
-        // start runs synchronously during construction, already inside the actor.
-        if (name === "start") return callback.bind(transformer);
-        if (name === "transform" || name === "flush" || name === "cancel") {
-          return context.makeReentryCallback((_lock, ...values: unknown[]) =>
-            Reflect.apply(callback, transformer, values),
-          );
-        }
-        return callback;
-      },
-    });
-    return Reflect.construct(target, [callbacks, ...strategies], newTarget);
-  },
-});
+// Native stream callbacks bypass transformed awaits. Capture their creator,
+// including async stores, before later input or demand arrives from another actor.
+// These constructors are captured before a host installs its actor scope.
+const ActorReadableStream = withActorStreamCallbacks(globalThis.ReadableStream);
+const ActorTransformStream = withActorStreamCallbacks(globalThis.TransformStream);
+
+function withActorStreamCallbacks<T extends typeof ReadableStream | typeof TransformStream>(
+  Stream: T,
+): T {
+  return new Proxy(Stream, {
+    construct(target, args, newTarget) {
+      const context = tryCurrentIoContext();
+      const [source, ...strategies] = args;
+      if (
+        !context || source == null ||
+        (typeof source !== "object" && typeof source !== "function")
+      ) {
+        return Reflect.construct(target, args, newTarget);
+      }
+      // A separate target preserves frozen sources and inherited getters.
+      const callbacks = new Proxy({}, {
+        get(_target, name) {
+          const callback = Reflect.get(source, name, source);
+          if (typeof callback !== "function") return callback;
+          // start runs synchronously during construction, already inside the actor.
+          if (name === "start") return callback.bind(source);
+          if (name === "pull" || name === "transform" || name === "flush" || name === "cancel") {
+            return context.makeReentryCallback((_lock, ...values: unknown[]) =>
+              Reflect.apply(callback, source, values),
+            );
+          }
+          return callback;
+        },
+      });
+      return Reflect.construct(target, [callbacks, ...strategies], newTarget);
+    },
+  });
+}
 
 /** ← every `SubtleCrypto` member that returns a promise, as a value the binding can iterate. */
 const ASYNC_SUBTLE_METHODS = [

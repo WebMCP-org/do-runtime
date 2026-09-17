@@ -27,6 +27,34 @@ import {
 import { HibernatableWebSocketRegistry } from "./web-socket";
 import { AsyncLocalStorage } from "../browser/async-hooks";
 
+test("readable stream callbacks re-enter their creator when consumed outside its actor", async () => {
+  const { ctx, scope } = newScope();
+  const target = { ReadableStream: globalThis.ReadableStream };
+  installActorScope(target, () => scope);
+  const store = new AsyncLocalStorage<string>();
+  const seen: unknown[] = [];
+  const source: UnderlyingDefaultSource<string> = {
+    pull(controller) {
+      seen.push(["pull", ctx.hasCurrent(), store.getStore(), this === source]);
+      controller.enqueue("chunk");
+    },
+    cancel() {
+      seen.push(["cancel", ctx.hasCurrent(), store.getStore(), this === source]);
+    },
+  };
+  const stream = await ctx.run(() =>
+    store.run("creator", () => new target.ReadableStream(Object.freeze(source), { highWaterMark: 0 })),
+  );
+  const reader = stream.getReader();
+  expect(await store.run("unrelated", () => reader.read())).toEqual({ value: "chunk", done: false });
+  await reader.cancel();
+  expect(seen).toEqual([
+    ["pull", true, "creator", true],
+    ["cancel", true, "creator", true],
+  ]);
+  expect(store.getStore()).toBeUndefined();
+});
+
 test("stream callbacks retain their creator's actor and async scope after delayed input", async () => {
   const { ctx, scope } = newScope();
   const target = { TransformStream: globalThis.TransformStream };
@@ -498,6 +526,7 @@ describe("installActorScope", () => {
     installActorScope(target, () => scope);
 
     expect(Object.keys(target).sort()).toEqual([
+      "ReadableStream",
       "TransformStream",
       "WebSocket",
       "WebSocketPair",
