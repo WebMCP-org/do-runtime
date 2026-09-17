@@ -34,6 +34,9 @@ test("readable stream callbacks re-enter their creator when consumed outside its
   const store = new AsyncLocalStorage<string>();
   const seen: unknown[] = [];
   const source: UnderlyingDefaultSource<string> = {
+    start() {
+      seen.push(["start", ctx.hasCurrent(), store.getStore(), this === source]);
+    },
     pull(controller) {
       seen.push(["pull", ctx.hasCurrent(), store.getStore(), this === source]);
       controller.enqueue("chunk");
@@ -45,10 +48,13 @@ test("readable stream callbacks re-enter their creator when consumed outside its
   const stream = await ctx.run(() =>
     store.run("creator", () => new target.ReadableStream(Object.freeze(source), { highWaterMark: 0 })),
   );
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(ctx.hasCurrent()).toBe(false);
   const reader = stream.getReader();
   expect(await store.run("unrelated", () => reader.read())).toEqual({ value: "chunk", done: false });
   await reader.cancel();
   expect(seen).toEqual([
+    ["start", true, "creator", true],
     ["pull", true, "creator", true],
     ["cancel", true, "creator", true],
   ]);
