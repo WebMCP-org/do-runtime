@@ -14,10 +14,8 @@ async function main() {
       "src/browser/index.ts",
       "src/git/index.ts"
     ],
-    deps: {
-      skipNodeModulesBundle: true,
-      neverBundle: ["cloudflare:workers"]
-    },
+    deps: { neverBundle: true },
+    inputOptions: { external: ["cloudflare:workers"] },
     format: "esm",
     outputOptions: { keepNames: true },
     sourcemap: true,

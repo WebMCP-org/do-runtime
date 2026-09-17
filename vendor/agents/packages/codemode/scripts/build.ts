@@ -37,10 +37,8 @@ async function main() {
       "src/browser.ts",
       "src/vite.ts"
     ],
-    deps: {
-      skipNodeModulesBundle: true,
-      neverBundle: ["cloudflare:workers"]
-    },
+    deps: { neverBundle: true },
+    inputOptions: { external: ["cloudflare:workers"] },
     format: "esm",
     outputOptions: { keepNames: true },
     sourcemap: true,

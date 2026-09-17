@@ -762,6 +762,7 @@ describe("Think — auto-continuation", () => {
       )
     ).toBe(true);
 
+    const prefix = ((await agent.getMessages()) as UIMessage[]).at(-1)!;
     const continuationDone = waitForDone(ws, 15000);
     ws.send(
       JSON.stringify({
@@ -790,6 +791,20 @@ describe("Think — auto-continuation", () => {
     expect(await agent.getServerApprovalToolExecutions()).toBe(1);
     expect(outputUpdateFrame).toBeDefined();
     expect(continuationComplete?.continuation).toBe(true);
+    const start = continuationFrames
+      .filter((frame) => frame.type === MSG_CHAT_RESPONSE && frame.body)
+      .map(
+        (frame) => JSON.parse(frame.body as string) as Record<string, unknown>
+      )
+      .find((chunk) => chunk.type === "start");
+    expect(start?.continuationStart).toEqual({
+      messageId: prefix.id,
+      parts: prefix.parts.map((part) =>
+        part.type === "text" || part.type === "reasoning"
+          ? part.text.length
+          : null
+      )
+    });
 
     const messages = (await agent.getMessages()) as UIMessage[];
     const toolPart = messages
@@ -1064,6 +1079,46 @@ describe("Think — auto-continuation", () => {
     }
 
     await closeWS(ws);
+  });
+
+  it("applies a tool result without reading the transcript, whatever its length", async () => {
+    // The apply used to re-read the whole persisted path per tool update —
+    // one full history read for every client result, approval and
+    // cross-message update in a long turn. It now resolves the owning row
+    // from the live cache and reads that row alone, so the billed reads are
+    // the same for a short transcript and a long one.
+    const short = await (await freshAgent()).measureToolUpdateRowsForTest(12);
+    const long = await (await freshAgent()).measureToolUpdateRowsForTest(160);
+
+    expect(short.state).toBe("output-available");
+    expect(long.state).toBe("output-available");
+    expect(short.cacheCoversPath).toBe(true);
+    expect(long.cacheCoversPath).toBe(true);
+    // One point read of the owner, Sessions' own no-op guard re-read, and
+    // the reference bookkeeping of the rewrite — never a path walk.
+    expect(long.rowsRead).toBeLessThan(20);
+    expect(long.rowsRead).toBe(short.rowsRead);
+    expect(long.rowsWritten).toBe(short.rowsWritten);
+  });
+
+  it("starts a turn without re-reading or re-writing the echoed transcript", async () => {
+    // A chat request carries the client's whole transcript. Reconciliation
+    // used to read the full path from storage, upsert every echoed message
+    // (an existence read plus a full-row compare each), then read the path
+    // again to refresh the cache. Now the cache is the server transcript,
+    // unchanged messages are skipped before Sessions sees them, and only the
+    // new user message is written.
+    const short = await (await freshAgent()).measureTurnStartRowsForTest(12);
+    const long = await (await freshAgent()).measureTurnStartRowsForTest(160);
+
+    expect(short.persisted).toBe(true);
+    expect(long.persisted).toBe(true);
+    expect(short.cached).toBe(13);
+    expect(long.cached).toBe(161);
+    expect(long.rowsWritten).toBe(1);
+    expect(short.rowsWritten).toBe(1);
+    expect(long.rowsRead).toBeLessThan(10);
+    expect(long.rowsRead).toBe(short.rowsRead);
   });
 
   it("serializes overlapping tool-result applies so neither clobbers the other (#1649)", async () => {

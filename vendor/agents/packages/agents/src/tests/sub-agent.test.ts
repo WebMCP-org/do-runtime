@@ -1484,6 +1484,35 @@ describe("SubAgent", () => {
     }
   });
 
+  it("closes a frame arriving on a connection to a deleted sub-agent", async () => {
+    const parentName = uniqueName();
+    const childName = uniqueName();
+    const parent = await getAgentByName(env.TestSubAgentParent, parentName);
+    const ws = await connectWS(
+      `/agents/test-sub-agent-parent/${parentName}/sub/broadcast-sub-agent/${childName}`
+    );
+    await waitForJsonMessage<{ type: MessageType }>(
+      ws,
+      (data) => data.type === MessageType.CF_AGENT_STATE
+    );
+    expect(await parent.has("BroadcastSubAgent", childName)).toBe(true);
+
+    const closed = new Promise<{ code: number; reason: string }>((resolve) => {
+      ws.addEventListener(
+        "close",
+        (event) => resolve({ code: event.code, reason: event.reason }),
+        { once: true }
+      );
+    });
+    await parent.broadcastSubAgentDelete(childName);
+
+    // Resolving a route is what registers a child, so this frame must not
+    // lazily recreate the agent its connection targeted.
+    ws.send("still-here?");
+    expect(await closed).toEqual({ code: 1008, reason: "Sub-agent deleted" });
+    expect(await parent.has("BroadcastSubAgent", childName)).toBe(false);
+  });
+
   // ── Regression: cross-DO I/O on bootstrap broadcast paths ───────────
   // Sub-agents share their parent's process but have their own isolate.
   // On production, iterating the connection registry or sending through

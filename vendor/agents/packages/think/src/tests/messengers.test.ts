@@ -1194,6 +1194,9 @@ function fakeHost(resolved: FiberRecoveryResult[]): MessengerThinkHost {
     startFiber() {
       throw new Error("startFiber is not used by this test");
     },
+    _runMessengerReplyTask() {
+      throw new Error("_runMessengerReplyTask is not used by this test");
+    },
     subAgent() {
       throw new Error("subAgent is not used by this test");
     }

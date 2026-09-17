@@ -121,21 +121,39 @@ function toolTurnBodies() {
 
 const expectedChars = TOOL_STEPS * WORDS_PER_STEP * "word ".length;
 
-async function mount(name: string, throttle?: number | false) {
+async function mount(
+  name: string,
+  throttle?: number | false,
+  renderCostMs = 0
+) {
   const { agent, sentMessages, target } = createFakeAgent(name);
   let setChatMessages: ReturnType<typeof useAgentChat>["setMessages"] | null =
     null;
 
+  let chatApi: ReturnType<typeof useAgentChat>;
+
+  const approvalCallbacks = new Set<
+    ReturnType<typeof useAgentChat>["addToolApprovalResponse"]
+  >();
+
   function TestComponent() {
     const chat = useAgentChat({
       agent,
+      autoContinueAfterToolResult: false,
       getInitialMessages: null,
       messages: [
         { id: "u1", parts: [{ text: "hi", type: "text" }], role: "user" }
       ] as UIMessage[],
       throttle
     });
+    // Model a busy transcript while queued socket tasks keep arriving.
+    const renderDeadline = performance.now() + renderCostMs;
+    while (performance.now() < renderDeadline) {
+      /* synchronous render work */
+    }
+    chatApi = chat;
     setChatMessages = chat.setMessages;
+    approvalCallbacks.add(chat.addToolApprovalResponse);
     const assistantText = chat.messages
       .filter((m) => m.role === "assistant")
       .flatMap((m) => m.parts)
@@ -159,6 +177,8 @@ async function mount(name: string, throttle?: number | false) {
     read: (id: string) =>
       container.querySelector(`[data-testid="${id}"]`)?.textContent ?? null,
     sentMessages,
+    approvalCallbacks,
+    chat: () => chatApi,
     setMessages: (...args: Parameters<NonNullable<typeof setChatMessages>>) => {
       if (!setChatMessages) {
         throw new Error("Default throttle test chat is not mounted");
@@ -225,6 +245,102 @@ describe("default chat throttle", () => {
     });
   });
 
+  it("streams a long turn without exhausting React's update depth", async () => {
+    const h = await mount("live-tool-result-prune", false, 3);
+    await vi.waitFor(() =>
+      expect(countType(h.sentMessages, RESUME_REQUEST)).toBe(1)
+    );
+    dispatch(h.target, { id: "req-live", type: RESUMING });
+    const frames = [
+      { messageId: "asst-1", type: "start" },
+      { type: "start-step" },
+      { id: "t1", type: "text-start" },
+      ...Array.from({ length: 120 }, () => ({
+        delta: "word ",
+        id: "t1",
+        type: "text-delta"
+      })),
+      { id: "t1", type: "text-end" },
+      { type: "finish-step" }
+    ];
+    // Each frame is its own queued socket task. Awaiting between frames
+    // would drain React's pending work and hide the cleanup dispatch bug.
+    await new Promise<void>((resolve) => {
+      for (const [index, frame] of frames.entries()) {
+        setTimeout(() => {
+          dispatch(h.target, {
+            body: JSON.stringify(frame),
+            done: false,
+            id: "req-live",
+            type: CHAT_RESPONSE
+          });
+          if (index === frames.length - 1) resolve();
+        }, 0);
+      }
+    });
+    dispatch(h.target, {
+      body: "",
+      done: true,
+      id: "req-live",
+      type: CHAT_RESPONSE
+    });
+    await vi.waitFor(() =>
+      expect({
+        chars: h.read("chars"),
+        error: h.read("error"),
+        status: h.read("status")
+      }).toEqual({ chars: "600", error: "", status: "ready" })
+    );
+  });
+
+  it("retains visible tool results and prunes them after history removes the call", async () => {
+    const h = await mount("tool-result-lifetime");
+    const pending: UIMessage = {
+      id: "a1",
+      role: "assistant",
+      parts: [
+        {
+          type: "tool-search",
+          toolCallId: "call-1",
+          state: "input-available",
+          input: { query: "hi" }
+        }
+      ]
+    };
+    h.setMessages([pending]);
+    await vi.waitFor(() => expect(h.chat().messages).toEqual([pending]));
+    h.chat().addToolOutput({
+      toolName: "search",
+      toolCallId: "call-1",
+      output: "found"
+    });
+    await vi.waitFor(() =>
+      expect(h.chat().messages[0].parts[0]).toMatchObject({
+        state: "output-available",
+        output: "found"
+      })
+    );
+    // An older snapshot must keep the client's result while its call exists.
+    h.setMessages([pending]);
+    await vi.waitFor(() =>
+      expect(h.chat().messages[0].parts[0]).toMatchObject({
+        state: "output-available",
+        output: "found"
+      })
+    );
+    h.setMessages([]);
+    await vi.waitFor(() => expect(h.chat().messages).toEqual([]));
+    h.setMessages([pending]);
+    await vi.waitFor(() => expect(h.chat().messages).toEqual([pending]));
+  });
+
+  it("keeps approval controls stable while streamed messages change", async () => {
+    const h = await mount("stable-approval-controls");
+    await replayTurn(h);
+    expect(h.read("chars")).toBe(String(expectedChars));
+    expect(h.approvalCallbacks.size).toBe(1);
+  });
+
   it("resolves functional updates against the current Chat store", async () => {
     const h = await mount("current-store-updater");
 
@@ -244,6 +360,94 @@ describe("default chat throttle", () => {
     await vi.waitFor(() => expect(h.read("message-ids")).toBe("u1,a1,u2"));
     expect(h.sentMessages[h.sentMessages.length - 1]).toContain('"id":"a1"');
   });
+
+  it.each(["sender", "observer"] as const)(
+    "applies compacted history during a live %s stream without losing parts",
+    async (role) => {
+      const h = await mount(`compaction-${role}`, 0);
+      await vi.waitFor(() =>
+        expect(countType(h.sentMessages, RESUME_REQUEST)).toBe(1)
+      );
+      dispatch(h.target, {
+        type: "cf_agent_stream_resume_none",
+        reason: "idle"
+      });
+      await vi.waitFor(() => expect(h.chat().status).toBe("ready"));
+      let requestId = "other-panel";
+      let turn: Promise<void> | undefined;
+      if (role === "sender") {
+        turn = h.chat().sendMessage({ text: "continue" });
+        await vi.waitFor(() =>
+          expect(countType(h.sentMessages, "cf_agent_use_chat_request")).toBe(1)
+        );
+        requestId = JSON.parse(
+          h.sentMessages.find(
+            (frame) => JSON.parse(frame).type === "cf_agent_use_chat_request"
+          )!
+        ).id;
+      }
+      const chunk = (body: Record<string, unknown>) =>
+        dispatch(h.target, {
+          type: CHAT_RESPONSE,
+          id: requestId,
+          body: JSON.stringify(body),
+          done: false
+        });
+      chunk({ type: "start", messageId: "asst-1" });
+      chunk({ type: "start-step" });
+      chunk({ type: "reasoning-start", id: "r" });
+      chunk({ type: "reasoning-delta", id: "r", delta: "thinking" });
+      chunk({ type: "reasoning-end", id: "r" });
+      chunk({
+        type: "tool-input-available",
+        toolCallId: "call",
+        toolName: "search",
+        input: { q: "query" }
+      });
+      chunk({
+        type: "tool-output-available",
+        toolCallId: "call",
+        output: "found"
+      });
+      chunk({ type: "text-start", id: "t" });
+      chunk({ type: "text-delta", id: "t", delta: "live answer" });
+      const assistant = () =>
+        h.chat().messages.find((message) => message.id === "asst-1");
+      await vi.waitFor(() =>
+        expect(JSON.stringify(assistant())).toContain("live answer")
+      );
+      const liveParts = structuredClone(assistant()!.parts);
+      const summary: UIMessage = {
+        id: "compaction_test",
+        role: "assistant",
+        parts: [{ type: "text", text: "summary" }]
+      };
+      dispatch(h.target, { type: CHAT_MESSAGES, messages: [summary] });
+      await vi.waitFor(() =>
+        expect(h.read("message-ids")).toBe("compaction_test,asst-1")
+      );
+      expect(assistant()!.parts).toEqual(liveParts);
+      chunk({ type: "text-delta", id: "t", delta: " continued" });
+      chunk({ type: "text-end", id: "t" });
+      chunk({ type: "finish-step" });
+      chunk({ type: "finish" });
+      dispatch(h.target, {
+        type: CHAT_RESPONSE,
+        id: requestId,
+        body: "",
+        done: true
+      });
+      await turn;
+      await vi.waitFor(() =>
+        expect(JSON.stringify(assistant())).toContain("live answer continued")
+      );
+      expect(
+        h.chat().messages.filter((message) => message.id === "compaction_test")
+      ).toHaveLength(1);
+      expect(JSON.stringify(assistant())).toContain("thinking");
+      expect(JSON.stringify(assistant())).toContain("found");
+    }
+  );
 
   it("preserves Chat store parts newer than the rendered snapshot", async () => {
     const h = await mount("current-store-snapshot", 200);
