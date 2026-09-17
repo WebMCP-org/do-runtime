@@ -246,8 +246,9 @@ export function gateReadableStream<T>(ctx: IoAwaiter, stream: ReadableStream<T>)
     // internal spec operations (not the `getReader` property above), and `pipeThrough` hands
     // back the transform's readable — a brand-new stream with none of this instrumentation.
     // `res.body.pipeThrough(new TextDecoderStream()).getReader().read()` would resume foreign
-    // on every chunk. The pipe's own internals never surface a user continuation, so the two
-    // seams that do are the ones gated: the returned readable, and `pipeTo`'s settlement.
+    // on every chunk. Gate the returned readable and `pipeTo`'s settlement here;
+    // actorScopeBindings.TransformStream separately gates user transformer callbacks
+    // invoked by the native pipe machinery.
     pipeThrough: {
       configurable: true,
       writable: true,

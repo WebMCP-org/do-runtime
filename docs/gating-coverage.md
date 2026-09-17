@@ -32,6 +32,7 @@ enumerates it. Every row is one of:
 | `body.values()` / async iteration | iterator reads through the gated reader; early return preserves native cancel and lock-release semantics | `api/http.ts` |
 | Reader/stream lifecycle (`reader.closed`, both `cancel()` methods) | settlement uses `awaitIo`; `closed` is gated and registered once | `api/http.ts` |
 | `body.tee()` | both halves re-gated | `api/http.ts` |
+| Actor-created `ReadableStream` / `TransformStream` callbacks | constructor captures the current actor and async stores; `pull`, `transform`, `flush`, and `cancel` use `makeReentryCallback`; synchronous `start` retains its native timing and receiver | `api/global-scope.ts`; delayed input and external consumer regressions in `global-scope.test.ts` |
 | `body.pipeThrough()` / `pipeTo()` | returned readable re-gated (recurses through chains); settlement `awaitIo`d — native pipe machinery bypasses the `getReader` override and would launder the stream | `api/http.ts`, 0.2.2 |
 | `setTimeout` / `setInterval` | arming captures the critical section; firing re-enters via `ctx.run` | `api/global-scope.ts` |
 | `scheduler.wait()` / `scheduler.yield()` | scoped `Scheduler` over the same timer path | `api/global-scope.ts` |

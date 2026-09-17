@@ -13,6 +13,13 @@ its caller's scope in `finally`; it never leaves one mutable store active while
 a promise is pending. Actor entry, reentry, critical sections and timer callbacks
 capture that scope before the runtime waits for its input lock.
 
+`installActorScope` also binds native `ReadableStream` and `TransformStream`
+callbacks. Sources and transformers created inside an actor retain its actor
+and async stores when later demand or network chunks arrive. Pull, transform,
+flush and cancel re-enter through the existing input gate; start remains synchronous.
+Streams constructed outside an actor retain native behavior. This covers the
+AI SDK's streamed tool execution, whose callbacks bypass transformed awaits.
+
 This requires compilation. Native `await` bypasses `Promise.prototype.then`, as
 the [TC39 async-context proposal](https://github.com/tc39/proposal-async-context)
 explains. The opt-in Vite transform first gates awaits, then uses Vite's installed
