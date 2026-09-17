@@ -3,11 +3,8 @@ import { describe, expect, it } from "vitest";
 import { getAgentByName, getSubAgentByName } from "agents";
 import { ThinkTestAgent } from "./agents/think-session";
 
-// Covers the Think server's `onConnect` broadcast policy. The server must
-// not send `cf_agent_chat_messages` while a resumable stream is in flight,
-// because the client is about to rebuild the in-progress assistant message
-// from the resume stream and a state broadcast here would clobber it.
-// See the onConnect block in `packages/think/src/think.ts` for details.
+// Ordinary streams rebuild their unpersisted assistant from replay; continuations
+// first refresh the canonical prefix that may have advanced while disconnected.
 
 const MSG_CHAT_MESSAGES = "cf_agent_chat_messages";
 const MSG_CHAT_RESPONSE = "cf_agent_use_chat_response";
@@ -125,7 +122,128 @@ function closeWS(ws: WebSocket): Promise<void> {
   });
 }
 
+describe("Think — compaction synchronizes canonical history", () => {
+  it.each(["manual", "automatic", "overlay", "facet"] as const)(
+    "pushes %s compaction through chat messages without legacy session frames",
+    async (mode) => {
+      const room = crypto.randomUUID();
+      const parent = await freshAgent(room);
+      const agent =
+        mode === "facet"
+          ? await getSubAgentByName(parent, ThinkTestAgent, "compaction-child")
+          : parent;
+      const { ws } =
+        mode === "facet"
+          ? await connectSubAgentWS(room, "compaction-child")
+          : await connectWS(room);
+      const frames: Array<Record<string, unknown>> = [];
+      ws.addEventListener("message", (event: MessageEvent) => {
+        frames.push(
+          JSON.parse(event.data as string) as Record<string, unknown>
+        );
+      });
+      try {
+        const messages = await agent.testCompactionFrames(mode);
+        await expect
+          .poll(() =>
+            JSON.stringify(
+              frames.find(
+                (frame) =>
+                  frame.type === MSG_CHAT_MESSAGES &&
+                  JSON.stringify(frame.messages).includes("compressed history")
+              )?.messages
+            )
+          )
+          .toBe(JSON.stringify(messages));
+        expect(JSON.stringify(messages)).not.toContain("long history");
+        expect(
+          frames.filter(
+            (frame) =>
+              frame.type === "cf_agent_session" ||
+              frame.type === "cf_agent_session_error"
+          )
+        ).toEqual([]);
+      } finally {
+        await closeWS(ws);
+      }
+    }
+  );
+});
+
 describe("Think — onConnect broadcast policy", () => {
+  it.each(["rpc", "websocket"])(
+    "does not duplicate a %s chunk on a mid-stream resume",
+    async (transport) => {
+      const room = crypto.randomUUID();
+      const agent = await freshAgent(room);
+      const { ws } = await connectWS(room);
+      await collectMessages(ws, 20);
+      await agent.holdStreamAfterFirstChunkForTest();
+      const turn =
+        transport === "rpc"
+          ? agent.testChat("resume while storing")
+          : Promise.resolve();
+      if (transport === "websocket")
+        ws.send(
+          JSON.stringify({
+            type: "cf_agent_use_chat_request",
+            id: "atomic-chunk",
+            init: {
+              method: "POST",
+              body: JSON.stringify({
+                messages: [
+                  {
+                    id: "u1",
+                    role: "user",
+                    parts: [{ type: "text", text: "resume while storing" }]
+                  }
+                ]
+              })
+            }
+          })
+        );
+      try {
+        await expect
+          .poll(() => agent.isStreamHeldAfterFirstChunkForTest())
+          .toBe(true);
+        const active = await agent.waitForActiveResumableStreamForTest();
+        if (!active) throw new Error("no active stream");
+        const received: Array<Record<string, unknown>> = [];
+        ws.addEventListener("message", (event: MessageEvent) => {
+          const frame = JSON.parse(event.data as string) as Record<
+            string,
+            unknown
+          >;
+          if (frame.type === MSG_CHAT_RESPONSE) received.push(frame);
+        });
+        ws.send(
+          JSON.stringify({ type: MSG_STREAM_RESUME_ACK, id: active.requestId })
+        );
+        await expect
+          .poll(() => received.some((frame) => frame.replayComplete))
+          .toBe(true);
+        await agent.releaseStreamAfterFirstChunkForTest();
+        await turn;
+        await expect
+          .poll(() => received.some((frame) => frame.done))
+          .toBe(true);
+        const chunks = received
+          .filter((frame) => frame.body)
+          .map((frame) => JSON.parse(frame.body as string) as { type: string });
+        expect(
+          chunks.filter((chunk) => chunk.type === "text-start")
+        ).toHaveLength(1);
+        expect(
+          chunks.filter((chunk) => chunk.type === "text-end")
+        ).toHaveLength(1);
+      } finally {
+        await agent.releaseStreamAfterFirstChunkForTest();
+        await turn;
+        await closeWS(ws);
+      }
+    }
+  );
+
   it("replays a duplicate completed request id without admitting a second turn", async () => {
     const room = crypto.randomUUID();
     const agent = await freshAgent(room);
@@ -184,6 +302,35 @@ describe("Think — onConnect broadcast policy", () => {
     expect(types).not.toContain(MSG_STREAM_RESUMING);
 
     await closeWS(ws);
+  });
+
+  it("sends the canonical continuation prefix before the resume offer", async () => {
+    const room = crypto.randomUUID();
+    const agent = await freshAgent(room);
+    await agent.testChat("completed while the client was offline");
+    const prefix = await agent.getMessages();
+    const streamId = await agent.testStartResumableStream(
+      "continued-offline",
+      true
+    );
+    const { ws } = await connectWS(room);
+    try {
+      const messages = await collectMessages(ws);
+      const snapshot = messages.findIndex(
+        (frame) => frame.type === MSG_CHAT_MESSAGES
+      );
+      const offer = messages.findIndex(
+        (frame) => frame.type === MSG_STREAM_RESUMING
+      );
+      expect(snapshot).toBeGreaterThanOrEqual(0);
+      expect(snapshot).toBeLessThan(offer);
+      expect(messages[snapshot].messages).toEqual(
+        JSON.parse(JSON.stringify(prefix))
+      );
+    } finally {
+      await closeWS(ws);
+      await agent.testCompleteResumableStream(streamId);
+    }
   });
 
   it("suppresses CHAT_MESSAGES on connect while a resumable stream is active", async () => {

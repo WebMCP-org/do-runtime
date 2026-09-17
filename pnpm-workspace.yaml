@@ -11,10 +11,10 @@ allowBuilds:
   node-liblzma: false
 # Allow the pinned oracle through the repository's release-age gate.
 minimumReleaseAgeExclude:
-  - "@cloudflare/workerd-darwin-64@1.20260907.1"
-  - "@cloudflare/workerd-darwin-arm64@1.20260907.1"
-  - "@cloudflare/workerd-linux-64@1.20260907.1"
-  - "@cloudflare/workerd-linux-arm64@1.20260907.1"
-  - "@cloudflare/workerd-windows-64@1.20260907.1"
-  - "workerd@1.20260907.1"
-  - "@cloudflare/workers-types@5.20260907.1"
+  - "@cloudflare/workerd-darwin-64@1.20260911.1"
+  - "@cloudflare/workerd-darwin-arm64@1.20260911.1"
+  - "@cloudflare/workerd-linux-64@1.20260911.1"
+  - "@cloudflare/workerd-linux-arm64@1.20260911.1"
+  - "@cloudflare/workerd-windows-64@1.20260911.1"
+  - "workerd@1.20260911.1"
+  - "@cloudflare/workers-types@5.20260911.1"

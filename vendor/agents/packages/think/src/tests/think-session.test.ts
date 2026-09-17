@@ -16,6 +16,7 @@ import type {
   ThinkAsyncHookTestAgent,
   ThinkRecoveryTestAgent,
   ThinkNonRecoveryTestAgent,
+  ThinkLegacySessionApiAgent,
   TestChatResult
 } from "./agents/think-session";
 import type {
@@ -450,6 +451,26 @@ describe("Think — core", () => {
 // ── Error handling + partial persistence ─────────────────────────
 
 describe("Think — error handling", () => {
+  it("warns once when reactive overflow recovery has no classifier override", async () => {
+    const agent = await freshAgent(`overflow-default-${crypto.randomUUID()}`);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      for (let turn = 0; turn < 2; turn++) {
+        const result = await agent.testChatWithReactiveOverflow();
+        expect(result.done).toBe(false);
+        expect(result.error).toContain("context_length_exceeded");
+      }
+      const warnings = warn.mock.calls.filter(([message]) =>
+        String(message).includes(
+          "contextOverflow.reactive is enabled but classifyChatError() is not overridden"
+        )
+      );
+      expect(warnings).toHaveLength(1);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it("should handle errors and return error message", async () => {
     const agent = await freshAgent("err-basic");
 
@@ -1103,6 +1124,60 @@ describe("Think — Session integration", () => {
   });
 });
 
+// ── Pre-Sessions Think API ───────────────────────────────────────
+
+async function freshLegacyAgent(name: string) {
+  return getAgentByName(
+    env.ThinkLegacySessionApiAgent as unknown as DurableObjectNamespace<ThinkLegacySessionApiAgent>,
+    name
+  );
+}
+
+describe("Think — pre-Sessions session API keeps working", () => {
+  it("folds withContext() blocks into the prompt and serves the context forwards", async () => {
+    const agent = await freshLegacyAgent("legacy-context");
+
+    expect(await agent.legacyBlockLabels()).toEqual(["soul", "memory"]);
+    await agent.legacyReplaceBlock("memory", "User prefers TypeScript.");
+    expect(await agent.legacyBlockContent("memory")).toBe(
+      "User prefers TypeScript."
+    );
+
+    const prompt = await agent.legacyFreezeSystemPrompt();
+    expect(prompt).toContain("You are a legacy-configured agent.");
+    expect(prompt).toContain("User prefers TypeScript.");
+
+    expect(await agent.legacyToolNames()).toContain("set_context");
+    expect(await agent.legacyAddAndRemoveContext("scratch")).toBe(true);
+    expect(await agent.legacyBlockLabels()).toEqual(["soul", "memory"]);
+
+    await agent.testChat("Hello!");
+    expect(await agent.legacyBlockContent("memory")).toBe(
+      "User prefers TypeScript."
+    );
+  });
+
+  it("accepts the positional appendMessage / getHistory / getRecentHistory forms", async () => {
+    const agent = await freshLegacyAgent("legacy-positional");
+
+    expect(await agent.legacyPositionalWrites()).toEqual({
+      rootLength: 2,
+      branchLength: 2
+    });
+    expect(await agent.legacyRecentHistoryLength()).toBe(2);
+  });
+
+  it("routes a failing compaction function through onCompactionError()", async () => {
+    const agent = await freshLegacyAgent("legacy-compaction-error");
+    await agent.legacyPositionalWrites();
+
+    expect(await agent.legacyCompact()).toEqual({
+      result: null,
+      errors: ["summarizer down"]
+    });
+  });
+});
+
 // ── Context blocks ───────────────────────────────────────────────
 
 describe("Think — context blocks", () => {
@@ -1165,7 +1240,9 @@ describe("Think — context blocks", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const agent = await getAgentByName(
       env.ThinkSystemPromptSkillsWarningAgent as unknown as DurableObjectNamespace<ThinkSystemPromptSkillsWarningAgent>,
-      "skills-system-prompt-warning"
+      // Unique per run: the warning fires once per instance, so a retry
+      // against a warm object would see no call.
+      `skills-system-prompt-warning-${crypto.randomUUID()}`
     );
 
     try {
@@ -1174,7 +1251,7 @@ describe("Think — context blocks", () => {
       });
       expect(warn).toHaveBeenCalledWith(
         expect.stringContaining(
-          "getSystemPrompt() is only used as a fallback when no Session context blocks are configured"
+          "getSystemPrompt() is only used as a fallback when no context blocks are configured"
         )
       );
     } finally {
@@ -1317,6 +1394,23 @@ describe("Think — getConfig inside configureSession", () => {
 // ── onChatResponse hook ──────────────────────────────────────────
 
 describe("Think — onChatResponse", () => {
+  it.each(["rpc", "stream"] as const)(
+    "persists the assistant before announcing %s completion",
+    async (transport) => {
+      const agent = await freshAgent(`persist-before-done-${transport}`);
+      if (transport === "rpc") {
+        await agent.runChatTurnForTest({ input: "Hello!" });
+      } else {
+        await agent.runChannelTurnForTest({ input: "Hello!" });
+      }
+      expect(await agent.getAssistantRowsAtDoneForTest()).toEqual([1]);
+      expect(await agent.getCompletionFramesForTest()).toEqual([
+        "done",
+        "messages"
+      ]);
+    }
+  );
+
   it("should fire onChatResponse after successful chat turn", async () => {
     const agent = await freshAgent("hook-success");
 
@@ -1724,61 +1818,69 @@ describe("Think — row size enforcement", () => {
 // ── Model message conversion ─────────────────────────────────────
 
 describe("Think — model message conversion", () => {
-  it("replays truncated workspace text read outputs as text", async () => {
-    const agent = await freshAgent("model-conversion-truncated-read");
-    const largeContent = "read-output ".repeat(100);
+  it.each([1, 2, 3])(
+    "replays workspace read output with %i newer stored messages",
+    async (recent) => {
+      const agent = await freshAgent(
+        `model-conversion-truncated-read-${recent}`
+      );
+      const largeContent = "read-output ".repeat(100);
 
-    await agent.persistTestMessage({
-      id: "u-read-text",
-      role: "user",
-      parts: [{ type: "text", text: "Read /large.txt" }]
-    });
-    await agent.persistTestMessage({
-      id: "a-read-text",
-      role: "assistant",
-      parts: [
-        {
-          type: "tool-read",
-          toolCallId: "tc-read-text",
-          state: "output-available",
-          input: { path: "/large.txt" },
-          output: {
-            path: "/large.txt",
-            content: largeContent,
-            totalLines: 1
-          }
-        } as UIMessage["parts"][number]
-      ]
-    });
-    for (let i = 0; i < 4; i++) {
       await agent.persistTestMessage({
-        id: `recent-${i}`,
+        id: "u-read-text",
         role: "user",
-        parts: [{ type: "text", text: `recent ${i}` }]
+        parts: [{ type: "text", text: "Read /large.txt" }]
       });
-    }
+      await agent.persistTestMessage({
+        id: "a-read-text",
+        role: "assistant",
+        parts: [
+          {
+            type: "tool-read",
+            toolCallId: "tc-read-text",
+            state: "output-available",
+            input: { path: "/large.txt" },
+            output: {
+              path: "/large.txt",
+              content: largeContent,
+              totalLines: 1
+            }
+          } as UIMessage["parts"][number]
+        ]
+      });
+      for (let i = 0; i < recent; i++) {
+        await agent.persistTestMessage({
+          id: `recent-${i}`,
+          role: "user",
+          parts: [{ type: "text", text: `recent ${i}` }]
+        });
+      }
 
-    const result = await agent.testChat("follow up");
+      const result = await agent.testChat("follow up");
 
-    expect(result.error).toBeUndefined();
-    const messagesJson = await agent.getLastBeforeTurnMessagesJson();
-    expect(messagesJson).not.toBeNull();
-    const messages = JSON.parse(messagesJson!) as Array<{
-      role: string;
-      content?: Array<{
-        output?: {
-          type: string;
-          value?: string;
-        };
+      expect(result.error).toBeUndefined();
+      const messagesJson = await agent.getLastBeforeTurnMessagesJson();
+      expect(messagesJson).not.toBeNull();
+      const messages = JSON.parse(messagesJson!) as Array<{
+        role: string;
+        content?: Array<{
+          output?: {
+            type: string;
+            value?: string;
+          };
+        }>;
       }>;
-    }>;
-    const toolOutput = messages
-      .find((message) => message.role === "tool")
-      ?.content?.find((part) => part.output?.type === "text")?.output;
+      const toolOutput = messages
+        .find((message) => message.role === "tool")
+        ?.content?.find((part) => part.output?.type === "text")?.output;
 
-    expect(toolOutput?.value).toContain("[truncated");
-    expect(toolOutput?.value).toContain("read-output");
-  });
+      // testChat appends one more user message: these exercise the third,
+      // fourth and fifth newest messages at Think's model conversion boundary.
+      if (recent < 3) expect(toolOutput?.value).toBe(largeContent);
+      else expect(toolOutput?.value).toContain("[truncated");
+      expect(toolOutput?.value).toContain("read-output");
+    }
+  );
 
   it("replays legacy raw-string workspace read outputs as text", async () => {
     const agent = await freshAgent("model-conversion-string-read");
@@ -2466,6 +2568,33 @@ describe("Think — body persistence", () => {
 // ── chatRecovery ────────────────────────────────────────
 
 describe("Think — chatRecovery", () => {
+  it("keeps pre-handoff failure on the current Task and replaces only post-handoff failure", async () => {
+    for (const callback of [
+      "_chatRecoveryContinue",
+      "_chatRecoveryRetry"
+    ] as const) {
+      const before = await freshRecoveryAgent(
+        `${callback}-before-${crypto.randomUUID()}`
+      ).then((agent) =>
+        agent.testRecoveryDispatchHandoffForTest({
+          callback,
+          phase: "before"
+        })
+      );
+      expect(before).toEqual({ threw: true, tasks: 1, schedules: 0 });
+
+      const after = await freshRecoveryAgent(
+        `${callback}-after-${crypto.randomUUID()}`
+      ).then((agent) =>
+        agent.testRecoveryDispatchHandoffForTest({
+          callback,
+          phase: "after"
+        })
+      );
+      expect(after).toEqual({ threw: false, tasks: 2, schedules: 0 });
+    }
+  });
+
   it("chat turn with recovery=true works normally and cleans up fibers", async () => {
     const agent = await freshRecoveryAgent("recovery-basic");
 
@@ -2541,17 +2670,18 @@ describe("Think — chatRecovery", () => {
     expect(fibers).toHaveLength(0);
   });
 
-  it("chat() records stream chunks for recovery lookup", async () => {
+  it("chat() retains terminal stream evidence after its message is persisted", async () => {
     const agent = await freshRecoveryAgent("chat-stream-metadata");
 
     const result = await agent.testChat("Record the stream");
     expect(result.done).toBe(true);
 
+    // Recovery can outlive the message commit; its terminal stream must still
+    // distinguish a completed turn from an interrupted one until the next turn.
     const snapshot = await agent.getLatestStreamSnapshot();
-    expect(snapshot).not.toBeNull();
-    expect(snapshot!.status).toBe("completed");
-    expect(snapshot!.chunkCount).toBeGreaterThan(0);
-    expect(snapshot!.text).toBe("Continued response.");
+    expect(snapshot?.status).toBe("completed");
+    const messages = (await agent.getStoredMessages()) as UIMessage[];
+    expect(messages.at(-1)?.role).toBe("assistant");
   });
 
   it("saveMessages with recovery wraps in fiber and cleans up", async () => {
@@ -3574,10 +3704,11 @@ describe("Think — onChatRecovery", () => {
       user: null
     });
 
-    await agent.triggerFiberRecovery();
-    expect(
-      await agent.getScheduledChatRecoveryCountForTest("_chatRecoveryRetry")
-    ).toBe(1);
+    // Assert on the counts returned from inside the trigger RPC: the
+    // zero-delay recovery alarm may fire (and consume the job row) as soon as
+    // the RPC releases the DO, so a follow-up count read can race it.
+    const scheduled = await agent.triggerFiberRecovery();
+    expect(scheduled.scheduledRetryCount).toBe(1);
     await agent.runScheduledRecoveryRetryForTest();
 
     const messages = (await agent.getStoredMessages()) as UIMessage[];
@@ -3640,10 +3771,8 @@ describe("Think — onChatRecovery", () => {
       user: null
     });
 
-    await agent.triggerFiberRecovery();
-    expect(
-      await agent.getScheduledChatRecoveryCountForTest("_chatRecoveryContinue")
-    ).toBe(1);
+    const scheduled = await agent.triggerFiberRecovery();
+    expect(scheduled.scheduledContinueCount).toBe(1);
 
     await agent.setRequestContextForTest({ mode: "stale" }, [
       { name: "staleTool", description: "Stale" }
@@ -3734,10 +3863,8 @@ describe("Think — onChatRecovery", () => {
       user: null
     });
 
-    await agent.triggerFiberRecovery();
-    expect(
-      await agent.getScheduledChatRecoveryCountForTest("_chatRecoveryContinue")
-    ).toBe(1);
+    const scheduled = await agent.triggerFiberRecovery();
+    expect(scheduled.scheduledContinueCount).toBe(1);
     await agent.runScheduledRecoveryContinueForTest();
 
     // Progress was made: the continuation re-ran inference and produced new
@@ -4482,6 +4609,23 @@ describe("Think — onChatRecovery", () => {
     expect(assistants[0].id).toBe("a-dup");
   });
 
+  it("does not recover a real completed turn whose recovery task outlived cutover", async () => {
+    const agent = await freshRecoveryAgent("completed-cutover-recovery");
+    const result = await agent.testChat("Finish before restart");
+    expect(result.done).toBe(true);
+    expect(result.requestId).toBeTruthy();
+    // A crash after the message commit can leave the enclosing recovery run.
+    await agent.insertInterruptedFiber(
+      `__cf_internal_chat_turn:${result.requestId}`
+    );
+    expect(await agent.triggerFiberRecovery()).toEqual({
+      scheduledContinueCount: 0,
+      scheduledRetryCount: 0
+    });
+    expect(await agent.getTurnCallCount()).toBe(1);
+    expect(await agent.getStoredMessages()).toHaveLength(2);
+  });
+
   it("does not continue a recovered chat fiber whose stream already completed", async () => {
     const agent = await freshRecoveryAgent("completed-stream-recovery");
 
@@ -4511,10 +4655,13 @@ describe("Think — onChatRecovery", () => {
     );
     await agent.insertInterruptedFiber("__cf_internal_chat_turn:req-completed");
 
-    await agent.triggerFiberRecovery();
+    const scheduled = await agent.triggerFiberRecovery();
 
     expect(await agent.getTurnCallCount()).toBe(0);
-    expect(await agent.getScheduledChatRecoveryCountForTest()).toBe(0);
+    expect(scheduled).toEqual({
+      scheduledContinueCount: 0,
+      scheduledRetryCount: 0
+    });
 
     const messages = (await agent.getStoredMessages()) as UIMessage[];
     expect(messages).toHaveLength(1);
@@ -4667,7 +4814,12 @@ describe("Think — onChatRecovery", () => {
       maxAttempts: 1,
       status: "scheduled",
       firstSeenAt: Date.now() - 60_000,
-      lastAttemptAt: Date.now() - 60_000
+      lastAttemptAt: Date.now() - 60_000,
+      // The marker is derived from the stream log, so the seeded stream's
+      // segments already count. Record them as the incident's last observed
+      // progress: this wake must see no NEW content, exactly as a real
+      // incident that opened over this stream would.
+      progress: await agent.readProgressMarkerForTest()
     });
 
     await agent.triggerFiberRecovery();
@@ -4853,7 +5005,12 @@ describe("Think — onChatRecovery", () => {
       maxAttempts: 1,
       status: "scheduled",
       firstSeenAt: Date.now() - 60_000,
-      lastAttemptAt: Date.now() - 60_000
+      lastAttemptAt: Date.now() - 60_000,
+      // The marker is derived from the stream log, so the seeded stream's
+      // segments already count. Record them as the incident's last observed
+      // progress: this wake must see no NEW content, exactly as a real
+      // incident that opened over this stream would.
+      progress: await agent.readProgressMarkerForTest()
     });
 
     await agent.triggerFiberRecovery();

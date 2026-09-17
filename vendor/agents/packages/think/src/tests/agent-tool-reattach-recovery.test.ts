@@ -124,6 +124,44 @@ describe("agent-tool child re-attach: request_id rebinding across recovery", () 
     expect(await agent.getTurnCallCount()).toBe(1);
   });
 
+  it("keeps Stop durable when an interrupted chat-turn Task replays", async () => {
+    // The 0.23 twin of the fiber case above: a ROOT agent's turn runs on the
+    // Tasks capability, so an isolate lost mid-turn leaves a non-terminal
+    // `cf_agents_task_runs` row (plus its stash), not a `cf_agents_runs`
+    // fiber. Its replay reaches the same ChatRecoveryEngine, and the durable
+    // Stop cutoff must fence it there too — otherwise a wake restarts the
+    // very turn the user stopped.
+    const name = `stop-durable-task-${crypto.randomUUID()}`;
+    let agent = await freshRecoveryAgent(name);
+    await agent.persistTestMessage({
+      id: "user",
+      role: "user",
+      parts: [{ type: "text", text: "old input" }]
+    });
+    await agent.insertInterruptedChatTurnTaskForTest("old-request", {
+      __cfThinkChatFiberSnapshot: {
+        kind: "think-chat-turn",
+        version: 1,
+        requestId: "old-request",
+        continuation: false,
+        latestMessageId: "user",
+        latestMessageRole: "user",
+        latestUserMessageId: "user",
+        startedAt: Date.now()
+      },
+      user: null
+    });
+    await agent.stopCurrentWork();
+    await evictDurableObject(agent as unknown as DurableObjectStub);
+    agent = await freshRecoveryAgent(name);
+    await agent.runDueTasksForTest();
+    await agent.runScheduledRecoveryRetryForTest();
+    expect(await agent.getTurnCallCount()).toBe(0);
+    await agent.testChat("new input");
+    await agent.runScheduledRecoveryRetryForTest();
+    expect(await agent.getTurnCallCount()).toBe(1);
+  });
+
   it("remembers cancellation delivered before child start", async () => {
     const name = `cancel-before-start-${crypto.randomUUID()}`;
     let agent = await freshRecoveryAgent(name);
@@ -249,10 +287,11 @@ describe("agent-tool child re-attach: request_id rebinding across recovery", () 
       }
     );
 
-    await agent.triggerFiberRecovery();
-    expect(
-      await agent.getScheduledChatRecoveryCountForTest("_chatRecoveryContinue")
-    ).toBe(1);
+    // Assert on the counts returned from inside the trigger RPC: the
+    // zero-delay recovery alarm may fire (and consume the job row) as soon as
+    // the RPC releases the DO, so a follow-up count read can race it.
+    const scheduled = await agent.triggerFiberRecovery();
+    expect(scheduled.scheduledContinueCount).toBe(1);
     await agent.runScheduledRecoveryContinueForTest();
 
     // The row's request_id moved off the pre-eviction turn to the recovery
@@ -296,10 +335,8 @@ describe("agent-tool child re-attach: request_id rebinding across recovery", () 
       }
     );
 
-    await agent.triggerFiberRecovery();
-    expect(
-      await agent.getScheduledChatRecoveryCountForTest("_chatRecoveryRetry")
-    ).toBe(1);
+    const scheduled = await agent.triggerFiberRecovery();
+    expect(scheduled.scheduledRetryCount).toBe(1);
     await agent.runScheduledRecoveryRetryForTest();
 
     const reboundReqId =

@@ -13,8 +13,8 @@ async function main() {
       "src/voice-react.tsx",
       "src/errors.ts"
     ],
-    skipNodeModulesBundle: true,
-    external: ["cloudflare:workers"],
+    deps: { neverBundle: true },
+    inputOptions: { external: ["cloudflare:workers"] },
     format: "esm",
     outputOptions: { keepNames: true },
     sourcemap: true,

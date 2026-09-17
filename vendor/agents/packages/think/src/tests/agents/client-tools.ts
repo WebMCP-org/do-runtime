@@ -16,7 +16,7 @@ import type {
   TurnContext
 } from "../../think";
 import { StreamAccumulator, type ClientToolSchema } from "agents/chat";
-import type { Session } from "agents/experimental/memory/session";
+import type { Session, SessionMessage } from "../../think";
 
 function createClientToolMockModel(): LanguageModel {
   let callCount = 0;
@@ -665,23 +665,67 @@ function createTextOnlyMockModel(): LanguageModel {
   } as LanguageModel;
 }
 
+/**
+ * Sums billed rows over a window of SQLite statements, the unit a Durable
+ * Object is charged for. Mirrors the Sessions bench harness in `agents`: every
+ * cursor's counters settle once it has been consumed, so the sum is taken
+ * when the window closes.
+ */
+class BilledRowsForTest {
+  #cursors: { readonly rowsWritten: number; readonly rowsRead: number }[] = [];
+  #active = false;
+
+  constructor(sql: SqlStorage) {
+    const exec = sql.exec.bind(sql);
+    (sql as { exec: SqlStorage["exec"] }).exec = ((
+      query: string,
+      ...params: unknown[]
+    ) => {
+      const cursor = exec(query, ...(params as never[]));
+      if (this.#active) this.#cursors.push(cursor);
+      return cursor;
+      // SAFETY: the wrapper forwards every argument and the cursor unchanged.
+    }) as SqlStorage["exec"];
+  }
+
+  start(): void {
+    this.#cursors = [];
+    this.#active = true;
+  }
+
+  stop(): { rowsRead: number; rowsWritten: number } {
+    this.#active = false;
+    let rowsRead = 0;
+    let rowsWritten = 0;
+    for (const cursor of this.#cursors) {
+      rowsRead += cursor.rowsRead;
+      rowsWritten += cursor.rowsWritten;
+    }
+    this.#cursors = [];
+    return { rowsRead, rowsWritten };
+  }
+}
+
+export type BilledRowsResult = { rowsRead: number; rowsWritten: number };
+
 export class ThinkClientToolsAgent extends Think {
+  readonly #billed = new BilledRowsForTest(this.ctx.storage.sql);
   private _messageUpdateGate?: {
     wait: Promise<void>;
     release: () => void;
-    settled?: Promise<void>;
+    settled?: Promise<SessionMessage | null>;
   };
 
   override configureSession(session: Session): Session {
     const updateMessage = session.updateMessage.bind(session);
-    session.updateMessage = (message) => {
+    session.updateMessage = (message, options) => {
       const gate = this._messageUpdateGate;
       if (gate && !gate.settled) {
         // Hold the real Session write, retaining its SQL and change callbacks.
-        gate.settled = gate.wait.then(() => updateMessage(message));
+        gate.settled = gate.wait.then(() => updateMessage(message, options));
         return gate.settled;
       }
-      return updateMessage(message);
+      return updateMessage(message, options);
     };
     return session;
   }
@@ -1077,6 +1121,113 @@ export class ThinkClientToolsAgent extends Think {
           output: z.string().optional().parse(part.output)
         }))
     }));
+  }
+
+  /**
+   * Persist a `transcript`-message conversation of small text messages, with
+   * the assistant message two before the leaf owning the client tool call
+   * `tc-measure` (where an approved tool's result landing in a continuation
+   * would find its owner), and leave the live cache current.
+   */
+  private async _seedMeasuredTranscript(transcript: number): Promise<string> {
+    const ownerId = `m-${transcript - 3}`;
+    for (let i = 0; i < transcript; i++) {
+      const id = `m-${i}`;
+      await this.session.appendMessage(
+        id === ownerId
+          ? ({
+              id,
+              role: "assistant",
+              parts: [
+                {
+                  type: "tool-client_action",
+                  toolCallId: "tc-measure",
+                  toolName: "client_action",
+                  state: "input-available",
+                  input: { action: "measure" }
+                }
+              ]
+            } as unknown as UIMessage)
+          : {
+              id,
+              role: i % 2 === 0 ? "user" : "assistant",
+              parts: [{ type: "text", text: `${i} ${"x".repeat(120)}` }]
+            }
+      );
+    }
+    await this.syncMessagesFromStorage();
+    return ownerId;
+  }
+
+  /**
+   * Billed rows for one client tool result applied to a persisted message on
+   * a transcript `transcript` messages long. Read from the same transcript
+   * at two lengths, the counts must match: the apply resolves its one target
+   * row from memory and reads that row alone.
+   */
+  async measureToolUpdateRowsForTest(
+    transcript: number
+  ): Promise<
+    BilledRowsResult & { state: string | undefined; cacheCoversPath: boolean }
+  > {
+    const ownerId = await this._seedMeasuredTranscript(transcript);
+    const internal = this as unknown as {
+      _applyToolResult(toolCallId: string, output: unknown): Promise<void>;
+      _cacheCoversActivePath: boolean;
+    };
+    this.#billed.start();
+    await internal._applyToolResult("tc-measure", "measured");
+    const billed = this.#billed.stop();
+    const stored = await this.session.getMessage(ownerId);
+    const part = stored?.parts.find(
+      (candidate) =>
+        (candidate as { toolCallId?: string }).toolCallId === "tc-measure"
+    ) as { state?: string } | undefined;
+    return {
+      ...billed,
+      state: part?.state,
+      cacheCoversPath: internal._cacheCoversActivePath
+    };
+  }
+
+  /**
+   * Billed rows for a turn start whose client echoes the whole server
+   * transcript plus one new user message — the shape every `useAgentChat`
+   * request has. Only the new message may touch storage.
+   */
+  async measureTurnStartRowsForTest(
+    transcript: number
+  ): Promise<BilledRowsResult & { persisted: boolean; cached: number }> {
+    await this._seedMeasuredTranscript(transcript);
+    const internal = this as unknown as {
+      _reconcileAndPersistIncoming(
+        incoming: UIMessage[],
+        options: {
+          requestId: string;
+          isRegeneration: boolean;
+          isCurrent: () => boolean;
+        }
+      ): Promise<{ branchParentId: string | undefined } | null>;
+    };
+    const echoed = this.messages.map(
+      (message) => JSON.parse(JSON.stringify(message)) as UIMessage
+    );
+    const incoming: UIMessage[] = [
+      ...echoed,
+      { id: "new-user", role: "user", parts: [{ type: "text", text: "next" }] }
+    ];
+    this.#billed.start();
+    const result = await internal._reconcileAndPersistIncoming(incoming, {
+      requestId: "measure",
+      isRegeneration: false,
+      isCurrent: () => true
+    });
+    const billed = this.#billed.stop();
+    return {
+      ...billed,
+      persisted: result !== null,
+      cached: this.messages.length
+    };
   }
 
   /**

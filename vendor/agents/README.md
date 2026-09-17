@@ -21,7 +21,7 @@ not run intentionally retired Codemode execution or unrelated upstream apps.
 `pnpm test:browser` builds and exercises the browser messenger leaves in
 Chromium, including native sockets in a real Worker. See
 [the integration guide](docs/think/browser-messengers.md) and
-[the next browser compatibility candidates](docs/browser-compatibility.md).
+[current browser integrations](docs/browser-compatibility.md).
 
 The native Agents and Think files run serially. Agents has a recorded
 parallel-worker bridge-test flake; Think's expanded suite hit its 60-second
@@ -30,12 +30,12 @@ passed with serial file execution; retries remain disabled.
 
 ## Packages
 
-- `agents@0.22.0`
-- `@cloudflare/ai-chat@0.11.0`
-- `@cloudflare/think@0.17.0`
-- `@cloudflare/voice@0.4.0`
+- `agents@0.23.0`
+- `@cloudflare/ai-chat@0.12.0`
+- `@cloudflare/think@0.18.0`
+- `@cloudflare/voice@0.5.0`
 - `@cloudflare/shell@0.4.3`
-- `@cloudflare/codemode@0.5.1`
+- `@cloudflare/codemode@0.5.2`
 
 Rook consumes these built packages. `@mcp-b/do-runtime` remains a lower
 layer and has no dependency on the SDK.

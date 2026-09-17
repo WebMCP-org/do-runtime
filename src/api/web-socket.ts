@@ -268,7 +268,7 @@ export class AcceptedWebSocket extends EventTarget implements RawWebSocket, WebS
   #delivery: SocketDelivery = { mode: "pending" };
   #pump: Promise<void> = Promise.resolve();
   #pending: { type: SocketEvent; event: Event }[] = [];
-  #readyState: number = AcceptedWebSocket.OPEN;
+  #readyState: WebSocket["readyState"] = AcceptedWebSocket.OPEN;
   #ownClose = false;
   #peerClose = false;
   #binaryType: "blob" | "arraybuffer" = "blob";
@@ -301,7 +301,7 @@ export class AcceptedWebSocket extends EventTarget implements RawWebSocket, WebS
     }
   }
 
-  get readyState(): number {
+  get readyState(): WebSocket["readyState"] {
     return this.#readyState;
   }
 
@@ -832,7 +832,12 @@ function validateAutoResponseSize(side: "Request" | "Response", value: string): 
 }
 
 function validateClose(code: number | undefined, reason: string): void {
-  if (code !== undefined && code !== 1000 && (code < 3000 || code > 4999)) {
+  // Match the pinned workerd oracle without the opt-in pedantic_wpt flag.
+  // Server policy/restart codes are valid; only reserved wire codes are excluded.
+  if (
+    code !== undefined &&
+    (code < 1000 || code >= 5000 || [1004, 1005, 1006, 1015].includes(code))
+  ) {
     throw new DOMException(`Invalid WebSocket close code: ${code}.`, "InvalidAccessError");
   }
   if (textEncoder.encode(reason).byteLength > MAX_CLOSE_REASON_BYTES) {

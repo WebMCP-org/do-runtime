@@ -273,14 +273,20 @@ describe("handler dispatch and close state", () => {
     });
     expect(await actor.call("closeValidation")).toEqual({
       code999: invalidCode(999),
+      code1004: invalidCode(1004),
       code1005: invalidCode(1005),
       code1006: invalidCode(1006),
+      code1015: invalidCode(1015),
       code5000: invalidCode(5000),
       longReason: {
         name: "SyntaxError",
         message: "WebSocket close reason must not be longer than 123 bytes when UTF-8 encoded.",
       },
       code1000: null,
+      code1001: null,
+      code1002: null,
+      code1008: null,
+      code1011: null,
       code3000: null,
       code4999: null,
     });

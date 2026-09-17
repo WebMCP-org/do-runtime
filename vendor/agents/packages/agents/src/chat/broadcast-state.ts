@@ -109,7 +109,7 @@ export function transition(
           state.status === "observing" &&
           state.streamId === event.streamId
         ) {
-          accumulator = state.accumulator.restartFromSeed();
+          accumulator = state.accumulator.restartFromSeed(true);
         } else {
           accumulator = new StreamAccumulator({
             messageId: event.messageId,

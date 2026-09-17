@@ -942,6 +942,9 @@ export function useAgent<State>(options: UseAgentOptions<unknown>): Omit<
     // still queued were composed for the *old* instance. Reject them
     // before anything can flush them onto the new instance.
     if (prevAddress !== addressKey) {
+      // An intentional route change starts a new identity comparison.
+      // Reconnecting to the same address must still detect identity changes.
+      previousIdentityRef.current = { name: null, agent: null };
       connectionErrorAddressKeyRef.current = null;
       setConnectionError(null);
       rejectQueuedCalls(

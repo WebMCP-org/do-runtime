@@ -1,11 +1,13 @@
 import {
   Think,
+  action,
   type ChatRecoveryContext,
   type ChatRecoveryOptions,
   type StreamCallback,
   type ThinkSubmissionInspection,
 } from "@cloudflare/think";
 import type { LanguageModel, UIMessage } from "ai";
+import { z } from "zod";
 import type { ThinkProbeStatus, ThinkProbeSubmission } from "../protocol";
 import type { CounterEnv } from "./counter";
 
@@ -52,6 +54,28 @@ export class ThinkProbe extends Think<CounterEnv> {
     return next;
   }
 
+  override getActions() {
+    return {
+      create_checkpoint: action({
+        name: "create_checkpoint",
+        description: "Store a title and schedule a one-time checkpoint.",
+        inputSchema: z.object({ title: z.string() }),
+        idempotencyKey: ({ ctx }) => {
+          if (!ctx.toolCallId) throw new Error("Missing model tool call id");
+          return ctx.toolCallId;
+        },
+        execute: async ({ title }) => {
+          await portHop();
+          await this.ctx.storage.put("probe:title", title);
+          const scheduled = await this.schedule(3600, "checkpoint", { title });
+          return { title, scheduleId: scheduled.id };
+        },
+      }),
+    };
+  }
+
+  async checkpoint(): Promise<void> {}
+
   override getModel(): LanguageModel {
     const probe = this;
     return {
@@ -62,7 +86,13 @@ export class ThinkProbe extends Think<CounterEnv> {
       doGenerate() {
         throw new Error("The Think composition probe only supports streaming.");
       },
-      async doStream({ abortSignal }) {
+      async doStream({ abortSignal, prompt }) {
+        const callTool =
+          prompt.some(
+            (message) =>
+              message.role === "user" &&
+              JSON.stringify(message.content).includes("Create a checkpoint"),
+          ) && !prompt.some((message) => message.role === "tool");
         await probe.#bump(INFERENCE_STARTS);
         let chunk = 0;
         let opened = false;
@@ -72,6 +102,22 @@ export class ThinkProbe extends Think<CounterEnv> {
             if (!opened) {
               opened = true;
               controller.enqueue({ type: "stream-start", warnings: [] });
+              if (callTool) {
+                await portHop();
+                controller.enqueue({
+                  type: "tool-call",
+                  toolCallId: "checkpoint-1",
+                  toolName: "create_checkpoint",
+                  input: JSON.stringify({ title: "Model-created checkpoint" }),
+                });
+                controller.enqueue({
+                  type: "finish",
+                  finishReason: "tool-calls",
+                  usage: { inputTokens: 1, outputTokens: 1 },
+                });
+                controller.close();
+                return;
+              }
               controller.enqueue({ type: "text-start", id: "probe-text" });
               return;
             }
@@ -165,6 +211,13 @@ export class ThinkProbe extends Think<CounterEnv> {
         : this.sql<{ count: number }>`SELECT COUNT(*) AS count FROM cf_agents_runs`[0].count;
     const assistant = messages.findLast((message) => message.role === "assistant");
     return {
+      checkpointTitle: (await this.ctx.storage.get<string>("probe:title")) ?? null,
+      checkpoints: (await this.listSchedules())
+        .filter((schedule) => schedule.callback === "checkpoint")
+        .map(({ id, payload }) => ({ id, payload })),
+      toolResults: messages
+        .flatMap((message) => message.parts)
+        .filter((part) => part.type === "tool-create_checkpoint"),
       assistantMessages: messages.filter((message) => message.role === "assistant").length,
       assistantText: assistant === undefined ? "" : text(assistant),
       emittedChunks: (await this.ctx.storage.get<number>(EMITTED_CHUNKS)) ?? 0,

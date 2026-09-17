@@ -57,6 +57,22 @@ function requestFrame(agent: FakeAgent): string {
 }
 
 describe("WebSocketChatTransport unacknowledged request replay", () => {
+  it("settles a resumed connection that closes before its first frame", async () => {
+    const agent = new FakeAgent();
+    const transport = new WebSocketChatTransport({ agent });
+    const resumed = transport.reconnectToStream({
+      chatId: "closed-before-replay"
+    });
+    expect(transport.handleStreamResuming({ id: "pending-replay" })).toBe(true);
+    agent.close();
+    const stream = await resumed;
+    expect(stream).not.toBeNull();
+    await expect(stream!.getReader().read()).resolves.toEqual({
+      done: true,
+      value: undefined
+    });
+  });
+
   it("survives transport replacement, replays byte-identically, and waits for durable ACK", async () => {
     const chatId = `cross-instance-${crypto.randomUUID()}`;
     const oldAgent = new FakeAgent();
@@ -108,8 +124,8 @@ describe("WebSocketChatTransport unacknowledged request replay", () => {
     expect(settled).toBe(false);
 
     // This is the true never-reached-server path: the replay is newly accepted,
-    // so the durable receipt resolves a direct response stream before any
-    // STREAM_RESUMING frame exists.
+    // so the durable receipt attaches a direct response stream before any
+    // STREAM_RESUMING frame exists. Resolution waits for its first frame.
     expect(
       racingTransport.handleStreamPending({
         type: MessageType.CF_AGENT_STREAM_PENDING,
@@ -117,9 +133,6 @@ describe("WebSocketChatTransport unacknowledged request replay", () => {
         persisted: true
       })
     ).toBe(true);
-    const resumedStream = await racingReconnect;
-    expect(resumedStream).not.toBeNull();
-    const reader = resumedStream!.getReader();
     racingAgent.message({
       type: MessageType.CF_AGENT_STREAM_RESUMING,
       id: requestId
@@ -142,6 +155,9 @@ describe("WebSocketChatTransport unacknowledged request replay", () => {
       body: JSON.stringify(chunk),
       done: false
     });
+    const resumedStream = await racingReconnect;
+    expect(resumedStream).not.toBeNull();
+    const reader = resumedStream!.getReader();
     await expect(reader.read()).resolves.toEqual({
       done: false,
       value: chunk as UIMessageChunk
