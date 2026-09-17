@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.8.2
+
+### Patch Changes
+
+- 4346a6e: Refresh runtime and build dependencies, including SQLite WASM, Cap’n Web and
+  structured clone. Validate conformance against workerd 1.20260911.1 and keep
+  WebSocket readyState declarations aligned with the current DOM types.
+
 ## 0.8.1
 
 ### Patch Changes
