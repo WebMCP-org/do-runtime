@@ -214,7 +214,7 @@ Web Worker and supply the sqlite-wasm backend shown in the runnable examples.
 For a standalone TypeScript host, install the ambient Node and Workers types:
 
 ```bash
-pnpm add -D typescript @types/node @cloudflare/workers-types@5.20260907.1
+pnpm add -D typescript @types/node @cloudflare/workers-types@5.20260911.1
 ```
 
 Use the following `tsconfig.json`. An existing Workers project can keep its
@@ -514,7 +514,7 @@ it does not need a sibling checkout, SDK source aliases, or a local candidate
 archive. Publish a new source tag for each SDK change instead of replacing
 an existing release's assets. The runtime's npm release remains independent.
 
-Change runtime behaviour with the corresponding workerd source open (line citations use release `v1.20260713.1`; the conformance oracle is pinned to `v1.20260907.1`). Ask the workerd lane an observable question before inventing a local rule; record any intentional divergence in the table above and in a conformance row. Keep host seams small and typed, keep gates internal, and keep product knowledge out of the port. See [`docs/decisions.md`](docs/decisions.md) for the invariants the code cites.
+Change runtime behaviour with the corresponding workerd source open (line citations use release `v1.20260713.1`; the conformance oracle is pinned to `v1.20260911.1`). Ask the workerd lane an observable question before inventing a local rule; record any intentional divergence in the table above and in a conformance row. Keep host seams small and typed, keep gates internal, and keep product knowledge out of the port. See [`docs/decisions.md`](docs/decisions.md) for the invariants the code cites.
 
 ## Acknowledgements
 

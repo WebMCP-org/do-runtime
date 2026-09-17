@@ -21,12 +21,10 @@ function host(deliver = vi.fn(async () => ({ status: "delivered" as const }))) {
 
 describe("TanStack AI message adapter", () => {
   it("creates a named server tool that delivers through the Host", async () => {
-    const deliver = vi.fn(
-      async (): Promise<DeliveryResult> => ({
-        status: "delivered",
-        reference: "message-1"
-      })
-    );
+    const deliver = vi.fn(async (): Promise<DeliveryResult> => ({
+      status: "delivered",
+      reference: "message-1"
+    }));
     const messageTool = createSendMessageTool(host(deliver), surface, {
       name: "contactSupport",
       description: "Escalate to a person",

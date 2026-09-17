@@ -228,7 +228,14 @@ async function runRelayRoundTrip(origin: string): Promise<RelayRoundTrip> {
       local = new AgentWebSocket("ws://actor.invalid/agents/counter/counter");
       local.binaryType = "arraybuffer";
       local.addEventListener("message", (localEvent) => {
-        if (relayHost.readyState === relayHost.OPEN) relayHost.send(localEvent.data);
+        if (relayHost.readyState === relayHost.OPEN) {
+          const data = localEvent.data;
+          relayHost.send(
+            ArrayBuffer.isView(data)
+              ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength).slice()
+              : data,
+          );
+        }
       });
       local.addEventListener("close", (close) => {
         if (relayHost.readyState < relayHost.CLOSING) {

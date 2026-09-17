@@ -261,7 +261,7 @@ async function readSkill(
   const resources = await Promise.all(
     (await collectFiles(skillDir, "", warn)).map(async (file) => {
       const encoding = resourceEncoding(file.path);
-      const bytes = await readFile(file.absolutePath);
+      const bytes = Buffer.from(await readFile(file.absolutePath));
       const kind = resourceKind(file.path);
       let content =
         encoding === "base64" ? bytes.toString("base64") : bytes.toString();
