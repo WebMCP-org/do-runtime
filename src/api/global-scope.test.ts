@@ -25,6 +25,39 @@ import {
   NO_GLOBAL_OUTBOUND_MESSAGE,
 } from "./global-scope";
 import { HibernatableWebSocketRegistry } from "./web-socket";
+import { AsyncLocalStorage } from "../browser/async-hooks";
+
+test("stream callbacks retain their creator's actor and async scope after delayed input", async () => {
+  const { ctx, scope } = newScope();
+  const target = { TransformStream: globalThis.TransformStream };
+  installActorScope(target, () => scope);
+  const store = new AsyncLocalStorage<string>();
+  const seen: unknown[] = [];
+  const transformer: Transformer<string, string> = {
+    transform(value, controller) {
+      seen.push(["transform", ctx.hasCurrent(), store.getStore(), this === transformer]);
+      controller.enqueue(value);
+    },
+    flush() {
+      seen.push(["flush", ctx.hasCurrent(), store.getStore(), this === transformer]);
+    },
+  };
+  const stream = await ctx.run(() =>
+    store.run("creator", () => new target.TransformStream(Object.freeze(transformer))),
+  );
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const reader = stream.readable.getReader();
+  const writer = stream.writable.getWriter();
+  const read = reader.read();
+  await store.run("unrelated", () => writer.write("tool call"));
+  expect(await read).toEqual({ value: "tool call", done: false });
+  await writer.close();
+  expect(seen).toEqual([
+    ["transform", true, "creator", true],
+    ["flush", true, "creator", true],
+  ]);
+  expect(store.getStore()).toBeUndefined();
+});
 
 describe("AlarmInvocationInfo", () => {
   test("carries the scheduled time and the retry count", () => {
@@ -465,6 +498,7 @@ describe("installActorScope", () => {
     installActorScope(target, () => scope);
 
     expect(Object.keys(target).sort()).toEqual([
+      "TransformStream",
       "WebSocket",
       "WebSocketPair",
       "WebSocketRequestResponsePair",
