@@ -1,5 +1,7 @@
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
+import { convertToModelMessages, type UIMessage } from "ai";
+import { createReadTool } from "../tools/workspace";
 import { getAgentByName } from "agents";
 
 async function freshAgent(name: string) {
@@ -15,6 +17,100 @@ const PNG_BYTES = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
 // ── Read tool ─────────────────────────────────────────────────────────
 
 describe("assistant tools — read", () => {
+  it.each([
+    ["report.pdf", "application/pdf", asciiBytes("%PDF-1.4\n")],
+    ["shot.png", "image/png", PNG_BYTES]
+  ])(
+    "keeps history usable when %s becomes inaccessible",
+    async (name, mimeType, data) => {
+      const path = `/mounts/cookbooks/${name}`;
+      const bytes = new Uint8Array(data);
+      let readable = true;
+      const reason =
+        "EACCES: local folder mount /mounts/cookbooks needs to be reconnected in the sidepanel";
+      const read = createReadTool({
+        ops: {
+          stat: () => ({
+            path,
+            name,
+            type: "file",
+            mimeType,
+            size: bytes.length,
+            createdAt: 0,
+            updatedAt: 0
+          }),
+          readFile: async () => null,
+          readFileBytes: async () => {
+            if (!readable)
+              throw Object.assign(new Error(reason), { code: "EACCES" });
+            return bytes;
+          }
+        }
+      });
+      const input = { path };
+      const output = await read.execute!(input, {
+        toolCallId: "read-file",
+        messages: [],
+        context: {}
+      });
+      const history: UIMessage[] = [
+        {
+          id: "assistant-read",
+          role: "assistant",
+          parts: [
+            {
+              type: "tool-read",
+              toolCallId: "read-file",
+              state: "output-available",
+              input,
+              output
+            }
+          ]
+        },
+        {
+          id: "followup",
+          role: "user",
+          parts: [
+            { type: "text", text: "Continue with this attachment." },
+            {
+              type: "file",
+              mediaType: "application/pdf",
+              filename: "replacement.pdf",
+              url: `data:application/pdf;base64,${btoa("%PDF-1.4\n")}`
+            }
+          ]
+        }
+      ];
+      const stored = JSON.stringify(history);
+      const render = () => convertToModelMessages(history, { tools: { read } });
+      const original = await render();
+      expect(original[1]).toMatchObject({
+        role: "tool",
+        content: [{ output: { type: "content" } }]
+      });
+
+      readable = false;
+      await expect(render()).resolves.toContainEqual({
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "read-file",
+            toolName: "read",
+            output: {
+              type: "error-text",
+              value: `Could not read file bytes: ${path}: ${reason}`
+            }
+          }
+        ]
+      });
+      expect(JSON.stringify(history)).toBe(stored);
+
+      readable = true;
+      await expect(render()).resolves.toEqual(original);
+    }
+  );
+
   it("reads a file with line numbers", async () => {
     const agent = await freshAgent("read-basic");
     await agent.seed([{ path: "/hello.txt", content: "line1\nline2\nline3" }]);

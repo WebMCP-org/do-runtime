@@ -436,7 +436,17 @@ export function createReadTool(options: ReadToolOptions): Tool {
         };
       }
 
-      const bytes = await ops.readFileBytes(input.path);
+      // History is rendered again for later turns and recovery. A file that
+      // became inaccessible must not prevent the rest of the chat from running.
+      let bytes: Uint8Array | null;
+      try {
+        bytes = await ops.readFileBytes(input.path);
+      } catch (error) {
+        return {
+          type: "error-text",
+          value: `Could not read file bytes: ${input.path}: ${errorMessage(error)}`
+        };
+      }
       if (bytes === null) {
         return {
           type: "error-text",
