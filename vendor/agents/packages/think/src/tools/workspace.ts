@@ -440,6 +440,17 @@ export function createReadTool(options: ReadToolOptions): Tool {
       // became inaccessible must not prevent the rest of the chat from running.
       let bytes: Uint8Array | null;
       try {
+        // Use current metadata: a saved reference may have grown or shrunk.
+        // Loading hundreds of MB just to reject inline output can kill a host.
+        const stat = await ops.stat(input.path);
+        if (stat && stat.size > MAX_MODEL_FILE_BYTES) {
+          return {
+            type: "error-text",
+            value:
+              `Read ${replayOutput.path} (${replayOutput.mediaType}, ${formatSize(stat.size)}), ` +
+              `but it exceeds the ${formatSize(MAX_MODEL_FILE_BYTES)} inline model output limit.`
+          };
+        }
         bytes = await ops.readFileBytes(input.path);
       } catch (error) {
         return {
@@ -647,6 +658,12 @@ async function detectWorkspaceMediaType({
   const statMime = normalizeMediaType(stat.mimeType);
   if (statMime && !isGenericMediaType(statMime)) {
     return statMime;
+  }
+
+  // Sniffing uses a whole-file read. Keep oversized untyped files as metadata
+  // rather than loading them just to learn they cannot be sent inline.
+  if (stat.size > MAX_MODEL_FILE_BYTES) {
+    return statMime || "application/octet-stream";
   }
 
   const bytes = await ops.readFileBytes(path);
