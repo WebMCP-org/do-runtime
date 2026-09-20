@@ -2161,3 +2161,12 @@ describe("workspace — observability", () => {
     expect(log).toHaveLength(0);
   });
 });
+
+it("reads byte ranges through legacy WorkspaceFsLike adapters", async () => {
+  const agent = await freshAgent("range-fallback");
+  expect(await agent.byteRangeContract()).toEqual({
+    bytes: [128, 255],
+    pastEnd: [],
+    zero: []
+  });
+});

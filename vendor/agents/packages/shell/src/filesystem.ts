@@ -178,7 +178,17 @@ export type WorkspaceFsLike = Pick<
   | "symlink"
   | "readlink"
   | "glob"
->;
+> & {
+  /** Optional bounded byte read; follows symlinks, returns null for missing files.
+   * Offset and length must be nonnegative safe integers with a safe sum.
+   * Reads past EOF return an empty buffer; short reads at EOF are allowed.
+   */
+  readFileRange?(
+    path: string,
+    offset: number,
+    length: number
+  ): Promise<Uint8Array | null>;
+};
 
 // ── Constants ────────────────────────────────────────────────────────
 

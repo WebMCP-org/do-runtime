@@ -1,3 +1,4 @@
+import { validateReadRange } from "./fs/read-range";
 import type { WorkspaceFsLike } from "./filesystem";
 import type { FileSystem, FileSystemDirent, FsStat } from "./fs/interface";
 import { FileSystemStateBackend } from "./memory";
@@ -39,6 +40,21 @@ export class WorkspaceFileSystem implements FileSystem {
     if (bytes === null) {
       throw enoent(path);
     }
+    return bytes;
+  }
+
+  async readFileRange(
+    path: string,
+    offset: number,
+    length: number
+  ): Promise<Uint8Array> {
+    validateReadRange(offset, length);
+    const bytes = this.ws.readFileRange
+      ? await this.ws.readFileRange(path, offset, length)
+      : (await this.ws.readFileBytes(path))?.slice(offset, offset + length);
+    if (bytes == null) throw enoent(path);
+    if (bytes.byteLength > length)
+      throw new Error("EIO: byte range exceeded requested length");
     return bytes;
   }
 
