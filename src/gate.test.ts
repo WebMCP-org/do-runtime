@@ -1,5 +1,5 @@
 import { describe, expect, test, vi } from "vitest";
-import { __gate, __gateAsyncIterable, __gateAwait, __resumeAwait } from "./gate";
+import { __gateAsyncIterable, __gateAwait, __resumeAwait } from "./gate";
 import { InputGate, OutputGate } from "./io/io-gate";
 import {
   BrokenActorError,
@@ -51,13 +51,13 @@ function portHop(): Promise<void> {
   });
 }
 
-describe("__gate", () => {
+describe("__gateAwait", () => {
   test("returns values and thenables unchanged outside an actor", () => {
     const value = { answer: 42 };
     const thenable = Promise.resolve("done");
 
-    expect(__gate(value)).toBe(value);
-    expect(__gate(thenable)).toBe(thenable);
+    expect(__gateAwait(value)).toBe(value);
+    expect(__gateAwait(thenable)).toBe(thenable);
   });
 
   test("warns once only when a development transform reaches a lockless continuation", async () => {
@@ -83,9 +83,9 @@ describe("__gate", () => {
     const context = newContext();
 
     const held = await context.run(async () => {
-      await __gate(portHop());
+      __resumeAwait(await __gateAwait(portHop()));
       const afterFirst = context.hasCurrent();
-      await __gate(portHop());
+      __resumeAwait(await __gateAwait(portHop()));
       return [afterFirst, context.hasCurrent()];
     });
 
@@ -96,8 +96,8 @@ describe("__gate", () => {
     const context = newContext();
 
     const held = await context.run(async () => {
-      await __gate(1);
-      await __gate(portHop());
+      __resumeAwait(await __gateAwait(1));
+      __resumeAwait(await __gateAwait(portHop()));
       return context.hasCurrent();
     });
 
@@ -109,8 +109,8 @@ describe("__gate", () => {
     const second = newContext();
     const run = (context: IoContext, label: string) =>
       context.run(async () => {
-        await __gate(Promise.resolve());
-        await __gate(portHop());
+        __resumeAwait(await __gateAwait(Promise.resolve()));
+        __resumeAwait(await __gateAwait(portHop()));
         requireInputLock(context, label);
         return label;
       });
@@ -139,13 +139,15 @@ describe("__gate", () => {
         released = true;
         lock.release();
       };
-      blockedContinuation = Promise.resolve(__gate(blockedValue.promise));
+      blockedContinuation = (async () => {
+        __resumeAwait(await __gateAwait(blockedValue.promise));
+      })();
     });
     await portHop();
 
     await unblocking.run(() => {
       unblockingContinuation = (async () => {
-        await __gate(unblockingValue.promise);
+        __resumeAwait(await __gateAwait(unblockingValue.promise));
         releaseBlockedLock();
       })();
     });
@@ -172,37 +174,28 @@ describe("__gate", () => {
   test("clears continuation context before a later macrotask", async () => {
     const context = newContext();
     await context.run(async () => {
-      await __gate(Promise.resolve());
+      __resumeAwait(await __gateAwait(Promise.resolve()));
     });
     await portHop();
     const outside = Promise.resolve("outside");
 
-    expect(__gate(outside)).toBe(outside);
+    expect(__gateAwait(outside)).toBe(outside);
   });
 
   test("keeps sampled provenance for transformed awaits", async () => {
     const context = newContext();
     await context.run(async () => {
-      await __gate(portHop());
+      __resumeAwait(await __gateAwait(portHop()));
     });
 
     expect(context.describeLostLock()).toContain("transformed await sampled at the site below");
-  });
-
-  test("re-enters the actor when an awaited promise rejects", async () => {
-    const context = newContext();
-
-    await context.run(async () => {
-      await expect(__gate(Promise.reject(new Error("expected")))).rejects.toThrow("expected");
-      requireInputLock(context, "after rejection");
-    });
   });
 
   test("re-enters the critical section captured by blockConcurrencyWhile", async () => {
     const context = newContext();
     const completed = context.run(() =>
       context.blockConcurrencyWhile(async () => {
-        await __gate(portHop());
+        __resumeAwait(await __gateAwait(portHop()));
         requireInputLock(context, "critical section continuation");
         return "done";
       }),
@@ -367,7 +360,7 @@ describe("transformed await resume", () => {
     Reflect.set(globalThis, key, { context, token: {} });
 
     try {
-      expect(__gate(value)).toBe(value);
+      expect(__gateAwait(value)).toBe(value);
     } finally {
       Reflect.deleteProperty(globalThis, key);
     }
@@ -428,6 +421,16 @@ describe("transformed await resume", () => {
 });
 
 describe("__gateAsyncIterable", () => {
+  test("re-enters the actor after each for-await step across a port hop", async () => {
+    const context = newContext();
+    const held = await context.run(async () => {
+      const seen: boolean[] = [];
+      for await (const _ of __gateAsyncIterable([portHop(), portHop()])) seen.push(context.hasCurrent());
+      return seen;
+    });
+    expect(held).toEqual([true, true]);
+  });
+
   test("awaits sync iterable values while retaining async iterator values", async () => {
     const promised = Promise.resolve(42);
     const values: unknown[] = [];

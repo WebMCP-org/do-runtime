@@ -4,6 +4,7 @@ import {
   createFilter,
   transformWithOxc,
   Visitor,
+  type Alias,
   type ESTree,
   type FilterPattern,
   type Plugin,
@@ -24,6 +25,8 @@ function correctAsyncGeneratorReturn(code: string, id: string) {
   // Match Babel's distinction between await (k=0) and delegated yield (k=1):
   // https://github.com/babel/babel/blob/main/packages/babel-helpers/src/helpers/wrapAsyncGenerator.ts
   // Keep this shape check until Vite's bundled Oxc helper incorporates that fix.
+  // Another async-context transform in the same pipeline may have corrected it already.
+  if (code.includes('var i = "return" === r && o.k ? "return" : "next";')) return null;
   const before = 'var i = "return" === r ? "return" : "next";';
   const start = code.indexOf(before);
   if (
@@ -237,6 +240,123 @@ export function doRuntimeAwaitTransform(options?: DoRuntimeAwaitTransformOptions
       if (total > 0) {
         this.info(
           `do-runtime await transform: ${transformed}/${total} awaits gated in ${modules} await-bearing included modules`,
+        );
+      }
+    },
+  };
+}
+
+/** Aliases to built siblings of `dist/vite.js`, as for `INJECTED_MODULES`; none from source. */
+function packageAliases(
+  entries: readonly (readonly [find: string | RegExp, path: string])[],
+): Alias[] {
+  if (!import.meta.url.endsWith(".js")) return [];
+  return entries.map(([find, path]) => ({
+    find,
+    replacement: fileURLToPath(new URL(path, import.meta.url)),
+  }));
+}
+
+/**
+ * The platform modules a Workers bundle imports, aliased to this package's own files so
+ * `newRpcSession()` and application code see one `RpcTarget` class. Run from source it returns
+ * none: this repository's lanes alias the source files.
+ */
+export function workersModuleAliases(): Alias[] {
+  return packageAliases([
+    ["cloudflare:workers", "./cloudflare-workers.js"],
+    ["cloudflare:email", "./cloudflare-email.js"],
+  ]);
+}
+
+export interface BrowserHostOptions {
+  /** Actor and SDK modules whose awaits must re-enter the actor's input gate. */
+  include: FilterPattern;
+  /** Alias `async_hooks` to the browser shim and lower async functions for it (default true). */
+  asyncContext?: boolean;
+  /**
+   * One self-contained bundle per facet realm: a chunk it imports would bind that chunk's free
+   * `WebSocketPair`, streams and timers to the root actor's scope. Worker bundles build without
+   * code splitting, matched chunks get `facetScopeBanner({ registry })`, and the build fails if
+   * one imports anything. Match on `chunk.facadeModuleId`: a name can also match a shared chunk.
+   */
+  facets?: {
+    registry: string;
+    match(chunk: { name: string; facadeModuleId?: string | null }): unknown;
+  };
+}
+
+/**
+ * The Workers bundle contract of a browser host, for the application's `plugins`: Vite drops a
+ * Worker plugin's `resolve` config, while aliases returned here reach pre-bundled dependencies
+ * too. Register it in a browser-only config: the aliases apply to every Vite environment and take
+ * precedence over the application's own entries.
+ *
+ * Workers build as ES modules, which top-level await and module chunks need. They keep class
+ * names, as wrangler's `keep_names` does by default, because the Agents SDK routes and persists
+ * sub-agents by `constructor.name`. They run the await transform. Unbundled development serves
+ * Worker modules through the application plugins, so the transform also runs there while
+ * serving, and only then.
+ */
+export function browserHost(options: BrowserHostOptions): Plugin[] {
+  const { facets } = options;
+  const asyncContext = options.asyncContext ?? true;
+  const transform = () => doRuntimeAwaitTransform({ include: options.include, asyncContext });
+  return [
+    {
+      name: "do-runtime-browser-host",
+      config: () => ({
+        resolve: {
+          alias: [
+            ...workersModuleAliases(),
+            ...packageAliases(
+              asyncContext ? [[/^(node:)?async_hooks$/, "./browser/async-hooks.js"]] : [],
+            ),
+          ],
+        },
+        worker: {
+          format: "es",
+          plugins: () => [transform(), ...(facets ? [facetBundles(facets)] : [])],
+          rolldownOptions: {
+            output: { keepNames: true, ...(facets ? { codeSplitting: false } : {}) },
+          },
+        },
+      }),
+      configureServer(server) {
+        if (facets && !server.environments.client.config.isBundled) {
+          server.config.logger.warnOnce(
+            "do-runtime: unbundled dev serves facet modules without their scope banner, so their " +
+              "globals resolve to the root actor's; load facets from a build.",
+          );
+        }
+      },
+    },
+    { ...transform(), apply: "serve" },
+    ...(facets ? [facetBundles(facets)] : []),
+  ];
+}
+
+function facetBundles({ registry, match }: NonNullable<BrowserHostOptions["facets"]>): Plugin {
+  const banner = facetScopeBanner({ registry });
+  return {
+    name: "do-runtime-facet-bundles",
+    // The output hook rather than `output.banner`, so it composes with a host's own banner.
+    banner: (chunk) => (match(chunk) ? banner : ""),
+    generateBundle(_, bundle) {
+      const shared = Object.values(bundle).flatMap((chunk) => {
+        if (chunk.type !== "chunk" || !match(chunk)) return [];
+        // An inlined dynamic import is listed as the chunk's own file.
+        const imports = [...chunk.imports, ...chunk.dynamicImports].filter(
+          (file) => file !== chunk.fileName,
+        );
+        return imports.length > 0
+          ? [`facet chunk ${chunk.fileName} imports ${imports.join(", ")}`]
+          : [];
+      });
+      if (shared.length > 0) {
+        this.error(
+          `do-runtime: a facet must build to one self-contained chunk; a chunk it imports binds ` +
+            `its globals to the root actor's scope:\n${shared.join("\n")}`,
         );
       }
     },

@@ -182,6 +182,33 @@ export, all inside a normal browser tab.
 Start it at `http://localhost:5173` with
 `pnpm --filter do-runtime-example-vibe-platform dev`.
 
+### MV3 quickstart
+
+The [Chrome MV3 example](examples/extension/README.md) splits its host across
+three runtime contexts and a build. Each one imports only the subpaths it needs:
+
+| Context | Example file | Imports from `@mcp-b/do-runtime` |
+| --- | --- | --- |
+| Service worker | `src/background.ts` | `/browser/offscreen-document` (`OffscreenDocumentCoordinator`) and `/browser/alarm-coordinator` (`BrowserAlarmCoordinator`, `parseBrowserAlarmProjection`, `parseBrowserAlarmTransportJournal`). |
+| Offscreen document | `src/offscreen/offscreen.ts` | `/browser/message-port-websocket` (`createMessagePortWebSocketConstructor`, the client end of each socket). It spawns the actor Worker and opens its RPC session with `capnweb` directly. |
+| Actor Worker | `src/worker/actor.worker.ts` | The root (`createActorContainer`, `installActorScope`, `AlarmScheduler`, `newRpcSession`, `platformTimer`, `platformFetch` and more), `/backends/sqlite-wasm` (`installSqliteWasmHost`, `SqliteWasmActorStorage`, `createSqliteWasmProvider`), `/browser` (`connectMessagePortWebSocket`, `installWebSocketUpgradeGlobals`, `withWebSocketUpgrade`), `/browser/message-port-websocket` (`serveMessagePortWebSockets`) and `/browser/alarm-coordinator` (`createBrowserAlarmProjector`). `browserHost()` resolves its `cloudflare:workers` import to `/cloudflare-workers`. |
+| Build | `vite.config.ts` | `/vite`: `...browserHost({ include, facets })` in `plugins`. Each facet builds in a pass of its own (`vite build --mode <facet>`), which adds `doRuntimeAwaitTransform` and `output.keepNames: true` itself. |
+
+The popup imports nothing from the package. It only sends `chrome.runtime`
+messages.
+
+The example's manifest (`public/manifest.json`) has these entries:
+
+- A module service worker: `"background": { "service_worker": "background.js", "type": "module" }`.
+- `"permissions": ["alarms", "offscreen", "storage", "unlimitedStorage"]`. The
+  service worker arms `chrome.alarms`, creates the offscreen document with the
+  `WORKERS` reason, and journals each wake in `chrome.storage.local`.
+- `'wasm-unsafe-eval'` in the `script-src` of `content_security_policy.extension_pages`,
+  which the manifest needs: without it, sqlite-wasm cannot compile. The policy
+  also refuses `blob:` workers, so the actor Worker ships as its own file, not a
+  `?worker&inline` blob. `browserHost()` builds Workers as ES modules, which
+  top-level await and module chunks need.
+
 ## Durable Object semantics
 
 An actor has an identity and private state. A Durable Object adds gates that
@@ -239,7 +266,7 @@ Save this as `host.mts` and run `pnpm exec tsc && node host.mts`:
 ```ts
 import { mkdir } from "node:fs/promises";
 import { DurableObject } from "@mcp-b/do-runtime/cloudflare-workers";
-import { createActorContainer, DEFAULT_ALARM_OUTLET, noFacets, type Timer } from "@mcp-b/do-runtime";
+import { createActorContainer, DEFAULT_ALARM_OUTLET, noFacets, platformTimer } from "@mcp-b/do-runtime";
 import { createNodeSqlProvider } from "@mcp-b/do-runtime/backends/node-sqlite";
 
 class Counter extends DurableObject {
@@ -258,15 +285,6 @@ class Counter extends DurableObject {
 }
 
 // The host supplies the substrate: a clock, a database provider, alarm and facet outlets.
-const timer: Timer = {
-  now: () => Date.now(),
-  afterDelay: (ms, signal) =>
-    new Promise((resolve) => {
-      const handle = setTimeout(resolve, ms);
-      signal?.addEventListener("abort", () => clearTimeout(handle));
-    }),
-};
-
 await mkdir("./data", { recursive: true });
 const container = await createActorContainer({
   id: "counter-1",
@@ -277,7 +295,7 @@ const container = await createActorContainer({
     sql: createNodeSqlProvider({ directory: "./data" }),
     alarms: DEFAULT_ALARM_OUTLET, // refuses — a real host passes AlarmScheduler.hooks("counter-1")
     facets: noFacets, // refuses — a real host constructs a child container per request
-    timer,
+    timer: platformTimer,
   },
 });
 
@@ -287,11 +305,11 @@ await counter.increment(); // 2
 ```
 
 Open a second container over the same directory and `increment()` answers `3`:
-the instance was volatile, the storage was not. Inside an initialized actor
-worker, the browser host supplies
-`createSqliteWasmProvider({ pool, capi: sqlite3.capi }, { prefix: "/counter-1" })` from
-`@mcp-b/do-runtime/backends/sqlite-wasm`. The supervisor, OPFS pool, and worker
-bootstrapping are shown in the browser examples above.
+the instance was volatile, the storage was not. Inside a browser actor worker,
+`ports.sql` is `new SqliteWasmActorStorage(host, "/counter-1")`, where `host` is
+`await installSqliteWasmHost(sqlite3, { name: "my-app", clearOnInit: false })`.
+Both come from `@mcp-b/do-runtime/backends/sqlite-wasm`. The supervisor, OPFS
+pool, and worker bootstrapping are shown in the browser examples above.
 
 ## Hosting an actor
 
@@ -306,8 +324,8 @@ The runtime owns semantics; the host owns placement and substrate. `createActorC
 | `ports.sql` | A `SqlDatabaseProvider`: `backends/node-sqlite` or `backends/sqlite-wasm`. |
 | `ports.alarms` | `AlarmScheduler.hooks(id)` for a root actor. Facets have no alarm slot. |
 | `ports.facets` | A `FacetHost`: place a child container, abort it, copy or delete its storage. |
-| `ports.timer` | `now()` and `afterDelay()`, captured below any installed actor scope. |
-| `ports.fetch` | Optional global outbound. Absent means `fetch` refuses by name, as a Worker with `globalOutbound: null` does. |
+| `ports.timer` | `platformTimer`, or your own `now()` and `afterDelay()` below any installed actor scope. |
+| `ports.fetch` | Optional global outbound, such as `platformFetch`. Absent means `fetch` refuses by name, as a Worker with `globalOutbound: null` does. |
 | `ports.hibernation` | Optional mirror callbacks for accepted sockets, attachment bytes, auto-response changes, and closure. Omit it when the host never rebuilds a live socket placement. |
 | `webSockets` | Socket references and mirrored tags/attachments to register before the new instance constructor runs. |
 | `gateHooks` | Optional input/output gate instrumentation for an embedding host. |
@@ -328,9 +346,9 @@ The lifecycle:
 The order inside an actor worker is load-bearing. Each inversion below has a
 measured failure in the browser test lane:
 
-1. Capture raw platform timers at module scope and build the `Timer` port on
-   them. Reading the installed globals from that port recurses after the actor
-   scope replaces them.
+1. Pass `platformTimer` as `ports.timer` and, if the actor may fetch,
+   `platformFetch` as `ports.fetch`. A port that read the installed globals
+   would recurse once the actor scope replaces them.
 2. Set
    `globalThis.sqlite3ApiConfig = { disable: { vfs: { opfs: true, "opfs-wl": true } } }`
    before initializing sqlite. The host uses the SAH pool; the other OPFS VFSes
@@ -340,9 +358,10 @@ measured failure in the browser test lane:
 4. Install the actor scope with a resolver that throws when its container is
    gone. A torn-down worker must refuse new work instead of falling through to
    ungated platform timers.
-5. Use a stable pool name, preserve files with `clearOnInit: false`, and size the
-   pool for two databases per root plus journals. The pool owns exclusive sync
-   access handles, so another context cannot open it at the same time.
+5. Use a stable pool name and `clearOnInit: false`. `initialCapacity` is only
+   the starting size: the backend grows the pool on open. The pool owns
+   exclusive sync access handles, so another context cannot open it at the same
+   time.
 
 For a standard Durable Object binding, call
 `createDurableObjectNamespace(uniqueKey, channel)` and put the result in `env`
@@ -353,7 +372,9 @@ thunks to the target's `container.resolveLoopback()`; it invokes the raw
 instance only when the exact caller is that target and otherwise owns the callee
 entry and caller `awaitIo`. Current slices and transformed continuations resolve
 automatically; pass the still-lock-holding structural caller as the third
-argument from untransformed post-await code. For an external transport, wrap
+argument from untransformed post-await code. `counterNamespace()` in
+`examples/extension/src/worker/actor.worker.ts` shows an in-realm binding built
+this way. For an external transport, wrap
 its promise with the caller's `container.awaitIo()` so the continuation
 re-enters the owning input gate.
 
@@ -379,6 +400,8 @@ The browser provider takes an already-installed OPFS SAH pool (`installSqliteWas
 
 Install every pool with `installSqliteWasmHost(sqlite3, options)` from `@mcp-b/do-runtime/backends/sqlite-wasm`, not with the driver's `installOpfsSAHPoolVfs`. It takes the same `name`, `directory`, `clearOnInit` and `initialCapacity` options and returns the `{ pool, capi }` host the provider expects. It also fixes two driver behaviours that lose data when the browser terminates a worker. A failed install deletes the pool's directory, so the helper first waits up to 10 seconds for the previous owner to release every file. The driver also never rolls back a transaction a terminated worker left open, so its uncommitted pages can overwrite committed rows; the helper makes SQLite roll the transaction back when the database is reopened. That fix applies to every SAH pool in the same sqlite3 instance and assumes one connection per database file, which is how this backend opens them.
 
+Opening a database, importing a snapshot and `copyFrom()` each grow the pool first, with the pool's own `reserveMinimumCapacity()`. The pool then holds every file plus a rollback journal for each open connection, so `initialCapacity` is only the size a new pool starts at. These steps run one at a time per pool, and the pool never shrinks. If the browser refuses the storage, the step fails with the driver's error. A wrapper around the driver's pool must forward `reserveMinimumCapacity`.
+
 Both concrete providers also implement `SqlDatabaseSnapshotProvider`. After the host has stopped the actor, `provider.close()` releases every database handle; `exportSnapshot()` then returns the SQLite images for the whole actor storage scope, and `importSnapshot()` replaces an idle scope. The same snapshot can seed a cold local replica because SQLite images are portable between these providers. Node snapshots require a dedicated directory-backed provider. This is backup/restore and replica seeding, not Cloudflare's time-indexed PITR or continuously updated read replication.
 
 The browser provider attempts to restore the original images when a snapshot import or direct `SqliteWasmActorStorage.copyFrom()` replacement fails; `SqliteWasmRestoreError.recoverySnapshot` retains those images if rollback also fails. This rollback lives in memory and cannot survive Worker or process loss during replacement; a host requiring that guarantee must import into a fresh prefix and durably switch placement after success.
@@ -386,6 +409,8 @@ The browser provider attempts to restore the original images when a snapshot imp
 ### Alarms
 
 Construct one `AlarmScheduler` per namespace over a `SqlDatabase` of its own. It owns `_cf_ALARM`, delivery, retry counts (`ALARM_RETRY_MAX_TRIES`), exponential backoff with jitter, and abandonment. Pass `scheduler.hooks(id)` as a root actor's `ports.alarms`, and give the scheduler a `getActor(id)` that places the actor if it is not running — an alarm is a reason to wake a Durable Object, not something that needs one awake already.
+
+A host whose scheduler lives in another worker forwards `AlarmOutlet.reconcile` as well as `scheduleRun`, and its `scheduleRun` awaits `priorTask` before sending. `createActorContainer` passes a root's stored alarm to `reconcile` before constructing the actor, and a rejection fails the placement. That repairs a schedule request lost after the actor's commit, at the actor's next placement, without resetting the retry ladder of an alarm the scheduler already holds or queueing a second delivery of it.
 
 A suspending browser host projects the scheduler's next wake through both halves of `@mcp-b/do-runtime/browser/alarm-coordinator`. In the background worker, `BrowserAlarmCoordinator` journals the physical hop, drops stale projections, rearms a consumed watchdog, and reconciles after restart; the host supplies durable journal storage, the physical alarm calls, and `deliver()`. Beside the scheduler, `createBrowserAlarmProjector()` supplies the scheduler's `projectWake` and the `acknowledge()` that `deliver()` returns across the host's transport; the background passes whatever arrives over that transport through `parseBrowserAlarmProjection()`, which returns `null` for a malformed projection, before `coordinator.project()`. Logical delivery policy remains in `AlarmScheduler`.
 
@@ -433,7 +458,10 @@ A missing route closes the client 1011, and a refused upgrade closes it 1008
 with the refusal's text when it is printable ASCII of at most 123 bytes. It does
 not tell the peer the socket opened: `serveMessagePortWebSockets(port, (bridge, url) => …)`
 sends that to clients from `createMessagePortWebSocketConstructor`, and a host
-with its own port protocol opens its end itself.
+with its own port protocol opens its end itself. Embedders relay
+`MessagePortWebSocketWireMessage` verbatim to extension clients, so a new frame
+type is a breaking change for them. That is why the "open" frame stayed out of
+`connectMessagePortWebSocket`.
 
 `container.quiescence()` reports armed timers, pending `waitUntil` work, input
 lock state, and output-gate breakage without waiting. `drainWaitUntil()` is for
@@ -441,7 +469,7 @@ shutdown and intentionally never settles while a live interval remains armed.
 
 Actor bundles can also install `doRuntimeAwaitTransform()` from `@mcp-b/do-runtime/vite`. Transformed awaits follow workerd's rule, with the exceptions in [gating coverage](docs/gating-coverage.md#transform). An await that settles while the actor still holds its input lock continues in the same checkpoint and keeps the lock and the implicit transaction: storage calls, plain values, and resumptions the runtime already admitted. An await on foreign I/O re-enters through a fresh input lock. A production build checks the final module graph and fails with transformed/total counts for any included module with an uncovered await; the development transform warns once per module if a transformed await reaches its fail-open path without an actor lock.
 
-The plugin resolves the imports it injects (`@mcp-b/do-runtime/gate`, `@mcp-b/do-runtime/browser/async-hooks`) to this package's own files, ahead of any host alias for them. `asyncContext: true` lowers async functions for the browser `AsyncLocalStorage`. Any dependency importing `cloudflare:workers`, `cloudflare:email` (a data-only `EmailMessage`) or `node:async_hooks`, including one Vite pre-bundles, still needs host aliases to `@mcp-b/do-runtime/cloudflare-workers`, `/cloudflare-email` and `/browser/async-hooks`. A host that loads facet bundles by URL into its root's realm prefixes each with `facetScopeBanner({ registry })`, which binds every name `installActorScope` writes (`ACTOR_SCOPE_GLOBALS`) to `globalThis[registry][scope]`, where `scope` is the bundle URL's `?scope=` parameter.
+The plugin resolves the imports it injects (`@mcp-b/do-runtime/gate`, `@mcp-b/do-runtime/browser/async-hooks`) to this package's own files, ahead of any host alias for them. `asyncContext: true` lowers async functions for the browser `AsyncLocalStorage`. Browser build: register `...browserHost({ include: actorModules })` from `@mcp-b/do-runtime/vite` in the `plugins` of a browser-only config; its aliases apply to every environment and win over the application's own. It aliases `cloudflare:workers`, `cloudflare:email` and `async_hooks` to this package's files, pre-bundled dependencies included, builds Workers as ES modules that keep class names, and runs this transform in Workers and, while serving, in the application. Without it, any dependency importing `cloudflare:workers`, `cloudflare:email` (a data-only `EmailMessage`) or `node:async_hooks`, including one Vite pre-bundles, needs host aliases to `@mcp-b/do-runtime/cloudflare-workers`, `/cloudflare-email` and `/browser/async-hooks`; `workersModuleAliases()` returns the first two. A host that loads facet bundles by URL into its root's realm prefixes each with `facetScopeBanner({ registry })`, which binds every name `installActorScope` writes (`ACTOR_SCOPE_GLOBALS`) to `globalThis[registry][scope]`, where `scope` is the bundle URL's `?scope=` parameter. With `facets: { registry, match }`, Worker bundles build without code splitting, each matched chunk gets `facetScopeBanner({ registry })`, and the build fails if a matched chunk imports anything. Match on `chunk.facadeModuleId`.
 
 ## What is not supported
 
@@ -502,7 +530,7 @@ pnpm test:conformance-browser-transformed   # the browser suite, compiled the sa
 pnpm test                                   # all of the above
 ```
 
-The workerd lane is what makes the others mean something: every row it passes is a contract the Node and browser lanes must also pass, including cross-root RPC gate release and resumption. The browser smoke lane also fills the real OPFS SAH pool to capacity and proves visible failure, no leaked slot, and recovery. Three of its smoke specs terminate a real worker mid-operation: `actor-crash` (the hot journal is rolled back and acknowledged writes survive), `alarm-recovery` (an interrupted alarm is redelivered exactly once), and `hibernation-worker-restart` (hibernated sockets survive through transferred `MessagePort`s). A substrate that lacks a feature asserts the named refusal instead of skipping the row. `pnpm bench:node` and `pnpm bench:browser` measure `sql.exec` latency over a realistic message store on each substrate.
+The workerd lane is what makes the others mean something: every row it passes is a contract the Node and browser lanes must also pass, including cross-root RPC gate release and resumption. The browser smoke lane also proves that opening a database grows a full OPFS SAH pool past its starting size, and that a full pool which cannot grow fails visibly, leaks no slot, and recovers once space is freed. Three of its smoke specs terminate a real worker mid-operation: `actor-crash` (the hot journal is rolled back and acknowledged writes survive), `alarm-recovery` (an interrupted alarm is redelivered exactly once), and `hibernation-worker-restart` (hibernated sockets survive through transferred `MessagePort`s). A substrate that lacks a feature asserts the named refusal instead of skipping the row. `pnpm bench:node` and `pnpm bench:browser` measure `sql.exec` latency over a realistic message store on each substrate.
 
 ## Development
 

@@ -79,7 +79,8 @@ import { SqliteMetadata } from "../util/sqlite-metadata";
 import { type SqliteCriticalError, SqliteDatabase } from "../util/sqlite";
 
 /**
- * The alarm port — one outbound method, matching upstream's seam exactly.
+ * The alarm port — upstream's one outbound method, plus `AlarmOutlet.reconcile`,
+ * which is this package's own.
  *
  * Everything else about alarms is runtime-internal: arm/consume semantics here,
  * retry ladder and serialised delivery in `server/alarm-scheduler.ts`. Delivery
@@ -98,9 +99,30 @@ export interface AlarmOutlet {
    * scheduled alarm is always at or before the persisted one.
    *
    * May throw synchronously; `ActorSqlite` relies on it, because a scheduling
-   * failure has to reach the caller before the local database commits.
+   * failure has to reach the caller before the local database commits. An
+   * outlet that reaches its scheduler over RPC cannot throw synchronously, so
+   * its commit can be durable while the request is lost. `AlarmOutlet.reconcile`
+   * repairs that at the actor's next placement.
    */
   scheduleRun(newAlarmTime: number | null, priorTask: Promise<void>): Promise<void>;
+
+  /**
+   * Package-original (docs/decisions.md). A root container opening over
+   * storage that holds an alarm calls this once, with that alarm, before the
+   * actor is constructed. It repairs a scheduler that lost a schedule request,
+   * which `ActorSqlite` cannot see: on reopen it assumes the scheduler holds
+   * what was persisted.
+   *
+   * Must be idempotent: a schedule already due at or before `stored` stays as
+   * it is, retry state and any delivery in flight included. Opening a container
+   * therefore never resets the ladder of, or queues a second delivery for, an
+   * alarm the scheduler already holds at or before `stored`. Alarms stay
+   * at-least-once: an alarm whose success was reported but whose deletion never
+   * committed runs again. `AlarmScheduler.hooks` implements it.
+   *
+   * Fail-closed like `scheduleRun`: a rejection fails container creation.
+   */
+  reconcile?(stored: number): Promise<void> | void;
 }
 
 /** ← `ActorSqlite::Hooks::DEFAULT`, whose `scheduleRun` refuses. */

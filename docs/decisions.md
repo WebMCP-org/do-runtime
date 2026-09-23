@@ -277,6 +277,11 @@ consumer peer dependencies retain one identity.
     `user_version`. Application schemas are the application's own, migrated
     in constructors exactly as on Cloudflare — the Agents SDK's versioned
     `_ensureSchema` and Drizzle's `durable-sqlite` migrator run unchanged.
+20. Treat `MessagePortWebSocketWireMessage` as a published wire format with
+    two frames, `message` and `close`. Embedders relay it verbatim to extension
+    clients, so a new frame type breaks them. `connectMessagePortWebSocket`
+    therefore sends no `open` frame; only `serveMessagePortWebSockets` sends
+    one, to its own clients.
 
 ## Deliberate divergences
 
@@ -296,6 +301,7 @@ consumer peer dependencies retain one identity.
 | A response BYOB reader cannot be re-gated after `read(view)` | BYOB readers throw; callers use a default reader or `arrayBuffer()` |
 | A workerd facet alarm appears to schedule and then breaks asynchronously ([workerd#6810](https://github.com/cloudflare/workerd/issues/6810)) | This runtime refuses facet `setAlarm()` synchronously |
 | A host may lose a physical wake between durable and platform timer writes | The host timer journals an opaque one-shot token before arming; the scheduler remains authoritative |
+| Workerd's alarm outlet is in-process and throws before the local commit; it has no remote outlet | An outlet reached over RPC cannot throw synchronously, so a lost request can leave an alarm persisted but unscheduled until the actor is next placed. At that placement the package-original `AlarmOutlet.reconcile` hands the root's persisted alarm to the scheduler before the actor is constructed. `AlarmScheduler.hooks` then sets only a missing or later schedule, so no retry ladder or running delivery is reset |
 | No jsg exception provenance in browser errors | An unclassified alarm failure stays retryable rather than being prematurely abandoned |
 | Local SQLite has no Cloudflare PITR or read-replica service | Those APIs throw named errors; bookmarks remain development counters, not recovery points |
 | Local SQLite has no libsql billing counters | SQL and ingest counters report returned rows and SQLite changes |

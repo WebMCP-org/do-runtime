@@ -1,10 +1,16 @@
 # Browser SDK async context
 
-Alias `node:async_hooks` (and bare `async_hooks` when needed) to
-`@mcp-b/do-runtime/browser/async-hooks`, and enable
-`doRuntimeAwaitTransform({ include: actorModules, asyncContext: true })` in both
-the application and Worker Vite plugins. Include the actor and every SDK module
-whose async functions need context. The extension example has a complete setup.
+Add `...browserHost({ include: actorModules })` from `@mcp-b/do-runtime/vite` to
+the application's Vite `plugins`. It aliases bare and `node:` `async_hooks` to
+`@mcp-b/do-runtime/browser/async-hooks` and runs
+`doRuntimeAwaitTransform({ include, asyncContext: true })` in Worker bundles. It
+also runs the transform in the application plugins, but only while serving:
+unbundled development serves Worker modules through them. Include the actor and
+every SDK module whose async functions need context, and keep those modules out
+of `optimizeDeps` in development, because pre-bundling skips plugin transforms.
+A build that bundles actor code outside `worker`, as the extension example's
+facet passes do, adds the transform itself. The extension example has a complete
+setup.
 
 The shim supports the Agents SDK's `AsyncLocalStorage`: independent stores,
 `run`, `getStore`, `exit`, `enterWith`, `disable`, `bind` and static `snapshot`.

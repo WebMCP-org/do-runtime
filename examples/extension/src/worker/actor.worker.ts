@@ -31,6 +31,8 @@ import {
   HibernationMirror,
   installActorScope,
   newRpcSession,
+  platformFetch,
+  platformTimer,
   type ActorContainer,
   type ActorEntry,
   type ActorGlobalScope,
@@ -41,7 +43,6 @@ import {
   type FacetId,
   type FacetStartRequest,
   type FacetTree,
-  type Timer,
 } from "@mcp-b/do-runtime";
 import {
   createSqliteWasmProvider,
@@ -72,44 +73,6 @@ import type {
   WorkerBoot,
 } from "../protocol";
 import { Counter, type CounterEnv } from "./counter";
-
-// =======================================================================================
-// Raw platform primitives, captured before anything else in this module can run
-//
-// `installActorScope` REPLACES `globalThis.setTimeout` with the container's
-// gated one, and the container's gated one is built ON the `Timer` port below.
-// So a `Timer` that read the installed global would arm a timeout in order to
-// implement a timeout — `#arm` → `afterDelay` → `setTimeout` → `setTimeoutImpl`
-// → `#arm` — which the runtime measured as `RangeError: Maximum call stack size
-// exceeded` the first time its own primitives were pointed at themselves.
-//
-// The general rule, and it is the reason these captures are the first
-// statements in the file: everything BELOW the runtime in one realm has to reach
-// the platform's timers, either by capturing them here or by running before the
-// scope is installed. `installSubstrate` does the second for sqlite.
-
-const rawSetTimeout = globalThis.setTimeout.bind(globalThis);
-const rawClearTimeout = globalThis.clearTimeout.bind(globalThis);
-const rawFetch = globalThis.fetch.bind(globalThis);
-
-/**
- * The clock and the delay the runtime and the scheduler both run on, over the
- * raw timers above.
- *
- * Cancellation leaves the promise unsettled rather than rejecting it, which is
- * what the runtime's own timer does: the waiter is gone, so nothing is owed an
- * answer.
- */
-const timer: Timer = {
-  now: () => Date.now(),
-  afterDelay: (ms, signal) =>
-    new Promise<void>((resolve) => {
-      const handle = rawSetTimeout(resolve, Math.max(0, ms));
-      signal?.addEventListener("abort", () => {
-        rawClearTimeout(handle);
-      });
-    }),
-};
 
 // =======================================================================================
 // Constants a host owes the runtime, and both of them are forever
@@ -153,20 +116,7 @@ const ACTOR_PREFIX = "/actor";
 const ALARM_PREFIX = "/alarms";
 const ALARM_DATABASE = "scheduler";
 
-/**
- * The pool's capacity, in files.
- *
- * The default of 6 is not enough. This root opens **two** databases — its own
- * storage and the facet tree index the runtime keeps beside it — the scheduler
- * opens a third, and SQLite puts a rollback journal beside each of those as a
- * further file. That is six before anything unusual happens. Each sub-agent
- * opens another database and journal, so size the pool for a useful actor tree
- * rather than the root alone.
- *
- * Running out is nameable but not obvious: the pool logs `SAH pool is full.
- * Cannot create file …` on the console and the caller gets
- * `SQLITE_CANTOPEN: sqlite3 result code 14`. This line is the knob.
- */
+/** The pool's starting size, in files. The backend grows the pool on open. */
 const POOL_CAPACITY = 64;
 const EVICTION_POLL_MS = 10;
 const EVICTION_TIMEOUT_MS = 5_000;
@@ -260,8 +210,8 @@ class ExtensionFacetHost implements FacetHost {
           sql: storage,
           alarms: DEFAULT_ALARM_OUTLET,
           facets: this,
-          timer,
-          fetch: rawFetch,
+          timer: platformTimer,
+          fetch: platformFetch,
         },
         facet: { depth: request.depth, id: request.id, tree },
       });
@@ -367,6 +317,8 @@ type Live = {
    * gated event, so this is the only handle anything outside the actor gets.
    */
   readonly entry: ActorEntry<Counter>;
+  /** The raw instance, which only the actor's own loopback calls reach. */
+  readonly instance: Counter;
   readonly storage: SqliteWasmActorStorage;
 };
 
@@ -388,18 +340,22 @@ function counterNamespace(gate?: FacetModule["gate"]) {
       if (live === undefined) {
         throw new Error("do-runtime example: root loopback reached before placement");
       }
+      const { container, instance } = live;
       const target = live.entry as unknown as Fetcher;
       const caller = gate?.container;
       if (caller === undefined) return target;
+      // The runtime decides between the raw instance, for the actor's own call
+      // (its entry would queue behind the lock the caller holds), and the entry
+      // under the caller's output gate and `awaitIo`.
       return new Proxy(target, {
         get(subject, property): unknown {
           const value: unknown = Reflect.get(subject, property, subject);
           if (typeof value !== "function") return value;
           return (...args: unknown[]) =>
-            caller.awaitIo(
-              caller.waitOutputLocks().then(() =>
-                Reflect.apply(value as (...values: unknown[]) => unknown, subject, args),
-              ),
+            container.resolveLoopback(
+              () => Reflect.apply(Reflect.get(instance, property, instance), instance, args),
+              () => Reflect.apply(value, subject, args),
+              caller,
             );
         },
       });
@@ -413,7 +369,7 @@ installWebSocketUpgradeGlobals();
 
 /**
  * What the installed globals resolve to, and it REFUSES rather than falling
- * through to the raw timers above.
+ * through to the platform's timers.
  *
  * One worker hosts one root here, so "no container" cannot mean "called from
  * outside any actor" — it can only mean the container was torn down while its
@@ -474,8 +430,8 @@ async function installSubstrate(): Promise<Substrate> {
   //
   // `installOpfsSAHPoolVfs` probes the other OPFS VFSes on its way in, and those
   // probes arm watchdogs through the GLOBAL `setTimeout`. sqlite-wasm is a
-  // third-party module in this realm and cannot be made to capture a raw timer
-  // the way this file does at the top, so installing the actor scope first hands
+  // third-party module in this realm and cannot be made to use `platformTimer`
+  // the way this file's ports do, so installing the actor scope first hands
   // the actor's gate to a storage library. Measured on the runtime's own browser
   // lane, that produced `Ignoring inability to install the … sqlite3_vfs`
   // warnings carrying the actor scope's refusal text.
@@ -545,7 +501,7 @@ async function installSubstrate(): Promise<Substrate> {
     },
   });
   const scheduler = new AlarmScheduler({
-    timer,
+    timer: platformTimer,
     db,
     getActor: () => ({
       deliverAlarm: async (scheduledTime: number, retryCount: number): Promise<AlarmResult> =>
@@ -599,10 +555,10 @@ async function place(): Promise<Live> {
       // reaches it. The host composes the two rather than writing a ladder.
       alarms: scheduler.hooks(ACTOR_ID),
       facets,
-      timer,
+      timer: platformTimer,
       hibernation,
       // Actor globals wrap this native outlet to gate outgoing MCP/OAuth I/O.
-      fetch: rawFetch,
+      fetch: platformFetch,
     },
     webSockets: hibernation.snapshot(),
   });
@@ -637,7 +593,7 @@ async function place(): Promise<Live> {
     storage.close();
     throw error;
   }
-  live = { container, entry: container.entry(instance), storage };
+  live = { container, entry: container.entry(instance), instance, storage };
   return live;
 }
 
@@ -675,7 +631,7 @@ async function waitUntilEvictable(container: ActorContainer): Promise<void> {
     if (Date.now() >= deadline) {
       throw new Error(`The actor did not become idle: ${JSON.stringify(state)}`);
     }
-    await timer.afterDelay(EVICTION_POLL_MS);
+    await platformTimer.afterDelay(EVICTION_POLL_MS);
   }
 }
 

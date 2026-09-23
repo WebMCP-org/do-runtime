@@ -1,6 +1,13 @@
-import { build, parseSync, type Plugin } from "vite";
+import { existsSync, readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { build, parseSync, type Plugin, type UserConfig } from "vite";
 import { describe, expect, test } from "vitest";
-import { doRuntimeAwaitTransform, type DoRuntimeAwaitTransformOptions } from "./vite";
+import {
+  browserHost,
+  doRuntimeAwaitTransform,
+  workersModuleAliases,
+  type DoRuntimeAwaitTransformOptions,
+} from "./vite";
 
 const HEADER =
   '/* @do-runtime-gated */\nimport { __gateAsyncIterable, __gateAwait, __resumeAwait } from "@mcp-b/do-runtime/gate";\n';
@@ -85,6 +92,9 @@ describe("doRuntimeAwaitTransform", () => {
                   : null,
         },
         doRuntimeAwaitTransform({ include: actorId, asyncContext: true }),
+        // A second async-context transform, as `browserHost()` beside a host's own, must
+        // leave the helper the first one corrected alone.
+        doRuntimeAwaitTransform({ include: "/unused", asyncContext: true }),
       ],
       build: {
         write: false,
@@ -270,4 +280,143 @@ test("from source, the plugin leaves its injected imports to the host's resoluti
   for (const id of ["@mcp-b/do-runtime/gate", "@mcp-b/do-runtime/browser/async-hooks"]) {
     expect(await Reflect.apply(hook.handler, {}, [id, undefined, {}])).toBeNull();
   }
+});
+
+describe("browserHost", () => {
+  const include = "**/actor/**";
+
+  function pluginNamed(plugins: readonly Plugin[], name: string): Plugin {
+    const plugin = plugins.find((candidate) => candidate.name === name);
+    if (plugin === undefined) throw new Error(`browserHost returned no ${name} plugin`);
+    return plugin;
+  }
+
+  function presetConfig(plugins: readonly Plugin[]): UserConfig {
+    const hook = pluginNamed(plugins, "do-runtime-browser-host").config;
+    if (typeof hook !== "function") throw new Error("expected a config function");
+    return Reflect.apply(hook, {}, [{}, { command: "build", mode: "production" }]) as UserConfig;
+  }
+
+  test("aliases the platform modules and async_hooks to the files the export map names", async () => {
+    // From source the preset leaves them to the host, as the plugin does its injected imports.
+    expect(workersModuleAliases()).toEqual([]);
+    expect(presetConfig(browserHost({ include })).resolve?.alias).toEqual([]);
+
+    // The built entry, which `pnpm typecheck` builds first, as CI does.
+    const built = (await import(
+      new URL("../dist/vite.js", import.meta.url).href
+    )) as typeof import("./vite");
+    const manifest = JSON.parse(
+      readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+    ) as {
+      exports: Record<
+        "./cloudflare-workers" | "./cloudflare-email" | "./browser/async-hooks",
+        { import: string }
+      >;
+    };
+    const exported = (subpath: keyof typeof manifest.exports): string =>
+      fileURLToPath(new URL(manifest.exports[subpath].import, new URL("../", import.meta.url)));
+    const workers = [
+      { find: "cloudflare:workers", replacement: exported("./cloudflare-workers") },
+      { find: "cloudflare:email", replacement: exported("./cloudflare-email") },
+    ];
+    const asyncHooks = {
+      find: /^(node:)?async_hooks$/,
+      replacement: exported("./browser/async-hooks"),
+    };
+
+    expect(built.workersModuleAliases()).toEqual(workers);
+    expect(presetConfig(built.browserHost({ include })).resolve?.alias).toEqual([
+      ...workers,
+      asyncHooks,
+    ]);
+    expect(
+      presetConfig(built.browserHost({ include, asyncContext: false })).resolve?.alias,
+    ).toEqual(workers);
+    for (const { replacement } of [...workers, asyncHooks]) {
+      expect(existsSync(replacement)).toBe(true);
+    }
+  });
+
+  test("builds Workers as named ES modules through the transform, whole per facet realm", async () => {
+    const plugins = (worker: UserConfig["worker"]) =>
+      (worker?.plugins?.() ?? []).map((plugin) => plugin as Plugin);
+    const facets = { registry: "__facets", match: () => true };
+
+    const { worker } = presetConfig(browserHost({ include, facets }));
+    expect(worker?.format).toBe("es");
+    expect(worker?.rolldownOptions?.output).toEqual({ keepNames: true, codeSplitting: false });
+    expect(plugins(worker).map((plugin) => plugin.name)).toEqual([
+      "do-runtime-await-transform",
+      "do-runtime-facet-bundles",
+    ]);
+
+    const plain = presetConfig(browserHost({ include })).worker;
+    expect(plain?.rolldownOptions?.output).toEqual({ keepNames: true });
+    const [transform, ...others] = plugins(plain);
+    expect(others).toEqual([]);
+    if (transform === undefined) throw new Error("Workers get no await transform");
+    // The Worker transform honours `include` and lowers for async context.
+    const source = "export async function f() { await x; }\n";
+    expect(await transformWith(transform, source, "/src/actor/a.js")).toContain(
+      "@mcp-b/do-runtime/browser/async-hooks",
+    );
+    await expect(transformWith(transform, source, "/src/page/a.js")).resolves.toBe(source);
+  });
+
+  test("runs the await transform in application plugins only while serving", () => {
+    expect(pluginNamed(browserHost({ include }), "do-runtime-await-transform").apply).toBe("serve");
+  });
+
+  test("banners a self-contained facet chunk and fails a build whose facet chunk imports another", async () => {
+    const modules: Record<string, string> = {
+      "/facet.js":
+        'import { same } from "/shared.js";\nexport const facet = () => same(new WebSocketPair());\nexport const later = () => import("/lazy.js");\n',
+      "/root.js": 'import { same } from "/shared.js";\nexport const root = same;\n',
+      "/shared.js": "export const same = (value) => value;\n",
+      "/lazy.js": "export const lazy = 1;\n",
+    };
+    const virtualModules: Plugin = {
+      name: "virtual-facet",
+      resolveId: (id) => (id in modules ? id : null),
+      load: (id) => modules[id] ?? null,
+    };
+    const facetBuild = (input: Record<string, string>, codeSplitting: boolean) =>
+      build({
+        configFile: false,
+        logLevel: "silent",
+        plugins: [
+          virtualModules,
+          ...browserHost({
+            include,
+            facets: { registry: "__facets", match: (chunk) => chunk.name === "facet" },
+          }),
+        ],
+        build: {
+          write: false,
+          minify: false,
+          rollupOptions: {
+            input,
+            preserveEntrySignatures: "strict",
+            output: { codeSplitting, banner: "/* host banner */" },
+          },
+        },
+      });
+
+    await expect(facetBuild({ facet: "/facet.js", root: "/root.js" }, true)).rejects.toThrow(
+      /facet chunk assets\/facet-[\w-]+\.js imports assets\/shared-[\w-]+\.js, assets\/lazy-[\w-]+\.js/,
+    );
+
+    const generated = await facetBuild({ facet: "/facet.js" }, false);
+    if (Array.isArray(generated) || !("output" in generated)) {
+      throw new Error("Expected one bundle");
+    }
+    const { code } = generated.output[0];
+    // Rolldown reprints the banner (`undefined` becomes `void 0`), so match its bindings.
+    expect(code).toContain("/* host banner */");
+    expect(code).toContain('globalThis["__facets"]');
+    expect(code).toMatch(
+      /const \{[^}]*\bWebSocketPair\b[^}]*\} = __facetScope;[\s\S]*new WebSocketPair\(\)/,
+    );
+  });
 });

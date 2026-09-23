@@ -1,12 +1,11 @@
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
-import { doRuntimeAwaitTransform, facetScopeBanner } from "@mcp-b/do-runtime/vite";
+import { browserHost, doRuntimeAwaitTransform } from "@mcp-b/do-runtime/vite";
 import agents from "agents/vite";
 import { defaultClientConditions, defineConfig } from "vite";
 
 const packageRoot = fileURLToPath(new URL("../../", import.meta.url));
 const resolvePackage = createRequire(import.meta.url).resolve;
-const cloudflareWorkersModule = `${packageRoot}dist/cloudflare-workers.js`;
 const cloudflareShellModule = `${packageRoot}vendor/agents/packages/shell/dist/index.js`;
 const unenvNode = (name: string): string => resolvePackage(`unenv/node/${name}`);
 
@@ -23,24 +22,40 @@ const actorAwaitTransformInclude = [
   "**/node_modules/**/@modelcontextprotocol/**",
 ];
 
-const actorPlugins = () => [
-  ...agents(),
-  doRuntimeAwaitTransform({ include: actorAwaitTransformInclude, asyncContext: true }),
-];
-
-const facetBanner = (chunk: { name: string }): string =>
-  chunk.name === "counter-child" || chunk.name === "think-probe"
-    ? facetScopeBanner({ registry: "__doRuntimeExtensionFacetScopes" })
-    : "";
+/**
+ * The facet modules the actor worker imports by URL into its own realm, each
+ * built alone by `vite build --mode <name>`. A chunk shared with another entry
+ * would bind its globals to the root actor's scope, so `browserHost` fails the
+ * build when a facet chunk imports one.
+ */
+const facetEntries = new Map([
+  ["counter-child", "src/worker/counter-child.worker.ts"],
+  ["think-probe", "src/worker/think-probe.ts"],
+]);
 
 export default defineConfig(({ mode }) => ({
-  plugins: actorPlugins(),
+  plugins: [
+    ...agents(),
+    ...browserHost({
+      include: actorAwaitTransformInclude,
+      facets: {
+        registry: "__doRuntimeExtensionFacetScopes",
+        match: (chunk) =>
+          [...facetEntries.values()].some((entry) => chunk.facadeModuleId?.endsWith(entry)),
+      },
+    }),
+    // A facet pass builds actor code outside `worker`, so it adds the transform
+    // that the preset keeps out of page builds.
+    ...(facetEntries.has(mode)
+      ? [doRuntimeAwaitTransform({ include: actorAwaitTransformInclude, asyncContext: true })]
+      : []),
+  ],
   /**
    * Un-hashed, predictable entries because the manifest and runtime facet
    * loader cannot reference content hashes.
    */
   build:
-    mode === "think-probe"
+    facetEntries.has(mode)
       ? {
           outDir: "dist",
           emptyOutDir: false,
@@ -48,12 +63,16 @@ export default defineConfig(({ mode }) => ({
           minify: false,
           modulePreload: false,
           rollupOptions: {
-            input: "src/worker/think-probe.ts",
+            input: facetEntries.get(mode),
+            // The actor worker imports the facet's class exports at runtime, so
+            // they are the extension's host ABI rather than dead entry code.
             preserveEntrySignatures: "strict",
             output: {
               codeSplitting: false,
-              banner: facetBanner,
-              entryFileNames: "think-probe.js",
+              // `subAgent(CounterLeaf)` routes by class name, which a minifier
+              // would mangle. The preset keeps names only in `worker` output.
+              keepNames: true,
+              entryFileNames: `${mode}.js`,
             },
           },
         }
@@ -69,25 +88,16 @@ export default defineConfig(({ mode }) => ({
           // Extensions load from disk. Preload hints buy nothing and add a chunk.
           modulePreload: false,
           rollupOptions: {
-            // `counter-child` is imported at runtime by the actor worker, so its class
-            // export is part of the extension's host ABI rather than dead app-entry code.
-            preserveEntrySignatures: "strict",
             // Relative to `root`, which is this directory. The two HTML entries sit at
             // the example root rather than under `src/`, so their built copies land at
             // `dist/offscreen.html` and `dist/popup.html` — the flat paths the manifest
             // and `chrome.offscreen.createDocument({ url })` both expect.
             input: {
               background: "src/background.ts",
-              "counter-child": "src/worker/counter-child.worker.ts",
               offscreen: "offscreen.html",
               popup: "popup.html",
             },
             output: {
-              // A Dynamic Worker gets its own global scope on workerd. In this
-              // same-worker browser host, bind the complete built facet module instead
-              // so dependencies such as the Agents SDK cannot fall through to the
-              // root actor's globals.
-              banner: facetBanner,
               entryFileNames: "[name].js",
               chunkFileNames: "assets/[name]-[hash].js",
               assetFileNames: "assets/[name]-[hash][extname]",
@@ -95,41 +105,20 @@ export default defineConfig(({ mode }) => ({
           },
         },
 
-  /**
-   * `new Worker(new URL(…), { type: "module" })` must build to a real module
-   * worker.
-   *
-   * The effective worker policy on an extension page is `'self'` — either from
-   * the manifest's `worker-src`, or by CSP3's fallback to `script-src` when it is
-   * absent — and a `chrome-extension://` script URL satisfies it while a `blob:`
-   * URL does not. Rollup's classic-worker fallback wraps the bundle in a blob, so
-   * this line is what keeps the worker loadable at all.
-   */
+  // `browserHost` adds the rest: Workers build as ES modules, which top-level
+  // await and module chunks need; they keep class names and run the transform.
   worker: {
-    format: "es",
-    plugins: actorPlugins,
+    plugins: () => agents(),
   },
 
   resolve: {
     conditions: ["worker", ...defaultClientConditions],
+    // `browserHost` aliases `cloudflare:workers`, `cloudflare:email` and
+    // `async_hooks` to the package's own files.
     alias: {
-      /**
-       * The specifier a Workers module imports `DurableObject` and `RpcTarget`
-       * from. No browser resolves it, so the host supplies it — exactly as
-       * `wrangler.jsonc` supplies it on Cloudflare — and what it supplies is this
-       * package's own port of the module.
-       *
-       * **One module identity, deliberately.** Route the platform specifier to
-       * the package's public subpath so `newRpcSession()` and application code
-       * see the same `RpcTarget` class. A source-file alias would load a second
-       * class beside the package build, and capnweb would refuse its instances.
-       */
-      "cloudflare:workers": cloudflareWorkersModule,
-      "cloudflare:email": `${packageRoot}dist/cloudflare-email.js`,
       ...(mode === "think-probe"
         ? {
             "@cloudflare/shell": cloudflareShellModule,
-            async_hooks: `${packageRoot}dist/browser/async-hooks.js`,
             crypto: unenvNode("crypto"),
             "node:crypto": unenvNode("crypto"),
             "node:events": unenvNode("events"),
@@ -138,7 +127,6 @@ export default defineConfig(({ mode }) => ({
             "node:zlib": unenvNode("zlib"),
           }
         : {}),
-      "node:async_hooks": `${packageRoot}dist/browser/async-hooks.js`,
       "node:diagnostics_channel": unenvNode("diagnostics_channel"),
       "node:os": unenvNode("os"),
       path: unenvNode("path"),

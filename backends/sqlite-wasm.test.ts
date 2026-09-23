@@ -63,6 +63,7 @@ test("reset fails closed when the SAH pool does not remove the database", () => 
       importDb: async () => 0,
       getFileNames: () => [],
       unlink: () => false,
+      reserveMinimumCapacity: async (minimum: number) => minimum,
     },
   } satisfies SqliteWasmHost;
   const database = new SqliteWasmDatabase(host, "/actor.root.sqlite");
@@ -106,6 +107,151 @@ test.each(["open", "reset"])("%s closes the new handle when SQLite setup fails",
   provider.close();
 });
 
+test("opens reserve every file plus a journal per connection, one at a time", async () => {
+  const files = new Map<string, Uint8Array>();
+  const host = memoryHost(files);
+  const reserved: number[] = [];
+  const provider = createSqliteWasmProvider(
+    {
+      ...host,
+      pool: {
+        ...host.pool,
+        // SQLite creates the database file when it opens it.
+        OpfsSAHPoolDb: class extends FakeDatabase {
+          constructor(filename: string) {
+            super();
+            files.set(filename, new Uint8Array());
+          }
+        },
+        reserveMinimumCapacity: async (minimum: number) => {
+          reserved.push(minimum);
+          return minimum;
+        },
+      },
+    },
+    { prefix: "/actor" },
+  );
+
+  // Concurrent, as a root and its facets open; each reservation sees every open before it.
+  await Promise.all(["root", "facets", "facet"].map((name) => provider.open(name)));
+  expect(reserved).toEqual([2, 4, 6]);
+  provider.close();
+  // Three files and one connection; closing asked for nothing.
+  (await provider.open("root")).close();
+  expect(reserved).toEqual([2, 4, 6, 4]);
+});
+
+test("a failed open leaves no connection counted", async () => {
+  const host = memoryHost(new Map());
+  const reserved: number[] = [];
+  host.pool.reserveMinimumCapacity = async (minimum) => {
+    reserved.push(minimum);
+    return minimum;
+  };
+  const provider = createSqliteWasmProvider(host, { prefix: "/actor" });
+  const limit = host.capi.sqlite3_limit;
+  host.capi.sqlite3_limit = () => {
+    throw new Error("SQLite setup failed");
+  };
+  await expect(provider.open("root")).rejects.toThrow("SQLite setup failed");
+  host.capi.sqlite3_limit = limit;
+  (await provider.open("root")).close();
+  // This fake creates no file, so each open asks for its own file and journal and nothing more.
+  expect(reserved).toEqual([2, 2]);
+});
+
+test("imports reserve their files in the open queue and refuse an open queued ahead of them", async () => {
+  const image = new Uint8Array(512);
+  image.set(new TextEncoder().encode("SQLite format 3\0"));
+  const files = new Map([
+    ["/source.root.sqlite", image],
+    ["/source.facets.sqlite", image],
+  ]);
+  const host = memoryHost(files);
+  const reserved: number[] = [];
+  host.pool.reserveMinimumCapacity = async (minimum) => {
+    reserved.push(minimum);
+    return minimum;
+  };
+  // A running actor, whose journal needs a slot through every import below.
+  const running = await createSqliteWasmProvider(host, { prefix: "/running" }).open("root");
+  await new SqliteWasmActorStorage(host, "/clone").copyFrom(new SqliteWasmActorStorage(host, "/source"));
+  const restore = createSqliteWasmProvider(host, { prefix: "/restore" });
+  await restore.importSnapshot({ version: 1, databases: [{ name: "root", image }] });
+  // 2 files + 2 for the open; then 2 files + 2 cloned + 1 journal; then 4 + 1 restored + 1.
+  expect(reserved).toEqual([4, 5, 6]);
+
+  const opening = restore.open("root");
+  await expect(
+    restore.importSnapshot({ version: 1, databases: [{ name: "root", image }] }),
+  ).rejects.toThrow("Cannot snapshot or restore while database handles are open.");
+  (await opening).close();
+  running.close();
+});
+
+test("a clone closes a destination open queued ahead of it before replacing its files", async () => {
+  const image = new Uint8Array(512);
+  image.set(new TextEncoder().encode("SQLite format 3\0"));
+  const files = new Map([
+    ["/source.root.sqlite", image],
+    ["/clone.root.sqlite", image],
+  ]);
+  const base = memoryHost(files);
+  const handles = new Set<SqliteWasmDatabaseHandle>();
+  const handlesAtUnlink: number[] = [];
+  const host: SqliteWasmHost = {
+    ...base,
+    pool: {
+      ...base.pool,
+      OpfsSAHPoolDb: class extends FakeDatabase {
+        constructor() {
+          super();
+          handles.add(this);
+        }
+        override close(): void {
+          handles.delete(this);
+        }
+      },
+      unlink: (name) => {
+        handlesAtUnlink.push(handles.size);
+        return files.delete(name);
+      },
+      // A macrotask, so the open is still queued when the clone starts.
+      reserveMinimumCapacity: (minimum) =>
+        new Promise<number>((resolve) => setTimeout(() => resolve(minimum))),
+    },
+  };
+  const destination = new SqliteWasmActorStorage(host, "/clone");
+  const opening = destination.open("root");
+  await destination.copyFrom(new SqliteWasmActorStorage(host, "/source"));
+  expect(handlesAtUnlink).toEqual([0]);
+  expect(handles.size).toBe(0);
+  await opening;
+});
+
+test("a failed growth fails that open with the pool's error and does not hold up the next", async () => {
+  const host = memoryHost(new Map());
+  const quota = new DOMException("The pool could not grow.", "QuotaExceededError");
+  let full = true;
+  const provider = createSqliteWasmProvider(
+    {
+      ...host,
+      pool: {
+        ...host.pool,
+        reserveMinimumCapacity: async (minimum: number) => {
+          if (full) throw quota;
+          return minimum;
+        },
+      },
+    },
+    { prefix: "/actor" },
+  );
+  await expect(provider.open("root")).rejects.toBe(quota);
+  full = false;
+  await expect(provider.open("root")).resolves.toBeInstanceOf(SqliteWasmDatabase);
+  provider.close();
+});
+
 test("actor storage copies and deletes every database under its prefix", async () => {
   const files = new Map<string, Uint8Array>([
     ["/source.root.sqlite", new Uint8Array([1])],
@@ -132,6 +278,7 @@ test("actor storage copies and deletes every database under its prefix", async (
       },
       getFileNames: () => [...files.keys()],
       unlink: (name: string) => files.delete(name),
+      reserveMinimumCapacity: async (minimum: number) => minimum,
     },
   } satisfies SqliteWasmHost;
 
@@ -173,6 +320,7 @@ test("actor storage preserves the destination when the source cannot be exported
       },
       getFileNames: () => [...files.keys()],
       unlink: (name: string) => files.delete(name),
+      reserveMinimumCapacity: async (minimum: number) => minimum,
     },
   } satisfies SqliteWasmHost;
 
@@ -367,6 +515,7 @@ function memoryHost(files: Map<string, Uint8Array>): SqliteWasmHost {
         return 0;
       },
       unlink: (name) => files.delete(name),
+      reserveMinimumCapacity: async (minimum) => minimum,
     },
   };
 }

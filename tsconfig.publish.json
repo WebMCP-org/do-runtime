@@ -6,6 +6,6 @@
     "outDir": "./dist",
     "types": ["@cloudflare/workers-types", "node"]
   },
-  "include": ["src/**/*.ts", "backends/*.ts", "conformance/host.ts"],
-  "exclude": ["**/*.test.ts"]
+  "include": ["src/**/*.ts", "backends/*.ts"],
+  "exclude": ["**/*.test.ts", "src/fixtures/**"]
 }

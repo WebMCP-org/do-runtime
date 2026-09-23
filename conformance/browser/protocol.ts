@@ -76,6 +76,8 @@ export interface SupervisorRpc {
   callActor(actorName: string, method: string, args: unknown[]): Promise<unknown>;
   /** ← `ActorSqliteHooks::scheduleRun`, forwarded to the namespace's one scheduler. */
   scheduleRun(actorName: string, scheduledTime: number | null): Promise<void>;
+  /** `AlarmOutlet.reconcile` (package-original), forwarded the same way. */
+  reconcile(actorName: string, stored: number): Promise<void>;
   /**
    * ← `AlarmScheduler::GetActorFn`, whose contract is that it PLACES the actor
    * if it is not running: an alarm is a reason to wake a Durable Object, not
@@ -97,6 +99,7 @@ export interface SupervisorRpc {
 /** What the alarm scheduler's worker exposes to the page. */
 export interface AlarmsRpc {
   scheduleRun(actorName: string, scheduledTime: number | null): Promise<void>;
+  reconcile(actorName: string, stored: number): Promise<void>;
 }
 
 /** What a root actor's worker exposes to the page. */

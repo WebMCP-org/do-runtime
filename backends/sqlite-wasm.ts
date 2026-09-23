@@ -4,14 +4,15 @@
  * `SqlDatabaseProvider` over the browser's OPFS SAH pool.
  *
  * The pool is a parameter, not something this module goes and gets. The host
- * decides the OPFS directory, the pool capacity and whether to clear on init,
- * all of which are layout questions this package deliberately knows nothing
- * about; it installs the pool through `installSqliteWasmHost`, which corrects
- * two driver behaviours a terminated worker turns into data loss. What arrives
- * here is the already-installed pool, and with it the two things a backend
- * needs that a bare `sqlite3` module cannot give: a database constructor bound
- * to that VFS, plus the pool's file export/import/unlink operations used by
- * snapshots and `reset()`.
+ * decides the OPFS directory, the pool's initial capacity and whether to clear
+ * on init, all of which are layout questions this package deliberately knows
+ * nothing about; it installs the pool through `installSqliteWasmHost`, which
+ * corrects two driver behaviours a terminated worker turns into data loss. What
+ * arrives here is the already-installed pool, and with it the two things a
+ * backend needs that a bare `sqlite3` module cannot give: a database constructor
+ * bound to that VFS, plus the pool's file export/import/unlink operations used by
+ * snapshots and `reset()`. Opening or importing a database grows the pool when it
+ * needs room.
  *
  * The pool is structurally typed rather than imported from
  * `@sqlite.org/sqlite-wasm`, so this package takes no dependency on the driver
@@ -20,9 +21,11 @@
  * driver's own `.d.mts`.
  *
  * The unit lane runs this file over fake pools and the real engine; only the
- * OPFS pool itself needs a browser. The pool is exercised twice in the browser
- * lane — by `sqlite-wasm.smoke.spec.ts`, which drives this file directly, and
- * by the conformance suite, which runs the whole package over it.
+ * OPFS pool itself needs a browser. In the browser lane three smoke specs drive
+ * this file directly — `sqlite-wasm.smoke.spec.ts` for the floor,
+ * `sqlite-wasm-growth.smoke.spec.ts` for pool growth and
+ * `sqlite-wasm-crash.smoke.spec.ts` for a terminated worker — and the
+ * conformance suite runs the whole package over it.
  */
 
 import {
@@ -70,6 +73,12 @@ export interface OpfsSahPool {
   getFileNames(): string[];
   /** Disassociates a virtual file from the pool. Results are undefined if it is in active use. */
   unlink(filename: string): boolean;
+  /**
+   * Grows the pool to at least `minCapacity` files and never shrinks it. A wrapper around the
+   * driver's pool must forward it: one that answers without growing leaves a full pool failing
+   * its next file creation with `SQLITE_CANTOPEN`.
+   */
+  reserveMinimumCapacity(minCapacity: number): Promise<number>;
 }
 
 /**
@@ -113,6 +122,11 @@ export type SqliteWasmPoolOptions = {
   /** The pool's OPFS directory. The driver's default is `.${name}`. */
   readonly directory?: string;
   readonly clearOnInit?: boolean;
+  /**
+   * The pool's size in files when it is first created; an existing pool keeps its own. Each
+   * open, snapshot restore or clone through this backend grows the pool so it holds every file
+   * plus a rollback journal for each connection the backend has open. It never shrinks.
+   */
   readonly initialCapacity?: number;
 };
 
@@ -313,6 +327,7 @@ export class SqliteWasmActorStorage implements SqlDatabaseProvider {
   /**
    * Drop every handle. Leaving one behind per respawn or facet abort would
    * accumulate concurrent writers inside a VFS that expects to own its files.
+   * An `open()` that has not resolved yet is not closed, here or by `deleteAll()`: await it first.
    */
   close(): void {
     this.#provider.close();
@@ -350,8 +365,11 @@ export class SqliteWasmActorStorage implements SqlDatabaseProvider {
         return { name, image: new Uint8Array(await source.#host.pool.exportFile(file)) };
       }),
     );
-    this.close();
-    await replaceDatabases(this.#host.pool, this.#prefix, images);
+    // Closed in the pool's queue, so an open queued ahead of the copy closes before replacement.
+    await withHeadroom(this.#host.pool, () => images.length, () => {
+      this.close();
+      return replaceDatabases(this.#host.pool, this.#prefix, images);
+    });
   }
 
   #ownedFiles(): string[] {
@@ -377,12 +395,14 @@ export function createSqliteWasmProvider(
       // Names come from inside the package, so this is defence in depth — but
       // it is the one place a name becomes a pool file name.
       requireSafeDatabaseName(name);
-      let database: SqliteWasmDatabase;
-      database = new SqliteWasmDatabase(host, `${prefix}.${name}.sqlite`, () =>
-        openDatabases.delete(database),
-      );
-      openDatabases.add(database);
-      return database;
+      const filename = `${prefix}.${name}.sqlite`;
+      // Its file if new, and its own journal: a connection is counted only once it is open.
+      return withHeadroom(host.pool, (files) => (files.includes(filename) ? 0 : 1) + 1, () => {
+        let database: SqliteWasmDatabase;
+        database = new SqliteWasmDatabase(host, filename, () => openDatabases.delete(database));
+        openDatabases.add(database);
+        return database;
+      });
     },
     close(): void {
       for (const database of [...openDatabases]) database.close();
@@ -409,9 +429,71 @@ export function createSqliteWasmProvider(
       requireClosed(openDatabases);
       requireValidSqlDatabaseSnapshot(snapshot);
       requireImportableRuntimeStorage(snapshot);
-      await replaceDatabases(host.pool, prefix, snapshot.databases);
+      await withHeadroom(host.pool, () => snapshot.databases.length, () => {
+        // Again in the queue, where an open queued ahead of this restore has opened.
+        requireClosed(openDatabases);
+        return replaceDatabases(host.pool, prefix, snapshot.databases);
+      });
     },
   };
+}
+
+/** Connections this module holds open, per pool. Each may need a journal slot at any time. */
+const openConnections = new WeakMap<OpfsSahPool, number>();
+/** Each pool's last queued step, so the next one reserves only once that one has its files. */
+const queues = new WeakMap<OpfsSahPool, Promise<unknown>>();
+
+/**
+ * Runs `run`, an open or an import that adds `adding(files)` files to the pool,
+ * once the pool has a slot for every file SQLite may need, growing it first with
+ * `reserveMinimumCapacity`. Every provider open, snapshot restore and `copyFrom`
+ * comes through here, one at a time per pool.
+ *
+ * A pool's capacity is a number of files. A full pool fails SQLite's next file
+ * creation with `SQLITE_CANTOPEN`, and an import with "No available handles to
+ * import to.". SQLite creates two kinds of file here:
+ *
+ * - A database file, which holds its slot until it is unlinked, open or not.
+ * - A rollback journal, `<database>-journal`, while a connection has a write
+ *   transaction open. Nothing changes SQLite's default `journal_mode=DELETE`
+ *   (the VFS has no shared memory for WAL), so the journal is created at a
+ *   transaction's first write and deleted at its commit or rollback.
+ *
+ * Nothing else reaches the pool. This build keeps temporary databases, sorter
+ * spill and statement journals in memory (`SQLITE_TEMP_STORE=2`), and actor SQL
+ * is refused what would add files or change that: `ATTACH`, `VACUUM`, and the
+ * `journal_mode`, `locking_mode` and `temp_store` pragmas. So the pool must hold
+ * every file it has, the files this step adds, and a journal for every open
+ * connection:
+ *
+ *     capacity >= files + adding + connections
+ *
+ * An open adds its database file if it is new and its own journal; an import adds
+ * one file per database it imports. Without the journal term, the database that
+ * takes the last slot opens and then no connection in the pool can write. `files`
+ * also counts journals in flight, any a terminated worker left and the files an
+ * import replaces, so the minimum errs high by those, never low.
+ *
+ * The queue makes each reservation count every earlier step's files; the driver's
+ * reservation is not atomic either. The pool never shrinks, and a growth that
+ * fails (a storage quota) fails the step with the driver's error. A
+ * `SqliteWasmDatabase` constructed directly is counted but grows nothing. Never
+ * open through a paused pool: growth gives it handles again, so the driver's
+ * `unpauseVfs()` would do nothing.
+ */
+function withHeadroom<T>(
+  pool: OpfsSahPool,
+  adding: (files: readonly string[]) => number,
+  run: () => T | Promise<T>,
+): Promise<T> {
+  const step = (queues.get(pool) ?? Promise.resolve()).then(async () => {
+    const files = pool.getFileNames();
+    const connections = openConnections.get(pool) ?? 0;
+    await pool.reserveMinimumCapacity(files.length + adding(files) + connections);
+    return run();
+  });
+  queues.set(pool, step.catch(() => {}));
+  return step;
 }
 
 /** A failed rollback retains the original images so the host can recover to another prefix. */
@@ -494,6 +576,8 @@ export class SqliteWasmDatabase implements SqlDatabase {
     this.#host = host;
     this.#filename = filename;
     this.#database = this.#openDatabase();
+    // After the open, so a failed open leaves no connection counted.
+    openConnections.set(host.pool, (openConnections.get(host.pool) ?? 0) + 1);
   }
 
   prepare(sql: string): SqlDatabaseStatement {
@@ -542,6 +626,7 @@ export class SqliteWasmDatabase implements SqlDatabase {
     if (this.#closed) return;
     this.#database.close();
     this.#closed = true;
+    openConnections.set(this.#host.pool, (openConnections.get(this.#host.pool) ?? 1) - 1);
     this.onClose();
   }
 
