@@ -152,3 +152,16 @@ it("serializes appends from separate Workers using the same OPFS root", async ()
       .sort()
   );
 });
+
+it("reads bounded binary ranges through OPFS without reading a whole native file", async () => {
+  expect(await run(directory(), "byte-ranges")).toEqual({
+    prefix: [0, 1, 2],
+    suffix: [254, 255],
+    empty: [],
+    pastEnd: [],
+    missing: null,
+    directory: "EISDIR",
+    invalid: "EINVAL",
+    reads: [3, 2, 0, 0]
+  });
+});

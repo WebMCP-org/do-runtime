@@ -39,6 +39,35 @@ async function run(name: string, operation: string, writer = "") {
   const root = await storage.getDirectoryHandle(name, { create: true });
   const ws = new OpfsWorkspace({ root });
   switch (operation) {
+    case "byte-ranges": {
+      await ws.writeFileBytes(
+        "/data",
+        Uint8Array.from({ length: 256 }, (_, i) => i)
+      );
+      await ws.symlink("data", "/link");
+      const fs = ws;
+      const reads: number[] = [];
+      const arrayBuffer = Blob.prototype.arrayBuffer;
+      Blob.prototype.arrayBuffer = function () {
+        reads.push(this.size);
+        if (this.size > 3) throw new Error("Full-file read forbidden");
+        return arrayBuffer.call(this);
+      };
+      try {
+        return {
+          prefix: Array.from((await fs.readFileRange("/link", 0, 3)) ?? []),
+          suffix: Array.from((await fs.readFileRange("/data", 254, 10)) ?? []),
+          empty: Array.from((await fs.readFileRange("/data", 0, 0)) ?? []),
+          pastEnd: Array.from((await fs.readFileRange("/data", 300, 1)) ?? []),
+          missing: await fs.readFileRange("/missing", 0, 0),
+          directory: await errorCode(fs.readFileRange("/", 0, 0)),
+          invalid: await errorCode(fs.readFileRange("/data", -1, 1)),
+          reads
+        };
+      } finally {
+        Blob.prototype.arrayBuffer = arrayBuffer;
+      }
+    }
     case "contract":
       return {
         memory: await fileContract(new InMemoryFs()),

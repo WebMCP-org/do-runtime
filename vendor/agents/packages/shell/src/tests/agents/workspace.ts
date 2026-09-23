@@ -1,3 +1,4 @@
+import { WorkspaceFileSystem } from "../../workspace";
 import {
   subscribe as dcSubscribe,
   unsubscribe as dcUnsubscribe
@@ -30,6 +31,20 @@ export class TestWorkspaceAgent extends Agent {
       this.changeLog.push(event);
     }
   });
+
+  async byteRangeContract() {
+    const fs = new WorkspaceFileSystem(this.workspace);
+    await this.workspace.writeFileBytes(
+      "/ranges",
+      new Uint8Array([0, 128, 255, 4])
+    );
+    await this.workspace.symlink("ranges", "/range-link");
+    return {
+      bytes: Array.from(await fs.readFileRange("/range-link", 1, 2)),
+      pastEnd: Array.from(await fs.readFileRange("/ranges", 8, 2)),
+      zero: Array.from(await fs.readFileRange("/ranges", 0, 0))
+    };
+  }
 
   async stat(path: string): Promise<FileStat | null | { error: string }> {
     try {

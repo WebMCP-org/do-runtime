@@ -52,6 +52,12 @@ export interface CpOptions {
 export interface FileSystem {
   readFile(path: string): Promise<string>;
   readFileBytes(path: string): Promise<Uint8Array>;
+  /** Optional bounded byte read. Nonnegative safe integer range; missing paths throw ENOENT. */
+  readFileRange?(
+    path: string,
+    offset: number,
+    length: number
+  ): Promise<Uint8Array>;
   writeFile(path: string, content: string): Promise<void>;
   writeFileBytes(path: string, content: Uint8Array): Promise<void>;
   appendFile(path: string, content: string | Uint8Array): Promise<void>;

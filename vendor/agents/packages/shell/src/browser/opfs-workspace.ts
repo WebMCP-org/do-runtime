@@ -1,3 +1,4 @@
+import { validateReadRange } from "../fs/read-range";
 import type { FileInfo, Workspace, WorkspaceFsLike } from "../filesystem";
 import {
   MAX_WORKSPACE_PATH_LENGTH,
@@ -125,7 +126,23 @@ export class OpfsWorkspace implements WorkspaceFsLike {
     return bytes === null ? null : TEXT_DECODER.decode(bytes);
   }
 
+  async readFileRange(
+    path: string,
+    offset: number,
+    length: number
+  ): Promise<Uint8Array | null> {
+    validateReadRange(offset, length);
+    return this.readBytes(path, { offset, length });
+  }
+
   async readFileBytes(path: string): Promise<Uint8Array | null> {
+    return this.readBytes(path);
+  }
+
+  private async readBytes(
+    path: string,
+    range?: { offset: number; length: number }
+  ): Promise<Uint8Array | null> {
     const normalized = normalizePath(path);
     return this.withSharedTree(async () => {
       if (normalized === "/") {
@@ -139,7 +156,11 @@ export class OpfsWorkspace implements WorkspaceFsLike {
         if (!native) return null;
         if (native.kind !== "file")
           throw fsError("EISDIR", `${path} is a directory`);
-        return new Uint8Array(await (await native.getFile()).arrayBuffer());
+        const file = await native.getFile();
+        const blob = range
+          ? file.slice(range.offset, range.offset + range.length)
+          : file;
+        return new Uint8Array(await blob.arrayBuffer());
       });
     });
   }
