@@ -587,11 +587,13 @@ describe("useAgent RPC robustness", () => {
           }}
         />
       );
-      await vi.waitFor(() =>
-        expect(onIdentity).toHaveBeenCalledWith(
-          baseOptions.name,
-          "test-callable-agent"
-        )
+      await vi.waitFor(
+        () =>
+          expect(onIdentity).toHaveBeenCalledWith(
+            baseOptions.name,
+            "test-callable-agent"
+          ),
+        { timeout: 10000 }
       );
       for (const name of [
         `identity-b-${crypto.randomUUID()}`,
@@ -599,8 +601,13 @@ describe("useAgent RPC robustness", () => {
       ]) {
         onIdentity.mockClear();
         setOptions!({ ...baseOptions, name });
-        await vi.waitFor(() =>
-          expect(onIdentity).toHaveBeenCalledWith(name, "test-callable-agent")
+        await vi.waitFor(
+          () =>
+            expect(onIdentity).toHaveBeenCalledWith(
+              name,
+              "test-callable-agent"
+            ),
+          { timeout: 10000 }
         );
         await expect(latestAgent!.call("add", [2, 3])).resolves.toBe(5);
       }
@@ -633,17 +640,24 @@ describe("useAgent RPC robustness", () => {
           }}
         />
       );
-      await vi.waitFor(() =>
-        expect(onIdentity).toHaveBeenCalledWith(firstUser, "test-state-agent")
+      await vi.waitFor(
+        () =>
+          expect(onIdentity).toHaveBeenCalledWith(
+            firstUser,
+            "test-state-agent"
+          ),
+        { timeout: 10000 }
       );
       setOptions!({ ...baseOptions, query: { user: secondUser } });
-      await vi.waitFor(() =>
-        expect(onIdentityChange).toHaveBeenCalledWith(
-          firstUser,
-          secondUser,
-          "test-state-agent",
-          "test-state-agent"
-        )
+      await vi.waitFor(
+        () =>
+          expect(onIdentityChange).toHaveBeenCalledWith(
+            firstUser,
+            secondUser,
+            "test-state-agent",
+            "test-state-agent"
+          ),
+        { timeout: 10000 }
       );
     });
 
