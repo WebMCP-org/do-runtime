@@ -261,3 +261,13 @@ describe("doRuntimeAwaitTransform", () => {
     await expect(actorBuild([])).rejects.toThrow("/actor.js: 0/1");
   });
 });
+
+test("from source, the plugin leaves its injected imports to the host's resolution", async () => {
+  // The package's built siblings resolve these; this repository's own lanes alias them to
+  // source instead, and must keep that identity. `scripts/check-package.mjs` pins the built side.
+  const hook = doRuntimeAwaitTransform({ asyncContext: true }).resolveId;
+  if (typeof hook !== "object") throw new Error("expected an ordered resolveId hook");
+  for (const id of ["@mcp-b/do-runtime/gate", "@mcp-b/do-runtime/browser/async-hooks"]) {
+    expect(await Reflect.apply(hook.handler, {}, [id, undefined, {}])).toBeNull();
+  }
+});

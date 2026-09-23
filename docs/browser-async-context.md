@@ -27,7 +27,7 @@ Oxc transformer to lower async functions and generators to Promise callbacks.
 Importing the shim installs context binding on `Promise.prototype.then` once per
 realm. Importing the runtime alone does not patch Promise.
 
-The opt-in transform also corrects Vite's bundled Oxc 0.144.0 generator helper:
+The opt-in transform also corrects the generator helper from Vite's bundled Oxc (≥ 0.144.0):
 an early return must resume awaited `finally` cleanup with `next`, while a
 delegated `yield*` may still require `return`. This follows the
 [upstream Babel helper](https://github.com/babel/babel/blob/main/packages/babel-helpers/src/helpers/wrapAsyncGenerator.ts).

@@ -16,7 +16,7 @@ enumerates it. Every row is one of:
 - **Open hole** — reachable from gated flows today; needs a seam.
 - **Fail-closed** — refused loudly rather than passed through ungated.
 - **Foreign by design** — no runtime seam can exist; actor code must use
-  `awaitIo` / `makeReentryCallback` discipline (or, if the tail grows, the
+  `awaitIo` discipline (or, if the tail grows, the
   compile-time await transform below).
 - **Not in contract** — realm globals a Durable Object should never touch;
   listed so the fall-through is a decision, not an accident.
@@ -32,7 +32,7 @@ enumerates it. Every row is one of:
 | `body.values()` / async iteration | iterator reads through the gated reader; early return preserves native cancel and lock-release semantics | `api/http.ts` |
 | Reader/stream lifecycle (`reader.closed`, both `cancel()` methods) | settlement uses `awaitIo`; `closed` is gated and registered once | `api/http.ts` |
 | `body.tee()` | both halves re-gated | `api/http.ts` |
-| Actor-created `ReadableStream` / `TransformStream` callbacks | constructor captures the current actor and async stores; `pull`, `transform`, `flush`, and `cancel` use `makeReentryCallback`; synchronous `start` retains its native timing and receiver | `api/global-scope.ts`; delayed input and external consumer regressions in `global-scope.test.ts` |
+| Actor-created `ReadableStream` / `TransformStream` callbacks | constructor captures the current actor and async stores; `pull`, `transform`, `flush`, and `cancel` use `makeReentryCallback`; synchronous `start` retains its native timing and receiver | `api/global-scope.ts`; delayed input and external consumer regressions in `global-scope.test.ts`; the §1.2 outside-consumer conformance row |
 | `body.pipeThrough()` / `pipeTo()` | returned readable re-gated (recurses through chains); settlement `awaitIo`d — native pipe machinery bypasses the `getReader` override and would launder the stream | `api/http.ts`, 0.2.2 |
 | `setTimeout` / `setInterval` | arming captures the critical section; firing re-enters via `ctx.run` | `api/global-scope.ts` |
 | `scheduler.wait()` / `scheduler.yield()` | scoped `Scheduler` over the same timer path | `api/global-scope.ts` |
@@ -49,15 +49,39 @@ through `@mcp-b/do-runtime/gate`, and wraps every `for await` source so
 
 The gate helper fails open outside actor code. A development transform supplies
 the module id and warns once if that path is reached; production keeps the helper
-silent. Inside an actor it publishes each continuation through a fresh
-input-gated slice, including awaits of plain values.
-The slice preserves a surrounding `blockConcurrencyWhile` critical section so
-the section can await its own continuation without deadlocking. The tokenized
-actor identity is realm-shared so separately bundled actor and host copies agree.
-It exists only while the captured context still holds its input lock, the
-synchronous current slice always wins, and the marker clears at that context's
-checkpoint boundary. Publications are serialized across actors so two promises
-settling in the same checkpoint cannot overwrite each other's identity.
+silent. Inside an actor, an await resumes where workerd would, except as below:
+
+- **Settled while the actor still holds its input lock**, in the critical section
+  the await ran under — a storage call, a plain value, or a resumption the runtime
+  already admitted (a timer, `fetch`, actor RPC, the `blockConcurrencyWhile`
+  hand-back). The continuation runs in that checkpoint, so it keeps the lock and
+  the implicit transaction (§1.2, §1.7.1).
+- **Settled anywhere else** — foreign I/O, a raw timer. The continuation re-enters
+  through a fresh input-gated slice queued behind waiting events (§1.3). That slice preserves a surrounding `blockConcurrencyWhile`
+  critical section so the section can await its own continuation without
+  deadlocking.
+
+The checkpoint ends at the runtime's `MessageChannel` hand-off, not at the end of
+the microtask drain. A foreign promise that settles in the gap before that
+hand-off therefore continues under the still-held lock, as an untransformed
+continuation would. It can run ahead of this actor's earlier foreign
+continuations already queued at the gate. A promise another actor resolves
+resumes inline if this actor holds a lock; workerd defers it to this actor's own
+turn. A promise resolved inside `blockConcurrencyWhile` resumes an await captured
+outside the section only after the section ends, where workerd resumes it inside;
+a section that waits on that continuation stalls until its 30-second deadline
+breaks the actor.
+
+The tokenized actor identity is realm-shared so separately bundled actor and host
+copies agree. It exists only while the captured context still holds its input
+lock, the synchronous current slice always wins, and the marker clears at that
+context's checkpoint boundary. One actor's continuations own a checkpoint, so two
+actors' promises settling in the same checkpoint cannot overwrite each other's
+identity. The other actor's continuation waits for a later task; if it had its
+lock, it keeps holding it, so none of that actor's other events can run first. Its
+implicit transaction still commits at the hand-off. It happens whenever another
+actor's continuation ran earlier in the same task, with or without a call between
+them.
 
 At build end the plugin reads the final Rollup module graph, after later
 transforms, and compares fully wrapped awaits with total awaits per included
@@ -78,9 +102,12 @@ promise continuations that do not pass through syntax the transform can rewrite.
    requires wrapping `get`, `getAll`, `entries`, `values`, `forEach`, and both
    iteration protocols; no current consumer calls `formData()`, so that proxy is
    deferred rather than silently claiming the Files are covered.
-2. **`WritableStream` seams** — none handed out by the runtime today, so no
-   hole yet; the moment an API returns one, `writer.write()` / `ready` /
-   `close()` need the same treatment. This row exists so that PR adds the seam.
+2. **Actor-created `WritableStream` sinks** — actor-constructed stream callbacks
+   are in scope (the Gated row above), but only `ReadableStream` and
+   `TransformStream` are wrapped. A sink fed by native pipe machinery, such as
+   `gatedBody.pipeTo(new WritableStream({ write(chunk) { … } }))`, runs `write`,
+   `close` and `abort` with no input lock, so a storage call inside them throws.
+   The seam is the same constructor proxy, extended to those three callbacks.
 
 ## Fail-closed
 
@@ -92,15 +119,18 @@ promise continuations that do not pass through syntax the transform can rewrite.
 ## Foreign by design
 
 For modules outside the transform, no runtime seam can exist for promises the
-actor manufactures itself. The discipline: resolve them through
-`ctx.awaitIo(...)`, or deliver events through `makeReentryCallback`. Provenance
-(0.2.1) names the window when the discipline slips.
+actor manufactures itself. The discipline: resolve them through the `awaitIo`
+the host hands actor code — `actorScopeBindings(...).awaitIo`, or the host's own
+wrapper over `container.awaitIo()`. Provenance (0.2.1) names the window when the
+discipline slips.
 
 - `new Promise` resolved from an event: `MessagePort.onmessage`,
   `addEventListener`, `FileReader`, `AbortSignal` `"abort"`.
-- User-constructed streams read outside a gated chain: `new ReadableStream`,
-  a `TransformStream` / `TextDecoderStream` / `CompressionStream` read directly
-  rather than via a gated body's `pipeThrough`.
+- Direct reads of user-constructed streams outside a gated chain: a
+  `new ReadableStream`, `TransformStream`, `TextDecoderStream` or
+  `CompressionStream` read directly rather than via a gated body's
+  `pipeThrough`. An actor-created stream's callbacks are gated (the row above);
+  reads from it are not.
 - `AbortSignal.timeout()` — a platform timer; use `scheduler.wait` + an
   `AbortController` instead.
 - One-shot platform promises: dynamic `import()`, `WebAssembly.instantiate`,
@@ -123,7 +153,7 @@ this one is absent rather than ungated).
 
 1. **Same-PR rule**: any change that exposes a new async platform surface to
    actor code adds or moves a row here in the same commit, the way vendored
-   edits carry their `upstream-diff.md` entry.
+   edits carry their `vendor/agents/docs/fork-diff.md` row.
 2. **Provenance is the tripwire**: every escape now reports the last gated site
    and the milliseconds elapsed — it points at the row to file.
 3. **Dist audits find holes before production does**: grep consumer bundles for

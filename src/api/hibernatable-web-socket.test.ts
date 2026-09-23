@@ -9,6 +9,7 @@ import {
   type ActorContainerOptions,
   type HibernationHost,
 } from "../server/actor-container";
+import { MessagePortWebSocket } from "../browser/message-port-websocket";
 import { HibernationMirror } from "../server/hibernation-mirror";
 import type { RawWebSocket } from "./web-socket";
 
@@ -338,6 +339,41 @@ describe("hibernation embedder contract", () => {
     await quiesce();
     expect(firstActor.messages).toEqual([]);
     expect(secondActor.messages).toEqual(["after-rebuild"]);
+  });
+
+  test("gates a rehydrated host transport's sends behind storage confirmation", async () => {
+    // A Worker restart rehydrates the host's own transport, not a pair half.
+    const channel = new MessageChannel();
+    const transport = new MessagePortWebSocket("ws://actor.test", channel.port1, false);
+    transport.open();
+    const frames: unknown[] = [];
+    channel.port2.addEventListener("message", (event) => frames.push(event.data));
+    channel.port2.start();
+    const confirmation = Promise.withResolvers<void>();
+    const container = await createActorContainer(
+      options({
+        ports: { ...options().ports, alarms: { scheduleRun: () => confirmation.promise } },
+        webSockets: [{ socket: transport, tags: ["id"] }],
+      }),
+    );
+    await container.start(() => ({ alarm() {} }));
+
+    const handed = await container.run(() => {
+      // Moving the alarm earlier holds this write's commit until scheduleRun confirms.
+      void container.state.storage.setAlarm(Date.now() + 60_000);
+      const [socket] = container.state.getWebSockets();
+      socket?.send("after the write");
+      return socket;
+    });
+    await quiesce();
+    expect(frames).toEqual([]);
+
+    confirmation.resolve();
+    await quiesce();
+    expect(frames).toEqual([{ type: "message", data: "after the write" }]);
+    expect(container.state.getWebSockets()).toEqual([handed]);
+    expect(container.state.getWebSockets()[0]).toBe(handed);
+    channel.port2.close();
   });
 
   test("pins cross-accept, attachment, and synchronous close errors", async () => {

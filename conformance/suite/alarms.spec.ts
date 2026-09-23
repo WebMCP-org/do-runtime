@@ -13,13 +13,25 @@ import { host } from "conformance:host";
 it("§1.8 an alarm re-armed from inside its own handler does not re-enter", async () => {
   const probe = await host.spawn("alarm-overlap");
   await probe.call("armAlarm");
-  await new Promise((resolve) => setTimeout(resolve, 1_200));
-  expect(await probe.call("readAlarmLog")).toEqual([
-    "enter:1",
-    "exit:1",
-    "enter:2",
-    "exit:2",
-  ]);
+  const deadline = Date.now() + 5_000;
+  let log: string[] = [];
+  while (log.length < 4 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    log = await probe.call("readAlarmLog");
+  }
+  expect(log).toEqual(["enter:1", "exit:1", "enter:2", "exit:2"]);
+});
+
+it("§1.8 deleteAlarm cancels a pending alarm before it fires", async () => {
+  const probe = await host.spawn("alarm-delete");
+  expect(await probe.call("armThenDeleteAlarm")).toBeNull();
+  // Nothing marks an absence, so poll through the window the alarm was due in and fail on the
+  // first delivery. Load can hide a late delivery; it cannot fail a correct lane.
+  const deadline = Date.now() + 1_000;
+  while (Date.now() < deadline) {
+    expect(await probe.call("readAlarmLog")).toEqual([]);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
 });
 
 /**

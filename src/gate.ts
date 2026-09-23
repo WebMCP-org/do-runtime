@@ -81,8 +81,13 @@ function currentPublication(): PublicationReservation | undefined {
   return Reflect.get(globalThis, CURRENT_PUBLICATION) as PublicationReservation | undefined;
 }
 
+/** One actor owns a checkpoint's ambient: refuse only another actor's continuation or publication. */
 function reservePublication(context: IoContext): PublicationReservation | undefined {
-  if (tryCurrentContinuation() !== undefined || currentPublication() !== undefined) return undefined;
+  const continuation = tryCurrentContinuation();
+  const publication = currentPublication();
+  if ((continuation ?? context) !== context || (publication?.context ?? context) !== context) {
+    return undefined;
+  }
   const reservation = { context };
   Reflect.set(globalThis, CURRENT_PUBLICATION, reservation);
   atCheckpointEnd(() => clearPublication(reservation));
@@ -100,6 +105,7 @@ function publishOutcome<T, Result>(
   promise: Promise<T>,
   finish: (outcome: Outcome<T>, reservation: PublicationReservation) => Result,
 ): Promise<Result> {
+  const criticalSection = context.getCriticalSection();
   const result = new Promise<Result>((resolve, reject) => {
     const publish = context.makeTransformReentryCallback((outcome: Outcome<T>) => {
       const reservation = reservePublication(context);
@@ -109,13 +115,40 @@ function publishOutcome<T, Result>(
       }
       resolve(finish(outcome, reservation));
     });
+    // Settled while this actor still holds a lock in the captured section: a storage call, a
+    // plain value, or a resumption the runtime already admitted. workerd continues such an await
+    // inside the same checkpoint, keeping the lock and the implicit transaction (§1.2, §1.7.1).
+    // Anything else re-enters through a fresh slice.
+    const settle = (outcome: Outcome<T>): void => {
+      if (!context.hasCurrent() || context.getCriticalSection() !== criticalSection) {
+        schedulePublication({ publish: () => publish(outcome), reject });
+        return;
+      }
+      if (context.isAborted()) {
+        reject(context.getAbortReason());
+        return;
+      }
+      const reservation = reservePublication(context);
+      if (reservation === undefined) {
+        // Another actor's continuation owns this checkpoint. Wait for the next task without
+        // releasing the lock, so no other event of this actor runs first; the implicit
+        // transaction still commits at the hand-off.
+        const lock = context.getInputLock();
+        schedulePublication({
+          publish: () => context.run(() => settle(outcome), { input: lock }),
+          reject,
+        });
+        return;
+      }
+      try {
+        resolve(finish(outcome, reservation));
+      } catch (exception) {
+        reject(exception);
+      }
+    };
     void promise.then(
-      (value) => {
-        schedulePublication({ publish: () => publish({ ok: true, value }), reject });
-      },
-      (exception: unknown) => {
-        schedulePublication({ publish: () => publish({ ok: false, exception }), reject });
-      },
+      (value) => settle({ ok: true, value }),
+      (exception: unknown) => settle({ ok: false, exception }),
     );
   });
   // Keep the actor alive through both the foreign wait and queued publication.
@@ -146,9 +179,11 @@ function resumeWithContext<T>(context: IoContext, promise: Promise<T>): Promise<
 }
 
 /**
- * Resolve one transformed await per task, inside a fresh actor slice. Admission
+ * Resolve a transformed await in a later task, inside an actor slice: a fresh one
+ * when the actor held no lock in the captured section as the promise settled, or
+ * the retained lock of one that waited out another actor's checkpoint. Admission
  * attempts are independent so a blocked actor cannot stall the actor that will
- * unblock it. The task boundary keeps each continuation ambient isolated.
+ * unblock it. The task boundary keeps each actor's continuation ambient isolated.
  */
 function schedulePublication(publication: Publication): void {
   const channel = new MessageChannel();

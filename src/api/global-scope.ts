@@ -52,6 +52,7 @@ import {
   type IoContext,
 } from "../io/io-context";
 import { onAbort } from "../io/io-gate";
+import { ACTOR_SCOPE_GLOBALS } from "./actor-scope-globals";
 import { gateResponseBody } from "./http";
 import {
   installWebSocketGlobals,
@@ -700,13 +701,8 @@ const ASYNC_SUBTLE_METHODS = [
  * exceeded` on the first row.
  */
 export function installActorScope(target: object, resolve: () => ActorGlobalScope): void {
-  const bindings = actorScopeBindings(resolve);
-  // Descriptors, not values: `crypto` is a getter, and reading it here would resolve the scope
-  // at install time — which is before the container exists on the facet path, where the whole
-  // arrangement is a late binding.
-  for (const [name, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(bindings))) {
-    // These are explicit actor capabilities, not web-platform globals.
-    if (name === "awaitIo" || name === "currentExternalEntry") continue;
-    Object.defineProperty(target, name, { ...descriptor, configurable: true });
+  const descriptors = Object.getOwnPropertyDescriptors(actorScopeBindings(resolve));
+  for (const name of ACTOR_SCOPE_GLOBALS) {
+    Object.defineProperty(target, name, { ...descriptors[name], configurable: true });
   }
 }

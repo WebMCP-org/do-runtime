@@ -1,8 +1,7 @@
 /**
  * ← workerd `NO upstream correspondence (storage-backend adaptation)`
  *
- * `SqlDatabaseProvider` over `node:sqlite`. Promoted out of
- * `host/fixtures/storage-node.ts`, which is already this adapter.
+ * `SqlDatabaseProvider` over `node:sqlite`.
  *
  * Upstream's equivalent is `SqliteDatabase`'s binding to the SQLite C API plus
  * its kj-filesystem VFS — 3,768 lines this package deliberately does not port,
@@ -11,8 +10,7 @@
  * write, and the four operations they need from a database.
  *
  * This is the substrate the unit lane runs on. It is also decision 11's Node
- * conformance lane, and `fixtures/storage-node.ts` already proves the seam
- * across 20 of the extension's 24 Node-lane test files.
+ * conformance lane.
  */
 
 import { randomUUID } from "node:crypto";
@@ -34,6 +32,9 @@ import {
   type SqlValue,
 } from "../src/util/sqlite";
 import { requireImportableRuntimeStorage } from "../src/util/sqlite-migrations";
+
+const TOTAL_CHANGES = "SELECT total_changes() AS value";
+const CHANGES = "SELECT changes() AS value";
 
 export type NodeSqlProviderOptions = {
   /**
@@ -127,19 +128,28 @@ export function createNodeSqlProvider(
 export class NodeSqlDatabase implements SqlDatabase {
   readonly #path: string;
   #database: DatabaseSync;
+  /** Prepared once per connection, because every statement reads them. */
+  #totalChangesQuery: StatementSync;
+  #changesQuery: StatementSync;
 
   #closed = false;
 
   constructor(path: string, private readonly onClose: () => void = () => {}) {
     this.#path = path;
     this.#database = new DatabaseSync(path);
+    this.#totalChangesQuery = this.#database.prepare(TOTAL_CHANGES);
+    this.#changesQuery = this.#database.prepare(CHANGES);
   }
 
   prepare(sql: string): SqlDatabaseStatement {
     const statement = this.#database.prepare(sql);
     const source = statement.sourceSQL;
-    return new NodeSqlStatement(statement, source, parameterLayout(source), () =>
-      this.#totalChanges(),
+    return new NodeSqlStatement(
+      statement,
+      source,
+      parameterLayout(source),
+      () => readCount(this.#totalChangesQuery, "total_changes()"),
+      () => readCount(this.#changesQuery, "changes()"),
     );
   }
 
@@ -174,6 +184,8 @@ export class NodeSqlDatabase implements SqlDatabase {
       }
     }
     this.#database = new DatabaseSync(this.#path);
+    this.#totalChangesQuery = this.#database.prepare(TOTAL_CHANGES);
+    this.#changesQuery = this.#database.prepare(CHANGES);
   }
 
   close(): void {
@@ -191,15 +203,14 @@ export class NodeSqlDatabase implements SqlDatabase {
     }
     return value;
   }
+}
 
-  #totalChanges(): number {
-    const row = this.#database.prepare("SELECT total_changes() AS value").get();
-    const value = row?.value;
-    if (typeof value !== "number" && typeof value !== "bigint") {
-      throw new Error("total_changes() did not return a number.");
-    }
-    return Number(value);
+function readCount(query: StatementSync, name: string): number {
+  const value = query.get()?.value;
+  if (typeof value !== "number" && typeof value !== "bigint") {
+    throw new Error(`${name} did not return a number.`);
   }
+  return Number(value);
 }
 
 type ParameterLayout = {
@@ -216,6 +227,7 @@ class NodeSqlStatement implements SqlDatabaseStatement {
     readonly sql: string,
     layout: ParameterLayout,
     private readonly totalChanges: () => number,
+    private readonly changes: () => number,
   ) {
     this.#statement = statement;
     this.#layout = layout;
@@ -236,9 +248,13 @@ class NodeSqlStatement implements SqlDatabaseStatement {
     const columns = statement.columns();
 
     if (columns.length === 0) {
+      // `changes` survives a statement that writes nothing (DDL), so it counts only if
+      // total_changes() moved. It excludes trigger and FTS5/R-Tree shadow-table writes.
+      const before = this.totalChanges();
       const { changes } =
         named === undefined ? statement.run(...anonymous) : statement.run(named, ...anonymous);
-      return { columnNames: [], rawRows: [], rowsWritten: Number(changes) };
+      const wrote = this.totalChanges() !== before;
+      return { columnNames: [], rawRows: [], rowsWritten: wrote ? Number(changes) : 0 };
     }
 
     statement.setReadBigInts(true);
@@ -246,13 +262,13 @@ class NodeSqlStatement implements SqlDatabaseStatement {
     const changesBefore = this.totalChanges();
     const rows: unknown[] =
       named === undefined ? statement.all(...anonymous) : statement.all(named, ...anonymous);
+    // `node:sqlite` exposes no sqlite3_stmt_readonly(). A moved total_changes() tells DML
+    // RETURNING from SELECT without parsing SQL; changes() is then this statement's own count.
+    const wrote = this.totalChanges() !== changesBefore;
     return {
       columnNames: columns.map((column) => column.name),
       rawRows: rows.map(asRow),
-      // `node:sqlite` exposes no sqlite3_stmt_readonly() or per-statement write
-      // counter. The total-change delta distinguishes SELECT from DML RETURNING
-      // without parsing SQL or executing the statement twice.
-      rowsWritten: this.totalChanges() - changesBefore,
+      rowsWritten: wrote ? this.changes() : 0,
     };
   }
 

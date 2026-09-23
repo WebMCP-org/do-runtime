@@ -243,7 +243,7 @@ export const noFacets: FacetHost = {
 };
 
 /**
- * The five ports. Each one is a seam workerd itself takes as a constructor
+ * The six ports. Each one is a seam workerd itself takes as a constructor
  * input; a port that would exist only because our code is currently shaped
  * badly is an invented seam and was rejected. Rejected, for the record:
  * a transport port (one implementation per substrate, forever), a logger port
@@ -252,13 +252,13 @@ export const noFacets: FacetHost = {
  * browser), and an addressing-strategy port (unnecessary once the package
  * speaks facet ids).
  *
- * A fifth, `isolates?: IsolateHost`, was here from the scaffolding and Section 7b
+ * An `isolates?: IsolateHost` port was here from the scaffolding and Section 7b
  * removed it. A Worker Loader is a **binding**, not a port: upstream builds it
  * from `Global::WorkerLoader{channel}` alongside every other binding
  * (`server/workerd-api.c++:748`) and it reaches an application through `env`,
  * exactly as `DurableObjectNamespace` and `ctx.exports` already do here. A host
- * constructs `WorkerLoader` over its own `IsolateChannelFactory` and puts it in
- * `env`; the container never sees one. See `api/worker-loader.ts`'s header.
+ * gets one over its own `IsolateChannelFactory` from `container.workerLoader()`
+ * and puts it in `env`. See `api/worker-loader.ts`'s header.
  */
 export type ActorPorts = {
   sql: SqlDatabaseProvider;
@@ -782,9 +782,11 @@ class ActorTree implements FacetTree {
     // Both outcomes chained: an abort is not conditional on the placement before it succeeding.
     const done = pending === undefined ? operation() : pending.then(operation, operation);
     this.#operations.set(id, done);
-    void done.finally(() => {
+    // Not `finally`, which would re-reject a failed operation where nothing handles it.
+    const clear = (): void => {
       if (this.#operations.get(id) === done) this.#operations.delete(id);
-    });
+    };
+    void done.then(clear, clear);
   }
 
   async subtreeOperationBarrier(id: FacetId): Promise<void> {
@@ -1175,7 +1177,12 @@ class FacetManagerImpl implements FacetManager {
    */
   #teardown(entry: FacetEntry, description: string): void {
     this.#tree.runOperation(entry.id, async () => {
-      this.#host.abort(entry.id, description);
+      try {
+        this.#host.abort(entry.id, description);
+      } catch (error) {
+        // `abort` should return, not throw; keep a host that throws readable in waitUntilStatus().
+        this.#container.trackFacetTeardown(Promise.reject(error));
+      }
     });
   }
 
@@ -1745,17 +1752,25 @@ export async function createActorContainer(
   options: ActorContainerOptions,
 ): Promise<ActorContainer> {
   const actorDb = await options.ports.sql.open(ACTOR_DATABASE_NAME);
-  ensureRuntimeStorageVersion(actorDb, ACTOR_DATABASE_NAME);
-  const db = new SqliteDatabase(actorDb);
+  let facetDb: SqlDatabase | undefined;
+  // The runtime owns what it opened: a refusal below must not strand the handles.
+  try {
+    ensureRuntimeStorageVersion(actorDb, ACTOR_DATABASE_NAME);
+    const db = new SqliteDatabase(actorDb);
 
-  // ← `ensureFacetTreeIndex()`'s `KJ_REQUIRE(parent == kj::none, "only 'root' may
-  // ensureFacetTreeIndex()")` (`server.c++:2704`). A facet is handed the root's rather than
-  // opening one, which is also why this is the only `open` a facet container makes.
-  if (options.facet !== undefined) {
-    return new ActorContainerImpl(options, db, undefined, options.facet.tree);
+    // ← `ensureFacetTreeIndex()`'s `KJ_REQUIRE(parent == kj::none, "only 'root' may
+    // ensureFacetTreeIndex()")` (`server.c++:2704`). A facet is handed the root's rather than
+    // opening one, which is also why this is the only `open` a facet container makes.
+    if (options.facet !== undefined) {
+      return new ActorContainerImpl(options, db, undefined, options.facet.tree);
+    }
+    facetDb = await options.ports.sql.open(FACET_DATABASE_NAME);
+    ensureRuntimeStorageVersion(facetDb, FACET_DATABASE_NAME);
+    const tree = new ActorTree(facetDb, options.ports.facets);
+    return new ActorContainerImpl(options, db, tree, tree);
+  } catch (error) {
+    facetDb?.close();
+    actorDb.close();
+    throw error;
   }
-  const facetDb = await options.ports.sql.open(FACET_DATABASE_NAME);
-  ensureRuntimeStorageVersion(facetDb, FACET_DATABASE_NAME);
-  const tree = new ActorTree(facetDb, options.ports.facets);
-  return new ActorContainerImpl(options, db, tree, tree);
 }

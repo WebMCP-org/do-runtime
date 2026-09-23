@@ -10,10 +10,27 @@
  * for alarm identity, retry policy, and delivery.
  */
 
+import {
+  BrowserAlarmCoordinator,
+  parseBrowserAlarmProjection,
+  parseBrowserAlarmTransportJournal,
+} from "@mcp-b/do-runtime/browser/alarm-coordinator";
 import { OffscreenDocumentCoordinator } from "@mcp-b/do-runtime/browser/offscreen-document";
-import { WAKE_ALARM, type ExtensionResponse } from "./protocol";
+import {
+  parseExtensionResponse,
+  WAKE_ALARM,
+  type ExtensionMessage,
+  type ExtensionResponse,
+} from "./protocol";
 
 const OFFSCREEN_URL = "offscreen.html";
+
+/** The alarm coordinator's journal, which outlives every service worker. */
+const WAKE_JOURNAL = "do-runtime-wake-journal";
+
+/** How long a document may take to answer its first ping before it is replaced. */
+const READY_TIMEOUT_MS = 10_000;
+const READY_POLL_MS = 50;
 
 const JUSTIFICATION =
   "Hosts the Durable Object runtime's actor worker, which needs OPFS synchronous access " +
@@ -40,9 +57,9 @@ const OFFSCREEN_CONTEXT: chrome.runtime.ContextType = "OFFSCREEN_DOCUMENT";
 const OFFSCREEN_REASON: chrome.offscreen.Reason = "WORKERS";
 
 /**
- * The runtime coalesces concurrent creation and recovers Chrome's hidden,
- * occupied offscreen slot. This adapter supplies only the Chrome operations and
- * its string-only occupied-slot signal.
+ * The runtime coalesces concurrent creation, recovers Chrome's hidden, occupied
+ * offscreen slot, and waits for the document to answer. This adapter supplies
+ * only the Chrome operations, its string-only occupied-slot signal, and a ping.
  */
 const offscreenDocument = new OffscreenDocumentCoordinator({
   async exists() {
@@ -60,28 +77,68 @@ const offscreenDocument = new OffscreenDocumentCoordinator({
     }),
   async close() {
     console.warn(
-      "[do-runtime example] an offscreen document held the slot but was not listed; " +
-        "closing it and retrying once.",
+      "[do-runtime example] replacing an offscreen document that is unlisted or not answering.",
     );
-    await chrome.offscreen.closeDocument();
+    // A document that is already gone refuses to close; creating one is still right.
+    await chrome.offscreen.closeDocument().catch(() => {});
   },
   isOccupiedError: (error) => String(error).includes(SINGLE_DOCUMENT_ERROR),
+  /**
+   * `createDocument` resolves before `offscreen.ts` registers its listener
+   * behind a top-level await, and Chrome answers a message sent in that gap
+   * with nothing rather than queueing it.
+   */
+  async ready() {
+    const deadline = Date.now() + READY_TIMEOUT_MS;
+    for (;;) {
+      const answer: unknown = await chrome.runtime
+        .sendMessage({ type: "host-ping" } satisfies ExtensionMessage)
+        .catch(() => undefined);
+      if (answer !== undefined) return;
+      if (Date.now() >= deadline) throw new Error("the offscreen document did not answer");
+      await new Promise((resolve) => setTimeout(resolve, READY_POLL_MS));
+    }
+  },
+  /** A document still mute after the timeout is replaced once, not pinged forever. */
+  replaceUnready: () => true,
 });
 
-export function ensureOffscreen(): Promise<void> {
-  return offscreenDocument.ensure();
-}
-
-async function projectWake(scheduledTime: number | null): Promise<void> {
-  if (scheduledTime === null) {
-    await chrome.alarms.clear(WAKE_ALARM);
-    return;
-  }
-  if (!Number.isSafeInteger(scheduledTime) || scheduledTime < 0) {
-    throw new TypeError("projected alarm time must be a non-negative safe integer");
-  }
-  await chrome.alarms.create(WAKE_ALARM, { when: scheduledTime });
-}
+/**
+ * The physical half of the worker's `AlarmScheduler`. The runtime journals each
+ * hop, so a service worker stopped mid-delivery leaves a watchdog that resumes
+ * it; this adapter supplies Chrome's alarm and storage calls and the delivery.
+ */
+const alarms = new BrowserAlarmCoordinator({
+  // Recreate the host if Chrome removed it, then wait until its scheduler has
+  // finished everything due by the consumed wake.
+  async deliver(scheduledTime) {
+    await offscreenDocument.ensure();
+    const response: unknown = await chrome.runtime.sendMessage({
+      type: "host-op",
+      op: "fireAlarm",
+      args: [scheduledTime],
+    } satisfies ExtensionMessage);
+    const result = parseExtensionResponse(response);
+    if (!result.ok) throw new Error(result.error);
+    const projection = parseBrowserAlarmProjection(result.value);
+    if (projection === null) throw new TypeError("the host answered an invalid wake projection");
+    return projection;
+  },
+  physical: {
+    async clear() {
+      await chrome.alarms.clear(WAKE_ALARM);
+    },
+    create: (when) => chrome.alarms.create(WAKE_ALARM, { when }),
+  },
+  store: {
+    load: async () =>
+      parseBrowserAlarmTransportJournal((await chrome.storage.local.get(WAKE_JOURNAL))[WAKE_JOURNAL]),
+    save: (journal) => chrome.storage.local.set({ [WAKE_JOURNAL]: journal }),
+  },
+});
+void alarms.reconcile().catch((error: unknown) => {
+  console.error("[do-runtime example] the alarm journal could not be reconciled:", error);
+});
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -89,10 +146,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 /**
  * `ensure-host` is the popup asking for a host before it sends any operation;
- * `project-wake` mirrors the scheduler's earliest durable wait into Chrome.
- * `host-op` messages are NOT answered here — the offscreen document receives
- * them directly — so this listener returns `false` for them and lets the channel
- * belong to whoever will actually reply.
+ * `project-wake` carries the scheduler's latest projection to the coordinator.
+ * `host-ping` and `host-op` messages are NOT answered here — the offscreen
+ * document receives them directly — so this listener returns `false` for them
+ * and lets the channel belong to whoever will actually reply.
  */
 chrome.runtime.onMessage.addListener(
   (
@@ -105,11 +162,13 @@ chrome.runtime.onMessage.addListener(
     }
     let operation: Promise<void>;
     if (message.type === "ensure-host") {
-      operation = ensureOffscreen();
-    } else if (message.scheduledTime === null || typeof message.scheduledTime === "number") {
-      operation = projectWake(message.scheduledTime);
+      operation = offscreenDocument.ensure();
     } else {
-      operation = Promise.reject(new TypeError("invalid projected wake message"));
+      const projection = parseBrowserAlarmProjection(message.projection);
+      operation =
+        projection === null
+          ? Promise.reject(new TypeError("invalid projected wake message"))
+          : alarms.project(projection);
     }
     void operation.then(
       () => {
@@ -125,8 +184,8 @@ chrome.runtime.onMessage.addListener(
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name !== WAKE_ALARM) return;
-  void ensureOffscreen().catch((error: unknown) => {
-    console.error("[do-runtime example] alarm wake could not recreate the host:", error);
+  void alarms.fire(alarm.scheduledTime).catch((error: unknown) => {
+    console.error("[do-runtime example] the alarm wake was not delivered:", error);
   });
 });
 
@@ -134,8 +193,8 @@ chrome.alarms.onAlarm.addListener((alarm) => {
  * Start the host on install and on browser startup, without waiting for a popup.
  */
 chrome.runtime.onInstalled.addListener(() => {
-  void ensureOffscreen();
+  void offscreenDocument.ensure();
 });
 chrome.runtime.onStartup.addListener(() => {
-  void ensureOffscreen();
+  void offscreenDocument.ensure();
 });

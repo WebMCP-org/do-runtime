@@ -134,7 +134,7 @@ only when no persisted state exists.
 
 Give the state an integer version and handle every shipped shape. The
 `migratePersistedState()` hook is currently supplied by the Rook Agents SDK fork;
-it is not part of upstream Agents 0.22.
+it is not part of upstream Agents 0.23.
 
 ```ts
 import { Agent } from "agents";

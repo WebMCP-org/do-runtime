@@ -8,7 +8,7 @@
  *  - `onWrite` taking the output-gate lock at the first must-confirm write,
  *    one lock per flush batch;
  *  - `transactionSync` as SAVEPOINT/RELEASE/ROLLBACK TO with a depth counter,
- *    plus the async-callback guard today's version lacks;
+ *    plus an async-callback guard upstream has no twin of;
  *  - alarm arm/consume/deferred-deletion, and `deleteAll`.
  *
  * Sole `ActorCacheInterface` implementation, exactly as on workerd-with-SQLite.

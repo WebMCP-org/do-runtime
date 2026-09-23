@@ -21,9 +21,12 @@ export const WAKE_ALARM = "do-runtime-wake";
 /** The authless relay fixture tells its host when an Agents client is paired. */
 export const RELAY_CLIENT_READY = "do-runtime:relay-client-ready";
 
+/** A `BrowserAlarmProjection`: the scheduler's earliest wake and its durable generation. */
+export type WakeProjection = { readonly generation: number; readonly when: number | null };
+
 /** What the actor worker can ask its offscreen supervisor to project. */
 export interface SupervisorRpc {
-  projectWake(scheduledTime: number | null): Promise<void>;
+  projectWake(projection: WakeProjection): Promise<void>;
 }
 
 /** The state shape the real Agents client receives over its socket. */
@@ -142,7 +145,10 @@ export interface HostRpc {
   submitThink(name: string, text: string, idempotencyKey: string): Promise<ThinkProbeSubmission>;
   thinkStatus(name: string): Promise<ThinkProbeStatus>;
   stopThink(name: string): Promise<void>;
-  armWake(delayMs: number): Promise<number>;
+  /** `holdMs` keeps the wake's handler running, so a test can interrupt its delivery. */
+  armWake(delayMs: number, holdMs?: number): Promise<number>;
+  /** Resolves once the scheduler has finished every wake due by `scheduledTime`. */
+  fireAlarm(scheduledTime: number): Promise<WakeProjection>;
   status(): Promise<HostStatus>;
 }
 
@@ -160,15 +166,17 @@ export type HostOp =
 /**
  * `chrome.runtime.sendMessage` payloads.
  *
- * `ensure-host` is answered by the service worker; `host-op` is answered by the
- * offscreen document, which receives extension messages directly. They are one
- * union because both travel the same channel and every listener has to be able
- * to say "not mine" — a listener that returns `true` for a message it will never
- * answer holds `sendResponse` open until the channel closes.
+ * `ensure-host` and `project-wake` are answered by the service worker;
+ * `host-ping` and `host-op` by the offscreen document, which receives extension
+ * messages directly. They are one union because all of them travel the same
+ * channel and every listener has to be able to say "not mine" — a listener that
+ * returns `true` for a message it will never answer holds `sendResponse` open
+ * until the channel closes.
  */
 export type ExtensionMessage =
   | { readonly type: "ensure-host" }
-  | { readonly type: "project-wake"; readonly scheduledTime: number | null }
+  | { readonly type: "project-wake"; readonly projection: WakeProjection }
+  | { readonly type: "host-ping" }
   | { readonly type: "host-op"; readonly op: HostOp; readonly args: readonly unknown[] };
 
 /** Every answer is a settled result rather than a throw: `sendResponse` cannot reject. */

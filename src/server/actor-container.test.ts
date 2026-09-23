@@ -9,6 +9,9 @@
  * all because it has no upstream body.
  */
 
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, expectTypeOf, test, vi } from "vitest";
 import { createNodeSqlProvider } from "../../backends/node-sqlite";
 import { __gateAwait, __resumeAwait } from "../gate";
@@ -19,6 +22,7 @@ import { markWebSocketUsed } from "../api/web-socket";
 import type { Timer } from "../io/io-context";
 import { CanceledError } from "../io/io-gate";
 import type { SqlDatabase, SqlDatabaseProvider } from "../util/sqlite";
+import { RUNTIME_STORAGE_VERSION } from "../util/sqlite-migrations";
 import { FacetDeletionReceiptStore } from "./facet-deletion";
 import type { ActorClassChannel } from "../io/io-channels";
 import type { IsolateChannelFactory } from "../api/worker-loader";
@@ -388,6 +392,28 @@ describe("newDatabaseIndexFile", () => {
     expect(second.getId(0, "b")).toBe(2);
     expect(second.getId(0, "c")).toBe(3);
   });
+});
+
+describe("createActorContainer", () => {
+  test.each(["root", "facets"])(
+    "closes what it opened when %s was written by a newer release",
+    async (name) => {
+      const directory = mkdtempSync(join(tmpdir(), "do-runtime-container-"));
+      try {
+        const sql = createNodeSqlProvider({ directory });
+        const seeded = await sql.open(name);
+        seeded.exec(`PRAGMA user_version = ${RUNTIME_STORAGE_VERSION + 1}`, []);
+        seeded.close();
+        await expect(
+          createActorContainer(options({ ports: { ...options().ports, sql } })),
+        ).rejects.toThrow("written by a newer @mcp-b/do-runtime");
+        // `exportSnapshot` refuses while any database handle is still open.
+        await expect(sql.exportSnapshot()).resolves.toBeDefined();
+      } finally {
+        rmSync(directory, { recursive: true, force: true });
+      }
+    },
+  );
 });
 
 describe("the composition", () => {
@@ -933,6 +959,24 @@ describe("facets", () => {
     // Same id: ids are stable, which is what makes the storage survive the abort.
     expect(host.started.map((request) => request.id)).toEqual([1, 1]);
     expect(host.deleted).toEqual([]);
+  });
+
+  test("a host abort that throws is handed to trackFacetTeardown, not left unhandled", async () => {
+    const host = new RecordingFacetHost();
+    host.abort = () => {
+      throw new Error("host abort exploded");
+    };
+    const { container, stub } = await counterContainer({
+      ports: { sql: createNodeSqlProvider(), alarms, facets: host, timer },
+    });
+    const track = vi.spyOn(
+      container as unknown as { trackFacetTeardown(work: Promise<void>): void },
+      "trackFacetTeardown",
+    );
+    await openFacet(stub, "child");
+    await stub.abortFacet("child");
+    await vi.waitFor(() => expect(track).toHaveBeenCalledOnce());
+    await expect(track.mock.calls[0]?.[0]).rejects.toThrow("host abort exploded");
   });
 
   test("delete aborts first, then removes the subtree deepest-first", async () => {

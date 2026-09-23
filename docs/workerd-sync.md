@@ -1,6 +1,15 @@
 # workerd sync: September 7, 2026
 
-The oracle and Workers types are pinned to `1.20260907.1` and `5.20260907.1`.
+**September 11 re-pin.** The oracle is now pinned to `v1.20260911.1`
+([`925464ba9fe5`](https://github.com/cloudflare/workerd/tree/925464ba9fe5751e4468626ce77f7a5810df274f)),
+with Workers types `5.20260911.1` and `@sqlite.org/sqlite-wasm` `3.53.4-build1`
+(SQLite 3.53.4), since 0.8.2. Conformance was re-validated on those pins, but the
+[`v1.20260907.1...v1.20260911.1`](https://github.com/cloudflare/workerd/compare/v1.20260907.1...v1.20260911.1)
+upstream range has not been audited the way this document audits the July range.
+A direct probe on SQLite 3.53.4 reproduced the default-expression findings below,
+so the [engine work](#sqlite-engine-work-still-required) is unchanged.
+
+The oracle and Workers types were pinned to `1.20260907.1` and `5.20260907.1`.
 This audit compares the source-comment baseline
 [`v1.20260713.1`](https://github.com/cloudflare/workerd/tree/03c396e9b14ea5644dfcfb696086d8df040a4efc)
 with [`v1.20260907.1`](https://github.com/cloudflare/workerd/tree/beb7bd5c370d898e5ea81947aaa80ba5f48cd47e).

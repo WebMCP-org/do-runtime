@@ -160,6 +160,17 @@ test("withEnvAndExports installs both at once", () => {
   clearEnv();
 });
 
+test("withEnvAndExports refuses a bad exports value without leaving the env scope installed", () => {
+  clearEnv();
+  Object.assign(env, { REAL: "base" });
+  expect(() => withEnvAndExports({ LEAKED: "scoped" }, "not an object", () => 1)).toThrow(
+    TypeError,
+  );
+  expect((env as Record<string, unknown>).REAL).toBe("base");
+  expect((env as Record<string, unknown>).LEAKED).toBeUndefined();
+  clearEnv();
+});
+
 // =======================================================================================
 // The entrypoint classes
 
