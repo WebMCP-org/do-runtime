@@ -1494,6 +1494,8 @@ describe("a break travels down", () => {
 });
 
 describe("alarms", () => {
+  // Alarm times sit a minute out. setAlarm() clamps a past time to now, so a time a slow runner
+  // overtakes before the write lands is stored as a different alarm and the delivery is canceled.
   test("delivery runs the handler and is strictly serialised", async () => {
     const scheduledTimes: Array<number | null> = [];
     const { container, stub, instance } = await counterContainer({
@@ -1510,7 +1512,7 @@ describe("alarms", () => {
       },
     });
 
-    const scheduled = Date.now() + 5;
+    const scheduled = Date.now() + 60_000;
     await stub.arm(scheduled);
     await container.waitOutputLocks();
     expect(scheduledTimes.at(-1)).toBe(scheduled);
@@ -1527,7 +1529,7 @@ describe("alarms", () => {
   test("a completed delivery reports success and no retry", async () => {
     // ← the `.then` after `alarm(...)` (`api/global-scope.c++:589-591`).
     const { container, stub } = await counterContainer();
-    const scheduled = Date.now() + 5;
+    const scheduled = Date.now() + 60_000;
     await stub.arm(scheduled);
     await container.waitOutputLocks();
 
@@ -1542,7 +1544,7 @@ describe("alarms", () => {
     // ← `alarm(lock, js.alloc<AlarmInvocationInfo>(scheduledTime, retryCount))`
     // (`api/global-scope.c++:588`).
     const { container, stub, instance } = await counterContainer();
-    const scheduled = Date.now() + 5;
+    const scheduled = Date.now() + 60_000;
     await stub.arm(scheduled);
     await container.waitOutputLocks();
 
@@ -1561,7 +1563,7 @@ describe("alarms", () => {
     // `shouldRetryCountsAgainstLimits = !isOutputGateBroken() || isUserGeneratedError`,
     // and the gate is intact here, so a plain handler failure counts.
     const { container, stub, instance } = await counterContainer();
-    const scheduled = Date.now() + 5;
+    const scheduled = Date.now() + 60_000;
     await stub.arm(scheduled);
     await container.waitOutputLocks();
 
@@ -1580,7 +1582,7 @@ describe("alarms", () => {
     // The alarm of a broken actor must survive its restart. `ctx.abort()` would
     // be a user error, so this breaks the gate the way a storage failure does.
     const { container, stub, instance } = await counterContainer();
-    const scheduled = Date.now() + 5;
+    const scheduled = Date.now() + 60_000;
     await stub.arm(scheduled);
     await container.waitOutputLocks();
 
@@ -1605,7 +1607,7 @@ describe("alarms", () => {
     // the assertion below would hold for a reason that has nothing to do with the
     // detail it is here to pin.
     const { container, stub, instance } = await counterContainer();
-    const scheduled = Date.now() + 5;
+    const scheduled = Date.now() + 60_000;
     await stub.arm(scheduled);
     await container.waitOutputLocks();
 
@@ -1623,7 +1625,7 @@ describe("alarms", () => {
 
   test.each([false, true])("ctx.abort honors retryAlarm: %s", async (retryAlarm) => {
     const { container, stub, instance } = await counterContainer();
-    const scheduled = Date.now() + 5;
+    const scheduled = Date.now() + 60_000;
     await stub.arm(scheduled);
     await container.waitOutputLocks();
 
@@ -1641,7 +1643,7 @@ describe("alarms", () => {
 
   test("ctx.abort remains terminal when the alarm has no outstanding writes", async () => {
     const { container, stub, instance } = await counterContainer();
-    const scheduled = Date.now() + 5;
+    const scheduled = Date.now() + 60_000;
     await stub.arm(scheduled);
     await container.waitOutputLocks();
     vi.spyOn(instance, "alarm").mockImplementationOnce(async () => {
@@ -1663,7 +1665,7 @@ describe("alarms", () => {
     // `Initializing` arm lets a constructor arm an alarm because "we don't
     // explicitly know if we have an alarm handler or not, so just let it happen.
     // We'll handle it when we go to run the alarm."
-    const scheduled = Date.now() + 5;
+    const scheduled = Date.now() + 60_000;
     const container = await createActorContainer(options());
     await container.start((ctx) => new Alarmless(ctx, scheduled));
     await container.waitOutputLocks();
@@ -1698,7 +1700,7 @@ describe("alarms", () => {
     // ← `ActorSqlite::abandonAlarm` (`io/actor-sqlite.c++:1039-1060`), which the
     // scheduler needs when it gives up (`alarm-scheduler.c++:244`).
     const { container, stub } = await counterContainer();
-    const scheduled = Date.now() + 5;
+    const scheduled = Date.now() + 60_000;
     await stub.arm(scheduled);
     await container.waitOutputLocks();
 
