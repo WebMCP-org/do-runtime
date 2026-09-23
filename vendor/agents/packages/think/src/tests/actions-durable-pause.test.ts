@@ -339,6 +339,27 @@ describe("durable-pause actions (turn-driven, connection-less)", () => {
     expect(await agent.listActionPendingForTest()).toHaveLength(0);
   });
 
+  // Vendor divergence ("Cancellation and recovery"): the queued continuation
+  // carries the approval's Stop epoch, and child cancellation drops it.
+  it("Stop recorded after a connection-less continuation was queued ends it", async () => {
+    const agent = await freshPauseAgent(
+      `dp-queued-stop-${crypto.randomUUID()}`
+    );
+    expect((await agent.testChat("seed a turn to continue")).done).toBe(true);
+    expect(await agent.runQueuedContinuationForTest("nothing")).toBeGreaterThan(
+      0
+    );
+    expect(await agent.runQueuedContinuationForTest("stop")).toBe(0);
+  });
+
+  it("child cancellation drops a queued connection-less continuation", async () => {
+    const agent = await freshPauseAgent(
+      `dp-queued-cancel-${crypto.randomUUID()}`
+    );
+    expect((await agent.testChat("seed a turn to continue")).done).toBe(true);
+    expect(await agent.runQueuedContinuationForTest("cancel")).toBe(0);
+  });
+
   it("attaches the descriptor to the paused part and continues with no open connection on approve", async () => {
     const agent = await freshPauseAgent(`dp-turn-${crypto.randomUUID()}`);
     await agent.useDurablePauseActionForTest();

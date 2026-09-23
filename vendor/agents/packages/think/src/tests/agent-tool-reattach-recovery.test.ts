@@ -1,6 +1,7 @@
-import { env } from "cloudflare:workers";
+import { env, exports } from "cloudflare:workers";
 import { evictDurableObject } from "cloudflare:test";
 import { getAgentByName } from "agents";
+import type { UIMessage } from "ai";
 import { describe, expect, it } from "vitest";
 import type { ThinkRecoveryTestAgent } from "./agents/think-session";
 
@@ -346,5 +347,200 @@ describe("agent-tool child re-attach: request_id rebinding across recovery", () 
     expect(
       await agent.resolveAgentToolRunForRequestForTest(reboundReqId as string)
     ).toBe("run-retry");
+  });
+});
+
+type Frame = Record<string, unknown>;
+const MSG_CHAT_RESPONSE = "cf_agent_use_chat_response";
+const MSG_CHAT_MESSAGES = "cf_agent_chat_messages";
+const poll = <T>(read: () => T | Promise<T>) =>
+  expect.poll(read, { timeout: 5000 });
+
+/** A socket on the recovery agent that records every JSON frame it receives. */
+async function connectRecoverySocket(room: string) {
+  const res = await exports.default.fetch(
+    `http://example.com/agents/think-recovery-test-agent/${room}`,
+    { headers: { Upgrade: "websocket" } }
+  );
+  const ws = res.webSocket as WebSocket;
+  ws.accept();
+  const frames: Frame[] = [];
+  ws.addEventListener("message", (event: MessageEvent) => {
+    try {
+      frames.push(JSON.parse(event.data as string) as Frame);
+    } catch {
+      // not a protocol frame
+    }
+  });
+  // Connected before any stream starts, so no socket waits on a resume ACK.
+  await poll(() =>
+    frames.some((frame) => frame.type === MSG_CHAT_MESSAGES)
+  ).toBe(true);
+  return { ws, frames };
+}
+
+function sendChat(ws: WebSocket, id: string, messageIds: string[]) {
+  const messages = messageIds.map((messageId) => ({
+    id: messageId,
+    role: "user",
+    parts: [{ type: "text", text: `question ${messageId}` }]
+  }));
+  ws.send(
+    JSON.stringify({
+      type: "cf_agent_use_chat_request",
+      id,
+      init: { method: "POST", body: JSON.stringify({ messages }) }
+    })
+  );
+}
+
+const doneFor = (frames: Frame[], id: string) =>
+  frames.find(
+    (frame) =>
+      frame.type === MSG_CHAT_RESPONSE && frame.id === id && frame.done === true
+  );
+
+/** A holds the model; B's request is admitted (persisted, broadcast) behind it. */
+async function admitBehindRunningTurn(name: string) {
+  const room = `${name}-${crypto.randomUUID()}`;
+  const agent = await freshRecoveryAgent(room);
+  const a = await connectRecoverySocket(room);
+  const b = await connectRecoverySocket(room);
+  await agent.holdRecoveryModelForTest();
+  sendChat(a.ws, "req-A", ["uA"]);
+  await poll(
+    async () => (await agent.getHeldRecoveryModelForTest()).calls
+  ).toBe(1);
+  sendChat(b.ws, "req-B", ["uA", "uB"]);
+  await poll(() =>
+    a.frames.some(
+      (frame) =>
+        frame.type === MSG_CHAT_MESSAGES &&
+        (frame.messages as Array<{ id: string }>).some(({ id }) => id === "uB")
+    )
+  ).toBe(true);
+  const close = async () => {
+    await agent.releaseRecoveryModelForTest();
+    a.ws.close();
+    b.ws.close();
+  };
+  return { agent, a, b, close };
+}
+
+/**
+ * Two sockets on one conversation. Think persists and broadcasts a chat
+ * request at admission, before it takes its turn-queue slot (upstream).
+ * `stopCurrentWork` is the fork's Stop ("Cancellation and recovery"); upstream
+ * has only the per-request `cancel` frame.
+ *
+ * Not covered: a per-request cancel that arrives while admission is still
+ * reconciling or compacting is dropped, because the request's abort
+ * controller only exists once its message is persisted (upstream order too);
+ * that request then runs.
+ */
+describe("fork Stop and cancel with a second socket's queued request", () => {
+  it("Stop leaves the queued request unanswered in history, and a replay reaches its receipt", async () => {
+    const { agent, a, b, close } = await admitBehindRunningTurn("stop-queued");
+    try {
+      await agent.stopCurrentWork();
+      await poll(() => doneFor(b.frames, "req-B")).toEqual({
+        type: MSG_CHAT_RESPONSE,
+        id: "req-B",
+        body: "",
+        done: true
+      });
+      await poll(() => doneFor(a.frames, "req-A")).toBeDefined();
+      expect(await agent.getHeldRecoveryModelForTest()).toEqual({
+        calls: 1,
+        aborted: true
+      });
+      expect(await agent.getTurnCallCount()).toBe(1);
+      const history = (await agent.getStoredMessages()) as UIMessage[];
+      expect(history.map(({ role }) => role)).toEqual([
+        "user",
+        "user",
+        "assistant"
+      ]);
+      expect(history.slice(0, 2).map(({ id }) => id)).toEqual(["uA", "uB"]);
+      expect(history[2].parts).toContainEqual(
+        expect.objectContaining({ type: "text", text: "Partial answer" })
+      );
+      expect(history[2].metadata).toMatchObject({ status: "aborted" });
+
+      // The stopped request stays unacknowledged on the client; replaying it
+      // after a reconnect must reach its receipt, not run it.
+      await agent.releaseRecoveryModelForTest();
+      const replay = b.frames.length;
+      sendChat(b.ws, "req-B", ["uA", "uB"]);
+      await poll(() => b.frames.slice(replay)).toContainEqual({
+        type: "cf_agent_stream_resuming",
+        id: "req-B"
+      });
+      b.ws.send(
+        JSON.stringify({ type: "cf_agent_stream_resume_ack", id: "req-B" })
+      );
+      await poll(() => doneFor(b.frames.slice(replay), "req-B")).toBeDefined();
+      expect(await agent.getTurnCallCount()).toBe(1);
+    } finally {
+      await close();
+    }
+  });
+
+  it("a per-request cancel ends a queued request that admission already persisted", async () => {
+    const { agent, a, b, close } =
+      await admitBehindRunningTurn("cancel-queued");
+    try {
+      b.ws.send(
+        JSON.stringify({ type: "cf_agent_chat_request_cancel", id: "req-B" })
+      );
+      await poll(() => agent.isRequestAbortedForTest("req-B")).toBe(true);
+      await agent.releaseRecoveryModelForTest();
+      await poll(() => doneFor(b.frames, "req-B")).toEqual({
+        type: MSG_CHAT_RESPONSE,
+        id: "req-B",
+        body: "",
+        done: true
+      });
+      await poll(() => doneFor(a.frames, "req-A")).toBeDefined();
+      expect(await agent.getTurnCallCount()).toBe(1);
+      const history = (await agent.getStoredMessages()) as UIMessage[];
+      expect(history.map(({ role }) => role)).toEqual([
+        "user",
+        "user",
+        "assistant"
+      ]);
+      expect(history[2].metadata).toMatchObject({ status: "completed" });
+    } finally {
+      await close();
+    }
+  });
+
+  it("pins accepted upstream behaviour: the queued request runs after the running turn, from a continue checkpoint", async () => {
+    const { agent, b, close } = await admitBehindRunningTurn("overlap-order");
+    try {
+      await agent.releaseHeldCallForTest();
+      await poll(
+        async () => (await agent.getHeldRecoveryModelForTest()).calls
+      ).toBe(2);
+      // uB was persisted before A's answer, so B's model call ends with that
+      // answer and Think's continue checkpoint; B's question is only context.
+      const promptB = (await agent.getHeldModelPromptsForTest())[1];
+      expect(promptB.slice(-3)).toEqual([
+        { role: "user", text: "question uB" },
+        { role: "assistant", text: "Partial answer" },
+        {
+          role: "user",
+          text: "Continue your previous response from exactly where it left off. Do not repeat any of it."
+        }
+      ]);
+      await agent.releaseRecoveryModelForTest();
+      await poll(() => doneFor(b.frames, "req-B")).toBeDefined();
+      const history = (await agent.getStoredMessages()) as UIMessage[];
+      expect(
+        history.map(({ id, role }) => (role === "user" ? id : role))
+      ).toEqual(["uA", "uB", "assistant", "assistant"]);
+    } finally {
+      await close();
+    }
   });
 });

@@ -565,7 +565,7 @@ Run \`pnpm exec wrangler deploy\` when you are ready to deploy.
       type: "module",
       scripts: { deploy: "wrangler deploy", "deploy:dry": "wrangler deploy --dry-run" },
       // The vendored fork's version; scripts/e2e.mjs checks it against the installed package.
-      dependencies: { agents: "0.23.0" },
+      dependencies: { agents: "0.24.0" },
       devDependencies: { wrangler: "^4.114.0" },
     },
     null,

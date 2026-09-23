@@ -30,7 +30,9 @@
 import { env, exports } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { getAgentByName } from "..";
+import { State } from "../state";
 import { MessageType } from "../types";
+import { withCapabilityHarness } from "./shared/capability-harness";
 
 // Helper to connect WebSocket to an agent
 async function connectWS(path: string) {
@@ -436,6 +438,34 @@ describe("state management", () => {
       await expect(agentStub.getPersistedStateRow()).resolves.toBe(
         '{"migrationFails":true}'
       );
+    });
+
+    // Vendor divergence: the hook runs on State's own load path, so direct
+    // capability readers (WebSockets.sendState/broadcastState) see it too.
+    it("migrates losslessly inside the State capability's get()", async () => {
+      await withCapabilityHarness(async ({ install, storage }) => {
+        const migratePersistedState = (state: unknown) =>
+          ({ ...(state as object), migrated: true }) as unknown;
+        const rowState = () =>
+          storage.sql
+            .exec<{ state: string }>("SELECT state FROM cf_agents_state")
+            .one().state;
+        const seeded = install(new State());
+        await seeded.lifecycle.start();
+        seeded.capability.set({ v: 1 });
+
+        const migrated = install(new State({ migratePersistedState }));
+        expect(migrated.capability.get()).toEqual({ v: 1, migrated: true });
+        expect(rowState()).toBe('{"v":1,"migrated":true}');
+
+        storage.sql.exec("UPDATE cf_agents_state SET state = 'invalid{json'");
+        const corrupt = install(
+          new State({ initialState: { v: 0 }, migratePersistedState })
+        );
+        expect(() => corrupt.capability.get()).toThrow();
+        expect(() => corrupt.capability.get()).toThrow();
+        expect(rowState()).toBe("invalid{json");
+      });
     });
   });
 

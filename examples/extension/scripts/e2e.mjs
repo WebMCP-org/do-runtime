@@ -392,7 +392,10 @@ async function main() {
     );
 
     await op(popup, "enqueueIncrement", [2]);
-    snapshot = await op(popup, "snapshot");
+    // Agents 0.24 runs each queue item as an alarm-driven Lifecycle job.
+    snapshot = await pollOp(popup, "snapshot", [], (value) =>
+      value.events.some((event) => event.kind === "sdk-queue"),
+    );
     check("the SDK queue callback updated Agent state", snapshot.value, 12);
     check(
       "the SDK queue callback completed",
