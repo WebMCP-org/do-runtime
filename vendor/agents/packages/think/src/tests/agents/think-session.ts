@@ -56,7 +56,7 @@ import {
   enforceRowSizeLimit,
   StreamAccumulator
 } from "agents/chat";
-import type { ClientToolSchema } from "agents/chat";
+import type { ClientToolSchema, ResumableStream, TurnQueue } from "agents/chat";
 import type { Schedule } from "agents";
 import type { Session } from "../../think";
 import type { ContextConfig } from "agents/context";
@@ -5405,6 +5405,37 @@ export class ThinkToolsTestAgent extends Think {
     }
   }
 
+  /**
+   * Queue the connection-less continuation an approval with no open socket
+   * queues, optionally Stop or cancel this child's run before the alarm loop
+   * runs it, and return the model steps the item started.
+   */
+  async runQueuedContinuationForTest(
+    after: "nothing" | "stop" | "cancel"
+  ): Promise<number> {
+    const before = this._beforeStepLog.length;
+    // SAFETY: the production push an approval makes, so the item carries its
+    // real id and payload; these are the private members' signatures.
+    const internals = this as unknown as {
+      _stopEpoch: number;
+      _queueConnectionlessContinuation(stopEpoch: number): Promise<void>;
+    };
+    await internals._queueConnectionlessContinuation(internals._stopEpoch);
+    if (after === "stop") await this.stopCurrentWork();
+    if (after === "cancel") await this.cancelAgentToolRun("run", "Stopped");
+    const deadline = Date.now() + 10_000;
+    while (
+      this
+        .sql`SELECT id FROM cf_agents_jobs WHERE fn = '_cfRunConnectionlessContinuation'`
+        .length > 0
+    ) {
+      if (Date.now() > deadline) throw new Error("continuation did not drain");
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    await this.waitUntilStable({ timeout: 5000 });
+    return this._beforeStepLog.length - before;
+  }
+
   /** Simulate compaction removing a durable-pause action's tool part. */
   async stripDurablePausePartsForTest(): Promise<void> {
     for (const message of this.messages) {
@@ -5809,6 +5840,10 @@ export class ThinkProgrammaticTestAgent extends Think {
 
   private _responseLog: ChatResponseResult[] = [];
   private _submissionLog: ThinkSubmissionInspection[] = [];
+  private _submissionSettlementRows = new Map<
+    string,
+    Record<string, string | number | null>
+  >();
   private _workflowEventLog: Array<{
     workflowName: string;
     workflowId: string;
@@ -5916,6 +5951,44 @@ export class ThinkProgrammaticTestAgent extends Think {
 
   override onChatResponse(result: ChatResponseResult): void {
     this._responseLog.push(result);
+    // Capture the real cutover, BEFORE the submission finalizer writes its
+    // ledger outcome. Tests restore exactly this durable crash-window row.
+    const row = this.sql<Record<string, string | number | null>>`
+      SELECT * FROM cf_think_submissions
+      WHERE request_id = ${result.requestId} AND status = 'running'
+    `[0];
+    if (row) this._submissionSettlementRows.set(result.requestId, row);
+  }
+
+  /** Abort the request (not cancelSubmission), after it starts streaming. */
+  async abortSubmissionRequestForTest(requestId: string): Promise<void> {
+    for (let attempt = 0; attempt < 200; attempt++) {
+      if (this._resumableStream.latestActiveStreamInfoForRequest(requestId)) {
+        this.abortRequest(requestId);
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    throw new Error("Submission request never started streaming");
+  }
+
+  /** Replay startup against the row captured before normal ledger settlement. */
+  async recoverSubmissionSettlementForTest(requestId: string): Promise<void> {
+    await this.drainSubmissionsForTest();
+    await this.drainWorkflowNotificationsForTest();
+    const row = this._submissionSettlementRows.get(requestId);
+    if (!row) throw new Error("Submission settlement snapshot missing");
+    const columns = Object.keys(row);
+    // Column names and values come only from SELECT * on our own SQLite table.
+    this.ctx.storage.sql.exec(
+      `INSERT OR REPLACE INTO cf_think_submissions (${columns.join(", ")})
+       VALUES (${columns.map(() => "?").join(", ")})`,
+      ...Object.values(row)
+    );
+    this._workflowEventLog = [];
+    this._submissionLog = [];
+    await this.recoverSubmissionsForTest();
+    await this.drainWorkflowNotificationsForTest();
   }
 
   override async sendWorkflowEvent(
@@ -6222,6 +6295,20 @@ export class ThinkProgrammaticTestAgent extends Think {
     this._workflowEventFailuresRemaining = count;
   }
 
+  private readonly _serverErrorLog: string[] = [];
+
+  override onError(connectionOrError: unknown, error?: unknown): void {
+    const theError = error ?? connectionOrError;
+    this._serverErrorLog.push(
+      theError instanceof Error ? theError.message : String(theError)
+    );
+  }
+
+  /** Messages of every error reported through `onError`. */
+  async getErrorsForTest(): Promise<string[]> {
+    return this._serverErrorLog;
+  }
+
   async getWorkflowEventsForTest(): Promise<
     Array<{
       workflowName: string;
@@ -6423,21 +6510,22 @@ export class ThinkProgrammaticTestAgent extends Think {
   }> {
     const submissionId = `alarm-owned-${crypto.randomUUID()}`;
     const internal = this as unknown as {
-      _drainThinkSubmissions(): Promise<void>;
-      _drainSubmissions(): Promise<void>;
-      _scheduleSubmissionDrain(): Promise<void>;
+      _cfRunSubmission(payload: { submissionId: string }): Promise<void>;
+      _executeSubmission(row: unknown): Promise<void>;
+      _queueSubmissionRun(submissionId: string): Promise<void>;
     };
-    const originalScheduledDrain = internal._drainThinkSubmissions;
-    const originalInlineDrain = internal._drainSubmissions;
+    const originalRun = internal._cfRunSubmission;
+    const originalExecute = internal._executeSubmission;
     let alarmDrainCalls = 0;
     let inlineDrainCalls = 0;
 
-    // Probe the two domain entrypoints directly. The named callback is the
-    // alarm-owned path; _drainSubmissions is the private inline implementation.
-    internal._drainThinkSubmissions = async () => {
+    // Probe the two entrypoints directly. The queue callback is the
+    // alarm-owned path; _executeSubmission is the private inline worker,
+    // which submitMessages must never reach on its own.
+    internal._cfRunSubmission = async () => {
       alarmDrainCalls += 1;
     };
-    internal._drainSubmissions = async () => {
+    internal._executeSubmission = async () => {
       inlineDrainCalls += 1;
     };
 
@@ -6445,7 +6533,7 @@ export class ThinkProgrammaticTestAgent extends Think {
       const submission = await this.testSubmitMessages("alarm owned", {
         submissionId
       });
-      // The drain is delivered by a platform-scheduled alarm whose firing
+      // The run is delivered by a platform-scheduled alarm whose firing
       // latency is not bounded by our timer ticks — give it a generous (~5s)
       // deadline; the happy path still exits on the first tick after it fires.
       for (let attempt = 0; attempt < 200 && alarmDrainCalls === 0; attempt++) {
@@ -6453,11 +6541,11 @@ export class ThinkProgrammaticTestAgent extends Think {
       }
       return { alarmDrainCalls, inlineDrainCalls, submission };
     } finally {
-      internal._drainThinkSubmissions = originalScheduledDrain;
-      internal._drainSubmissions = originalInlineDrain;
-      // The probe's no-op alarm consumed its schedule row while leaving the
-      // submission pending. Re-arm the real drain for the eventual assertion.
-      await internal._scheduleSubmissionDrain();
+      internal._cfRunSubmission = originalRun;
+      internal._executeSubmission = originalExecute;
+      // The probe's no-op callback consumed the queue item while leaving the
+      // submission pending. Re-queue the real run for the eventual assertion.
+      await internal._queueSubmissionRun(submissionId);
     }
   }
 
@@ -6628,14 +6716,74 @@ export class ThinkProgrammaticTestAgent extends Think {
     return this.deleteSubmissions(options);
   }
 
+  /**
+   * Queue a run for every pending submission (rows inserted directly by a
+   * test have none) and wait until the alarm loop has run them all.
+   */
   async drainSubmissionsForTest(): Promise<void> {
-    await this._drainThinkSubmissions();
+    await (
+      this as unknown as { _queuePendingSubmissionRuns: () => Promise<void> }
+    )._queuePendingSubmissionRuns();
+    await this._waitForQueueDrainForTest("_cfRunSubmission");
+  }
+
+  private async _waitForQueueDrainForTest(
+    callback: string,
+    timeoutMs = 10_000
+  ): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      // Queue items and any scheduled retries of the same callback.
+      const pending = this.sql<{ c: number }>`
+        SELECT COUNT(*) AS c FROM cf_agents_jobs WHERE fn = ${callback}
+      `[0]?.c;
+      if (!pending) return;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    throw new Error(`queued ${callback} items did not drain in time`);
   }
 
   async recoverSubmissionsForTest(): Promise<void> {
     await (
       this as unknown as { _recoverSubmissionsOnStart: () => Promise<void> }
     )._recoverSubmissionsOnStart();
+  }
+
+  /** Emulate an upgrade from the table definition without cutover columns. */
+  async useLegacySubmissionSchemaForTest(): Promise<void> {
+    this.ctx.storage.sql.exec(
+      "ALTER TABLE cf_think_submissions DROP COLUMN result_status"
+    );
+    this.ctx.storage.sql.exec(
+      "ALTER TABLE cf_think_submissions DROP COLUMN output_json"
+    );
+    // SAFETY: startup's once-per-isolate DDL guard is reset to model a new isolate.
+    (
+      this as unknown as { _submissionTableEnsured: boolean }
+    )._submissionTableEnsured = false;
+  }
+
+  /** Seed legacy terminal evidence or an overflow attempt awaiting its retry. */
+  async seedSubmissionStreamForTest(
+    requestId: string,
+    status: "completed" | "error" | "retry"
+  ): Promise<void> {
+    const streamId = this._startResumableStream(requestId);
+    if (status === "error") this._errorResumableStream(streamId, requestId);
+    else this._completeResumableStream(streamId);
+    if (status === "retry") {
+      this
+        .sql`UPDATE cf_think_submissions SET result_status = 'retry' WHERE request_id = ${requestId}`;
+    }
+  }
+
+  /** Model an accepted retry that crashes before opening its successor stream. */
+  async moveSubmissionRequestForTest(
+    submissionId: string,
+    requestId: string
+  ): Promise<void> {
+    this
+      .sql`UPDATE cf_think_submissions SET request_id = ${requestId} WHERE submission_id = ${submissionId}`;
   }
 
   async resetTurnStateForTest(): Promise<void> {
@@ -6701,6 +6849,47 @@ export class ThinkProgrammaticTestAgent extends Think {
     );
   }
 
+  /** Seed one pending recovered retry through the selected production transport. */
+  async scheduleRecoveredRetryForTest(
+    requestId: string,
+    transport: "tasks" | "legacy-schedule"
+  ): Promise<void> {
+    const data = { recoveredRequestId: requestId };
+    if (transport === "legacy-schedule") {
+      await this.schedule(60, "_chatRecoveryRetry", data, {
+        idempotent: true
+      });
+      return;
+    }
+    const input = {
+      callback: "_chatRecoveryRetry" as const,
+      data,
+      delaySeconds: 60
+    };
+    await this.tasks.__DO_NOT_USE_WILL_BREAK__enqueue(
+      CHAT_RECOVERY_TASK_NAME,
+      input,
+      chatRecoveryTaskRunOptions(input, "redefer")
+    );
+  }
+
+  /** Mark matching Task attempts terminal without removing their metadata. */
+  async markScheduledRecoveryTaskTerminalForTest(
+    requestId: string
+  ): Promise<void> {
+    this.sql`
+      UPDATE cf_agents_task_runs
+      SET state = 'completed', next_at = NULL
+      WHERE definition = ${CHAT_RECOVERY_TASK_NAME}
+        AND json_extract(metadata, '$.recoveredRequestId') = ${requestId}
+    `;
+  }
+
+  /** Deliver the pending retry through the production recovery callback. */
+  async runScheduledRecoveryRetryForTest(): Promise<void> {
+    await runRecoveryWorkForTest(this, "_chatRecoveryRetry");
+  }
+
   async insertSubmissionForTest(options: {
     submissionId: string;
     status?: ThinkSubmissionStatus;
@@ -6751,16 +6940,9 @@ export class ThinkProgrammaticTestAgent extends Think {
     `;
   }
 
-  async recoverWorkflowNotificationsForTest(): Promise<void> {
-    (
-      this as unknown as { _recoverWorkflowNotifications: () => void }
-    )._recoverWorkflowNotifications();
-  }
-
+  /** Wait until the alarm loop has delivered every queued workflow notification. */
   async drainWorkflowNotificationsForTest(): Promise<void> {
-    await (
-      this as unknown as { _drainWorkflowNotifications: () => Promise<void> }
-    )._drainWorkflowNotifications();
+    await this._waitForQueueDrainForTest("_cfDeliverWorkflowNotification");
   }
 
   async insertWorkflowNotificationForTest(options: {
@@ -6770,74 +6952,59 @@ export class ThinkProgrammaticTestAgent extends Think {
     workflowId?: string;
     eventType?: string;
     payload?: unknown;
+    firstFailedAt?: number;
   }): Promise<void> {
-    (
-      this as unknown as { _ensureWorkflowNotificationTable: () => void }
-    )._ensureWorkflowNotificationTable();
-    const now = Date.now();
-    this.sql`
-      INSERT INTO cf_think_workflow_notifications (
-        notification_id, submission_id, workflow_name, workflow_id, event_type,
-        payload_json, attempts, last_error, created_at, updated_at, delivered_at
-      )
-      VALUES (
-        ${options.notificationId},
-        ${options.submissionId},
-        ${options.workflowName ?? "TEST_WORKFLOW"},
-        ${options.workflowId ?? "workflow-1"},
-        ${options.eventType ?? "think-prompt-test"},
-        ${JSON.stringify(options.payload ?? { submissionId: options.submissionId, status: "error" })},
-        0,
-        NULL,
-        ${now},
-        ${now},
-        NULL
-      )
-    `;
+    await this.queue(
+      "_cfDeliverWorkflowNotification",
+      {
+        workflowName: options.workflowName ?? "TEST_WORKFLOW",
+        workflowId: options.workflowId ?? "workflow-1",
+        event: {
+          type: options.eventType ?? "think-prompt-test",
+          payload: options.payload ?? {
+            submissionId: options.submissionId,
+            status: "error"
+          }
+        },
+        ...(options.firstFailedAt !== undefined && {
+          firstFailedAt: options.firstFailedAt
+        })
+      },
+      // Same policy as production pushes: no in-process retries.
+      { id: options.notificationId, retry: { maxAttempts: 1 } }
+    );
   }
 
   async listWorkflowNotificationsForTest(): Promise<
     Array<{
       notificationId: string;
-      submissionId: string;
       workflowName: string;
       workflowId: string;
       eventType: string;
-      payloadJson: string;
-      attempts: number;
-      lastError: string | null;
-      deliveredAt: number | null;
+      payload: unknown;
     }>
   > {
-    (
-      this as unknown as { _ensureWorkflowNotificationTable: () => void }
-    )._ensureWorkflowNotificationTable();
-    return this.sql<{
-      notification_id: string;
-      submission_id: string;
-      workflow_name: string;
-      workflow_id: string;
-      event_type: string;
-      payload_json: string;
-      attempts: number;
-      last_error: string | null;
-      delivered_at: number | null;
-    }>`
-      SELECT notification_id, submission_id, workflow_name, workflow_id,
-             event_type, payload_json, attempts, last_error, delivered_at
-      FROM cf_think_workflow_notifications
-      ORDER BY created_at ASC, notification_id ASC
-    `.map((row) => ({
-      notificationId: row.notification_id,
-      submissionId: row.submission_id,
-      workflowName: row.workflow_name,
-      workflowId: row.workflow_id,
-      eventType: row.event_type,
-      payloadJson: row.payload_json,
-      attempts: row.attempts,
-      lastError: row.last_error,
-      deliveredAt: row.delivered_at
-    }));
+    const items = this.sql<{ id: string; payload: string }>`
+      SELECT id, payload FROM cf_agents_jobs
+      WHERE capability = 'queue' AND fn = '_cfDeliverWorkflowNotification'
+      ORDER BY time ASC
+    `;
+    return items.map((row) => {
+      const envelope = JSON.parse(row.payload) as {
+        payload: {
+          workflowName: string;
+          workflowId: string;
+          event: { type: string; payload?: unknown };
+        };
+      };
+      return {
+        notificationId: row.id,
+        workflowName: envelope.payload.workflowName,
+        workflowId: envelope.payload.workflowId,
+        eventType: envelope.payload.event.type,
+        payload: envelope.payload.event.payload
+      };
+    });
   }
 
   async insertMalformedSubmissionForTest(options: {
@@ -7021,6 +7188,46 @@ export class ThinkProgrammaticTestAgent extends Think {
 
   async getStoredMessages(): Promise<UIMessage[]> {
     return this.getMessages();
+  }
+
+  /** Inspect a submission's stream evidence through the real resume handshake. */
+  async inspectSubmissionStreamEvidenceForTest(requestId: string): Promise<{
+    streamStatus: string | null;
+    resultStatus: string | null;
+    hasActiveStream: boolean;
+    hasActiveRequestStream: boolean;
+    resumeFrames: Array<{ type: string; reason?: string }>;
+  }> {
+    const resumeFrames: Array<{ type: string; reason?: string }> = [];
+    const connection = {
+      id: "submission-evidence-probe",
+      readyState: WebSocket.OPEN,
+      send(message: string) {
+        resumeFrames.push(JSON.parse(message));
+      }
+    };
+    // SAFETY: the real resume driver only needs this open connection's id and
+    // send method on its idle path; the private host method has this signature.
+    const host = this as unknown as {
+      _handleStreamResumeRequest(target: typeof connection): Promise<void>;
+    };
+    await host._handleStreamResumeRequest(connection);
+    return {
+      streamStatus:
+        this._resumableStream.latestStreamInfoForRequest(requestId)?.status ??
+        null,
+      resultStatus:
+        this.sql<{ result_status: string | null }>`
+          SELECT result_status FROM cf_think_submissions
+          WHERE request_id = ${requestId}
+          LIMIT 1
+        `[0]?.result_status ?? null,
+      hasActiveStream: this._resumableStream.hasActiveStream(),
+      hasActiveRequestStream:
+        this._resumableStream.latestActiveStreamInfoForRequest(requestId) !==
+        null,
+      resumeFrames
+    };
   }
 
   async getResponseLog(): Promise<ChatResponseResult[]> {
@@ -7448,6 +7655,7 @@ export class ThinkRecoveryTestAgent extends Think {
   private _capturedTurnSystems: string[] = [];
   private _holdModel = false;
   private _heldModelCalls = 0;
+  private _heldModelPrompts: Array<Array<{ role: string; text: string }>> = [];
   private _heldModelAborted = false;
   private _releaseHeldModel: (() => void) | undefined;
   private _stopTestTools: ToolSet = {};
@@ -7617,6 +7825,24 @@ export class ThinkRecoveryTestAgent extends Think {
     this._releaseHeldModel?.();
   }
 
+  /** Finish the current held call; later calls are held too. */
+  async releaseHeldCallForTest(): Promise<void> {
+    this._releaseHeldModel?.();
+  }
+
+  /** Each held model call's prompt, as role and joined text per message. */
+  async getHeldModelPromptsForTest() {
+    return this._heldModelPrompts;
+  }
+
+  /** Whether a per-request cancel has aborted this request's controller. */
+  async isRequestAbortedForTest(requestId: string): Promise<boolean> {
+    const { _aborts } = this as unknown as {
+      _aborts: { getExistingSignal(id: string): AbortSignal | undefined };
+    };
+    return _aborts.getExistingSignal(requestId)?.aborted === true;
+  }
+
   async submitMessagesForTest(messages: UIMessage[]): Promise<string> {
     return (await this.submitMessages(messages)).submissionId;
   }
@@ -7677,8 +7903,19 @@ export class ThinkRecoveryTestAgent extends Think {
     if (this._stopTestModel) return this._stopTestModel;
     if (this._holdModel) {
       return new MockLanguageModelV3({
-        doStream: async ({ abortSignal }) => {
+        doStream: async ({ abortSignal, prompt }) => {
           this._heldModelCalls++;
+          this._heldModelPrompts.push(
+            prompt.map((message) => ({
+              role: message.role,
+              text:
+                typeof message.content === "string"
+                  ? message.content
+                  : message.content
+                      .map((part) => (part.type === "text" ? part.text : ""))
+                      .join("")
+            }))
+          );
           return {
             stream: new ReadableStream({
               start: (controller) => {
@@ -9151,8 +9388,415 @@ export class ThinkRecoveryTestAgent extends Think {
     return super.waitUntilStable(options);
   }
 
-  /** Seed a `running` durable submission keyed by `requestId` (== submission id). */
-  async seedRunningSubmissionForTest(requestId: string): Promise<void> {
+  /**
+   * Gate real recovery work at each ownership boundary and run startup ledger
+   * reconciliation there. Only the seed is synthetic; Tasks and turns are real.
+   */
+  async reproduceSubmissionRecoveryHandoffGapForTest(
+    recoveryKind: "retry" | "continue",
+    pauseAt:
+      | "before-acceptance"
+      | "after-acceptance"
+      | "before-completion"
+      | "after-terminal-foreign-stream"
+      | "after-foreign-turn" = "before-acceptance",
+    streamOutcome: "completed" | "error" = "completed"
+  ): Promise<{
+    duringHandoff: string | null;
+    afterCompletion: string | null;
+    requestRebound: boolean;
+    handoffSignals: number;
+    activeChatTasks: number;
+    activeRecoveryTasks: number;
+    terminalStatuses: string[];
+    responseCount: number;
+    error: string | null;
+    foreignTurn?: {
+      submissionId: string;
+      requestId: string;
+      status: string;
+      requestIdAfterForeignTurn: string | null;
+      recoverySettledAfterForeignTurn: boolean;
+      successorQueuedBehindBlocker: boolean;
+      requestIdAtSuccessorAcceptance: string | null;
+      completedRequestId: string | null;
+      responseRequestIds: string[];
+      terminalRequestIds: Array<string | null>;
+    };
+  }> {
+    const submissionId = `handoff-${recoveryKind}-${crypto.randomUUID()}`;
+    const userMessage: UIMessage = {
+      id: `user-${submissionId}`,
+      role: "user",
+      parts: [{ type: "text", text: "Recover this submission" }]
+    };
+    await this.session.appendMessage(userMessage);
+    let targetAssistantId: string | undefined;
+    if (recoveryKind === "continue") {
+      targetAssistantId = `assistant-${submissionId}`;
+      await this.session.appendMessage({
+        id: targetAssistantId,
+        role: "assistant",
+        parts: [{ type: "text", text: "Partial" }]
+      });
+    }
+
+    // SAFETY: this inert fixture reaches Think's private startup/bookkeeping
+    // seams without exposing production test hooks. These are their signatures.
+    const internals = this as unknown as {
+      _turnQueue: TurnQueue;
+      _ensureSubmissionTable(): void;
+      _updateChatRecoveryIncident(
+        incidentId: string | undefined,
+        status: string,
+        reason?: string
+      ): Promise<void>;
+    };
+    internals._ensureSubmissionTable();
+    const now = Date.now();
+    this.sql`
+      INSERT INTO cf_think_submissions (
+        submission_id, idempotency_key, request_id, stream_id, status,
+        messages_json, metadata_json, error_message, created_at,
+        messages_applied_at, started_at, completed_at
+      ) VALUES (
+        ${submissionId}, NULL, ${submissionId}, NULL, 'running',
+        ${JSON.stringify([userMessage])}, NULL, NULL, ${now},
+        ${now}, ${now}, NULL
+      )
+    `;
+
+    const callback =
+      recoveryKind === "retry"
+        ? ("_chatRecoveryRetry" as const)
+        : ("_chatRecoveryContinue" as const);
+    const data = {
+      incidentId: `incident-${submissionId}`,
+      originalRequestId: submissionId,
+      recoveredRequestId: submissionId,
+      ...(recoveryKind === "retry"
+        ? { targetUserId: userMessage.id }
+        : { targetAssistantId })
+    };
+    if (recoveryKind === "retry") {
+      await this.preScheduleRecoveryRetryForTest(data);
+    } else {
+      await this.preScheduleRecoveryContinueForTest(data);
+    }
+
+    const createGate = () => {
+      let resolve = () => {};
+      const promise = new Promise<void>((done) => {
+        resolve = done;
+      });
+      return { promise, resolve };
+    };
+    const paused = createGate();
+    const release = createGate();
+    const terminal = createGate();
+    const detachedFinished = createGate();
+    const successorQueued = createGate();
+    const releaseQueueBlocker = createGate();
+    const queue = internals._turnQueue;
+    const enqueue = queue.enqueue.bind(queue);
+    const pause = async () => {
+      paused.resolve();
+      await release.promise;
+    };
+    const session = this.session;
+    const getLatestLeaf = session.getLatestLeaf.bind(session);
+    const beforeStep = this.beforeStep.bind(this);
+    const updateIncident = internals._updateChatRecoveryIncident.bind(this);
+    const onSubmissionStatus = this.onSubmissionStatus.bind(this);
+    const onChatResponse = this.onChatResponse.bind(this);
+    const getModel = this.getModel.bind(this);
+    // Vendor divergence: one `_runScheduledChatRecovery` body backs both
+    // callbacks in this fork, so the handoff probe wraps it instead of
+    // upstream's two `*Detached` methods.
+    const host = this as unknown as {
+      _runScheduledChatRecovery(
+        recovery: { kind: "continue" | "retry"; data?: unknown },
+        onTurnStarted?: () => void
+      ): Promise<void>;
+    };
+    const runScheduledRecovery = host._runScheduledChatRecovery.bind(this);
+    let handoffSignals = 0;
+    let responseCount = 0;
+    const terminalStatuses: string[] = [];
+    const responseRequestIds: string[] = [];
+    const terminalRequestIds: Array<string | null> = [];
+    let requestIdAtSuccessorAcceptance: string | null = null;
+    const readSubmissionRequestId = () =>
+      this.sql<{ request_id: string }>`
+        SELECT request_id FROM cf_think_submissions
+        WHERE submission_id = ${submissionId}
+      `[0]?.request_id ?? null;
+    const beforeAcceptance =
+      pauseAt === "before-acceptance" || pauseAt === "after-foreign-turn";
+    let latestLeafReads = 0;
+    session.getLatestLeaf = async () => {
+      const leaf = await getLatestLeaf();
+      latestLeafReads++;
+      if (beforeAcceptance && latestLeafReads === 2) {
+        await pause();
+      }
+      return leaf;
+    };
+    this.beforeStep = async (ctx) => {
+      if (pauseAt === "after-acceptance") await pause();
+      if (pauseAt === "after-foreign-turn" && responseCount === 1) {
+        requestIdAtSuccessorAcceptance = readSubmissionRequestId();
+      }
+      return beforeStep(ctx);
+    };
+    internals._updateChatRecoveryIncident = async (id, status, reason) => {
+      // The successor Task has been removed, but ledger completion has not
+      // started. This is the exact terminal-stream / ledger handoff window.
+      if (
+        (pauseAt === "before-completion" ||
+          pauseAt === "after-terminal-foreign-stream") &&
+        id === data.incidentId &&
+        (status === "completed" || status === "failed")
+      ) {
+        await pause();
+      }
+      return updateIncident(id, status, reason);
+    };
+    this.onSubmissionStatus = async (submission) => {
+      await onSubmissionStatus(submission);
+      if (
+        submission.submissionId === submissionId &&
+        submission.status !== "running"
+      ) {
+        terminalStatuses.push(submission.status);
+        terminalRequestIds.push(submission.requestId ?? null);
+        terminal.resolve();
+      }
+    };
+    this.onChatResponse = async (result) => {
+      responseCount++;
+      responseRequestIds.push(result.requestId);
+      await onChatResponse(result);
+    };
+    if (streamOutcome === "error") {
+      this.getModel = () => createInBandErrorMockModel("handoff stream error");
+    }
+    host._runScheduledChatRecovery = async (recovery, onTurnStarted) => {
+      try {
+        await runScheduledRecovery(recovery, () => {
+          handoffSignals++;
+          onTurnStarted?.();
+        });
+      } finally {
+        detachedFinished.resolve();
+      }
+    };
+
+    let recoverySettled = false;
+    const recoveryWork = runQueuedRecoveryTaskForTest(this, callback).then(
+      (result) => {
+        recoverySettled = true;
+        return result;
+      }
+    );
+    try {
+      await paused.promise;
+      // This turn originates outside the paused successor's async context. Let
+      // it finish before resuming the successor's pre-admission leaf read.
+      const foreignResult =
+        pauseAt === "after-foreign-turn"
+          ? await this.saveMessages([
+              {
+                id: `foreign-${submissionId}`,
+                role: "user",
+                parts: [{ type: "text", text: "An unrelated turn" }]
+              }
+            ])
+          : undefined;
+      // On the broken implementation the foreign acceptance releases recovery;
+      // await its settlement explicitly rather than depending on microtask order.
+      if (foreignResult && handoffSignals > 0) await recoveryWork;
+      const recoverySettledAfterForeignTurn = recoverySettled;
+      // Once accepted, explicitly wait for the predecessor to settle so the
+      // successor alone must protect the row. Before acceptance the signal
+      // count proves the predecessor has NOT been told to hand off.
+      if (!beforeAcceptance) await recoveryWork;
+      const handoffSignalsAtPause = handoffSignals;
+      const activeRecoveryTasks = recoveryWorkCountForTest(this, callback);
+      const chatTasks = this.sql<{ count: number }>`
+        SELECT COUNT(*) AS count FROM cf_agents_task_runs
+        WHERE definition = ${ThinkRecoveryTestAgent.CHAT_FIBER_NAME}
+          AND state IN ('pending', 'running', 'waiting', 'recovering')
+      `;
+      const row = this.sql<{ request_id: string }>`
+        SELECT request_id FROM cf_think_submissions
+        WHERE submission_id = ${submissionId}
+      `[0];
+      if (pauseAt === "after-terminal-foreign-stream") {
+        // A foreign producer invokes reclaim after the successor's cutover,
+        // while the recovery callback is still paused before ledger settlement.
+        // SAFETY: the fixture accesses the existing private stream adapter.
+        const { _resumableStream } = this as unknown as {
+          _resumableStream: ResumableStream;
+        };
+        const foreignStream = _resumableStream.start("foreign-terminal-gap");
+        _resumableStream.complete(foreignStream);
+      }
+      await this.recoverSubmissionsOnStartForTest();
+      // Repeated reconciliation must not duplicate terminal notifications.
+      await this.recoverSubmissionsOnStartForTest();
+      const duringHandoff = await this.getSubmissionStatusForTest(submissionId);
+
+      // Occupy the real admission queue outside the successor's async context.
+      // Waiting behind this entry must preserve the successor's acceptance
+      // context, even though the predecessor releases it from a foreign context.
+      const blockerId = `queue-blocker-${submissionId}`;
+      const queueBlocker = foreignResult
+        ? enqueue(blockerId, () => releaseQueueBlocker.promise)
+        : undefined;
+      if (foreignResult) {
+        queue.enqueue = (requestId, fn, options) => {
+          const result = enqueue(requestId, fn, options);
+          successorQueued.resolve();
+          return result;
+        };
+      }
+      release.resolve();
+      let successorQueuedBehindBlocker = false;
+      if (foreignResult) {
+        await successorQueued.promise;
+        successorQueuedBehindBlocker =
+          queue.activeRequestId === blockerId && queue.queuedCount() === 2;
+        releaseQueueBlocker.resolve();
+        await queueBlocker;
+      }
+      await recoveryWork;
+      await terminal.promise;
+      await detachedFinished.promise;
+      const afterCompletion =
+        await this.getSubmissionStatusForTest(submissionId);
+      const completed = this.sql<{ error_message: string | null }>`
+        SELECT error_message FROM cf_think_submissions
+        WHERE submission_id = ${submissionId}
+      `[0];
+      return {
+        duringHandoff,
+        afterCompletion,
+        requestRebound: row?.request_id !== submissionId,
+        handoffSignals: handoffSignalsAtPause,
+        activeChatTasks: chatTasks[0]?.count ?? 0,
+        activeRecoveryTasks,
+        terminalStatuses,
+        responseCount,
+        error: completed?.error_message ?? null,
+        ...(foreignResult && {
+          foreignTurn: {
+            submissionId,
+            requestId: foreignResult.requestId,
+            status: foreignResult.status,
+            requestIdAfterForeignTurn: row?.request_id ?? null,
+            recoverySettledAfterForeignTurn,
+            successorQueuedBehindBlocker,
+            requestIdAtSuccessorAcceptance,
+            completedRequestId: readSubmissionRequestId(),
+            responseRequestIds,
+            terminalRequestIds
+          }
+        })
+      };
+    } finally {
+      release.resolve();
+      releaseQueueBlocker.resolve();
+      queue.enqueue = enqueue;
+      session.getLatestLeaf = getLatestLeaf;
+      this.beforeStep = beforeStep;
+      internals._updateChatRecoveryIncident = updateIncident;
+      this.onSubmissionStatus = onSubmissionStatus;
+      this.onChatResponse = onChatResponse;
+      this.getModel = getModel;
+      host._runScheduledChatRecovery = runScheduledRecovery;
+    }
+  }
+
+  /** Exercise the facet legacy-fiber branch without requiring facet routing. */
+  async facetRecoveryAcceptanceForTest(): Promise<{
+    acceptedBeforeCompletion: boolean;
+    durableAtAcceptance: boolean;
+  }> {
+    // SAFETY: these private methods are the real acceptance and fiber seams;
+    // overriding only the path selects the facet engine in this inert fixture.
+    const internals = this as unknown as {
+      _runRecoveredTurnAfterAcceptance<T>(
+        row: null,
+        onAccepted: () => void,
+        run: () => Promise<T>
+      ): Promise<T>;
+      _runChatRecoveryFiber<T>(
+        requestId: string,
+        continuation: boolean,
+        run: () => Promise<T>
+      ): Promise<T>;
+    };
+    Object.defineProperty(this, "parentPath", {
+      configurable: true,
+      value: [{ className: "ThinkRecoveryTestAgent", name: "parent" }]
+    });
+    let accepted = false;
+    let durableAtAcceptance = false;
+    const requestId = crypto.randomUUID();
+    try {
+      return await internals._runRecoveredTurnAfterAcceptance(
+        null,
+        () => {
+          accepted = true;
+          durableAtAcceptance = this.sql<{ snapshot: string | null }>`
+            SELECT snapshot FROM cf_agents_runs
+            WHERE name = ${ThinkRecoveryTestAgent.CHAT_FIBER_NAME + ":" + requestId}
+          `.some((row) => row.snapshot !== null);
+        },
+        () =>
+          internals._runChatRecoveryFiber(requestId, false, async () => ({
+            acceptedBeforeCompletion: accepted,
+            durableAtAcceptance
+          }))
+      );
+    } finally {
+      Reflect.deleteProperty(this, "parentPath");
+    }
+  }
+
+  /** A subclass can settle recovery without accepting a successor Task. */
+  async recoverSubmissionWithoutSuccessorForTest(): Promise<{
+    status: string | null;
+    activeRecoveryTasks: number;
+  }> {
+    const submissionId = `no-successor-${crypto.randomUUID()}`;
+    await this.seedRunningSubmissionForTest(submissionId);
+    const continueLastTurn = this.continueLastTurn.bind(this);
+    this.continueLastTurn = async () => ({ requestId: "", status: "skipped" });
+    try {
+      await this.preScheduleRecoveryContinueForTest({
+        recoveredRequestId: submissionId,
+        originalRequestId: submissionId
+      });
+      await runQueuedRecoveryTaskForTest(this, "_chatRecoveryContinue");
+      return {
+        status: await this.getSubmissionStatusForTest(submissionId),
+        activeRecoveryTasks: recoveryWorkCountForTest(
+          this,
+          "_chatRecoveryContinue"
+        )
+      };
+    } finally {
+      this.continueLastTurn = continueLastTurn;
+    }
+  }
+
+  /** Seed a running submission, optionally already rebound to a successor. */
+  async seedRunningSubmissionForTest(
+    requestId: string,
+    submissionId = requestId
+  ): Promise<void> {
     (
       this as unknown as { _ensureSubmissionTable(): void }
     )._ensureSubmissionTable();
@@ -9163,7 +9807,7 @@ export class ThinkRecoveryTestAgent extends Think {
         messages_json, metadata_json, error_message, created_at,
         messages_applied_at, started_at, completed_at
       ) VALUES (
-        ${requestId}, NULL, ${requestId}, NULL, 'running',
+        ${submissionId}, NULL, ${requestId}, NULL, 'running',
         '[]', NULL, NULL, ${now}, ${now}, ${now}, NULL
       )
     `;

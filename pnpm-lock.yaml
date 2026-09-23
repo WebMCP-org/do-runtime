@@ -430,7 +430,7 @@ packages:
       '@chat-adapter/discord': 4.38.0
       '@chat-adapter/slack': 4.38.0
       '@chat-adapter/telegram': 4.38.0
-      agents: '>=0.23.0 <1.0.0'
+      agents: '>=0.24.0 <1.0.0'
       ai: ^6.0.0 || ^7.0.0
       react: ^19.0.0
       zod: ^4.0.0

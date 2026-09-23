@@ -31,6 +31,14 @@ checking inference hooks and resumed tool bodies. The native test caller checks
 that no actor context leaks out. See
 [the runtime setup and limits](../../../docs/browser-async-context.md).
 
+## Agent sockets
+
+Only the default `cf-websocket` transport is supported on do-runtime. The SDK's
+Cap'n Web transport (`transport: "capnweb"`) is not. By inspection, not yet
+reproduced by a test: its callables run after a promise hop that drops the actor
+identity, its `RpcTarget` needs a prior `newRpcSession()`, and `quiescence()`
+cannot see its classic socket.
+
 ## Outbound MCP and OAuth
 
 `examples/extension/scripts/e2e.mjs` now connects the real built Agents MCP client

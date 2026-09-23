@@ -25,16 +25,6 @@ function isLegacyTestState(state: unknown): state is LegacyTestState {
 }
 
 export class TestStateAgent extends Agent<Cloudflare.Env, TestState> {
-  // Capture the DEFAULT_STATE sentinel reference for cache reset in tests.
-  // Child field initializers run after super(), at which point _state is DEFAULT_STATE.
-  // @ts-expect-error - accessing private field for testing
-  private _stateSentinel: TestState = this._state;
-
-  private resetStateCacheForHydration() {
-    // @ts-expect-error - accessing private field for testing
-    this._state = this._stateSentinel;
-  }
-
   initialState: TestState = {
     count: 0,
     items: [],
@@ -104,7 +94,6 @@ export class TestStateAgent extends Agent<Cloudflare.Env, TestState> {
     this.ctx.storage.sql.exec(
       `INSERT OR REPLACE INTO cf_agents_state (id, state) VALUES ('cf_state_row_id', 'invalid{json')`
     );
-    this.resetStateCacheForHydration();
   }
 
   // Insert the state shape used before lastUpdated was introduced.
@@ -112,7 +101,6 @@ export class TestStateAgent extends Agent<Cloudflare.Env, TestState> {
     this.ctx.storage.sql.exec(
       `INSERT OR REPLACE INTO cf_agents_state (id, state) VALUES ('cf_state_row_id', '{"count":7,"items":["legacy"]}')`
     );
-    this.resetStateCacheForHydration();
   }
 
   // Insert valid JSON whose migration deliberately fails.
@@ -120,7 +108,6 @@ export class TestStateAgent extends Agent<Cloudflare.Env, TestState> {
     this.ctx.storage.sql.exec(
       `INSERT OR REPLACE INTO cf_agents_state (id, state) VALUES ('cf_state_row_id', '{"migrationFails":true}')`
     );
-    this.resetStateCacheForHydration();
   }
 
   getPersistedStateRow(): string | null | undefined {
@@ -153,12 +140,9 @@ export class TestStateAgent extends Agent<Cloudflare.Env, TestState> {
       : super.migratePersistedState(state);
   }
 
-  // Get the current schema version from cf_agents_state
+  // Get the Agent's schema version from its KV key
   getSchemaVersion(): number {
-    const rows = this.ctx.storage.sql
-      .exec("SELECT state FROM cf_agents_state WHERE id = 'cf_schema_version'")
-      .toArray() as { state: string | null }[];
-    return rows.length > 0 ? Number(rows[0].state) : 0;
+    return this.ctx.storage.kv.get<number>("cf_agents:schema_version") ?? 0;
   }
 
   // Return sorted DDL for all cf_agents_* tables from sqlite_master.
@@ -193,22 +177,18 @@ export class TestStateAgent extends Agent<Cloudflare.Env, TestState> {
     return rows.map((r) => r.name);
   }
 
-  // Count rows in cf_agents_state (excluding internal schema version row)
+  // Count rows in cf_agents_state
   getStateRowCount(): number {
     const rows = this.ctx.storage.sql
-      .exec(
-        "SELECT count(*) as cnt FROM cf_agents_state WHERE id != 'cf_schema_version'"
-      )
+      .exec("SELECT count(*) as cnt FROM cf_agents_state")
       .toArray() as [{ cnt: number }];
     return rows[0].cnt;
   }
 
-  // Get all row IDs in cf_agents_state (excluding internal schema version row)
+  // Get all row IDs in cf_agents_state
   getStateRowIds(): string[] {
     const rows = this.ctx.storage.sql
-      .exec(
-        "SELECT id FROM cf_agents_state WHERE id != 'cf_schema_version' ORDER BY id"
-      )
+      .exec("SELECT id FROM cf_agents_state ORDER BY id")
       .toArray() as { id: string }[];
     return rows.map((r) => r.id);
   }
@@ -222,9 +202,23 @@ export class TestStateAgent extends Agent<Cloudflare.Env, TestState> {
 
   // Reset schema version to 0 (simulates a pre-versioning DO)
   resetSchemaVersion() {
+    this.ctx.storage.kv.delete("cf_agents:schema_version");
+  }
+
+  // Simulate a DO created when Agent kept its schema version as a row in
+  // cf_agents_state (before the State capability owned that table).
+  insertLegacySchemaVersionRow(version: number) {
+    this.ctx.storage.kv.delete("cf_agents:schema_version");
     this.ctx.storage.sql.exec(
-      "DELETE FROM cf_agents_state WHERE id = 'cf_schema_version'"
+      "INSERT OR REPLACE INTO cf_agents_state (id, state) VALUES ('cf_schema_version', ?)",
+      String(version)
     );
+  }
+
+  // Re-run the State capability's own migration (owner of cf_agents_state).
+  async runStateMigration() {
+    await this.ctx.storage.delete("cf_agents:state_schema_version");
+    await this._state.onStart();
   }
 
   // Re-run the real migration logic from the Agent base class.
@@ -241,7 +235,6 @@ export class TestStateAgent extends Agent<Cloudflare.Env, TestState> {
       "INSERT OR REPLACE INTO cf_agents_state (id, state) VALUES ('cf_state_row_id', ?)",
       value
     );
-    this.resetStateCacheForHydration();
   }
 
   // Simulate orphaned wasChanged: legacy DO crashed during corruption recovery,
@@ -253,16 +246,11 @@ export class TestStateAgent extends Agent<Cloudflare.Env, TestState> {
     this.ctx.storage.sql.exec(
       `INSERT OR REPLACE INTO cf_agents_state (id, state) VALUES ('cf_state_was_changed', 'true')`
     );
-    this.resetStateCacheForHydration();
   }
 }
 
 // Test Agent without initialState to test undefined behavior
 export class TestStateAgentNoInitial extends Agent {
-  // Capture the DEFAULT_STATE sentinel reference for cache reset in tests.
-  // @ts-expect-error - accessing private field for testing
-  private _stateSentinel: unknown = this._state;
-
   // No initialState defined - should return undefined
 
   getState() {
@@ -274,28 +262,19 @@ export class TestStateAgentNoInitial extends Agent {
   }
 
   getSchemaVersion(): number {
-    const rows = this.ctx.storage.sql
-      .exec("SELECT state FROM cf_agents_state WHERE id = 'cf_schema_version'")
-      .toArray() as { state: string | null }[];
-    return rows.length > 0 ? Number(rows[0].state) : 0;
+    return this.ctx.storage.kv.get<number>("cf_agents:schema_version") ?? 0;
   }
 
   getStateRowCount(): number {
-    // Exclude the schema version row from the count
     const rows = this.ctx.storage.sql
-      .exec(
-        "SELECT count(*) as cnt FROM cf_agents_state WHERE id != 'cf_schema_version'"
-      )
+      .exec("SELECT count(*) as cnt FROM cf_agents_state")
       .toArray() as [{ cnt: number }];
     return rows[0].cnt;
   }
 
   getStateRowIds(): string[] {
-    // Exclude the schema version row
     const rows = this.ctx.storage.sql
-      .exec(
-        "SELECT id FROM cf_agents_state WHERE id != 'cf_schema_version' ORDER BY id"
-      )
+      .exec("SELECT id FROM cf_agents_state ORDER BY id")
       .toArray() as { id: string }[];
     return rows.map((r) => r.id);
   }
@@ -305,8 +284,6 @@ export class TestStateAgentNoInitial extends Agent {
     this.ctx.storage.sql.exec(
       `INSERT OR REPLACE INTO cf_agents_state (id, state) VALUES ('cf_state_row_id', 'invalid{json')`
     );
-    // @ts-expect-error - accessing private field for testing
-    this._state = this._stateSentinel;
   }
 
   getPersistedStateRow(): string | null | undefined {
@@ -332,9 +309,6 @@ export class TestStateAgentNoInitial extends Agent {
       "INSERT OR REPLACE INTO cf_agents_state (id, state) VALUES ('cf_state_row_id', ?)",
       value
     );
-    // Reset in-memory cache to sentinel so getter re-reads from DB
-    // @ts-expect-error - accessing private field for testing
-    this._state = this._stateSentinel;
   }
 
   // Simulate orphaned wasChanged: legacy DO crashed during corruption recovery,
@@ -346,8 +320,6 @@ export class TestStateAgentNoInitial extends Agent {
     this.ctx.storage.sql.exec(
       `INSERT OR REPLACE INTO cf_agents_state (id, state) VALUES ('cf_state_was_changed', 'true')`
     );
-    // @ts-expect-error - accessing private field for testing
-    this._state = this._stateSentinel;
   }
 
   // Simulate legacy state row without wasChanged: old SDK version that only wrote
@@ -360,15 +332,27 @@ export class TestStateAgentNoInitial extends Agent {
       "INSERT OR REPLACE INTO cf_agents_state (id, state) VALUES ('cf_state_row_id', ?)",
       value
     );
-    // @ts-expect-error - accessing private field for testing
-    this._state = this._stateSentinel;
   }
 
   // Reset schema version to 0 (simulates a pre-versioning DO)
   resetSchemaVersion() {
+    this.ctx.storage.kv.delete("cf_agents:schema_version");
+  }
+
+  // Simulate a DO created when Agent kept its schema version as a row in
+  // cf_agents_state (before the State capability owned that table).
+  insertLegacySchemaVersionRow(version: number) {
+    this.ctx.storage.kv.delete("cf_agents:schema_version");
     this.ctx.storage.sql.exec(
-      "DELETE FROM cf_agents_state WHERE id = 'cf_schema_version'"
+      "INSERT OR REPLACE INTO cf_agents_state (id, state) VALUES ('cf_schema_version', ?)",
+      String(version)
     );
+  }
+
+  // Re-run the State capability's own migration (owner of cf_agents_state).
+  async runStateMigration() {
+    await this.ctx.storage.delete("cf_agents:state_schema_version");
+    await this._state.onStart();
   }
 
   // Re-run the real migration logic from the Agent base class.
@@ -399,8 +383,9 @@ export class TestThrowingStateAgent extends Agent<Cloudflare.Env, TestState> {
   }
 
   // Notification hook: should not gate broadcasts; errors go to onError
-  onStateChanged(state: TestState, _source: Connection | "server") {
+  async onStateChanged(state: TestState, _source: Connection | "server") {
     this.onStateChangedCalled = true;
+    await Promise.resolve();
     if (state.count === -2) {
       throw new Error("onStateChanged failed: count cannot be -2");
     }

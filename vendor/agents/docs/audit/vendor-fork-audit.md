@@ -4,7 +4,8 @@ Audited 2026-09-12 (Pacific), after merging Agents 0.23 / Think 0.18 with
 [the released continuation fixes](https://github.com/WebMCP-org/do-runtime/pull/61),
 [reconnect identity](https://github.com/WebMCP-org/do-runtime/pull/62) and Rook's
 stable React approval command. The original refresh checkout was left untouched;
-the integration and gates use an isolated worktree.
+the integration and gates use an isolated worktree. On 2026-09-23 the baseline
+moved to Agents 0.24 / Think 0.19; the findings below still apply.
 [VENDOR.md](../../VENDOR.md) owns provenance and the
 [current inventory](../fork-diff.md) records retained owners and retirement
 conditions. Historical audits remain in Git.
@@ -41,16 +42,16 @@ use the gates below.
 
 | Package   | Changed source files | Added lines | Removed lines |
 | --------- | -------------------: | ----------: | ------------: |
-| Agents    |                   34 |       2,887 |           676 |
+| Agents    |                   38 |       2,845 |           639 |
 | AI Chat   |                    1 |         164 |            42 |
-| Think     |                   15 |       2,718 |         1,191 |
+| Think     |                   15 |       2,991 |         1,450 |
 | Voice     |                    0 |           0 |             0 |
-| Shell     |                    9 |       1,917 |            80 |
+| Shell     |                   12 |       1,995 |            93 |
 | Codemode  |                    0 |           0 |             0 |
-| **Total** |               **59** |   **7,686** |     **1,989** |
+| **Total** |               **66** |   **7,995** |     **2,224** |
 
 These are textual differences, not a count of independent patches or removable
-code. Thirteen new browser-messenger/OPFS files account for 2,631 added lines;
+code. Thirteen new browser-messenger/OPFS files account for 2,652 added lines;
 those implementations moved out of Rook and now have one SDK owner. Tests,
 fixtures, declarations outside `src`, build scripts, manifests, dependencies and
 documentation are excluded. Removing an unused upstream skill integration also
@@ -58,7 +59,7 @@ counts as a source difference. The six-package build/export configuration
 remains part of the maintained surface even though it is excluded here.
 
 Measured with `git diff --no-index --numstat`, one file at a time, between
-upstream `5f7ad7e4edac2ec8dd1d6a31758f251cb52373fa` and this fork. Include
+upstream `c076e4c9ff6cfb72931085226edfd3ee7965ac48` and this fork. Include
 `.ts`, `.tsx`, `.js`, `.jsx`, `.mjs` under the six `packages/*/src` trees;
 exclude paths with `test` or `fixture` in any component and `__mocks__`.
 Count files present on only one side against `/dev/null`. This classification
@@ -74,6 +75,11 @@ with Think 0.18.0, at
 [`5f7ad7e4`](https://github.com/cloudflare/agents/tree/5f7ad7e4edac2ec8dd1d6a31758f251cb52373fa).
 Main was
 [`43a58a10`](https://github.com/cloudflare/agents/tree/43a58a1014fbe6f1fe3a1fcc38ad08d53bb5b112).
+The current baseline is
+[Agents 0.24.0](https://github.com/cloudflare/agents/releases/tag/agents%400.24.0),
+with Think 0.19.0, at
+[`c076e4c9`](https://github.com/cloudflare/agents/tree/c076e4c9ff6cfb72931085226edfd3ee7965ac48),
+which was also main on 2026-09-23.
 An issue being closed is not enough: match its reproduction, changed owner and
 release inclusion to the retained behavior.
 
@@ -92,7 +98,7 @@ release inclusion to the retained behavior.
 | [#1894 routing](https://github.com/cloudflare/agents/issues/1894#issuecomment-5255204682)                                                                                                                                                                                                 | Maintainer recommends separate conversation DOs and discusses Worker-level routing.                                                                                                | Aligns with Rook's namespace conversation ownership; no need for a second session overlay.                                                                                                                                           |
 | [#2106 recovered delivery](https://github.com/cloudflare/agents/issues/2106), [#1842 repeated apology](https://github.com/cloudflare/agents/issues/1842)                                                                                                                                  | Related messenger recovery reports remain distinct from live completion/capability lifetime.                                                                                       | Do not overclaim the retained delivery hooks solve every recovery route.                                                                                                                                                             |
 | [#1849 voice settlement](https://github.com/cloudflare/agents/issues/1849), [#2225 voice/channel move](https://github.com/cloudflare/agents/pull/2225)                                                                                                                                    | Response-pipeline settlement workaround is a different boundary; new release moves Voice ownership.                                                                                | Port final-audio flush/error/meter contracts to `agents/channels/voice`; do not add the unrelated settled-promise workaround.                                                                                                        |
-| [#2179 State capability](https://github.com/cloudflare/agents/pull/2179)                                                                                                                                                                                                                  | Main-only at audit time; moves the old corrupt-row fallback into `agents/state`.                                                                                                   | A new port target, not a lossless migration fix. Keep the single application migration hook and untouched-row-on-failure contract.                                                                                                   |
+| [#2179 State capability](https://github.com/cloudflare/agents/pull/2179)                                                                                                                                                                                                                  | Released in 0.24; moves the old corrupt-row fallback into `agents/state`.                                                                                                          | Re-homed, not retired: `State` takes the fork's `migratePersistedState` option and Agent passes its hook. Plain `State` hosts keep the upstream fallback.                                                                            |
 | [#2014 truncation](https://github.com/cloudflare/agents/issues/2014), [#1997 persistence failure](https://github.com/cloudflare/agents/issues/1997)                                                                                                                                       | Open reports suggest host before-step restoration and an external database retry.                                                                                                  | Do not stack those workarounds here. Fix opaque output at its SDK owner; external Postgres retry is not evidence for a native Agent SQL retry layer.                                                                                 |
 
 No exact upstream browser-messenger or Shell OPFS replacement was found.
