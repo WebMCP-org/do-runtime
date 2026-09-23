@@ -1,5 +1,196 @@
 # Changelog
 
+## 0.9.0
+
+### Minor Changes
+
+- 8a939e7: A root container now repairs, when it is next placed, an alarm its scheduler lost. An alarm outlet
+  that reaches its scheduler over RPC cannot fail before the actor's local commit, so a failed
+  request, or a worker killed at the wrong moment, could leave an alarm stored in the actor that
+  never fires. The new optional `AlarmOutlet.reconcile(stored)` hook fixes this: `createActorContainer`
+  calls it once, before construction, with the alarm the actor stored, and a rejection fails creation.
+  Until the actor is placed again, a lost alarm that was its only wake source stays dormant, so a
+  host that wants a prompt repair re-places a root whose container broke on a failed commit.
+  
+  `AlarmScheduler.hooks(id)` implements it, now typed `Required<AlarmOutlet>`: it sets the alarm only
+  when the scheduler has none for the actor, or has a later one. Opening a container therefore never
+  resets the ladder of, or queues a second delivery for, an alarm the scheduler already holds at or
+  before the stored time. Alarms stay at-least-once: an alarm whose success was reported but whose
+  deletion never committed runs again. Hosts that forward `scheduleRun` to a scheduler in another
+  worker should forward `AlarmOutlet.reconcile` the same way and drop any re-push of `getAlarm()`
+  after placement. That re-push reset the retry ladder and redelivered a failing alarm immediately,
+  at retry count 0, on every alarm-triggered placement.
+- 8a939e7: Remove package surface that nothing imports. This breaks a consumer that used any of it:
+  
+  - The `@mcp-b/do-runtime/server/alarm-scheduler` subpath is gone. Import `AlarmScheduler`, its
+    types and its retry constants from `@mcp-b/do-runtime`, which already exports every one.
+  - The `@mcp-b/do-runtime/conformance` subpath is gone. It exported this repository's conformance
+    harness types and `substrate()` helper, which only its own lanes use.
+  - The root no longer exports `installWebSocketGlobals` or `markWebSocketUsed`. The runtime calls
+    both itself: `container.globals` and `installActorScope` carry the socket globals, and
+    `installWebSocketUpgradeGlobals()` from `@mcp-b/do-runtime/browser` marks upgraded sockets.
+  - `@mcp-b/do-runtime/gate` no longer exports `__gate`. `doRuntimeAwaitTransform` emits
+    `__gateAwait`, `__resumeAwait` and `__gateAsyncIterable`, which stay.
+- 8a939e7: Export `platformTimer` and `platformFetch` from `@mcp-b/do-runtime`: a `Timer` and a `FetchPort`
+  over the platform's own `setTimeout`, `clearTimeout` and `fetch`, for `ports.timer`,
+  `ports.fetch` and `AlarmScheduler`. The package captures them when it loads, which is before
+  any `installActorScope` can replace the globals with gated ones built on those ports. A host no
+  longer has to capture the timers at the top of its worker module before anything else runs. A
+  port that read the installed globals would recurse. An aborted `afterDelay`, including one whose
+  signal was already aborted, never settles.
+- 8a939e7: The sqlite-wasm backend now grows its OPFS SAH pool when it opens a database, restores a snapshot
+  or clones a facet's storage, so a pool that fills up no longer breaks the actors in it. Before each
+  of these it calls the pool's `reserveMinimumCapacity()` so the pool holds every file plus a
+  rollback journal for each connection the backend has open. Previously a full pool (for example,
+  one holding facets that were never deleted) still let one more database open but left no slot for
+  its journal. Every later write then failed with `SQLITE_CANTOPEN`, the actor's output gate broke,
+  and re-placing the actor broke it again. A clone or restore could also use up the journal slots or
+  fail with `No available handles to import to.`, and a failed facet clone left the facet empty.
+  
+  `initialCapacity` is now only the size a new pool starts at. The backend never shrinks a pool. If
+  the browser refuses the storage, the operation fails with the driver's error.
+  `OpfsSahPool.reserveMinimumCapacity` is now a required member. The driver's pool already has it,
+  but a pool wrapper must forward it.
+  
+  Opens, restores and clones on one pool now run one at a time, so `open()` resolves a little later.
+  Close the storage or delete it only after its `open()` calls have resolved. An `open()` still
+  waiting its turn is not closed, and `importSnapshot()` refuses if that open lands first.
+- 8a939e7: Add `browserHost({ include, asyncContext, facets })` and `workersModuleAliases()` to
+  `@mcp-b/do-runtime/vite`: the Workers bundle contract every browser host wrote by hand. Register
+  `...browserHost({ include })` in the application's `plugins`, in a browser-only config. It
+  aliases `cloudflare:workers`, `cloudflare:email` and, by default, bare and `node:` `async_hooks`
+  to the package's own files, ahead of the application's own aliases and including for
+  dependencies Vite pre-bundles. Workers build as ES modules, keep class names (the Agents SDK
+  routes and persists sub-agents by `constructor.name`), and run
+  `doRuntimeAwaitTransform({ include, asyncContext: true })`. The application plugins run the
+  transform only while serving, because unbundled development serves Worker modules through them,
+  so production page builds no longer lower non-actor code. With
+  `facets: { registry, match }`, Worker bundles turn code splitting off, matched chunks get
+  `facetScopeBanner({ registry })` through the `banner` output hook, and the build fails when a
+  matched chunk imports anything: an imported chunk's free `WebSocketPair`, streams and timers
+  would bind to the root actor's scope. `workersModuleAliases()` returns just the two platform
+  aliases, for configurations that run no transform.
+  
+  A second `asyncContext` transform in the same pipeline, such as a host's own beside
+  `browserHost()`, no longer fails on the Oxc async-generator helper the first one corrected.
+- ada5bd1: Ship the Worker half of the browser alarm protocol. `createBrowserAlarmProjector()`
+  supplies the `AlarmScheduler`'s `projectWake` and an `acknowledge()` for the
+  `BrowserAlarmCoordinator`'s `deliver()`. Projections leave one at a time, and each draws
+  its generation only after the previous one was sent. A consumed wake is acknowledged only
+  after the latest projection is accepted, no delivery or cleanup is active, and the next
+  wake is absent or later. If the latest projection failed, `acknowledge()` sends it again
+  first, so a scheduler with nothing new to project cannot leave the wake retrying forever.
+  `nextGeneration()` must be durable across Worker restarts: the coordinator silently drops
+  any projection older than the generation it journaled, so an in-memory counter would stall
+  every wake after a restart. `parseBrowserAlarmProjection()` is now exported.
+  
+  Add `connectMessagePortWebSocket()` to `@mcp-b/do-runtime/browser`. It routes one
+  MessagePort socket through a Workers-style `fetch` such as the Agents SDK's
+  `routeAgentRequest()`. A socket nothing routes closes with 1011, and a refused upgrade
+  closes with 1008 and the refusal's text when it is printable ASCII of at most 123 bytes.
+  Previously every failure closed with a generic 1011 that dropped the Agent's reason.
+  `serveMessagePortWebSockets()` now takes `(bridge, url) => Promise<void>`, such as
+  `(bridge, url) => connectMessagePortWebSocket(bridge, url, route)`, instead of a function
+  resolving a URL to a socket. It reports a connection failure after closing the client,
+  and a socket that finishes connecting after `stop()` now closes with
+  "MessagePort transport closed" instead of "host stopped".
+  
+  Gate a hibernatable socket that is a host transport, such as a `MessagePortWebSocket`
+  rehydrated after a Worker restart. The actor used to receive the transport itself, so its
+  `send()` and `close()` could leave before a preceding storage write was confirmed. It now
+  receives one stable socket per transport that waits for the output gate like a
+  `WebSocketPair` half; hibernation hosts still see the transport.
+  
+  `OffscreenDocumentAdapter` gains optional `ready()` and `replaceUnready()` hooks. The
+  coordinator runs readiness in the same single flight as creation, for new and existing
+  documents, and replaces a document that fails it at most once.
+  
+  Fix two `MessagePortWebSocket` hangs. A throwing `onmessage`, `onopen` or `onclose`
+  handler skipped the `addEventListener` listeners behind it; during the open flush it also
+  dropped the queued frames and held every later frame in the queue. Handler errors are now
+  reported the way `EventTarget` reports a throwing listener. A throw while bridging a
+  connected socket, such as a second `accept()`, left the brokered client connecting; it now
+  closes with 1011.
+- ada5bd1: Add `installSqliteWasmHost()` to `@mcp-b/do-runtime/backends/sqlite-wasm`. It installs an OPFS SAH
+  pool through sqlite-wasm's `installOpfsSAHPoolVfs()` with the `name`, `directory`, `clearOnInit`
+  and `initialCapacity` options, and returns the `{ pool, capi }` host the sqlite-wasm provider
+  takes. Concurrent calls for one pool share a single install. Install pools through it:
+  
+  - It waits up to 10 seconds for a terminated worker to release the pool before installing, then
+    rejects with a `NoModificationAllowedError`. Installing while the previous worker was still
+    shutting down could delete the pool's directory and every database in it.
+  - A transaction interrupted by worker termination is now rolled back when its database is
+    reopened. Previously, reopening could expose the interrupted transaction's writes in place of
+    committed rows and left the recovery journal behind, so snapshot export stayed refused.
+- ada5bd1: Export `ACTOR_SCOPE_GLOBALS` from `@mcp-b/do-runtime` and `facetScopeBanner()` from
+  `@mcp-b/do-runtime/vite`. The banner binds every name `installActorScope()` writes to a
+  facet bundle's own scope. Banners that bound only timers, `fetch` and `crypto` left
+  `WebSocketPair` on the root actor's global, so a facet's socket frames waited on the root's
+  output gate and could leave before the facet's own write committed.
+  
+  `doRuntimeAwaitTransform()` now resolves the imports it injects to the package's own files,
+  ahead of any host alias for them, so hosts no longer alias `@mcp-b/do-runtime/gate` or
+  `@mcp-b/do-runtime/browser/async-hooks`. Add a `@mcp-b/do-runtime/cloudflare-email` export,
+  a data-only `EmailMessage` for hosts to alias `cloudflare:email` to.
+
+### Patch Changes
+
+- 8a939e7: `bridgeWebSocket()`, and so `connectMessagePortWebSocket()`, no longer throws inside the Worker
+  when its MessagePort peer reports a close that `WebSocket.close()` refuses: 1006, which a host
+  sends when a `chrome.runtime.Port` disconnects with `lastError`, as well as 1005, 1015, any
+  other reserved code, a code from 0 to 999 or from 5000 to 65535, and a reason over 123 UTF-8
+  bytes. The throw surfaced as an uncaught error on the Worker, which a host may treat as fatal
+  to the actor. The actor's socket now sees a dropped connection instead: the host's code and
+  reason, `wasClean: false`, and no close handshake. An `accept()`ed socket is already `CLOSED`
+  when its `close` event fires, and a hibernatable actor receives
+  `webSocketClose(ws, code, reason, false)` with the socket `CLOSING`, as after any peer close.
+  A close that `close()` accepts still completes a handshake as before. `MessagePortWebSocket`
+  now reports such a wire close with `wasClean: false`, so a socket rehydrated from a raw
+  `MessagePortWebSocket` reports these closes the same way, and so do clients made by
+  `createMessagePortWebSocketConstructor()`. That includes 1005 (no status received), whereas
+  workerd treats a close frame without a status as clean. A wire close with a code outside
+  0-65535 is instead a protocol error: the `MessagePortWebSocket` closes itself with 1002, so a
+  bridged actor sees a clean 1002 close with a handshake. When a subclass calls the protected
+  `disconnect()` on a bridged `MessagePortWebSocket` with a valid code, the pair is now dropped
+  instead of completing a handshake.
+- ada5bd1: Validate both `withEnvAndExports()` scopes before installing either. A non-object `exports`
+  argument previously left the `env` scope installed for the whole realm, so every later `env`
+  read resolved against it.
+  
+  Treat a `Timer.afterDelay` that rejects on abort, as `node:timers/promises` does, as
+  cancellation. Replacing or deleting a waiting alarm previously raised an unhandled
+  `AbortError`, which terminates a Node host by default. The `Timer` contract now states that
+  an aborted wait may stay pending or reject, but must not resolve.
+  
+  Close the databases `createActorContainer()` opened when an open-time check refuses, such as
+  storage written by a newer release. Each refused attempt previously leaked its handles: a
+  retry opened another connection to the same OPFS file, and on Node the provider's
+  `exportSnapshot()` refused from then on. A `FacetHost.abort` that throws is now recorded like a
+  failed facet deletion instead of becoming an unhandled rejection.
+  
+  Report `rowsWritten` as 0 for statements without result columns that write nothing, in both
+  SQLite backends. DDL previously repeated the last write's count, because SQLite does not
+  reset `sqlite3_changes()` for it. `SqliteWasmActorStorage.copyFrom()` now reads every source
+  file in the same task as its recovery-sidecar check, so a source that is still running cannot
+  open a write transaction between the two.
+- ada5bd1: Keep the input lock and the implicit transaction across transformed awaits that settle while
+  the actor still holds its lock. `doRuntimeAwaitTransform()` previously resumed every await
+  through a macrotask hop and a fresh input lock queued behind waiting events, including awaits
+  of storage calls and plain values. Another event could then run between `await
+  storage.get()` and the following `put()`, so two concurrent read-modify-writes lost an update.
+  The implicit transaction also committed at the await, so writes survived an abort that workerd
+  rolls back. A transformed `await ctx.blockConcurrencyWhile()` let queued events run before its
+  caller resumed. Every consumer that transforms the Agents SDK was exposed on its storage
+  sequences.
+  
+  A transformed await now continues in the same checkpoint when its promise settles while the
+  actor holds its lock: storage calls, plain values, and resumptions the runtime already admitted.
+  Settled awaits no longer pay a macrotask each. An await on foreign I/O still re-enters through
+  a fresh lock. When another actor's continuation owns the checkpoint, the await waits for a later
+  task without releasing its lock, and its implicit transaction commits at that hand-off. Code that
+  relied on a storage-only await to let other events in now blocks them, as on workerd. The Node
+  and browser conformance lanes now also run the suite with the probe compiled by the transform.
+
 ## 0.8.3
 
 ### Patch Changes
