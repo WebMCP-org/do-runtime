@@ -116,7 +116,19 @@ async function run(): Promise<SmokeReport> {
   }
   if (filler === "") throw new Error("the smoke pool had no free slot to exhaust");
 
-  const overflowProvider = createSqliteWasmProvider(host, { prefix: "/overflow" });
+  // A pool whose reservation reports its size instead of growing, so a full one stays full.
+  const fixedSize: SqliteWasmHost = {
+    capi: sqlite3.capi,
+    pool: {
+      OpfsSAHPoolDb: pool.OpfsSAHPoolDb,
+      exportFile: (name) => pool.exportFile(name),
+      importDb: (name, image) => pool.importDb(name, image),
+      getFileNames: () => pool.getFileNames(),
+      unlink: (name) => pool.unlink(name),
+      reserveMinimumCapacity: async () => pool.getCapacity(),
+    },
+  };
+  const overflowProvider = createSqliteWasmProvider(fixedSize, { prefix: "/overflow" });
   let fullError = "allowed";
   try {
     (await overflowProvider.open("root")).close();

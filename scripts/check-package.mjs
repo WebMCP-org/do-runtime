@@ -75,6 +75,9 @@ if (typeof runtime.createActorContainer !== "function") {
 if (typeof runtime.BrokenActorError !== "function" || typeof runtime.CanceledError !== "function") {
   throw new Error("packed root entry does not export its actor lifecycle errors");
 }
+if (typeof runtime.platformTimer?.afterDelay !== "function" || typeof runtime.platformFetch !== "function") {
+  throw new Error("packed root entry does not export platformTimer and platformFetch");
+}
 if (
   typeof alarmCoordinator.BrowserAlarmCoordinator !== "function" ||
   typeof alarmCoordinator.parseBrowserAlarmTransportJournal !== "function" ||
@@ -97,22 +100,41 @@ if (typeof offscreenDocument.OffscreenDocumentCoordinator !== "function") {
 if (typeof nodeBackend.createNodeSqlProvider !== "function") {
   throw new Error("packed Node backend does not export createNodeSqlProvider");
 }
-if (typeof gate.__gate !== "function" || typeof gate.__gateAsyncIterable !== "function") {
+if (
+  typeof gate.__gateAwait !== "function" ||
+  typeof gate.__resumeAwait !== "function" ||
+  typeof gate.__gateAsyncIterable !== "function"
+) {
   throw new Error("packed gate entry does not export its helpers");
 }
-if (typeof vite.doRuntimeAwaitTransform !== "function" || typeof vite.facetScopeBanner !== "function") {
-  throw new Error("packed Vite entry does not export doRuntimeAwaitTransform and facetScopeBanner");
+if (
+  typeof vite.doRuntimeAwaitTransform !== "function" ||
+  typeof vite.facetScopeBanner !== "function" ||
+  typeof vite.browserHost !== "function" ||
+  typeof vite.workersModuleAliases !== "function"
+) {
+  throw new Error("packed Vite entry does not export its transform, banner and browser-host preset");
 }
 if (new (modules.get("./cloudflare-email").EmailMessage)("a", "b", "c").to !== "b") {
   throw new Error("packed cloudflare-email entry does not export its EmailMessage constructor");
 }
 // The plugin resolves what it injects to the very files the export map names, so an application
-// import of the same subpath is the same module instance.
+// import of the same subpath is the same module instance. The preset's aliases do the same.
+const exportTarget = (subpath) => fileURLToPath(new URL(manifest.exports[subpath].import, root));
 const { resolveId } = vite.doRuntimeAwaitTransform({ asyncContext: true });
 for (const subpath of ["./gate", "./browser/async-hooks"]) {
-  const target = fileURLToPath(new URL(manifest.exports[subpath].import, root));
-  if (resolveId.handler(`@mcp-b/do-runtime${subpath.slice(1)}`) !== target) {
+  if (resolveId.handler(`@mcp-b/do-runtime${subpath.slice(1)}`) !== exportTarget(subpath)) {
     throw new Error(`packed Vite plugin does not resolve its injected ${subpath} import to the export`);
+  }
+}
+const presetAliases = vite.browserHost({ include: [] })[0].config().resolve.alias;
+for (const [aliases, find, subpath] of [
+  [vite.workersModuleAliases(), "cloudflare:workers", "./cloudflare-workers"],
+  [vite.workersModuleAliases(), "cloudflare:email", "./cloudflare-email"],
+  [presetAliases, String(/^(node:)?async_hooks$/), "./browser/async-hooks"],
+]) {
+  if (!aliases.some((alias) => String(alias.find) === find && alias.replacement === exportTarget(subpath))) {
+    throw new Error(`packed Vite preset does not alias ${find} to the ${subpath} export`);
   }
 }
 

@@ -110,7 +110,7 @@ export class MessagePortWebSocket extends EventTarget implements RawWebSocket {
 
   #dispatchWireMessage(message: MessagePortWebSocketWireMessage): void {
     if (message.type === "close") {
-      this.#finishClose(message.code, message.reason, true);
+      this.#finishClose(message.code, message.reason, isCleanWireClose(message.code, message.reason));
       return;
     }
     if (this.readyState !== MessagePortWebSocket.OPEN) return;
@@ -210,7 +210,7 @@ export function bridgeWebSocket(socket: UpgradeWebSocket, bridge: MessagePortWeb
     socket.send(event.data);
   });
   bridge.addEventListener("close", (event) => {
-    socket.close(event.code, event.reason);
+    closeFromTransport(socket, event.code, event.reason, event.wasClean);
   });
   socket.accept();
   bridge.open();
@@ -298,11 +298,23 @@ function parseWireMessage(
     value.type === "close" &&
     typeof value.code === "number" &&
     Number.isInteger(value.code) &&
+    value.code >= 0 &&
+    value.code <= 0xffff &&
     typeof value.reason === "string"
   ) {
     return { type: "close", code: value.code, reason: value.reason };
   }
   return null;
+}
+
+// Mirrors validateClose() in src/api/web-socket.ts; the bridged/rehydrated parity test pins them together.
+function isCleanWireClose(code: number, reason: string): boolean {
+  return (
+    code >= 1000 &&
+    code < 5000 &&
+    ![1004, 1005, 1006, 1015].includes(code) &&
+    new TextEncoder().encode(reason).byteLength <= 123
+  );
 }
 
 function parseSocketRequest(value: unknown): SocketRequest | null {
@@ -322,6 +334,26 @@ function parseCloseEvent(event: Event): { readonly code: number; readonly reason
   if (typeof event.code !== "number" || !Number.isInteger(event.code)) return null;
   if (typeof event.reason !== "string") return null;
   return { code: event.code, reason: event.reason };
+}
+
+/**
+ * Realm-shared with `AcceptedWebSocket` in `api/web-socket.ts`, which ends a
+ * runtime socket on its transport's close. An unclean close, or a code or
+ * reason its `close()` refuses, such as the 1006 a host reports for a vanished
+ * peer, then arrives as an abnormal close instead of throwing in this listener.
+ * A symbol rather than an import keeps the runtime out of this entry.
+ */
+const TRANSPORT_CLOSED = Symbol.for("@mcp-b/do-runtime/web-socket-transport-closed");
+
+function closeFromTransport(
+  socket: UpgradeWebSocket,
+  code: number,
+  reason: string,
+  wasClean: boolean,
+): void {
+  const transportClosed: unknown = Reflect.get(socket, TRANSPORT_CLOSED);
+  if (typeof transportClosed === "function") transportClosed.call(socket, code, reason, wasClean);
+  else socket.close(code, reason);
 }
 
 function isWebSocketData(value: unknown): value is MessagePortWebSocketData {

@@ -414,6 +414,49 @@ describe("createActorContainer", () => {
       }
     },
   );
+
+  test("hands a persisted alarm to AlarmOutlet.reconcile once, before the actor starts", async () => {
+    const { provider } = sharedProvider();
+    const reconcile = vi.fn();
+    const ports = { ...options().ports, sql: provider, alarms: { ...alarms, reconcile } };
+    const first = await createActorContainer(options({ ports }));
+    expect(reconcile).not.toHaveBeenCalled();
+    const counter = await first.start((ctx, env) => new Counter(ctx, env));
+    const scheduled = Date.now() + 60_000;
+    await first.entry(counter).arm(scheduled);
+    await first.waitOutputLocks();
+
+    const second = await createActorContainer(options({ ports }));
+    expect(reconcile).toHaveBeenCalledExactlyOnceWith(scheduled);
+    await second.start((ctx, env) => new Counter(ctx, env));
+    expect(reconcile).toHaveBeenCalledOnce();
+  });
+
+  test("a rejecting AlarmOutlet.reconcile fails creation and closes what it opened", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "do-runtime-container-"));
+    try {
+      const seeding = createNodeSqlProvider({ directory });
+      const { container, stub } = await counterContainer({
+        ports: { ...options().ports, sql: seeding },
+      });
+      await stub.arm(Date.now() + 60_000);
+      await container.waitOutputLocks();
+      seeding.close();
+
+      const sql = createNodeSqlProvider({ directory });
+      const refused = new Error("the alarm scheduler is unreachable");
+      const reconcile = (): Promise<void> => Promise.reject(refused);
+      await expect(
+        createActorContainer(
+          options({ ports: { ...options().ports, sql, alarms: { ...alarms, reconcile } } }),
+        ),
+      ).rejects.toBe(refused);
+      // `exportSnapshot` refuses while any database handle is still open.
+      await expect(sql.exportSnapshot()).resolves.toBeDefined();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("the composition", () => {

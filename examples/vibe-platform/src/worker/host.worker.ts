@@ -9,7 +9,7 @@
  * The ORDER of the boot below is the part that is easy to get wrong and hard to
  * debug, so each step says what breaks without it.
  *
- *   1. capture the platform's timers            (or the runtime's timer recurses)
+ *   1. use the package's `platformTimer`        (or the runtime's timer recurses)
  *   2. disable the two async-proxy OPFS VFSes   (or a proxy worker starts, with timers)
  *   3. init sqlite, install the SAH pool        (before 4: the installer uses globals)
  *   4. install the actor scope                  (only now: it takes those globals)
@@ -20,21 +20,6 @@
  * capturing them first or by running before the actor scope is installed.
  */
 
-// ---------------------------------------------------------------------------
-// 1. The platform's timers, captured before anything can replace them.
-//
-// `installActorScope` (step 4) overwrites `globalThis.setTimeout` with the
-// actor's gated one, and the actor's gated one is built ON the `Timer` port
-// below. A `Timer` that reached the installed global would arm a timeout in
-// order to implement a timeout: measured, in the runtime's own conformance
-// lane, as `RangeError: Maximum call stack size exceeded`
-// (`conformance/browser/substrate.ts:220`). Module scope is early enough
-// because nothing installs a scope at import time — but it must stay at module
-// scope, not inside `place()`, which runs after step 4 on a respawn.
-
-const rawSetTimeout = globalThis.setTimeout.bind(globalThis);
-const rawClearTimeout = globalThis.clearTimeout.bind(globalThis);
-
 import sqlite3InitModule from "@sqlite.org/sqlite-wasm";
 import {
   createActorContainer,
@@ -43,9 +28,9 @@ import {
   installActorScope,
   newRpcSession,
   noFacets,
+  platformTimer,
   type ActorContainer,
   type ActorEntry,
-  type Timer,
 } from "@mcp-b/do-runtime";
 import {
   installSqliteWasmHost,
@@ -92,22 +77,6 @@ const POOL_NAME = "do-runtime-vibe-platform";
 const STORAGE_PREFIX = "/workspace";
 
 // ---------------------------------------------------------------------------
-// The ports: what this host supplies the runtime
-
-/** Wall clock, on the timers captured above. */
-const timer: Timer = {
-  now: () => Date.now(),
-  afterDelay: (ms, signal) =>
-    new Promise<void>((resolve) => {
-      const handle = rawSetTimeout(resolve, Math.max(0, ms));
-      // Cancellation leaves the promise unsettled: the waiter is gone.
-      signal?.addEventListener("abort", () => {
-        rawClearTimeout(handle);
-      });
-    }),
-};
-
-// ---------------------------------------------------------------------------
 // 2 + 3. sqlite and the pool, before any actor scope exists
 
 async function installPool(): Promise<SqliteWasmHost> {
@@ -138,11 +107,7 @@ async function installPool(): Promise<SqliteWasmHost> {
       // every run; this one is a workspace, and clearing on init would delete the
       // user's files on every page load.
       clearOnInit: false,
-      // Two databases per root actor — its own storage and the facet-tree index —
-      // plus a rollback journal beside each, is four files. Eight is that with
-      // headroom; the pool cannot grow past its capacity without an explicit
-      // `reserveMinimumCapacity`, and running out surfaces as `SQLITE_CANTOPEN`
-      // from whichever open happens to be unlucky.
+      // Only the starting size: the backend grows the pool on open.
       initialCapacity: 8,
     });
   } catch (error) {
@@ -226,7 +191,7 @@ async function place(): Promise<Live> {
       // `FacetHost` that constructs a child container per request.
       alarms: DEFAULT_ALARM_OUTLET,
       facets: noFacets,
-      timer,
+      timer: platformTimer,
       // `ports.fetch` is deliberately absent. This actor SERVES fetches; it
       // makes none. Absence is upstream's `globalOutbound: null` posture, so a
       // stray `fetch()` inside the actor refuses by name instead of quietly

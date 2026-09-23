@@ -227,6 +227,7 @@ class MemoryWebSocketEndpoint extends EventTarget implements RawWebSocket {
   #sentClose = false;
 
   send(data: string | ArrayBufferLike | ArrayBufferView | Blob): void {
+    if (this.#sentClose) return;
     this.peer.dispatchEvent(new MessageEvent("message", { data: cloneMessageData(data) }));
   }
 
@@ -235,7 +236,24 @@ class MemoryWebSocketEndpoint extends EventTarget implements RawWebSocket {
     this.#sentClose = true;
     this.peer.dispatchEvent(new CloseEvent("close", { code, reason, wasClean: true }));
   }
+
+  /** Drop the connection: each end that has not heard a close hears this one, unclean. */
+  abort(code: number, reason: string): void {
+    const unheard = [this.peer, this].filter((end) => !end.peer.#sentClose);
+    this.#sentClose = true;
+    this.peer.#sentClose = true;
+    for (const end of unheard) {
+      end.dispatchEvent(new CloseEvent("close", { code, reason, wasClean: false }));
+    }
+  }
 }
+
+/**
+ * `bridgeWebSocket()` reports its transport's close through this realm-shared
+ * key rather than an import, which keeps the runtime out of the
+ * `browser/message-port-websocket` entry.
+ */
+const TRANSPORT_CLOSED = Symbol.for("@mcp-b/do-runtime/web-socket-transport-closed");
 
 /** One public socket identity, in classic or hibernatable mode after acceptance. */
 export class AcceptedWebSocket extends EventTarget implements RawWebSocket, WebSocket {
@@ -355,6 +373,23 @@ export class AcceptedWebSocket extends EventTarget implements RawWebSocket, WebS
     this.#enqueue(() => this.#socket.close(code, reason));
   }
 
+  /**
+   * The host transport under this socket closed. A clean close with a code and
+   * reason `close()` accepts closes the socket with a handshake. Any other, such
+   * as the 1006 a host reports for a vanished MessagePort peer, drops a pair's
+   * connection instead of throwing: each half that has not heard a close
+   * receives it verbatim and unclean.
+   */
+  [TRANSPORT_CLOSED](code: number, reason: string, wasClean = true): void {
+    const socket = this.#socket;
+    const dropped = !wasClean || !isValidClose(code, reason);
+    if (dropped && !this.#released && socket instanceof MemoryWebSocketEndpoint) {
+      socket.abort(code, reason);
+      return;
+    }
+    this.close(code, reason);
+  }
+
   serializeAttachment(value: unknown): void {
     if (arguments.length === 0) serializeAttachmentMethod.call(this);
     else serializeAttachment(this, value);
@@ -457,7 +492,8 @@ export class AcceptedWebSocket extends EventTarget implements RawWebSocket, WebS
       if (this.#delivery.mode === "classic" && this.#pairState !== undefined) {
         // Pair halves perform the WebSocket close handshake in-memory. An
         // embedder-supplied raw socket owns its own protocol and only reports.
-        if (event.code === 1005 || event.code === 1006 || event.code === 1015) {
+        // A dropped connection leaves nobody to answer.
+        if (!event.wasClean || event.code === 1005 || event.code === 1006 || event.code === 1015) {
           this.#readyState = AcceptedWebSocket.CLOSED;
         } else {
           this.close(event.code, event.reason);
@@ -842,6 +878,7 @@ function validateAutoResponseSize(side: "Request" | "Response", value: string): 
 function validateClose(code: number | undefined, reason: string): void {
   // Match the pinned workerd oracle without the opt-in pedantic_wpt flag.
   // Server policy/restart codes are valid; only reserved wire codes are excluded.
+  // isCleanWireClose() in browser/message-port-websocket.ts mirrors these rules.
   if (
     code !== undefined &&
     (code < 1000 || code >= 5000 || [1004, 1005, 1006, 1015].includes(code))
@@ -853,6 +890,15 @@ function validateClose(code: number | undefined, reason: string): void {
       `WebSocket close reason must not be longer than ${MAX_CLOSE_REASON_BYTES} bytes when UTF-8 encoded.`,
       "SyntaxError",
     );
+  }
+}
+
+function isValidClose(code: number, reason: string): boolean {
+  try {
+    validateClose(code, reason);
+    return true;
+  } catch {
+    return false;
   }
 }
 

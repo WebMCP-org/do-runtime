@@ -37,8 +37,8 @@ type TransformedAwait<T> = {
   readonly reservation: PublicationReservation;
 };
 
-/** Re-enter the actor that owns this transformed await; fail open outside actors. */
-export function __gate<T>(value: T): T | Promise<Awaited<T>> {
+/** Re-enter the actor that owns this `for await` step; fail open outside actors. */
+function __gate<T>(value: T): T | Promise<Awaited<T>> {
   const context = tryCurrentIoContext();
   if (context === undefined) return value;
   return resumeWithContext(context, Promise.resolve(value));

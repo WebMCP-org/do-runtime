@@ -60,10 +60,6 @@
       "types": "./dist/src/browser/offscreen-document.d.ts",
       "import": "./dist/browser/offscreen-document.js"
     },
-    "./server/alarm-scheduler": {
-      "types": "./dist/src/server/alarm-scheduler.d.ts",
-      "import": "./dist/server/alarm-scheduler.js"
-    },
     "./backends/sqlite-wasm": {
       "types": "./dist/backends/sqlite-wasm.d.ts",
       "import": "./dist/backends/sqlite-wasm.js"
@@ -87,10 +83,6 @@
     "./vite": {
       "types": "./dist/src/vite.d.ts",
       "import": "./dist/vite.js"
-    },
-    "./conformance": {
-      "types": "./dist/conformance/host.d.ts",
-      "import": "./dist/conformance.js"
     },
     "./package.json": "./package.json",
     "./browser/async-hooks": {

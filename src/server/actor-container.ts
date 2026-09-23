@@ -75,6 +75,7 @@ import type { FacetManager, FacetStartInfo } from "../io/worker";
 import { asFacetStub } from "../io/worker";
 import type { SqlDatabase, SqlDatabaseProvider } from "../util/sqlite";
 import { hasCurrentSqliteTable, SqliteDatabase } from "../util/sqlite";
+import { SqliteMetadata } from "../util/sqlite-metadata";
 import { ensureRuntimeStorageVersion } from "../util/sqlite-migrations";
 import { ActorIdFactoryImpl } from "./actor-id-impl";
 import type { IndexFile } from "./facet-tree-index";
@@ -1747,6 +1748,11 @@ class ActorContainerImpl implements ActorContainer {
  * Asynchronous because `SqlDatabaseProvider.open` is — see this file's header for
  * why that surfaces here rather than being hidden behind a lazily-opening
  * `state`.
+ *
+ * A root whose storage holds an alarm hands it to `AlarmOutlet.reconcile` on
+ * `ports.alarms` before the container is built, so a scheduler that lost the
+ * request holds the alarm again before the actor can run. A rejection fails
+ * creation, the same fail-closed contract as `scheduleRun`.
  */
 export async function createActorContainer(
   options: ActorContainerOptions,
@@ -1767,6 +1773,12 @@ export async function createActorContainer(
     facetDb = await options.ports.sql.open(FACET_DATABASE_NAME);
     ensureRuntimeStorageVersion(facetDb, FACET_DATABASE_NAME);
     const tree = new ActorTree(facetDb, options.ports.facets);
+    // Roots only: a facet returned above and has no alarm slot. Read by a throwaway reader before
+    // the container exists, so a refusal leaves no rehydrated socket bound to a discarded one.
+    const metadata = new SqliteMetadata(db);
+    db.removeResetListener(metadata);
+    const storedAlarm = metadata.getAlarm();
+    if (storedAlarm !== null) await options.ports.alarms.reconcile?.(storedAlarm);
     return new ActorContainerImpl(options, db, tree, tree);
   } catch (error) {
     facetDb?.close();

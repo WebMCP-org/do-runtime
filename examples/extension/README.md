@@ -37,9 +37,10 @@ popup.html ──sendMessage──▶ service worker ──chrome.offscreen.crea
   back to `child-src` and then to `script-src`, which already says `'self'`. It is
   kept in the manifest as an explicit statement of what this extension loads, not
   as a workaround. Either way the effective policy is `'self'`, which a
-  `chrome-extension://` script URL satisfies and a `blob:` URL does not — so
-  `worker: { format: "es" }` in `vite.config.ts` is the part that matters, since
-  the classic-worker fallback wraps the bundle in a blob.
+  `chrome-extension://` script URL satisfies and a `blob:` URL does not, so the
+  worker ships as its own file rather than a `?worker&inline` blob.
+  `browserHost()` in `vite.config.ts` builds Workers as ES modules, which
+  top-level await and module chunks need.
 - **An OPFS SAH pool inside the extension origin.** No `SharedArrayBuffer`, no
   COOP/COEP headers, no cross-origin isolation — measured, none of it is needed.
   The extension origin gets its own OPFS, so the actor's database is private to
@@ -159,7 +160,7 @@ only as a competing supervisor and asserts that Web Locks refuse it before OPFS.
 | `src/worker/counter.ts` | The root actor and its typed sub-agent class token. |
 | `src/worker/counter-child.worker.ts` | The real bundled child and nested-child classes. |
 | `src/worker/think-probe.ts` | A deterministic Think facet used only by the browser composition test. |
-| `src/worker/actor.worker.ts` | The host: raw timers, sqlite boot order, root/facet placement, and alarm scheduler. |
+| `src/worker/actor.worker.ts` | The host: platform ports, sqlite boot order, root/facet placement, and alarm scheduler. |
 | `src/offscreen/offscreen.ts` | The supervisor: spawns the worker, holds the session, forwards extension messages. |
 | `relay/worker.ts` | The authless native Durable Object used only to prove the external relay seam. |
 | `src/background.ts` | The service worker: offscreen lifecycle and `chrome.alarms` projection. |
@@ -184,11 +185,9 @@ pnpm exec tsc -p examples/extension/tsconfig.worker.json
 
 Every step is where it is because moving it was measured to fail.
 
-1. **Capture raw `setTimeout`/`clearTimeout` at module scope, first.**
-   `installActorScope` replaces `globalThis.setTimeout` with the container's
-   gated one, which is built *on* the `Timer` port — so a `Timer` reading the
-   installed global arms a timeout to implement a timeout and recurses to
-   `RangeError: Maximum call stack size exceeded`.
+1. **Pass `platformTimer` as `ports.timer` and, if the actor may fetch,
+   `platformFetch` as `ports.fetch`.** A port that read the installed globals
+   would recurse once the actor scope replaces them.
 2. **Set `globalThis.sqlite3ApiConfig` before `sqlite3InitModule()`.** It is read
    once, at bootstrap. Disabling the `opfs` and `opfs-wl` VFSes keeps the proxy
    workers this host does not use out of the picture; `opfs-sahpool` must stay
@@ -290,12 +289,14 @@ Written down because this example exists partly to find them.
 - **The hibernation mirror is not process durability.** It survives a container
   replacement inside this Worker. It cannot survive destruction of the Worker
   that owns the raw `MessagePort` socket; that lifecycle reconnects instead.
-- **The facet entries repeat their dependencies.** The root worker,
-  `counter-child.js`, and `think-probe.js` are self-contained (about 1.3 MB and
-  6.4 MB unminified for the two facets in this readable demo build). Each output
-  banner binds the complete chunk—including SDK internals—to that facet's async
-  primitives. A product build can minify them; sharing those chunks would
-  reintroduce the parent-global bug this e2e catches.
+- **The facet entries repeat their dependencies.** Each facet is its own build
+  pass (`vite build --mode counter-child`, `--mode think-probe`) with code
+  splitting off, so the root worker, `counter-child.js`, and `think-probe.js` are
+  self-contained (about 2.1 MB and 7.4 MB unminified for the two facets in this
+  readable demo build). Each banner binds the complete chunk—including SDK
+  internals—to that facet's async primitives. A chunk shared with another entry
+  would bind to the root actor's instead, so `browserHost()` fails the build when
+  a facet chunk imports one. A product build can minify them.
 - **Vite emits the sqlite proxy workers even when they are disabled.** The driver
   references `sqlite3-opfs-async-proxy.js` and `sqlite3-worker1.mjs` through
   `new URL(..., import.meta.url)`, so both land in `dist/assets/` (~600 kB) even
@@ -337,4 +338,5 @@ still calls the runtime's fetch wrapper, which owns output and response-body
 gates. The fixture owns no production credentials and sends no external messages.
 
 The Vite configuration enables compiler-assisted browser async context for actor
-and SDK modules. See [setup and limitations](../../docs/browser-async-context.md).
+and SDK modules through `browserHost()`. See
+[setup and limitations](../../docs/browser-async-context.md).

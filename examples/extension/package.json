@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "vite build && vite build --mode think-probe",
+    "build": "vite build && vite build --mode counter-child && vite build --mode think-probe",
     "e2e": "node scripts/e2e.mjs"
   },
   "dependencies": {

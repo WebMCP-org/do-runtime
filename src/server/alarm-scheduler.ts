@@ -459,8 +459,16 @@ export class AlarmScheduler {
    * ← `ActorSqliteHooks` (`server.c++:3199-3219`), which is the whole of how an
    * actor's storage engine reaches a scheduler: one adapter per actor, holding
    * that actor's key, turning a time into `setAlarm` or `deleteAlarm`.
+   *
+   * Plus `AlarmOutlet.reconcile`, which upstream has no twin of. It leaves alone
+   * an entry due at or before the stored alarm, meaning its queued alarm if it
+   * has one and its own time otherwise. Delivering that entry
+   * reaches `armAlarmHandler`, which reschedules for the stored time itself, so
+   * a retrying alarm keeps its ladder and a running one gets no rerun. Only a
+   * missing or later entry goes to `setAlarm`, as new work. Nothing is deleted:
+   * an entry the actor no longer wants cancels itself at delivery.
    */
-  hooks(actorId: string): AlarmOutlet {
+  hooks(actorId: string): Required<AlarmOutlet> {
     return {
       // Deliberately not `async`: `AlarmOutlet.scheduleRun` may throw synchronously and
       // `ActorSqlite` relies on it, because a scheduling failure has to reach the caller before
@@ -469,6 +477,12 @@ export class AlarmScheduler {
       scheduleRun: (scheduledTime: number | null, _priorTask: Promise<void>): Promise<void> => {
         if (scheduledTime !== null) this.setAlarm(actorId, scheduledTime);
         else this.deleteAlarm(actorId);
+        return this.#projection;
+      },
+      reconcile: (stored: number): Promise<void> | void => {
+        const entry = this.#alarms.get(actorId);
+        if (entry !== undefined && (entry.queuedAlarm ?? entry.scheduledTime) <= stored) return;
+        this.setAlarm(actorId, stored);
         return this.#projection;
       },
     };

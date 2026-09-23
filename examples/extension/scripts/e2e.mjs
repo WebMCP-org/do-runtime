@@ -53,7 +53,11 @@ function check(message, actual, expected) {
 
 /** The build is a precondition, so this script owns it rather than assuming it. */
 function build() {
-  for (const args of [["build"], ["build", "--mode", "think-probe"]]) {
+  for (const args of [
+    ["build"],
+    ["build", "--mode", "counter-child"],
+    ["build", "--mode", "think-probe"],
+  ]) {
     const result = spawnSync(
       process.execPath,
       [`${repoRoot}node_modules/vite/bin/vite.js`, ...args],

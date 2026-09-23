@@ -29,7 +29,7 @@
 
 import sqlite3InitModule from "@sqlite.org/sqlite-wasm";
 import { installSqliteWasmHost, type SqliteWasmHost } from "../../backends/sqlite-wasm";
-import type { Timer } from "../../src/index";
+import { platformTimer } from "../../src/index";
 
 /**
  * ← the namespace's configured `uniqueKey`. One constant for the whole lane, for
@@ -46,33 +46,7 @@ export async function installPool(
   return await installSqliteWasmHost(await sqlite3InitModule(), {
     name,
     clearOnInit,
-    // One pool now holds the whole actor tree: the root's own database, the facet
-    // tree index, one database per facet placed, and a rollback journal beside
-    // each of those as a further file. The default of six is enough only until it
-    // is not, so this is sized for the deepest tree the suite builds with room
-    // over it, not for the tightest fit.
-    //
-    // **What running out actually looks like, measured at capacity 3.** The pool
-    // names it itself, on the console, and names the file it could not create:
-    // `SAH pool is full. Cannot create file /facet-1.root.sqlite-journal`. What
-    // the caller gets is the driver's `SQLITE_CANTOPEN: sqlite3 result code 14`,
-    // and three of the four §1.10 rows fail on it promptly. So this is nameable
-    // after all — the 8c report called it an unnameable `SQLITE_FULL` from inside
-    // a commit and that was wrong on both halves. What it does not name is this
-    // line, which is the knob.
-    //
-    // A headroom check in `SqliteWasmActorStorage.open` was tried and is NOT
-    // here, because it measured worse at the time. Refusing before the facet's
-    // database opens at all — rather than later, when its journal does — fails
-    // the placement inside `createActorContainer`, and the lane wedged on that:
-    // the rows timed out at 15s and the refusal reached neither the test nor the
-    // console. A failure the caller can see beats a better-worded one it cannot.
-    //
-    // A placement failure now reaches the first call on the facet's stub, so the
-    // check would no longer be silent. It still does not come back. Its only job
-    // was to reword a failure the pool already names on the console and in the
-    // driver's own `SQLITE_CANTOPEN`, and this line is the knob that actually
-    // decides whether the tree fits.
+    // Only the starting size: the backend grows the pool on open to fit the tree.
     initialCapacity: 64,
   });
 }
@@ -84,35 +58,10 @@ export async function installPool(
  * pair with it: every alarm in the suite has to arrive on real elapsed time.
  * `AlarmScheduler` takes this timer, and a wake that only happens when a test
  * pokes it is not a platform.
- */
-/**
- * Captured at module scope, and this module is imported before any worker
- * installs the runtime's globals — so `rawSetTimeout` is the platform's even
- * after `installActorScope` has replaced `globalThis.setTimeout`.
  *
- * Not a style choice. `container.globals.setTimeout` is built ON the `Timer`
- * below, so a `Timer` that reached the installed global would arm a timeout to
- * implement a timeout: `#arm` → `afterDelay` → `setTimeout` → `setTimeoutImpl`
- * → `#arm`. Measured as `RangeError: Maximum call stack size exceeded` the first
- * time the node lane was pointed at the runtime's own primitives, before its
- * timer was given the same treatment. Every substrate piece BELOW the runtime
- * has to keep the raw ones.
+ * The package's `platformTimer`, captured before any worker installs the
+ * runtime's globals. `container.globals.setTimeout` is built ON this timer, so
+ * one that read the installed global would arm a timeout to implement a
+ * timeout: `RangeError: Maximum call stack size exceeded`.
  */
-const rawSetTimeout = globalThis.setTimeout.bind(globalThis);
-const rawClearTimeout = globalThis.clearTimeout.bind(globalThis);
-
-export const timer: Timer = {
-  now: () => Date.now(),
-  afterDelay: (ms, signal) =>
-    new Promise<void>((resolve) => {
-      const handle = rawSetTimeout(resolve, Math.max(0, ms));
-      // Cancellation leaves the promise unsettled, which is what the node lane's
-      // timer does and what kj's cancel-by-drop means: the waiter is gone.
-      signal?.addEventListener("abort", () => {
-        rawClearTimeout(handle);
-      });
-    }),
-};
-
-export const sleep = (ms: number): Promise<void> =>
-  new Promise<void>((resolve) => rawSetTimeout(resolve, Math.max(0, ms)));
+export const timer = platformTimer;

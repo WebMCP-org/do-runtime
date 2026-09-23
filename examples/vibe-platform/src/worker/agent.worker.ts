@@ -1,6 +1,3 @@
-const rawSetTimeout = globalThis.setTimeout.bind(globalThis);
-const rawClearTimeout = globalThis.clearTimeout.bind(globalThis);
-
 import sqlite3InitModule from "@sqlite.org/sqlite-wasm";
 import {
   createActorContainer,
@@ -9,9 +6,9 @@ import {
   installActorScope,
   newRpcSession,
   noFacets,
+  platformTimer,
   type ActorContainer,
   type ActorEntry,
-  type Timer,
 } from "@mcp-b/do-runtime";
 import {
   installSqliteWasmHost,
@@ -39,15 +36,6 @@ const ACTOR_ID = "default";
 
 Object.defineProperty(globalThis, CLOUDFLARE_WORKERS_GLOBAL, { value: cloudflareWorkers });
 Object.defineProperty(globalThis, AGENTS_GLOBAL, { value: agents });
-
-const timer: Timer = {
-  now: () => Date.now(),
-  afterDelay: (ms, signal) =>
-    new Promise<void>((resolve) => {
-      const handle = rawSetTimeout(resolve, Math.max(0, ms));
-      signal?.addEventListener("abort", () => rawClearTimeout(handle));
-    }),
-};
 
 type ReleasableSqliteWasmHost = SqliteWasmHost & {
   pool: SqliteWasmHost["pool"] & { pauseVfs(): unknown };
@@ -183,7 +171,7 @@ async function place(): Promise<NonNullable<typeof live>> {
       sql: storage,
       alarms: DEFAULT_ALARM_OUTLET,
       facets: noFacets,
-      timer,
+      timer: platformTimer,
     },
   });
   scopeContainer = container;

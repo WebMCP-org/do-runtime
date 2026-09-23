@@ -677,13 +677,21 @@ function methodNames(prototype: object): string[] {
  * Asynchronous where the node lane's is synchronous, and `ActorSqlite` is built
  * for that: `#requestScheduledAlarm` returns the promise unchanged and the
  * pre-commit path awaits it, so "durable before the returned promise resolves"
- * now covers a round trip rather than a function call. What is lost is the
- * synchronous throw, which no path in the suite reaches.
+ * now covers a round trip rather than a function call. `priorTask` is therefore
+ * awaited before the request is sent, which is what keeps a move-earlier from
+ * racing an in-flight move-later. What is lost is the synchronous throw: a
+ * failed request arrives after the commit, and `AlarmOutlet.reconcile` repairs
+ * the schedule at the next placement.
  */
 function alarmOutlet(actorName: string): AlarmOutlet {
   return {
-    scheduleRun: (scheduledTime: number | null): Promise<void> =>
-      Promise.resolve(requirePeer().scheduleRun(actorName, scheduledTime)).then(() => undefined),
+    scheduleRun: async (scheduledTime: number | null, priorTask: Promise<void>): Promise<void> => {
+      await priorTask;
+      await requirePeer().scheduleRun(actorName, scheduledTime);
+    },
+    reconcile: async (stored: number): Promise<void> => {
+      await requirePeer().reconcile(actorName, stored);
+    },
   };
 }
 

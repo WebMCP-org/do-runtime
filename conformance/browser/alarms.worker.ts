@@ -61,6 +61,12 @@ class AlarmsTarget extends RpcTarget implements AlarmsRpc {
       void requireSupervisor().report(`alarm scheduler background task failed: ${String(failure)}`);
     }
   }
+
+  /** `AlarmOutlet.reconcile`, arriving the same way when an actor is placed over its storage. */
+  async reconcile(actorName: string, stored: number): Promise<void> {
+    if (scheduler === undefined) throw new Error("Browser lane: the alarm scheduler is not up.");
+    await (await scheduler).hooks(actorName).reconcile(stored);
+  }
 }
 
 function requireSupervisor(): Session<SupervisorRpc> {

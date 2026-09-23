@@ -1062,6 +1062,113 @@ describe("hooks", () => {
 });
 
 // =======================================================================================
+// AlarmOutlet.reconcile — package-original, so there is no upstream line to cite. A container
+// opening over storage that persisted an alarm hands it over once. A schedule due at or before
+// it stands untouched; a missing or later one is set.
+
+describe("reconcile", () => {
+  test.each(["FINISHED", "WAITING"] as const)(
+    "a %s entry retrying at the stored time keeps its ladder, where an unconditional setAlarm re-push would zero it",
+    async (status) => {
+      let context = await harness();
+      const scheduledTime = context.timer.now();
+      context.actor.results = [USER_FAILURE];
+      await fire(context);
+      // FINISHED while the live scheduler waits out the retry; a restart reloads it WAITING.
+      if (status === "WAITING") context = await restart(context);
+      const before = context.state();
+      expect(before[0]).toMatchObject({ backoff: 1, counted_retry: 1 });
+
+      await context.scheduler.hooks("a").reconcile(scheduledTime);
+
+      expect(context.state()).toEqual(before);
+      expect(context.timer.delays()).toEqual([2_000]);
+      context.actor.results = [USER_FAILURE];
+      await ladder(context, 1);
+      expect(context.actor.deliveries.at(-1)).toEqual({ scheduledTime, retryCount: 1 });
+      expect(context.timer.delays()).toEqual([4_000]);
+    },
+  );
+
+  test("a STARTED entry at the stored time gets no queued alarm, and its row keeps its ladder", async () => {
+    const context = await harness();
+    const scheduledTime = context.timer.now();
+    context.actor.results = [USER_FAILURE, OK];
+    const { promise, resolve } = Promise.withResolvers<void>();
+    context.actor.holds.set(1, promise);
+    await fire(context);
+    await ladder(context, 1);
+    expect(context.actor.deliveries).toHaveLength(2);
+    const before = context.state();
+    expect(before[0]).toMatchObject({ running: 1, backoff: 1, counted_retry: 1 });
+
+    await context.scheduler.hooks("a").reconcile(scheduledTime);
+
+    // While STARTED, getAlarm answers the queued alarm.
+    expect(context.scheduler.getAlarm("a")).toBe(null);
+    expect(context.state()).toEqual(before);
+    resolve();
+    await settle();
+    await context.timer.fireDue();
+    expect(context.actor.deliveries).toHaveLength(2);
+    expect(context.rows()).toEqual([]);
+  });
+
+  test("a missing row is re-created and delivered as a first attempt", async () => {
+    const context = await harness();
+    const stored = context.timer.now() + 5_000;
+
+    await context.scheduler.hooks("a").reconcile(stored);
+
+    expect(context.rows()).toEqual([{ actor_id: "a", scheduled_time: stored }]);
+    await context.timer.advance(5_000);
+    expect(context.actor.deliveries).toEqual([{ scheduledTime: stored, retryCount: 0 }]);
+  });
+
+  test("a later entry moves to the stored time", async () => {
+    const context = await harness();
+    const stored = context.timer.now() + 5_000;
+    context.scheduler.setAlarm("a", stored + 1_000);
+
+    await context.scheduler.hooks("a").reconcile(stored);
+
+    expect(context.scheduler.getAlarm("a")).toBe(stored);
+    expect(context.rows()).toEqual([{ actor_id: "a", scheduled_time: stored }]);
+    expect(context.timer.delays()).toEqual([5_000]);
+  });
+
+  test("an entry earlier than the stored time is left alone", async () => {
+    const context = await harness();
+    const scheduled = context.timer.now() + 5_000;
+    context.scheduler.setAlarm("a", scheduled);
+
+    await context.scheduler.hooks("a").reconcile(scheduled + 1_000);
+
+    expect(context.scheduler.getAlarm("a")).toBe(scheduled);
+    expect(context.rows()).toEqual([{ actor_id: "a", scheduled_time: scheduled }]);
+    expect(context.timer.delays()).toEqual([5_000]);
+  });
+
+  test("a running entry is compared by its queued alarm", async () => {
+    const context = await harness();
+    const { promise, resolve } = Promise.withResolvers<void>();
+    context.actor.holds.set(0, promise);
+    await fire(context);
+    const queued = context.timer.now() + 10_000;
+    context.scheduler.setAlarm("a", queued);
+
+    await context.scheduler.hooks("a").reconcile(queued);
+    expect(context.scheduler.getAlarm("a")).toBe(queued);
+
+    await context.scheduler.hooks("a").reconcile(queued - 5_000);
+    expect(context.scheduler.getAlarm("a")).toBe(queued - 5_000);
+    resolve();
+    await settle();
+    expect(context.timer.delays()).toEqual([5_000]);
+  });
+});
+
+// =======================================================================================
 // checkTimestamp
 
 describe("checkTimestamp", () => {

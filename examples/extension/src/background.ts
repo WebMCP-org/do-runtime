@@ -86,17 +86,29 @@ const offscreenDocument = new OffscreenDocumentCoordinator({
   /**
    * `createDocument` resolves before `offscreen.ts` registers its listener
    * behind a top-level await, and Chrome answers a message sent in that gap
-   * with nothing rather than queueing it.
+   * with nothing rather than queueing it. Each ping races the deadline, because
+   * a wedged listener never answers and `ready()` must settle.
    */
   async ready() {
     const deadline = Date.now() + READY_TIMEOUT_MS;
-    for (;;) {
-      const answer: unknown = await chrome.runtime
-        .sendMessage({ type: "host-ping" } satisfies ExtensionMessage)
-        .catch(() => undefined);
-      if (answer !== undefined) return;
-      if (Date.now() >= deadline) throw new Error("the offscreen document did not answer");
-      await new Promise((resolve) => setTimeout(resolve, READY_POLL_MS));
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const expired = new Promise<undefined>((resolve) => {
+      timer = setTimeout(resolve, READY_TIMEOUT_MS);
+    });
+    try {
+      for (;;) {
+        const answer: unknown = await Promise.race([
+          chrome.runtime
+            .sendMessage({ type: "host-ping" } satisfies ExtensionMessage)
+            .catch(() => undefined),
+          expired,
+        ]);
+        if (answer !== undefined) return;
+        if (Date.now() >= deadline) throw new Error("the offscreen document did not answer");
+        await new Promise((resolve) => setTimeout(resolve, READY_POLL_MS));
+      }
+    } finally {
+      clearTimeout(timer);
     }
   },
   /** A document still mute after the timeout is replaced once, not pinged forever. */

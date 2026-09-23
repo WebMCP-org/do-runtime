@@ -1,8 +1,8 @@
 import { fileURLToPath } from "node:url";
+import { workersModuleAliases } from "@mcp-b/do-runtime/vite";
 import { defineConfig } from "vite";
 
 const repoRoot = fileURLToPath(new URL("../../", import.meta.url));
-const cloudflareWorkersModule = `${repoRoot}dist/cloudflare-workers.js`;
 
 /**
  * Cross-origin isolation, and who actually needs it.
@@ -31,17 +31,17 @@ const crossOriginIsolation = {
 
 export default defineConfig({
   resolve: {
-    alias: {
-      // Use the package subpath so application code and runtime transport share
-      // one DurableObject/RpcTarget identity, while authored source keeps the
-      // exact platform specifier it will deploy with.
-      "cloudflare:workers": cloudflareWorkersModule,
-      "cloudflare:email": `${repoRoot}dist/cloudflare-email.js`,
-      "node:async_hooks": "unenv/node/async_hooks",
-      "node:diagnostics_channel": "unenv/node/diagnostics_channel",
-      "node:os": "unenv/node/os",
-      path: "unenv/node/path",
-    },
+    alias: [
+      // The package's own `cloudflare:workers` and `cloudflare:email`, so
+      // application code and runtime transport share one DurableObject/RpcTarget
+      // identity, while authored source keeps the exact platform specifier it
+      // will deploy with.
+      ...workersModuleAliases(),
+      { find: "node:async_hooks", replacement: "unenv/node/async_hooks" },
+      { find: "node:diagnostics_channel", replacement: "unenv/node/diagnostics_channel" },
+      { find: "node:os", replacement: "unenv/node/os" },
+      { find: "path", replacement: "unenv/node/path" },
+    ],
   },
   optimizeDeps: {
     // Both of these locate a `.wasm` with `new URL("…", import.meta.url)`.

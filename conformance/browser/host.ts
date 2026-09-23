@@ -154,6 +154,10 @@ class SupervisorTarget extends RpcTarget implements SupervisorRpc {
     await alarms().scheduleRun(actorName, scheduledTime);
   }
 
+  async reconcile(actorName: string, stored: number): Promise<void> {
+    await alarms().reconcile(actorName, stored);
+  }
+
   /** ← `AlarmScheduler::GetActorFn`, which PLACES the actor if it is not running. */
   async deliverAlarm(
     actorName: string,
