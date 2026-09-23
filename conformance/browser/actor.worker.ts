@@ -47,6 +47,7 @@
  */
 
 import {
+  ACTOR_SCOPE_GLOBALS,
   actorScopeBindings,
   createActorContainer,
   HibernationMirror,
@@ -547,20 +548,6 @@ const facetScopes: Record<string, ActorScopeBindings> = {};
 (globalThis as Record<string, unknown>)[FACET_SCOPE_GLOBAL] = facetScopes;
 let facetScopeCounter = 0;
 
-/** The actor globals the dynamic facet module binds to its own container. */
-const FACET_SCOPE_NAMES = [
-  "scheduler",
-  "setTimeout",
-  "clearTimeout",
-  "setInterval",
-  "clearInterval",
-  "fetch",
-  "crypto",
-  "WebSocket",
-  "WebSocketPair",
-  "WebSocketRequestResponsePair",
-] as const;
-
 async function facetModule(className: string, gate: FacetGate): Promise<FacetClass> {
   const hash = className.lastIndexOf("#");
   if (hash < 0) throw new Error(`Browser lane cannot resolve facet class ${className}.`);
@@ -583,7 +570,7 @@ async function facetModule(className: string, gate: FacetGate): Promise<FacetCla
   });
 
   const rewritten =
-    `const { ${FACET_SCOPE_NAMES.join(", ")} } = ` +
+    `const { ${ACTOR_SCOPE_GLOBALS.join(", ")} } = ` +
     `globalThis.${FACET_SCOPE_GLOBAL}[${JSON.stringify(key)}];\n` +
     (await isolates.mainModule(isolateName)).replace(
       /import\s+(\{[^}]*\})\s+from\s+["']cloudflare:workers["'];?/g,
@@ -735,9 +722,18 @@ async function place(): Promise<Live> {
       facets,
       timer,
       hibernation,
+      // "fetched" in two chunks, the second after a timer, as every lane's outbound answers.
       fetch: async () => {
         await timer.afterDelay(60);
-        return new Response("fetched");
+        const body = new ReadableStream({
+          async start(controller) {
+            controller.enqueue(new TextEncoder().encode("fet"));
+            await timer.afterDelay(20);
+            controller.enqueue(new TextEncoder().encode("ched"));
+            controller.close();
+          },
+        });
+        return new Response(body);
       },
     },
     webSockets: hibernation.snapshot(),

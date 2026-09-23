@@ -53,11 +53,13 @@
  *
  * **A real OPFS crash stays outside the shared oracle.** Worker termination asks
  * whether SQLite's rollback journal survives a process disappearing mid-write on
- * OPFS, which workerd cannot answer because it has no OPFS. The browser-only
- * `sqlite-wasm-crash.smoke.spec.ts` therefore owns that proof: it commits one row,
- * terminates the worker with a second row in an open transaction, retries bounded
- * replacement workers until the browser releases the pool handles, and observes
- * only the committed row. The shared §1.6 crash row keeps the narrower portable
+ * OPFS, which workerd cannot answer because it has no OPFS. The browser-only smoke
+ * specs therefore own that proof. `sqlite-wasm-crash.smoke.spec.ts` commits one
+ * row, terminates the worker with a second row in an open transaction, and starts
+ * one replacement, whose `installSqliteWasmHost` waits for the pool handles to be
+ * released; it observes only the committed row. `actor-crash.smoke.spec.ts`
+ * terminates an actor after SQLite has spilled journaled pages, so recovery has to
+ * replay the hot journal. The shared §1.6 crash row keeps the narrower portable
  * contract: volatile instance state disappears while output-gated storage stays.
  *
  * `crash()` below is the same thing the node lane means by it: drop the container

@@ -1,5 +1,6 @@
 node_modules/
 dist/
+.sdk-pack/
 .tsbuild/
 .wrangler/
 __screenshots__/

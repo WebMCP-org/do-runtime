@@ -1,6 +1,7 @@
 import {
   ALARM_RETRY_MAX_TRIES,
   alarmRetryDelayMs,
+  type AlarmSchedulerOptions,
 } from "../server/alarm-scheduler";
 
 type LooseRecord = Record<string, unknown>;
@@ -159,7 +160,99 @@ export class BrowserAlarmCoordinator {
   }
 }
 
-function parseBrowserAlarmProjection(value: unknown): BrowserAlarmProjection | null {
+/**
+ * The Worker half of the browser alarm protocol. Pass `projectWake` to the
+ * `AlarmScheduler` and return `acknowledge()` from the coordinator's
+ * `deliver()`.
+ *
+ * Projections leave one at a time, in call order; each draws its generation
+ * only after the previous one was sent, so generations rise in send order even
+ * when `nextGeneration()` is asynchronous. `acknowledge(scheduledTime)` resolves
+ * with the latest projection once the coordinator has accepted it, no delivery
+ * or cleanup is active, and its wake is absent or later than `scheduledTime`.
+ * Only the latest projection counts. If it failed, `acknowledge()` sends it
+ * again before waiting, so an idle scheduler does not leave the wake stuck on
+ * an old failure; waiters reject only when the latest projection fails.
+ */
+export function createBrowserAlarmProjector(options: {
+  /**
+   * Must be durable and strictly increasing across Worker restarts. The
+   * coordinator drops every projection older than the generation it journaled,
+   * so a counter that restarts lower silently stalls each later wake. Keep it
+   * in a host table beside the scheduler: a runtime `_cf_` table would need a
+   * storage-version bump and would restart below generations already journaled.
+   */
+  nextGeneration(): number | Promise<number>;
+  /** Carries one projection to `BrowserAlarmCoordinator.project()`. */
+  project(projection: BrowserAlarmProjection): Promise<void>;
+}): {
+  projectWake: NonNullable<AlarmSchedulerOptions["projectWake"]>;
+  acknowledge(scheduledTime: number): Promise<BrowserAlarmProjection>;
+} {
+  type Sent = {
+    readonly when: number | null;
+    readonly activeDeliveries: number;
+    result?: PromiseSettledResult<BrowserAlarmProjection>;
+  };
+  const waiters = new Set<{
+    readonly after: number;
+    resolve(projection: BrowserAlarmProjection): void;
+    reject(reason: unknown): void;
+  }>();
+  let latest: Sent | undefined;
+  let tail: Promise<unknown> = Promise.resolve();
+
+  const settle = (): void => {
+    const result = latest?.result;
+    if (result?.status === "rejected") {
+      for (const waiter of waiters) waiter.reject(result.reason);
+      waiters.clear();
+      return;
+    }
+    if (result === undefined || latest?.activeDeliveries !== 0) return;
+    for (const waiter of waiters) {
+      if (result.value.when !== null && result.value.when <= waiter.after) continue;
+      waiters.delete(waiter);
+      waiter.resolve(result.value);
+    }
+  };
+
+  const projectWake = (when: number | null, activeDeliveries: number): Promise<void> => {
+    const sent: Sent = { when, activeDeliveries };
+    latest = sent;
+    const projected = tail.then(async () => {
+      const projection = { generation: await options.nextGeneration(), when };
+      await options.project(projection);
+      return projection;
+    });
+    tail = projected.catch(() => {});
+    const record = (result: PromiseSettledResult<BrowserAlarmProjection>): void => {
+      sent.result = result;
+      settle();
+    };
+    void projected.then(
+      (value) => record({ status: "fulfilled", value }),
+      (reason: unknown) => record({ status: "rejected", reason }),
+    );
+    return projected.then(() => {});
+  };
+
+  return {
+    projectWake,
+    acknowledge(scheduledTime) {
+      return new Promise((resolve, reject) => {
+        waiters.add({ after: scheduledTime, resolve, reject });
+        if (latest?.result?.status === "rejected") {
+          void projectWake(latest.when, latest.activeDeliveries).catch(() => {});
+        } else {
+          settle();
+        }
+      });
+    },
+  };
+}
+
+export function parseBrowserAlarmProjection(value: unknown): BrowserAlarmProjection | null {
   if (!isRecord(value)) return null;
   if (!isNonnegativeInteger(value.generation)) return null;
   if (value.when !== null && !isFiniteNumber(value.when)) return null;

@@ -14,6 +14,7 @@ import {
   type Timer,
 } from "@mcp-b/do-runtime";
 import {
+  installSqliteWasmHost,
   SqliteWasmActorStorage,
   type SqliteWasmHost,
 } from "@mcp-b/do-runtime/backends/sqlite-wasm";
@@ -29,7 +30,6 @@ import {
   type WireRequest,
   type WireResponse,
 } from "../wire";
-import type { RetryablePoolOptions } from "./sqlite-storage";
 
 // Stable forever: changing either value orphans the authored actor's data.
 const UNIQUE_KEY = "do-runtime-example-vibe-user-agent";
@@ -59,22 +59,18 @@ async function installPool(): Promise<ReleasableSqliteWasmHost> {
     value: { disable: { vfs: { opfs: true, "opfs-wl": true } } },
   });
   const sqlite3 = await sqlite3InitModule();
-  const options: RetryablePoolOptions = {
-    name: POOL_NAME,
-    clearOnInit: false,
-    initialCapacity: 8,
-    forceReinitIfPreviouslyFailed: true,
-  };
-
-  for (let attempt = 1; ; attempt += 1) {
-    try {
-      const pool = await sqlite3.installOpfsSAHPoolVfs(options);
-      return { pool, capi: sqlite3.capi };
-    } catch (error) {
-      if (attempt === 1) report("the agent storage is still releasing; waiting", false);
-      if (attempt >= 20) throw new Error("The user agent's storage stayed locked.", { cause: error });
-      await new Promise<void>((resolve) => rawSetTimeout(resolve, 150));
+  try {
+    // Waits up to 10 s for a terminated predecessor to release the pool.
+    return await installSqliteWasmHost(sqlite3, {
+      name: POOL_NAME,
+      clearOnInit: false,
+      initialCapacity: 8,
+    });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "NoModificationAllowedError") {
+      throw new Error("The user agent's storage stayed locked.", { cause: error });
     }
+    throw error;
   }
 }
 

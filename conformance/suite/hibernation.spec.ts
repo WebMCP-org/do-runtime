@@ -23,7 +23,6 @@ async function eventually<T>(read: () => Promise<T>, ready: (value: T) => boolea
 async function journal(actor: ProbeActor): Promise<{
   events: Record<string, unknown>[];
   trace: string[];
-  times: { event: string; at: number }[];
   listenerMessages: number;
   clients: Record<string, unknown[]>;
   closes: Record<string, { code: number; reason: string; wasClean: boolean }[]>;
@@ -167,13 +166,11 @@ describe("handler dispatch and close state", () => {
   it("D2 silently drops missing and throwing handlers and keeps later delivery alive", async () => {
     const actor = await host.spawn("ws-handler-failures");
     await actor.call("openSelfSocket", "socket", ["socket"]);
+    // Missing for one dispatch, then restored by that dispatch itself; frames arrive in order.
     await actor.call("removeSocketMessageHandler");
     await actor.call("sendSelf", "socket", "missing");
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    await actor.call("restoreSocketMessageHandler");
     await actor.call("throwOnNextSocketMessage");
     await actor.call("sendSelf", "socket", "throws");
-    await new Promise((resolve) => setTimeout(resolve, 50));
     await actor.call("sendSelf", "socket", "survives");
 
     const result = await eventually(
@@ -188,10 +185,10 @@ describe("handler dispatch and close state", () => {
   });
 
   it("D4 overlaps handler promises but waits for blockConcurrencyWhile", async () => {
+    // Frames dispatch in order, so the trace alone says overlap or serialization.
     const concurrent = await host.spawn("ws-concurrent");
     await concurrent.call("openSelfSocket", "socket", ["socket"]);
     await concurrent.call("sendSelf", "socket", "slow:one");
-    await new Promise((resolve) => setTimeout(resolve, 60));
     await concurrent.call("sendSelf", "socket", "slow:two");
     const overlapping = await eventually(
       () => journal(concurrent),
@@ -203,12 +200,10 @@ describe("handler dispatch and close state", () => {
       "end:slow:one",
       "end:slow:two",
     ]);
-    expect(overlapping.times[1]!.at - overlapping.times[0]!.at).toBeLessThan(180);
 
     const blocked = await host.spawn("ws-blocked");
     await blocked.call("openSelfSocket", "socket", ["socket"]);
     await blocked.call("sendSelf", "socket", "block:one");
-    await new Promise((resolve) => setTimeout(resolve, 60));
     await blocked.call("sendSelf", "socket", "block:two");
     const serialized = await eventually(
       () => journal(blocked),
@@ -220,7 +215,6 @@ describe("handler dispatch and close state", () => {
       "start:block:two",
       "end:block:two",
     ]);
-    expect(serialized.times[2]!.at - serialized.times[0]!.at).toBeGreaterThanOrEqual(190);
   });
 
   it("D5/B4 reports peer close while listed, tolerates reciprocity, then evicts", async () => {
@@ -482,5 +476,28 @@ it("preserves tags and attachment across a real eviction without reconnecting", 
     actorName: "ws-eviction",
     marker: "init",
     connects: 1,
+  });
+});
+
+it("a socket rehydrated after eviction can send to its client and delivers the client's close to webSocketClose", async () => {
+  const actor = await host.spawn("ws-eviction-close");
+  const client = await host.connect(actor, ["connection-id"]);
+  await host.evict(actor);
+  await client.send("echo");
+  expect(await client.nextMessage()).toBe("echoed");
+
+  await client.close(4000, "bye");
+  const result = await eventually(
+    () => journal(actor),
+    (value) => value.events.some((event) => "close" in event),
+  );
+  expect(result.events.at(-1)).toEqual({
+    id: "connection-id",
+    close: { code: 4000, reason: "bye", wasClean: true },
+    readyState: 2,
+    listedDuringHandler: false,
+    tagsDuringHandler: ["connection-id"],
+    sendAfterPeerClose: null,
+    reciprocalClose: null,
   });
 });

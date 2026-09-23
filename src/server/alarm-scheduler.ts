@@ -606,7 +606,11 @@ export class AlarmScheduler {
   async #checkTimestamp(delay: number, scheduledTime: number, signal: AbortSignal): Promise<void> {
     let remaining = delay;
     for (;;) {
-      await this.#timer.afterDelay(remaining, signal);
+      // An aborted wake is kj's cancel-by-drop, whether the timer leaves it pending or rejects it.
+      await this.#timer.afterDelay(remaining, signal).catch((error: unknown) => {
+        if (!signal.aborted) throw error;
+      });
+      if (signal.aborted) return;
 
       // Since we are waiting on timer.afterDelay, it's possible that timer.now() was behind
       // the real time by a few ms, leading to premature alarm() execution. This checks it the current

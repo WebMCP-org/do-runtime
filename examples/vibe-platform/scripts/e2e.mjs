@@ -126,7 +126,7 @@ if (forcedOffline) await page.route("https://esm.sh/**", (route) => route.abort(
 const pageErrors = [];
 page.on("pageerror", (error) => pageErrors.push(String(error)));
 page.on("console", (message) => {
-  if (message.type() === "error") pageErrors.push(message.text());
+  if (message.type() === "error") pageErrors.push(`${message.text()} (${message.location().url})`);
 });
 
 const preview = () => page.frameLocator("#preview");
@@ -383,8 +383,11 @@ try {
     const exportedPackage = JSON.parse(
       await readFile(path.join(exportDirectory, "package.json"), "utf8"),
     );
-    if (exportedPackage.dependencies?.agents !== "0.22.0") {
-      throw new Error("exported package.json does not pin agents@0.22.0");
+    const tested = JSON.parse(
+      await readFile(path.join(root, "node_modules/agents/package.json"), "utf8"),
+    ).version;
+    if (exportedPackage.dependencies?.agents !== tested) {
+      throw new Error(`exported package.json does not pin the tested agents@${tested}`);
     }
     await symlink(path.join(root, "node_modules"), path.join(exportDirectory, "node_modules"));
     const result = await execFileAsync(
@@ -401,6 +404,14 @@ try {
     );
     const transcript = `${result.stdout}\n${result.stderr}`.trim();
     console.log(`      ${transcript.split("\n").slice(-4).join("\n      ")}`);
+  });
+
+  await step("the page raised no errors beyond the ones the steps cause on purpose", async () => {
+    // The deliberate syntax and constructor failures reach the UI log, not the console. Offline,
+    // the preview's React imports from esm.sh fail, and nothing else may.
+    const expected = online ? [] : [/^Failed to load resource: .*\(https:\/\/esm\.sh\//];
+    const unexpected = pageErrors.filter((error) => !expected.some((pattern) => pattern.test(error)));
+    if (unexpected.length > 0) throw new Error(unexpected.join("\n"));
   });
 
   if (failures > 0) {

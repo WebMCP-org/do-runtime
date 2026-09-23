@@ -76,6 +76,10 @@
       "types": "./dist/cloudflare-workers.d.ts",
       "import": "./dist/cloudflare-workers.js"
     },
+    "./cloudflare-email": {
+      "types": "./dist/src/api/cloudflare-email.d.ts",
+      "import": "./dist/cloudflare-email.js"
+    },
     "./gate": {
       "types": "./dist/src/gate.d.ts",
       "import": "./dist/gate.js"
@@ -103,26 +107,27 @@
     "build": "pnpm build:package",
     "typecheck": "pnpm build:package && tsc -b tsconfig.json && tsc -p conformance/tsconfig.json && tsc -p examples/extension/tsconfig.page.json && tsc -p examples/extension/tsconfig.worker.json && tsc -p examples/vibe-platform/tsconfig.page.json && tsc -p examples/vibe-platform/tsconfig.worker.json",
     "test": "pnpm test:unit && pnpm test:conformance",
-    "examples:build": "pnpm sdk:sync && pnpm build:package && pnpm --filter \"do-runtime-example-*\" build",
     "test:examples": "pnpm sdk:sync && pnpm build:package && node examples/extension/scripts/e2e.mjs && node examples/vibe-platform/scripts/e2e.mjs",
     "test:unit": "vitest run --config vitest.unit.config.ts",
-    "test:conformance": "pnpm test:conformance-workerd && pnpm test:conformance-node && pnpm test:conformance-browser",
+    "test:conformance": "pnpm test:conformance-workerd && pnpm test:conformance-node && pnpm test:conformance-browser && pnpm test:conformance-node-transformed && pnpm test:conformance-browser-transformed",
     "test:conformance-workerd": "vitest run --config conformance/workerd/vitest.config.ts",
     "test:conformance-node": "vitest run --config conformance/node/vitest.config.ts",
     "test:conformance-browser": "vitest run --config conformance/browser/vitest.config.ts",
+    "test:conformance-node-transformed": "vitest run --config conformance/node/vitest.transformed.config.ts",
+    "test:conformance-browser-transformed": "vitest run --config conformance/browser/vitest.transformed.config.ts conformance/suite",
     "check:oracle": "node scripts/check-workerd-oracle.mjs",
     "check:package": "pnpm build:package && publint && attw --pack . --profile esm-only && node scripts/check-package.mjs",
     "build:package": "node scripts/build-package.mjs && tsc -p tsconfig.publish.json && node scripts/fix-declaration-imports.mjs",
     "changeset": "changeset",
     "changeset:version": "changeset version",
-    "changeset:publish": "pnpm check:package && changeset publish",
+    "changeset:publish": "changeset publish",
     "prepare": "pnpm build:package",
     "prepack": "pnpm build:package",
     "prepublishOnly": "pnpm check:package",
     "publish:dry": "pnpm publish --access public --dry-run",
     "bench:node": "vitest run --config conformance/bench/vitest.node.config.ts",
     "bench:browser": "vitest run --config conformance/bench/vitest.browser.config.ts",
-    "sdk:pack": "pnpm sdk:build && rm -rf dist/sdk && pnpm --dir vendor/agents --filter agents --filter \"@cloudflare/*\" --fail-if-no-match -r pack --pack-destination \"$PWD/dist/sdk\""
+    "sdk:pack": "pnpm sdk:build && rm -rf .sdk-pack && pnpm --dir vendor/agents --filter agents --filter \"@cloudflare/*\" --fail-if-no-match -r pack --pack-destination \"$PWD/.sdk-pack\""
   },
   "dependencies": {
     "@ungap/structured-clone": "1.4.0",
@@ -146,7 +151,6 @@
     "@types/node": "^26.5.1",
     "@types/ungap__structured-clone": "1.2.0",
     "@vitest/browser-playwright": "4.1.11",
-    "@vitest/coverage-v8": "4.1.11",
     "drizzle-orm": "^0.45.2",
     "playwright": "1.63.0",
     "publint": "0.3.24",

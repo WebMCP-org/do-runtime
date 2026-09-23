@@ -4,6 +4,12 @@ import type {
   CrashReport,
 } from "./sqlite-wasm-crash.worker";
 
+/**
+ * Longer than `installSqliteWasmHost` waits for a terminated worker's handles (10 s), so a slow
+ * release fails as the helper's refusal rather than as a timeout here.
+ */
+const WORKER_TIMEOUT_MS = 12_000;
+
 function runWorker(command: CrashCommand): Promise<{ worker: Worker; report: CrashReport }> {
   const worker = new Worker(new URL("./sqlite-wasm-crash.worker.ts", import.meta.url), {
     type: "module",
@@ -13,7 +19,7 @@ function runWorker(command: CrashCommand): Promise<{ worker: Worker; report: Cra
     const timeout = setTimeout(() => {
       worker.terminate();
       resolve({ worker, report: { kind: "error", error: "worker timed out" } });
-    }, 2_000);
+    }, WORKER_TIMEOUT_MS);
     worker.addEventListener("message", (event: MessageEvent<CrashReport>) => {
       clearTimeout(timeout);
       resolve({ worker, report: event.data });
@@ -34,22 +40,11 @@ test(
     dirty.worker.terminate();
     expect(dirty.report).toEqual({ kind: "dirty" });
 
-    const deadline = Date.now() + 10_000;
-    let lastError = "replacement worker did not start";
-    while (Date.now() < deadline) {
-      const recovered = await runWorker({ mode: "recover", poolName });
-      recovered.worker.terminate();
-      if (recovered.report.kind === "recovered") {
-        expect(recovered.report.rows).toEqual(["committed"]);
-        return;
-      }
-      lastError =
-        recovered.report.kind === "error"
-          ? recovered.report.error
-          : `unexpected ${recovered.report.kind} report`;
-      await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-    throw new Error(`replacement worker could not reacquire OPFS: ${lastError}`);
+    // One replacement: its install waits for the terminated worker's handles, and killing it
+    // mid-wait to try again would only leave another set of handles held.
+    const recovered = await runWorker({ mode: "recover", poolName });
+    recovered.worker.terminate();
+    expect(recovered.report).toEqual({ kind: "recovered", rows: ["committed"] });
   },
   20_000,
 );

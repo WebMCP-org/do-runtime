@@ -24,11 +24,15 @@ for (const name of platforms) {
 
 const readme = await readFile(new URL("README.md", root), "utf8");
 const decisions = await readFile(new URL("docs/decisions.md", root), "utf8");
+const sync = await readFile(new URL("docs/workerd-sync.md", root), "utf8");
 if (!readme.includes(`conformance oracle is pinned to \`v${version}\``)) {
   throw new Error(`README.md does not name oracle v${version}`);
 }
 if (!decisions.includes(`oracle is pinned separately to release \`v${version}\``)) {
   throw new Error(`docs/decisions.md does not name oracle v${version}`);
+}
+if (!sync.includes(`oracle is now pinned to \`v${version}\``)) {
+  throw new Error(`docs/workerd-sync.md does not record the re-pin to oracle v${version}`);
 }
 
 console.log(`workerd oracle pins agree on v${version}`);

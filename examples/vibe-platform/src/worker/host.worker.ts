@@ -48,6 +48,7 @@ import {
   type Timer,
 } from "@mcp-b/do-runtime";
 import {
+  installSqliteWasmHost,
   SqliteWasmActorStorage,
   type SqliteWasmHost,
 } from "@mcp-b/do-runtime/backends/sqlite-wasm";
@@ -61,7 +62,6 @@ import {
   type WorkspaceRpc,
 } from "../wire";
 import { Workspace, type WorkspaceEnv } from "./workspace";
-import type { RetryablePoolOptions } from "./sqlite-storage";
 
 // ---------------------------------------------------------------------------
 // Names that must never change
@@ -110,20 +110,6 @@ const timer: Timer = {
 // ---------------------------------------------------------------------------
 // 2 + 3. sqlite and the pool, before any actor scope exists
 
-const sleep = (ms: number): Promise<void> =>
-  new Promise<void>((resolve) => rawSetTimeout(resolve, ms));
-
-/**
- * The driver's option bag, plus the one option it implements and does not
- * declare. Without `forceReinitIfPreviouslyFailed` the driver caches the
- * REJECTED promise under this pool name (`installOpfsSAHPoolVfs`, in
- * `dist/index.mjs`), so every retry below would return the first failure
- * forever.
- */
-/** How long to keep trying for the pool before telling the user it is locked. */
-const POOL_ATTEMPTS = 20;
-const POOL_RETRY_MS = 150;
-
 async function installPool(): Promise<SqliteWasmHost> {
   // The driver reads this once at bootstrap and then `delete`s it, which is why
   // the property has to be configurable — a plain non-configurable definition
@@ -145,38 +131,28 @@ async function installPool(): Promise<SqliteWasmHost> {
 
   const sqlite3 = await sqlite3InitModule();
 
-  const options: RetryablePoolOptions = {
-    name: POOL_NAME,
-    // NOT the conformance lane's `true`. That lane wants a pristine profile on
-    // every run; this one is a workspace, and clearing on init would delete the
-    // user's files on every page load.
-    clearOnInit: false,
-    // Two databases per root actor — its own storage and the facet-tree index —
-    // plus a rollback journal beside each, is four files. Eight is that with
-    // headroom; the pool cannot grow past its capacity without an explicit
-    // `reserveMinimumCapacity`, and running out surfaces as `SQLITE_CANTOPEN`
-    // from whichever open happens to be unlucky.
-    initialCapacity: 8,
-    forceReinitIfPreviouslyFailed: true,
-  };
-
-  for (let attempt = 1; ; attempt += 1) {
-    try {
-      const pool = await sqlite3.installOpfsSAHPoolVfs(options);
-      return { pool, capi: sqlite3.capi };
-    } catch (error) {
-      // Two situations produce this failure and only one is worth waiting out.
-      // A page RELOAD leaves the previous worker's sync access handles held
-      // until the browser gets round to releasing them, and there is no signal
-      // for that, so retrying is the only strategy available. (Measured on
-      // Chromium, 2026-08: a reload never actually needed a retry. This is for
-      // when it does, and it costs nothing when it does not.) A second TAB holds
-      // the handles for as long as it stays open, and no amount of retrying will
-      // help — so the loop ends by naming that case.
-      if (attempt === 1) report("the workspace storage is locked; waiting for it", false);
-      if (attempt >= POOL_ATTEMPTS) throw new Error(WORKSPACE_LOCKED_MESSAGE, { cause: error });
-      await sleep(POOL_RETRY_MS);
+  try {
+    return await installSqliteWasmHost(sqlite3, {
+      name: POOL_NAME,
+      // NOT the conformance lane's `true`. That lane wants a pristine profile on
+      // every run; this one is a workspace, and clearing on init would delete the
+      // user's files on every page load.
+      clearOnInit: false,
+      // Two databases per root actor — its own storage and the facet-tree index —
+      // plus a rollback journal beside each, is four files. Eight is that with
+      // headroom; the pool cannot grow past its capacity without an explicit
+      // `reserveMinimumCapacity`, and running out surfaces as `SQLITE_CANTOPEN`
+      // from whichever open happens to be unlucky.
+      initialCapacity: 8,
+    });
+  } catch (error) {
+    // The helper has already waited 10 s for a reloaded or crashed worker to
+    // release the pool. A second TAB holds it for as long as it stays open, and
+    // no amount of waiting helps, so name that case.
+    if (error instanceof DOMException && error.name === "NoModificationAllowedError") {
+      throw new Error(WORKSPACE_LOCKED_MESSAGE, { cause: error });
     }
+    throw error;
   }
 }
 

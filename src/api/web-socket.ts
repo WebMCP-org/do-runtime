@@ -125,7 +125,8 @@ type SocketDelivery =
 type SocketMetadata = {
   accepted?: SocketAcceptance;
   attachment?: Uint8Array;
-  rawListenersInstalled?: true;
+  /** The actor's gated side of a host transport, kept across registries. */
+  wrapper?: AcceptedWebSocket;
 };
 
 /** Raw listeners follow transport ownership without retaining a released actor wrapper. */
@@ -514,7 +515,10 @@ type HandlerDispatch = {
 };
 
 type RegistryEntry = {
-  readonly socket: RawWebSocket;
+  /** What the actor holds: a pair half, or the gated wrapper of a host transport. */
+  readonly socket: AcceptedWebSocket;
+  /** The identity hibernation hosts mirror. */
+  readonly raw: RawWebSocket;
   readonly tags: string[];
   autoResponseTimestamp?: number;
 };
@@ -569,10 +573,10 @@ export class HibernatableWebSocketRegistry {
       );
     }
     const normalizedTags = normalizeTags(tags);
-    if (socket instanceof AcceptedWebSocket) socket.acceptHibernation(this);
-    else this.#listenRaw(socket);
+    const accepted = socket instanceof AcceptedWebSocket ? socket : this.#wrap(socket);
+    if (accepted === socket) accepted.acceptHibernation(this);
     state.accepted = { mode: "hibernatable", registry: this, tags: normalizedTags };
-    this.#entries.push({ socket, tags: normalizedTags });
+    this.#entries.push({ socket: accepted, raw: socket, tags: normalizedTags });
     this.#host?.accepted(socket, normalizedTags);
   }
 
@@ -629,7 +633,7 @@ export class HibernatableWebSocketRegistry {
         "Failed to execute 'getWebSocketAutoResponseTimestamp' on 'DurableObjectState': parameter 1 is not of type 'WebSocket'.",
       );
     }
-    const timestamp = this.#entries.find((entry) => entry.socket === socket)?.autoResponseTimestamp;
+    const timestamp = this.#entryFor(socket)?.autoResponseTimestamp;
     return timestamp === undefined ? null : new Date(timestamp);
   }
 
@@ -662,9 +666,8 @@ export class HibernatableWebSocketRegistry {
   }
 
   attachmentChanged(socket: RawWebSocket, bytes: Uint8Array): void {
-    if (this.#entries.some((entry) => entry.socket === socket)) {
-      this.#host?.attachment(socket, bytes);
-    }
+    const entry = this.#entryFor(socket);
+    if (entry !== undefined) this.#host?.attachment(entry.raw, bytes);
   }
 
   receive(socket: RawWebSocket, type: SocketEvent, event: Event): void {
@@ -674,11 +677,13 @@ export class HibernatableWebSocketRegistry {
       const data = (event as MessageEvent).data as unknown;
       if (typeof data === "string" && data === this.#autoResponse?.request) {
         entry.autoResponseTimestamp = this.#ctx.now();
-        this.#host?.autoResponseTimestamp?.(socket, entry.autoResponseTimestamp);
-        if (socket instanceof AcceptedWebSocket) {
-          socket.sendAutoResponse(this.#autoResponse.response);
-        } else if ((socket.readyState ?? AcceptedWebSocket.OPEN) < AcceptedWebSocket.CLOSING) {
-          socket.send(this.#autoResponse.response);
+        this.#host?.autoResponseTimestamp?.(entry.raw, entry.autoResponseTimestamp);
+        // A host transport answers directly, as it does while the actor is evicted.
+        const raw = entry.raw;
+        if (raw instanceof AcceptedWebSocket) {
+          raw.sendAutoResponse(this.#autoResponse.response);
+        } else if ((raw.readyState ?? AcceptedWebSocket.OPEN) < AcceptedWebSocket.CLOSING) {
+          raw.send(this.#autoResponse.response);
         }
         return;
       }
@@ -713,21 +718,24 @@ export class HibernatableWebSocketRegistry {
     const index = this.#entries.indexOf(entry);
     if (index === -1) return;
     this.#entries.splice(index, 1);
-    this.#host?.closed(entry.socket);
+    this.#host?.closed(entry.raw);
   }
 
-  #listenRaw(socket: RawWebSocket): void {
-    const state = socketMetadata(socket);
-    if (state.rawListenersInstalled === true) return;
-    state.rawListenersInstalled = true;
-    for (const type of ["message", "close", "error"] as const) {
-      socket.addEventListener(type, (event) => {
-        const accepted = socketMetadata(socket).accepted;
-        if (accepted?.mode === "hibernatable") {
-          accepted.registry.receive(socket, type, event);
-        }
-      });
-    }
+  #entryFor(socket: RawWebSocket): RegistryEntry | undefined {
+    return this.#entries.find((entry) => entry.socket === socket || entry.raw === socket);
+  }
+
+  /**
+   * The actor's side of a host transport, output-gated like a pair half. One
+   * wrapper per transport shares its metadata and moves to a replacement
+   * registry, so the actor sees one stable socket and frames arrive once.
+   */
+  #wrap(raw: RawWebSocket): AcceptedWebSocket {
+    const state = socketMetadata(raw);
+    state.wrapper ??= new AcceptedWebSocket(this.#ctx, raw);
+    metadata.set(state.wrapper, state);
+    state.wrapper.rehydrateHibernation(this, this.#ctx);
+    return state.wrapper;
   }
 
   #rehydrate(value: RehydratedWebSocket): void {
@@ -742,8 +750,8 @@ export class HibernatableWebSocketRegistry {
       state.attachment = value.attachment.slice();
     }
     if (socket instanceof AcceptedWebSocket) socket.rehydrateHibernation(this, this.#ctx);
-    else this.#listenRaw(socket);
-    const entry: RegistryEntry = { socket, tags };
+    const accepted = socket instanceof AcceptedWebSocket ? socket : this.#wrap(socket);
+    const entry: RegistryEntry = { socket: accepted, raw: socket, tags };
     if (value.autoResponseTimestamp !== undefined) {
       entry.autoResponseTimestamp = value.autoResponseTimestamp;
     }
