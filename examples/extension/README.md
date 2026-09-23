@@ -69,9 +69,10 @@ popup.html ──sendMessage──▶ service worker ──chrome.offscreen.crea
   scheduler delivers the stored event on its own. The e2e also stops the service
   worker in the middle of a held delivery; the coordinator's journaled watchdog
   brings it back, and the delivery completes exactly once.
-- **The Agents SDK queue.** The e2e enqueues an increment and observes its state
-  write through `snapshot()`, exercising the SDK's SQLite-backed queue rather
-  than a host callback.
+- **The Agents SDK queue.** The e2e enqueues an increment and polls `snapshot()`
+  for its state write. `Agent.queue()` runs each item as an alarm-driven
+  Lifecycle job, so this also exercises the in-worker alarm path rather than a
+  host callback.
 - **Real Agents SDK sub-agents.** The root uses the public `subAgent()`,
   `parentAgent()`, `abortSubAgent()`, and `deleteSubAgent()` APIs. The e2e proves
   sibling isolation, overlapping awaits, nested children, restart persistence,
@@ -272,7 +273,7 @@ substrate. Cloudflare-managed products remain explicit integration boundaries:
 | Hibernatable WebSockets and bidirectional state sync across same-Worker container eviction | Socket survival across Worker/offscreen destruction: a platform-owned transport |
 | Decorated callable and streaming RPC | Production model providers and client/tool approval integrations |
 | Think chat with a deterministic model: durable submit, Stop, partial persistence, and recovery across Worker teardown | |
-| SQLite-backed queue and root/sub-agent `Agent.schedule()` | Outbound email: an Email Routing send binding |
+| Alarm-driven `Agent.queue()` and root/sub-agent `Agent.schedule()` | Outbound email: an Email Routing send binding |
 | Local sub-agents, nesting, restart, abort, and delete | |
 | Stateless MCP server and tools | |
 | Inbound `routeAgentEmail()` and `onEmail()` | |
