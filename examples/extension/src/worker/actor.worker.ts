@@ -45,6 +45,7 @@ import {
 } from "@mcp-b/do-runtime";
 import {
   createSqliteWasmProvider,
+  installSqliteWasmHost,
   SqliteWasmActorStorage,
   type SqliteWasmHost,
 } from "@mcp-b/do-runtime/backends/sqlite-wasm";
@@ -52,11 +53,11 @@ import sqlite3InitModule from "@sqlite.org/sqlite-wasm";
 import { getAgentByName, routeAgentEmail, routeAgentRequest } from "agents";
 import { RpcTarget } from "cloudflare:workers";
 import {
+  connectMessagePortWebSocket,
   installWebSocketUpgradeGlobals,
-  upgradeWebSocket,
   withWebSocketUpgrade,
-  type UpgradeWebSocket,
 } from "@mcp-b/do-runtime/browser";
+import { createBrowserAlarmProjector } from "@mcp-b/do-runtime/browser/alarm-coordinator";
 import { serveMessagePortWebSockets } from "@mcp-b/do-runtime/browser/message-port-websocket";
 import type {
   CounterSnapshot,
@@ -67,6 +68,7 @@ import type {
   SupervisorRpc,
   ThinkProbeStatus,
   ThinkProbeSubmission,
+  WakeProjection,
   WorkerBoot,
 } from "../protocol";
 import { Counter, type CounterEnv } from "./counter";
@@ -439,6 +441,8 @@ type Substrate = {
   readonly host: SqliteWasmHost;
   /** The namespace's one scheduler. It owns `_cf_ALARM`, the retry ladder, and delivery. */
   readonly scheduler: AlarmScheduler;
+  /** Resolves a consumed Chrome wake once the scheduler has finished the work due by then. */
+  readonly acknowledgeWake: (scheduledTime: number) => Promise<WakeProjection>;
 };
 
 let substrate: Promise<Substrate> | undefined;
@@ -475,8 +479,12 @@ async function installSubstrate(): Promise<Substrate> {
   // the actor's gate to a storage library. Measured on the runtime's own browser
   // lane, that produced `Ignoring inability to install the … sqlite3_vfs`
   // warnings carrying the actor scope's refusal text.
+  //
+  // Through `installSqliteWasmHost`, never the driver directly: it waits for a
+  // terminated predecessor to release the pool, and makes SQLite roll back the
+  // transaction that predecessor left open.
   const sqlite3 = await sqlite3InitModule();
-  const pool = await sqlite3.installOpfsSAHPoolVfs({
+  const host: SqliteWasmHost = await installSqliteWasmHost(sqlite3, {
     name: POOL_NAME,
     // NOT the conformance lane's `true`. That lane wipes the pool so a stale
     // browser profile cannot make a run pass or fail; an extension wiping its
@@ -484,7 +492,6 @@ async function installSubstrate(): Promise<Substrate> {
     clearOnInit: false,
     initialCapacity: POOL_CAPACITY,
   });
-  const host: SqliteWasmHost = { pool, capi: sqlite3.capi };
 
   // ---------------------------------------------------------------------------------
   // 3. Now install the actor scope: gated `setTimeout`, `clearTimeout`,
@@ -512,22 +519,44 @@ async function installSubstrate(): Promise<Substrate> {
   // running. That is upstream's `getActorContainer(id)` contract and it is the
   // whole point of an alarm: a wake is a reason to start a Durable Object, not
   // something that requires one to be started already.
+  //
+  // Each wake reaches the service worker's `BrowserAlarmCoordinator` with a
+  // generation, and the coordinator ignores any older than the last it
+  // journaled. So the counter must outlive this worker: it is this host's own
+  // table, beside the runtime's `_cf_ALARM` in the scheduler's database.
+  const db = await createSqliteWasmProvider(host, { prefix: ALARM_PREFIX }).open(ALARM_DATABASE);
+  db.exec(
+    "CREATE TABLE IF NOT EXISTS wake_generation " +
+      "(id INTEGER PRIMARY KEY CHECK (id = 1), generation INTEGER NOT NULL)",
+    [],
+  );
+  const wakes = createBrowserAlarmProjector({
+    nextGeneration: () =>
+      Number(
+        db.exec(
+          "INSERT INTO wake_generation VALUES (1, 1) " +
+            "ON CONFLICT (id) DO UPDATE SET generation = generation + 1 RETURNING generation",
+          [],
+        ).rawRows[0]?.[0],
+      ),
+    project: async (projection) => {
+      if (peer === undefined) throw new Error("cannot project an alarm before the supervisor connects");
+      await peer.projectWake(projection);
+    },
+  });
   const scheduler = new AlarmScheduler({
     timer,
-    db: await createSqliteWasmProvider(host, { prefix: ALARM_PREFIX }).open(ALARM_DATABASE),
+    db,
     getActor: () => ({
       deliverAlarm: async (scheduledTime: number, retryCount: number): Promise<AlarmResult> =>
         await (await placed()).container.deliverAlarm(scheduledTime, retryCount),
       abandonAlarm: async (scheduledTime: number): Promise<number | null> =>
         await (await placed()).container.abandonAlarm(scheduledTime),
     }),
-    projectWake: async (scheduledTime) => {
-      if (peer === undefined) throw new Error("cannot project an alarm before the supervisor connects");
-      await peer.projectWake(scheduledTime);
-    },
+    projectWake: wakes.projectWake,
   });
 
-  return { host, scheduler };
+  return { host, scheduler, acknowledgeWake: wakes.acknowledge };
 }
 
 // =======================================================================================
@@ -819,8 +848,17 @@ class HostTarget extends RpcTarget implements HostRpc {
     await (await placed()).entry.stopThink(name);
   }
 
-  async armWake(delayMs: number): Promise<number> {
-    return await (await placed()).entry.armWake(delayMs);
+  async armWake(delayMs: number, holdMs = 0): Promise<number> {
+    return await (await placed()).entry.armWake(delayMs, holdMs);
+  }
+
+  /**
+   * The service worker's delivery of a consumed Chrome wake. The scheduler
+   * delivers on its own timer from the moment this worker boots; this answers
+   * once that work is done, with the next wake to arm.
+   */
+  async fireAlarm(scheduledTime: number): Promise<WakeProjection> {
+    return await (await installedSubstrate()).acknowledgeWake(scheduledTime);
   }
 
   /**
@@ -851,22 +889,6 @@ class HostTarget extends RpcTarget implements HostRpc {
 /** Held so the session is not collected while the worker lives. */
 let peer: ReturnType<typeof newRpcSession<SupervisorRpc>> | undefined;
 
-async function connectAgentSocket(url: string): Promise<UpgradeWebSocket> {
-  await placed();
-  const request = withWebSocketUpgrade(new Request(url.replace(/^ws/, "http")));
-  const response = await routeAgentRequest(
-    request,
-    { Counter: rootNamespace },
-    { onBeforeConnect: withWebSocketUpgrade },
-  );
-  if (response == null) throw new Error(`No Agent route matched ${request.url}`);
-  const socket = upgradeWebSocket(response);
-  if (response.status !== 101 || socket === undefined) {
-    throw new Error(`Agent WebSocket upgrade failed with ${response.status}`);
-  }
-  return socket;
-}
-
 function isWorkerBoot(value: unknown): value is WorkerBoot {
   return (
     typeof value === "object" &&
@@ -887,5 +909,21 @@ self.addEventListener("message", (event: MessageEvent<unknown>) => {
   // directly: it applies the `RpcTarget` prototype graft that makes the class
   // above recognisable to capnweb, immediately before opening the session.
   peer = newRpcSession<SupervisorRpc>(event.data.port, new HostTarget());
-  serveMessagePortWebSockets(event.data.sockets, connectAgentSocket);
+  // The runtime turns a missing route or a refused upgrade into the close the
+  // client reads; the Agent's own refusal text becomes a 1008 reason.
+  serveMessagePortWebSockets(event.data.sockets, (bridge, url) =>
+    connectMessagePortWebSocket(bridge, url, async (request) => {
+      await placed();
+      return await routeAgentRequest(
+        request,
+        { Counter: rootNamespace },
+        { onBeforeConnect: withWebSocketUpgrade },
+      );
+    }),
+  );
+  // Start the scheduler now, not at the first operation: a worker recreated by
+  // a Chrome wake has no client, and its due alarm must still be delivered.
+  void installedSubstrate().catch((error: unknown) => {
+    console.error("[do-runtime example] the alarm scheduler could not start:", error);
+  });
 });

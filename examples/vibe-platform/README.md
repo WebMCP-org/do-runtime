@@ -57,7 +57,8 @@ The workspace starter is also seeded exactly once, under boot semantics.
 dependency. `server/*` and `src/*` are byte-for-byte the workspace rows; generated `worker.ts` routes
 `/api/*` to the Durable Object and other requests to the built front-end assets. `wrangler.jsonc`
 contains the Durable Object binding, `new_sqlite_classes` migration, assets configuration, and the
-Agents SDK's `nodejs_compat` flag; `package.json` pins the same Agents SDK version tested here.
+Agents SDK's `nodejs_compat` flag; `package.json` pins the Agents SDK release the vendored fork
+tested here carries, and the e2e fails if the two differ.
 
 ## Shape
 
@@ -99,9 +100,10 @@ set the headers directly.
 
 **One tab at a time.** Each OPFS SAH pool takes exclusive sync access handles — that exclusivity is
 what makes SQLite synchronous here — so a second tab cannot install the workspace or user-agent
-pool. An agent edit closes SQLite and pauses its VFS before replacing the worker; both installers
-still retry for reloads and crashes, where the old worker cannot acknowledge release. Close the
-other tab and reload; measured, it recovers.
+pool. An agent edit closes SQLite and pauses its VFS before replacing the worker; for reloads and
+crashes, where the old worker cannot acknowledge release, both installers go through
+`installSqliteWasmHost`, which waits up to 10 seconds for the pool to be released and then reports
+it locked. Close the other tab and reload; measured, it recovers.
 
 **The preview needs the network.** React comes from esm.sh at preview time. Offline, the bundle
 still builds and the workspace still saves and persists — the iframe just renders nothing. The e2e
@@ -109,9 +111,11 @@ detects this and prints `SKIP` for the three steps that need a rendered React ap
 failing; `VIBE_E2E_OFFLINE=1 node scripts/e2e.mjs` takes that path on purpose.
 
 **This is the Agents SDK's HTTP state path, not its whole platform.** The SDK eagerly imports Node
-and email modules, so Vite maps the Node imports through `unenv` and a fail-closed email shim. The
-starter disables Agent WebSocket hibernation because every source edit deliberately terminates the
-Worker and its local transport; an in-Worker mirror would disappear with both. The [MV3 extension
+and email modules, so Vite maps the Node imports through `unenv` and `cloudflare:email` to the
+package's data-only export. The
+starter keeps the SDK's default hibernatable sockets, but this host mirrors none of them
+(`ports.hibernation`): every source edit deliberately terminates the Worker and its local transport,
+and an in-Worker mirror would disappear with both. The [MV3 extension
 example](../extension/README.md) is the broader compatibility harness: it keeps the transport alive
 across container eviction and runs the SDK client, hibernatable socket server, bidirectional state
 sync, callable and streaming RPC, the SDK queue and scheduler, stateless MCP, and inbound email

@@ -126,7 +126,6 @@ export class Probe extends DurableObject<ProbeEnv> {
   >();
   #handlerEvents: Record<string, unknown>[] = [];
   #handlerTrace: string[] = [];
-  #handlerTimes: { event: string; at: number }[] = [];
   #listenerMessages = 0;
   #latePair: [WebSocket, WebSocket] | undefined;
   #capacityClients: WebSocket[] = [];
@@ -207,11 +206,42 @@ export class Probe extends DurableObject<ProbeEnv> {
     this.trace.push("fetch:exit");
     return { marker: this.marker, status: response.status, body };
   }
+  /**
+   * A fetched body read the three ways SDK code reads one, with a storage write after every
+   * chunk. Every lane's outbound streams its second chunk after a timer, so that read resumes
+   * from a later task: ungated, its write has no input lock. Measured: each chunk resumes gated.
+   */
+  async readFetchedBody(): Promise<Record<string, string[]>> {
+    const url = "https://conformance.invalid/body";
+    const decoder = new TextDecoder();
+    const out = { piped: [] as string[], reader: [] as string[], iterated: [] as string[] };
+    const piped = (await fetch(url)).body!.pipeThrough(new TextDecoderStream()).getReader();
+    for (let next = await piped.read(); !next.done; next = await piped.read()) {
+      out.piped.push(next.value);
+      await this.ctx.storage.put("piped", out.piped);
+    }
+    const reader = (await fetch(url)).body!.getReader();
+    for (let next = await reader.read(); !next.done; next = await reader.read()) {
+      out.reader.push(decoder.decode(next.value));
+      await this.ctx.storage.put("reader", out.reader);
+    }
+    for await (const chunk of (await fetch(url)).body!) {
+      out.iterated.push(decoder.decode(chunk));
+      await this.ctx.storage.put("iterated", out.iterated);
+    }
+    return out;
+  }
   /** Local storage. Measured: HOLDS, so this returns "A". */
   async gateViaStorage(): Promise<string> {
     this.marker = "A";
     await this.ctx.storage.put("probe", 1);
     await this.ctx.storage.get("probe");
+    return this.marker;
+  }
+  /** A plain value. Measured: a microtask never returns to the event loop, so this returns "A". */
+  async gateViaPlainValue(): Promise<string> {
+    this.marker = "A";
+    await 42;
     return this.marker;
   }
 
@@ -266,6 +296,29 @@ export class Probe extends DurableObject<ProbeEnv> {
     const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode("probe"));
     await this.ctx.storage.put("afterDigest", digest.byteLength);
     return `${(await this.ctx.storage.get<number>("afterDigest")) ?? "MISSING"}`;
+  }
+
+  /**
+   * A stream this actor creates and only an outside consumer pulls (`highWaterMark: 0`). Storage
+   * comes first in `pull`, so a callback that did not re-enter the actor has no input lock.
+   * Measured: `"123"`, then 3 pulls.
+   */
+  pullStream(): ReadableStream<Uint8Array> {
+    let n = 0;
+    const storage = this.ctx.storage;
+    return new ReadableStream<Uint8Array>(
+      {
+        async pull(controller) {
+          await storage.put("pulls", ++n);
+          controller.enqueue(new TextEncoder().encode(String(await storage.get("pulls"))));
+          if (n === 3) controller.close();
+        },
+      },
+      { highWaterMark: 0 },
+    );
+  }
+  async readPulls(): Promise<number> {
+    return (await this.ctx.storage.get<number>("pulls")) ?? 0;
   }
 
   /**
@@ -329,9 +382,10 @@ export class Probe extends DurableObject<ProbeEnv> {
   //
   // Writes here are deliberately un-awaited: the question is what survives when
   // the actor dies before the implicit transaction commits.
-  /** Neither survives: one transaction spans the storage await. */
+  /** Neither survives: one transaction spans both storage awaits. */
   async txAcrossStorageAwait(): Promise<never> {
     void this.ctx.storage.put("p1", 1);
+    await this.ctx.storage.get("p1");
     await this.ctx.storage.get("p1");
     void this.ctx.storage.put("p2", 2);
     this.ctx.abort("conformance: kill before commit");
@@ -378,16 +432,39 @@ export class Probe extends DurableObject<ProbeEnv> {
   // -- §1.5 critical sections ------------------------------------------------
   flag = "init";
   async setFlag(): Promise<string> {
+    this.trace.push("setFlag");
     this.flag = "B";
     return "set";
   }
   /** Measured: genuinely blocks, so this returns "A". */
   async blockConcurrency(): Promise<string> {
     await this.ctx.blockConcurrencyWhile(async () => {
+      this.trace.push("section:enter");
       this.flag = "A";
       await scheduler.wait(60);
+      this.trace.push("section:exit");
     });
     return this.flag;
+  }
+  /**
+   * A section that throws. Measured: the caller sees the callback's error and the object is
+   * reset; the put before the section survives and the one inside it is rolled back.
+   */
+  async failSection(): Promise<string> {
+    this.marker = "dirty";
+    await this.ctx.storage.put("before", 1);
+    await this.ctx.blockConcurrencyWhile(async () => {
+      await this.ctx.storage.put("inside", 1);
+      throw new Error("conformance: section failed");
+    });
+    return "returned";
+  }
+  async readSectionFailure(): Promise<Record<string, unknown>> {
+    return {
+      marker: this.marker,
+      before: (await this.ctx.storage.get("before")) ?? null,
+      inside: (await this.ctx.storage.get("inside")) ?? null,
+    };
   }
   /** Measured: nests without deadlocking. */
   async nestedBlockConcurrency(): Promise<string> {
@@ -590,19 +667,25 @@ export class Probe extends DurableObject<ProbeEnv> {
    * actually is instead of what it was assumed to be.
    */
   async reservedNames(): Promise<Record<string, string>> {
+    // Classified by message, as `sqlPragmas` does: "no such table" is not the refusal. SQLite words
+    // a denied column read "access to … is prohibited", so both authorizer wordings count.
     const attempt = (sql: string): string => {
       try {
         this.ctx.storage.sql.exec(sql);
         return "allowed";
-      } catch {
-        return "refused";
+      } catch (error) {
+        return error instanceof Error && /not authorized|SQLITE_AUTH/.test(error.message)
+          ? "refused"
+          : `refused otherwise: ${String(error)}`;
       }
     };
     this.ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS names(callback TEXT)");
+    // `_cf_KV` exists once a KV value does, so the SELECT below reads a real reserved table.
+    this.ctx.storage.kv.put("reserved-names", 1);
     return {
       // A reserved identifier, which is the whole point of the rule.
       createTable: attempt("CREATE TABLE IF NOT EXISTS _cf_probe(x)"),
-      selectFrom: attempt("SELECT * FROM _cf_probe"),
+      selectFrom: attempt("SELECT * FROM _cf_KV"),
       // A quoted identifier is still an identifier.
       quotedIdentifier: attempt('CREATE TABLE IF NOT EXISTS "_cf_quoted"(x)'),
       // Data. The `agents` statement above, with its own table name.
@@ -1001,6 +1084,25 @@ export class Probe extends DurableObject<ProbeEnv> {
     return { asyncRead, syncRead, listed, deleted, missing: typeof kv.get("shared:sync") };
   }
 
+  /**
+   * `list()` range options, and the count a multi-key `delete` returns. `p;` is the first key
+   * after the `p:` prefix range, so a reverse listing that overshot the range would return it.
+   */
+  async listOptions(): Promise<Record<string, unknown>> {
+    const storage = this.ctx.storage;
+    await storage.put({ a: 1, b: 2, c: 3, d: 4, "p:1": 1, "p:2": 2, "p:3": 3, "p;": 0 });
+    const keys = async (options?: DurableObjectListOptions) => [
+      ...(await storage.list(options)).keys(),
+    ];
+    return {
+      lastWithPrefix: await keys({ prefix: "p:", reverse: true, limit: 1 }),
+      startEnd: await keys({ start: "b", end: "d" }),
+      startAfterEnd: await keys({ startAfter: "b", end: "d" }),
+      deleted: await storage.delete(["a", "b", "missing"]),
+      remaining: await keys(),
+    };
+  }
+
   /** `deleteAll()` resets the actor database, including alarm metadata. */
   async deleteAllState(): Promise<Record<string, unknown>> {
     await this.ctx.storage.put("delete-me", "present");
@@ -1013,8 +1115,8 @@ export class Probe extends DurableObject<ProbeEnv> {
   }
 
   // -- §2.4 the value codec --------------------------------------------------
-  /** Rich values retain the same public structured-clone types in every lane. */
-  async richValueRoundTrip(): Promise<Record<string, string>> {
+  /** Rich values retain the same public structured-clone types and contents in every lane. */
+  async richValueRoundTrip(): Promise<Record<string, unknown>> {
     await this.ctx.storage.put("codec", {
       when: new Date(0),
       map: new Map([["k", 1]]),
@@ -1026,12 +1128,12 @@ export class Probe extends DurableObject<ProbeEnv> {
     const read = await this.ctx.storage.get<Record<string, unknown>>("codec");
     if (read === undefined) throw new Error("Stored rich value disappeared.");
     return {
-      when: read.when instanceof Date ? "Date" : typeof read.when,
-      map: read.map instanceof Map ? "Map" : typeof read.map,
-      set: read.set instanceof Set ? "Set" : typeof read.set,
-      bytes: read.bytes instanceof ArrayBuffer ? "ArrayBuffer" : typeof read.bytes,
-      re: read.re instanceof RegExp ? "RegExp" : typeof read.re,
-      err: read.err instanceof Error ? "Error" : typeof read.err,
+      when: read.when instanceof Date ? read.when.getTime() : typeof read.when,
+      map: read.map instanceof Map ? [...read.map] : typeof read.map,
+      set: read.set instanceof Set ? [...read.set] : typeof read.set,
+      bytes: read.bytes instanceof ArrayBuffer ? [...new Uint8Array(read.bytes)] : typeof read.bytes,
+      re: read.re instanceof RegExp ? String(read.re) : typeof read.re,
+      err: read.err instanceof Error ? String(read.err) : typeof read.err,
     };
   }
 
@@ -1076,6 +1178,12 @@ export class Probe extends DurableObject<ProbeEnv> {
   }
   async readAlarmLog(): Promise<string[]> {
     return (await this.ctx.storage.get<string[]>("alarmLog")) ?? [];
+  }
+  /** Measured: `getAlarm()` answers null, and the handler never runs (`alarmLog` stays empty). */
+  async armThenDeleteAlarm(): Promise<number | null> {
+    await this.ctx.storage.setAlarm(Date.now() + 200);
+    await this.ctx.storage.deleteAlarm();
+    return await this.ctx.storage.getAlarm();
   }
 
   // -- §1.8 a failed alarm is retried, and told how many times ---------------
@@ -1347,19 +1455,24 @@ export class Probe extends DurableObject<ProbeEnv> {
     this.#throwNextMessage = true;
   }
 
+  /**
+   * Missing for exactly one dispatch: the lookup that finds nothing also restores the method, so
+   * the next frame reaches it with no race between frame delivery and a restoring call.
+   */
   removeSocketMessageHandler(): void {
-    Object.defineProperty(this, "webSocketMessage", { configurable: true, value: undefined });
-  }
-
-  restoreSocketMessageHandler(): void {
-    Reflect.deleteProperty(this, "webSocketMessage");
+    Object.defineProperty(this, "webSocketMessage", {
+      configurable: true,
+      get: () => {
+        Reflect.deleteProperty(this, "webSocketMessage");
+        return undefined;
+      },
+    });
   }
 
   socketJournal(): Record<string, unknown> {
     return {
       events: this.#handlerEvents,
       trace: this.#handlerTrace,
-      times: this.#handlerTimes,
       listenerMessages: this.#listenerMessages,
       clients: Object.fromEntries(
         [...this.#clientMessages].map(([id, messages]) => [
@@ -1592,20 +1705,16 @@ export class Probe extends DurableObject<ProbeEnv> {
 
     if (typeof message === "string" && message.startsWith("slow:")) {
       this.#handlerTrace.push(`start:${message}`);
-      this.#handlerTimes.push({ event: `start:${message}`, at: Date.now() });
       await scheduler.wait(200);
       this.#handlerTrace.push(`end:${message}`);
-      this.#handlerTimes.push({ event: `end:${message}`, at: Date.now() });
       return;
     }
     if (typeof message === "string" && message.startsWith("block:")) {
       this.#handlerTrace.push(`start:${message}`);
-      this.#handlerTimes.push({ event: `start:${message}`, at: Date.now() });
       await this.ctx.blockConcurrencyWhile(async () => {
         await scheduler.wait(200);
       });
       this.#handlerTrace.push(`end:${message}`);
-      this.#handlerTimes.push({ event: `end:${message}`, at: Date.now() });
       return;
     }
     if (message === "echo") ws.send("echoed");

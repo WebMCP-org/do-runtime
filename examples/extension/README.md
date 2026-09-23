@@ -56,10 +56,18 @@ popup.html ──sendMessage──▶ service worker ──chrome.offscreen.crea
   exponential backoff, abandonment — is rows rather than process memory, which is
   the divergence from workerd that exists precisely because MV3 evicts its
   contexts.
-- **A physical MV3 wake.** The scheduler projects only its earliest durable wait
-  through the offscreen supervisor onto `chrome.alarms`. The e2e destroys the
-  offscreen document before that alarm is due and proves Chrome wakes the service
-  worker, recreates the host, and lets the scheduler deliver the stored event.
+- **A physical MV3 wake.** The worker's `createBrowserAlarmProjector()` projects
+  the scheduler's earliest durable wait through the offscreen supervisor to the
+  service worker's `BrowserAlarmCoordinator`, which arms `chrome.alarms` and
+  journals each hop in `chrome.storage.local`. The projection generation lives in
+  a host table beside `_cf_ALARM`, because the coordinator ignores any generation
+  older than the last it journaled and a restarted worker must count on from
+  there. The worker boots its scheduler with no client attached. The e2e
+  destroys the offscreen document and sends no host operation until the
+  coordinator has acknowledged the wake: Chrome recreates the host, and the new
+  scheduler delivers the stored event on its own. The e2e also stops the service
+  worker in the middle of a held delivery; the coordinator's journaled watchdog
+  brings it back, and the delivery completes exactly once.
 - **The Agents SDK queue.** The e2e enqueues an increment and observes its state
   write through `snapshot()`, exercising the SDK's SQLite-backed queue rather
   than a host callback.
@@ -70,10 +78,13 @@ popup.html ──sendMessage──▶ service worker ──chrome.offscreen.crea
   Chrome recreates an evicted host.
 - **A hibernatable `AgentClient` connection across container eviction.** The
   offscreen page opens the SDK client over a `MessagePort`-backed WebSocket,
-  while the actor receives the server half through `routeAgentRequest()` and
-  `ctx.acceptWebSocket()`. The e2e replaces only the root actor container and
-  proves that the same client receives a new state broadcast and writes state
-  back to the replacement without reconnecting. It also covers standard named
+  while the actor receives the server half through `ctx.acceptWebSocket()`. The
+  worker's `serveMessagePortWebSockets` connects each socket through
+  `connectMessagePortWebSocket()` and `routeAgentRequest()`, which close an
+  unrouted socket with 1011 and a refused upgrade with 1008 and the Agent's
+  reason. The e2e replaces only the root actor container and proves that the
+  same client receives a new state broadcast and writes state back to the
+  replacement without reconnecting. It also covers standard named
   routing, `getAgentByName()` direct stubs, a decorated `@callable()` method,
   and a streaming callable's chunks and final value.
 - **A real network relay boundary.** The e2e boots an authless, hibernatable
@@ -90,11 +101,13 @@ popup.html ──sendMessage──▶ service worker ──chrome.offscreen.crea
   carries an in-memory `ForwardableEmailMessage` through `routeAgentEmail()` to
   the actor's `onEmail()` hook. Forwarding and replies still refuse because this
   host has no outbound email binding.
-- **Offscreen corpse recovery.** A crashed offscreen document disappears from
-  `chrome.runtime.getContexts` while still holding the one offscreen slot.
-  `src/background.ts` catches the resulting "single offscreen document" error —
-  the error string is Chrome's only report of the corpse — closes it, and retries
-  once.
+- **Offscreen corpse recovery and readiness.** A crashed offscreen document
+  disappears from `chrome.runtime.getContexts` while still holding the one
+  offscreen slot. The package's `OffscreenDocumentCoordinator` closes it and
+  retries creation once; `src/background.ts` supplies only the adapter, including
+  the "single offscreen document" substring that is Chrome's only report of the
+  corpse. The adapter's `ready()` pings the document until its listener answers,
+  so `ensure-host` resolves only when a `host-op` will be heard.
 
 ## Load it unpacked
 
@@ -154,7 +167,7 @@ only as a competing supervisor and asserts that Web Locks refuse it before OPFS.
 | `src/protocol.ts` | The types both TypeScript projects compile. It imports nothing. |
 | `@mcp-b/do-runtime/browser` | The browser Request/`Response`-101 upgrade adapter; the runtime supplies `WebSocketPair`. |
 | `@mcp-b/do-runtime` `HibernationMirror` | The process-local `HibernationHost` record shared by this example and the conformance embedders. |
-| `../platform-shims/message-port-websocket.ts` | The client-side WebSocket adapter carried over a `MessagePort`. |
+| `@mcp-b/do-runtime/browser/message-port-websocket` | The WebSocket adapter carried over a `MessagePort`: the offscreen client and the worker's server side. |
 | `public/manifest.json` | Copied verbatim into `dist/` by Vite's `publicDir`. |
 | `wrangler.relay.jsonc` | Local-workerd configuration for the relay proof. |
 
@@ -180,10 +193,13 @@ Every step is where it is because moving it was measured to fail.
    once, at bootstrap. Disabling the `opfs` and `opfs-wl` VFSes keeps the proxy
    workers this host does not use out of the picture; `opfs-sahpool` must stay
    enabled.
-3. **Install sqlite and the pool *before* `installActorScope`.**
-   `installOpfsSAHPoolVfs` probes the other OPFS VFSes on the way in and those
-   probes arm watchdogs through the global `setTimeout`. Installing the actor
-   scope first hands the actor's gate to a storage library.
+3. **Install sqlite and the pool with `installSqliteWasmHost`, *before*
+   `installActorScope`.** The helper waits for a terminated predecessor to
+   release the pool and makes SQLite roll back the transaction it left open.
+   The driver's `installOpfsSAHPoolVfs`, which it calls, probes the other OPFS
+   VFSes on the way in, and those probes arm watchdogs through the global
+   `setTimeout`. Installing the actor scope first hands the actor's gate to a
+   storage library.
 4. **`installActorScope(globalThis, resolve)` where `resolve` throws.** One
    worker hosts one root, so "no container" cannot mean "outside any actor" — it
    can only mean the container was torn down mid-flight, and handing that
@@ -267,10 +283,10 @@ substrate. Cloudflare-managed products remain explicit integration boundaries:
 Written down because this example exists partly to find them.
 
 - **The Agents SDK root entry eagerly imports Workers-only Node and email modules.**
-  Vite maps the Node imports through `unenv`; `cloudflare:email` remains a
-  fail-closed shim. The inbound test supplies a host-created
-  `ForwardableEmailMessage`; its forwarding and reply methods refuse because the
-  demo has no outbound Email Routing binding.
+  Vite maps the Node imports through `unenv`; `cloudflare:email` resolves to the
+  package's `EmailMessage` data constructor, which sends nothing. The inbound test
+  supplies a host-created `ForwardableEmailMessage`; its forwarding and reply
+  methods refuse because the demo has no outbound Email Routing binding.
 - **The hibernation mirror is not process durability.** It survives a container
   replacement inside this Worker. It cannot survive destruction of the Worker
   that owns the raw `MessagePort` socket; that lifecycle reconnects instead.
@@ -286,20 +302,25 @@ Written down because this example exists partly to find them.
   though `sqlite3ApiConfig` turns those VFSes off. The `sqlite3.wasm` binary is
   emitted correctly with no plugin and no `locateFile` override, which is the good
   half of the same mechanism.
-- **A failed pool install tries to delete the pool directory.** The second holder
-  above also logs `removeVfs() failed with no recovery strategy: … 'removeEntry' …`.
-  It fails, because the first holder has the directory open — but a cleanup path
-  that reaches for `removeEntry` on shared storage after a failed acquisition is
-  worth knowing about before it succeeds on some other platform.
-- **Two `ensureOffscreen()` callers can close a healthy document.** Not the
-  runtime's, but a trap for anyone copying this shape: `onInstalled` and the
+- **A failed pool install deletes the pool directory when it can.** The driver's
+  `installOpfsSAHPoolVfs` runs `removeVfs()` after a failed acquisition. Against a
+  live holder the delete fails (`removeVfs() failed with no recovery strategy: …
+  'removeEntry' …`), but on Chrome it succeeds when the holder is a terminated
+  worker still releasing its handles: retrying the driver's install across that
+  release lost the whole pool in 3 of 24 measured recoveries. `installSqliteWasmHost`
+  waits until every file is released before installing, and after 10 s rejects
+  with a `NoModificationAllowedError` instead of reaching the driver's cleanup.
+- **Two uncoordinated creators can close a healthy document.** A trap for anyone
+  who replaces the package's coordinator with their own: `onInstalled` and the
   popup's first message arrive together, both see no document, the loser gets
-  "single offscreen document", and the corpse-recovery path then closes the
-  winner's live document. `src/background.ts` serialises on an in-flight promise
-  for exactly this reason.
+  "single offscreen document", and corpse recovery then closes the winner's live
+  document. `OffscreenDocumentCoordinator.ensure()` single-flights creation and
+  recovery for exactly this reason.
 - **`chrome.offscreen.createDocument` can resolve before the document listens.**
-  A message sent right after it is answered `undefined` rather than queued, so
-  `src/popup/popup.ts` retries once — and only for that outcome.
+  `offscreen.ts` registers its listener behind a top-level `await`, and a message
+  sent in that gap is answered `undefined` rather than queued. The adapter's
+  `ready()` pings until the listener answers, inside the same single flight, and
+  replaces a document that stays mute past its timeout once.
 - **`chrome-types` models `chrome.offscreen.Reason` and
   `chrome.runtime.ContextType` as types, not runtime enums.** The dotted form
   Chrome's own docs use does not compile; string literals do.

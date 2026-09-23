@@ -36,9 +36,10 @@ import {
   AlarmScheduler,
   createActorContainer,
   HibernationMirror,
-  installWebSocketGlobals,
+  installActorScope,
   type ActorContainer,
   type ActorEntry,
+  type ActorGlobalScope,
   type FacetHandle,
   type FacetHost,
   type FacetId,
@@ -127,90 +128,28 @@ const current = new AsyncLocalStorage<ActorContainer>();
 /** Captured before anything is installed, so the fall-through below cannot recurse. */
 const nodeSetTimeout = globalThis.setTimeout;
 const nodeClearTimeout = globalThis.clearTimeout;
-const nodeSetInterval = globalThis.setInterval;
-const nodeClearInterval = globalThis.clearInterval;
-const nodeFetch = globalThis.fetch;
-
-type SchedulerGlobal = {
-  wait(ms: number, options?: { signal?: AbortSignal }): Promise<void>;
-  yield(): Promise<void>;
-};
-
-const scheduler: SchedulerGlobal = {
-  wait: (ms, options) => {
-    const container = current.getStore();
-    if (container === undefined) {
-      return new Promise<void>((resolve) => {
-        nodeSetTimeout(resolve, ms);
-      });
-    }
-    return container.globals.scheduler.wait(ms, options);
-  },
-  yield: () => scheduler.wait(0),
-};
-(globalThis as { scheduler?: SchedulerGlobal }).scheduler ??= scheduler;
-
-globalThis.setTimeout = ((callback: (...args: never[]) => void, ms?: number, ...args: never[]) => {
-  const container = current.getStore();
-  if (container === undefined) return nodeSetTimeout(callback, ms, ...args);
-  return container.globals.setTimeout(callback, ms, ...args);
-}) as typeof globalThis.setTimeout;
-
-globalThis.clearTimeout = ((id?: number) => {
-  const container = current.getStore();
-  if (container === undefined) return nodeClearTimeout(id);
-  return container.globals.clearTimeout(id);
-}) as typeof globalThis.clearTimeout;
-
-globalThis.setInterval = ((callback: (...args: never[]) => void, ms?: number, ...args: never[]) => {
-  const container = current.getStore();
-  if (container === undefined) return nodeSetInterval(callback, ms, ...args);
-  return container.globals.setInterval(callback, ms, ...args);
-}) as typeof globalThis.setInterval;
-
-globalThis.clearInterval = ((id?: number) => {
-  const container = current.getStore();
-  if (container === undefined) return nodeClearInterval(id);
-  return container.globals.clearInterval(id);
-}) as typeof globalThis.clearInterval;
-
-globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) => {
-  const container = current.getStore();
-  if (container === undefined) return nodeFetch(input, init);
-  return container.globals.fetch(input, init);
-}) as typeof globalThis.fetch;
-
-const ActorWebSocketPair: typeof WebSocketPair = new Proxy(
-  class WebSocketPair {
-    declare readonly 0: WebSocket;
-    declare readonly 1: WebSocket;
-  },
-  {
-    construct() {
-      const Pair = current.getStore()?.globals.WebSocketPair;
-      if (Pair === undefined) {
-        throw new Error("Node lane: WebSocketPair was constructed outside an actor event.");
-      }
-      return new Pair();
-    },
-  },
-);
-installWebSocketGlobals(globalThis, ActorWebSocketPair);
-installWebSocketUpgradeGlobals();
 
 /**
- * `crypto`, on the same ambient as the timers above.
- *
- * A getter rather than an assigned value, because `crypto.subtle` is read at the
- * call site and the answer depends on which actor is running — the whole point of
- * `current` here. Outside an actor it is the platform's, which is what `nodeCrypto`
- * keeps.
+ * What the installed names reach with an empty ambient: Node's own, captured before the install.
+ * The rest of `installActorScope`'s set — `WebSocketPair`, `scheduler` — has no caller outside an
+ * actor here, so it has no fall-through either. One actor caller does arrive with an empty store:
+ * a stream callback pulled from an outside consumer's async context re-enters its actor's lock but
+ * not this lane's store, so a scope primitive called there is not the actor's.
  */
-const nodeCrypto = globalThis.crypto;
-Object.defineProperty(globalThis, "crypto", {
-  configurable: true,
-  get: () => (current.getStore()?.globals.crypto as Crypto | undefined) ?? nodeCrypto,
-});
+const platform = {
+  setTimeout: nodeSetTimeout,
+  clearTimeout: nodeClearTimeout,
+  setInterval: globalThis.setInterval,
+  clearInterval: globalThis.clearInterval,
+  fetch: globalThis.fetch,
+  crypto: globalThis.crypto,
+  WebSocket: globalThis.WebSocket,
+} as unknown as ActorGlobalScope;
+
+// The package's own set, so a binding added there (the actor stream constructors were the first
+// this lane missed) reaches this lane without a line here.
+installActorScope(globalThis, () => current.getStore()?.globals ?? platform);
+installWebSocketUpgradeGlobals();
 
 /**
  * Runs every method of an actor instance inside that actor's ambient, so a
@@ -791,9 +730,18 @@ async function place(name: string): Promise<Record_> {
       facets: host,
       timer,
       hibernation,
+      // "fetched" in two chunks, the second after a timer, as every lane's outbound answers.
       fetch: async () => {
         await timer.afterDelay(60);
-        return new Response("fetched");
+        const body = new ReadableStream({
+          async start(controller) {
+            controller.enqueue(new TextEncoder().encode("fet"));
+            await timer.afterDelay(20);
+            controller.enqueue(new TextEncoder().encode("ched"));
+            controller.close();
+          },
+        });
+        return new Response(body);
       },
     },
     webSockets: hibernation.snapshot(),

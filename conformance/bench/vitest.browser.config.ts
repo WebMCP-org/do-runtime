@@ -4,8 +4,7 @@
  * `include` names the two bench files and nothing else, and the file names end
  * in `.bench.ts` rather than `.spec.ts` so the browser lane's
  * `conformance/browser/*.smoke.spec.ts` and `conformance/suite/**` globs cannot
- * reach them either. The baseline stays exactly what it was: unit 755,
- * workerd 38/38, node 38/38, browser 41/41.
+ * reach them either.
  *
  * `optimizeDeps` is copied from `conformance/browser/vitest.config.ts` — named
  * so the first worker to import the driver does not trigger a mid-run

@@ -1,5 +1,7 @@
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
+import { convertToModelMessages, type UIMessage } from "ai";
+import { createReadTool } from "../tools/workspace";
 import { getAgentByName } from "agents";
 
 async function freshAgent(name: string) {
@@ -15,6 +17,201 @@ const PNG_BYTES = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
 // ── Read tool ─────────────────────────────────────────────────────────
 
 describe("assistant tools — read", () => {
+  it("does not load an oversized untyped file just to detect its format", async () => {
+    const path = "/mounts/cookbooks/untyped.pdf";
+    let reads = 0;
+    const read = createReadTool({
+      ops: {
+        stat: () => ({
+          path,
+          name: "untyped.pdf",
+          type: "file",
+          size: 389 * 1024 * 1024,
+          createdAt: 0,
+          updatedAt: 0
+        }),
+        readFile: async () => null,
+        readFileBytes: async () => {
+          reads++;
+          return new Uint8Array(asciiBytes("%PDF-1.4\n"));
+        }
+      }
+    });
+    await expect(
+      read.execute!(
+        { path },
+        { toolCallId: "untyped-read", messages: [], context: {} }
+      )
+    ).resolves.toMatchObject({
+      kind: "binary",
+      path,
+      sizeBytes: 389 * 1024 * 1024,
+      unsupported: true
+    });
+    expect(reads).toBe(0);
+  });
+
+  it.each([
+    ["report.pdf", "application/pdf"],
+    ["shot.png", "image/png"]
+  ])(
+    "checks the current size of %s before loading media",
+    async (name, mimeType) => {
+      const path = `/mounts/cookbooks/${name}`;
+      const bytes = new Uint8Array([1, 2, 3]);
+      let size = bytes.length;
+      let reads = 0;
+      const read = createReadTool({
+        ops: {
+          stat: () => ({
+            path,
+            name,
+            type: "file",
+            mimeType,
+            size,
+            createdAt: 0,
+            updatedAt: 0
+          }),
+          readFile: async () => null,
+          readFileBytes: async () => {
+            reads++;
+            return bytes;
+          }
+        }
+      });
+      const input = { path };
+      const output = await read.execute!(input, {
+        toolCallId: "large-read",
+        messages: [],
+        context: {}
+      });
+      const render = () =>
+        read.toModelOutput!({ toolCallId: "large-read", input, output });
+      // Saved metadata can be small while the current file has grown. Do not
+      // allocate a 389 MiB fixture just to prove that its bytes are never read.
+      size = 389 * 1024 * 1024;
+      await expect(render()).resolves.toEqual({
+        type: "error-text",
+        value: expect.stringContaining(
+          "exceeds the 3.5 MB inline model output limit"
+        )
+      });
+      expect(reads).toBe(0);
+      const largeOutput = await read.execute!(input, {
+        toolCallId: "large-read",
+        messages: [],
+        context: {}
+      });
+      expect(reads).toBe(0);
+
+      // Conversely, replacing a large file with a small one must restore access
+      // without changing its old transcript metadata.
+      size = bytes.length;
+      await expect(
+        read.toModelOutput!({
+          toolCallId: "large-read",
+          input,
+          output: largeOutput
+        })
+      ).resolves.toMatchObject({ type: "content" });
+      expect(reads).toBe(1);
+    }
+  );
+
+  it.each([
+    ["report.pdf", "application/pdf", asciiBytes("%PDF-1.4\n")],
+    ["shot.png", "image/png", PNG_BYTES]
+  ])(
+    "keeps history usable when %s becomes inaccessible",
+    async (name, mimeType, data) => {
+      const path = `/mounts/cookbooks/${name}`;
+      const bytes = new Uint8Array(data);
+      let readable = true;
+      const reason =
+        "EACCES: local folder mount /mounts/cookbooks needs to be reconnected in the sidepanel";
+      const read = createReadTool({
+        ops: {
+          stat: () => ({
+            path,
+            name,
+            type: "file",
+            mimeType,
+            size: bytes.length,
+            createdAt: 0,
+            updatedAt: 0
+          }),
+          readFile: async () => null,
+          readFileBytes: async () => {
+            if (!readable)
+              throw Object.assign(new Error(reason), { code: "EACCES" });
+            return bytes;
+          }
+        }
+      });
+      const input = { path };
+      const output = await read.execute!(input, {
+        toolCallId: "read-file",
+        messages: [],
+        context: {}
+      });
+      const history: UIMessage[] = [
+        {
+          id: "assistant-read",
+          role: "assistant",
+          parts: [
+            {
+              type: "tool-read",
+              toolCallId: "read-file",
+              state: "output-available",
+              input,
+              output
+            }
+          ]
+        },
+        {
+          id: "followup",
+          role: "user",
+          parts: [
+            { type: "text", text: "Continue with this attachment." },
+            {
+              type: "file",
+              mediaType: "application/pdf",
+              filename: "replacement.pdf",
+              url: `data:application/pdf;base64,${btoa("%PDF-1.4\n")}`
+            }
+          ]
+        }
+      ];
+      const stored = JSON.stringify(history);
+      const render = () => convertToModelMessages(history, { tools: { read } });
+      const original = await render();
+      expect(original[1]).toMatchObject({
+        role: "tool",
+        content: [{ output: { type: "content" } }]
+      });
+
+      readable = false;
+      await expect(render()).resolves.toContainEqual({
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "read-file",
+            toolName: "read",
+            output: {
+              type: "error-text",
+              value: `Could not read file bytes: ${path}: ${reason}`
+            }
+          }
+        ]
+      });
+      expect(JSON.stringify(history)).toBe(stored);
+
+      readable = true;
+      await expect(render()).resolves.toEqual(original);
+    }
+  );
+
   it("reads a file with line numbers", async () => {
     const agent = await freshAgent("read-basic");
     await agent.seed([{ path: "/hello.txt", content: "line1\nline2\nline3" }]);

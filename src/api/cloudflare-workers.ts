@@ -234,6 +234,8 @@ function runInScopes(
   pushes: readonly { readonly scopes: Bindings[]; readonly value: unknown }[],
   fn: () => unknown,
 ): unknown {
+  // Validate every scope before pushing any: a refusal must not leave one installed realm-wide.
+  for (const push of pushes) asBindings(push.value);
   for (const push of pushes) push.scopes.push(asBindings(push.value));
   try {
     const result = fn();

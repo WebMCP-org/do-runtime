@@ -57,6 +57,11 @@ describe("node-sqlite backend", () => {
     expect(db.exec("DELETE FROM things WHERE id = ?", [99]).rowsWritten).toBe(0);
     expect(db.exec("DELETE FROM things WHERE id = ?", [1]).rowsWritten).toBe(1);
     expect(db.exec("DELETE FROM things", []).rowsWritten).toBe(2);
+    expect(db.exec("CREATE TABLE other (id INTEGER)", []).rowsWritten).toBe(0);
+    // FTS5 writes its shadow tables too; total_changes() counts those, changeCount does not.
+    db.exec("CREATE VIRTUAL TABLE docs USING fts5(body)", []);
+    expect(db.exec("INSERT INTO docs VALUES ('one')", []).rowsWritten).toBe(1);
+    expect(db.exec("INSERT INTO docs VALUES ('two') RETURNING rowid", []).rowsWritten).toBe(1);
   });
 
   test("the backend accepts only SQLite's four binding value kinds", async () => {

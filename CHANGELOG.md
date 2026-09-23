@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.8.3
+
+### Patch Changes
+
+- a423fd2: Preserve the creating actor's input gate and async context in ReadableStream
+  and TransformStream callbacks. Delayed input and stream demand previously entered
+  provider callbacks or tool execution without their creating scope, causing
+  valid model turns, title actions, and routine actions to fail at storage access.
+
+## 0.8.2
+
+### Patch Changes
+
+- 4346a6e: Refresh runtime and build dependencies, including SQLite WASM, Cap’n Web and
+  structured clone. Validate conformance against workerd 1.20260911.1 and keep
+  WebSocket readyState declarations aligned with the current DOM types.
+
 ## 0.8.1
 
 ### Patch Changes

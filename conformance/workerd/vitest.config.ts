@@ -13,9 +13,18 @@ export default defineConfig({
     cloudflareTest({
       wrangler: { configPath: `${here}wrangler.test.jsonc` },
       miniflare: {
+        // "fetched" in two chunks, the second after a timer, as every lane's outbound answers.
         outboundService: async () => {
           await new Promise((resolve) => setTimeout(resolve, 60));
-          return new Response("fetched");
+          const body = new ReadableStream({
+            async start(controller) {
+              controller.enqueue(new TextEncoder().encode("fet"));
+              await new Promise((resolve) => setTimeout(resolve, 20));
+              controller.enqueue(new TextEncoder().encode("ched"));
+              controller.close();
+            },
+          });
+          return new Response(body);
         },
       },
     }),

@@ -148,7 +148,15 @@ export class MessagePortWebSocket extends EventTarget implements RawWebSocket {
   }
 
   #emit<E extends Event>(event: E, handler: ((event: E) => void) | null): void {
-    handler?.(event);
+    // Report a throwing handler the way EventTarget reports a listener, so it
+    // cannot skip the listeners behind it or abandon a frame flush.
+    try {
+      handler?.(event);
+    } catch (error) {
+      queueMicrotask(() => {
+        throw error;
+      });
+    }
     this.dispatchEvent(event);
   }
 }
@@ -238,10 +246,16 @@ export function createMessagePortWebSocketConstructor(
   };
 }
 
-/** Serve brokered MessagePort sockets from real in-worker socket endpoints. */
+/**
+ * Serve brokered MessagePort sockets from real in-worker socket endpoints.
+ * `connect` bridges each client's server-side endpoint, for example with
+ * `connectMessagePortWebSocket()` from `@mcp-b/do-runtime/browser`; once it
+ * resolves, the client is told the socket is open. A bridge that `stop()`
+ * closed refuses a late socket by closing it with 1001.
+ */
 export function serveMessagePortWebSockets(
   port: MessagePort,
-  connect: (url: string) => Promise<UpgradeWebSocket>,
+  connect: (bridge: MessagePortWebSocket, url: string) => Promise<void>,
 ): () => void {
   const bridges = new Set<MessagePortWebSocket>();
   const listener = (event: MessageEvent<unknown>): void => {
@@ -250,17 +264,16 @@ export function serveMessagePortWebSockets(
     const bridge = new MessagePortWebSocket(request.url, request.port, false);
     bridges.add(bridge);
     bridge.addEventListener("close", () => bridges.delete(bridge), { once: true });
-    void connect(request.url).then(
-      (socket) => {
-        if (!bridges.has(bridge)) {
-          socket.close(1001, "host stopped");
-          return;
-        }
-        bridgeWebSocket(socket, bridge);
+    void connect(bridge, request.url)
+      .then(() => {
         request.port.postMessage({ type: "open" } satisfies MessagePortWebSocketReadyMessage);
-      },
-      () => bridge.close(1011, "WebSocket connection failed"),
-    );
+      })
+      .catch((error: unknown) => {
+        bridge.close(1011, "WebSocket connection failed");
+        queueMicrotask(() => {
+          throw error;
+        });
+      });
   };
   port.addEventListener("message", listener);
   port.start();

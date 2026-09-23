@@ -36,7 +36,7 @@ export default defineConfig({
       // one DurableObject/RpcTarget identity, while authored source keeps the
       // exact platform specifier it will deploy with.
       "cloudflare:workers": cloudflareWorkersModule,
-      "cloudflare:email": `${repoRoot}examples/platform-shims/cloudflare-email.ts`,
+      "cloudflare:email": `${repoRoot}dist/cloudflare-email.js`,
       "node:async_hooks": "unenv/node/async_hooks",
       "node:diagnostics_channel": "unenv/node/diagnostics_channel",
       "node:os": "unenv/node/os",
@@ -53,7 +53,7 @@ export default defineConfig({
   server: {
     headers: crossOriginIsolation,
     fs: {
-      // The platform shims above live outside this example's root.
+      // The package's `dist/` files above live outside this example's root.
       allow: [repoRoot],
     },
   },

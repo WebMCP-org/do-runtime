@@ -5,6 +5,7 @@ import {
   BrokenActorError,
   IoContext,
   requireInputLock,
+  tryCurrentIoContext,
   type Actor,
   type Timer,
 } from "./io/io-context";
@@ -219,6 +220,81 @@ describe("__gate", () => {
 });
 
 describe("transformed await resume", () => {
+  test.each([
+    ["a held storage await", (context: IoContext) => context.awaitIoWithInputLock(Promise.resolve(1))],
+    ["an already-settled storage result", () => Promise.resolve(1)],
+    ["a plain value", () => 1],
+  ])("resumes %s twice in one checkpoint before a queued event runs", async (_, awaited) => {
+    await portHop();
+    const context = newContext();
+    const order: string[] = [];
+    const first = context.run(async () => {
+      order.push("first:start");
+      // Both awaits resume in this checkpoint, so they share one implicit transaction.
+      let crossedTask = false;
+      void portHop().then(() => { crossedTask = true; });
+      __resumeAwait(await __gateAwait(awaited(context)));
+      __resumeAwait(await __gateAwait(awaited(context)));
+      expect(crossedTask).toBe(false);
+      order.push("first:resumed");
+    });
+    const queued = context.run(() => {
+      order.push("queued");
+    });
+
+    await Promise.all([first, queued]);
+    expect(order).toEqual(["first:start", "first:resumed", "queued"]);
+  });
+
+  test("waits out a critical section that settles an await captured outside it", async () => {
+    await portHop();
+    const context = newContext();
+    const order: string[] = [];
+    const outside = Promise.withResolvers<void>();
+    const waiter = context.run(async () => {
+      __resumeAwait(await __gateAwait(outside.promise));
+      order.push("outside");
+    });
+    await portHop();
+    await context.run(() =>
+      context.blockConcurrencyWhile(async () => {
+        outside.resolve();
+        __resumeAwait(await __gateAwait(portHop()));
+        order.push("section");
+      }),
+    );
+    await waiter;
+    expect(order).toEqual(["section", "outside"]);
+  });
+
+  test("keeps a second actor's lock without taking over another actor's checkpoint", async () => {
+    const owner = newContext();
+    const second = newContext();
+    const order: string[] = [];
+    let secondResumed!: Promise<void>;
+    let ambient: IoContext | undefined;
+    await owner.run(async () => {
+      __resumeAwait(await __gateAwait(Promise.resolve()));
+      // The owner's continuation is current; the second actor settles a held await inside it.
+      await second.run(() => {
+        secondResumed = (async () => {
+          __resumeAwait(await __gateAwait(Promise.resolve()));
+          requireInputLock(second, "second actor continuation");
+          order.push("second:resumed");
+        })();
+      });
+      void second.run(() => {
+        order.push("second:queued");
+      });
+      for (let turn = 0; turn < 4; turn++) await Promise.resolve();
+      ambient = tryCurrentIoContext();
+    });
+
+    await secondResumed;
+    await expect.poll(() => order).toEqual(["second:resumed", "second:queued"]);
+    expect(ambient).toBe(owner);
+  });
+
   test.each(["fulfillment", "rejection"])("stays busy through a foreign await and queued %s", async (outcome) => {
     const actor = new TestActor();
     const context = new IoContext(actor, timer);
@@ -241,8 +317,10 @@ describe("transformed await resume", () => {
     expect(context.waitUntilTaskCount()).toBeGreaterThan(0);
     expect(drained).toBe(false);
 
-    // Another event can enter during the wait, then hold up its publication.
+    // Another event can enter during the wait, then hold up its publication. The foreign
+    // promise settles after that event's slice hands off, outside any checkpoint of this actor.
     const lock = await context.run(() => context.getInputLock());
+    await portHop();
     try {
       if (outcome === "fulfillment") pending.resolve(42);
       else pending.reject(failure);

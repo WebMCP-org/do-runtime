@@ -28,9 +28,7 @@
  *     `SqliteDatabase`, exactly as upstream's take a `SqliteDatabase&`.
  *
  * `transactionSync` is NOT here — it lives in `io/actor-sqlite.ts` as
- * SAVEPOINT/RELEASE with a depth counter, exactly as upstream has it. Today
- * both browser and Node adapters duplicate `BEGIN IMMEDIATE`, which is why a
- * nested call is a live SQLite error (§2.4). Moving it inward fixes that.
+ * SAVEPOINT/RELEASE with a depth counter, exactly as upstream has it.
  *
  * Not ported, because the substrate has no equivalent: the `Regulator` /
  * authorizer machinery (there is no untrusted-SQL path in `util/`, and
@@ -128,8 +126,7 @@ export interface SqlDatabase {
    *
    * On the backend rather than above it because only the backend knows how to
    * recreate its own file, and because the alternative — enumerating and
-   * dropping every table — is the fragile dance today's `storage.ts` performs,
-   * complete with an FTS5 shadow-table ordering hazard its comment documents.
+   * dropping every table — is fragile.
    * The `SqlDatabase` reference stays valid across the call; what changes is
    * the file behind it.
    */
@@ -237,9 +234,9 @@ export type QueryOptions = {
  * Raised when SQLite has rolled back an open transaction on its own. Upstream
  * hands this to `ActorSqlite`, which treats it as fatal; §1.6 is why — a
  * storage failure this severe destroys the object rather than being survived.
- * Until `io/actor-sqlite.ts` wires it to `onBroken`, latching it and refusing
- * every subsequent statement is what keeps a caller from reading through a
- * cache that is knowingly wrong.
+ * `io/actor-sqlite.ts` breaks the output gate on it; latching it here and
+ * refusing every subsequent statement keeps a caller from reading through a
+ * cache that is knowingly wrong in the meantime.
  */
 export class SqliteCriticalError extends Error {
   override readonly name = "SqliteCriticalError";

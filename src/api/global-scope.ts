@@ -47,10 +47,12 @@ import {
   EXCEPTION_DURABLE_OBJECT_ABORT_NO_RETRY,
   hasUserErrorDetail,
   isExceptionFromInputGateBroken,
+  tryCurrentIoContext,
   tryCurrentSlice,
   type IoContext,
 } from "../io/io-context";
 import { onAbort } from "../io/io-gate";
+import { ACTOR_SCOPE_GLOBALS } from "./actor-scope-globals";
 import { gateResponseBody } from "./http";
 import {
   installWebSocketGlobals,
@@ -531,6 +533,8 @@ export type ActorScopeBindings = {
   readonly WebSocket: typeof globalThis.WebSocket;
   readonly WebSocketPair: WebSocketPairConstructor;
   readonly WebSocketRequestResponsePair: typeof WebSocketRequestResponsePair;
+  readonly ReadableStream: typeof globalThis.ReadableStream;
+  readonly TransformStream: typeof globalThis.TransformStream;
   readonly currentExternalEntry?: object | undefined;
 };
 
@@ -572,6 +576,8 @@ export function actorScopeBindings(resolve: () => ActorGlobalScope): ActorScopeB
     }),
     WebSocketPair: BoundWebSocketPair,
     WebSocketRequestResponsePair,
+    ReadableStream: ActorReadableStream,
+    TransformStream: ActorTransformStream,
     get currentExternalEntry(): object | undefined {
       return resolve().currentExternalEntry;
     },
@@ -612,6 +618,45 @@ function scopeCrypto(resolve: () => ActorGlobalScope): Crypto {
 
 /** Captured at import, before any host installs a scope over it. */
 const platformCrypto = globalThis.crypto;
+
+// Native stream callbacks bypass transformed awaits. Capture their creator,
+// including async stores, before later input or demand arrives from another actor.
+// These constructors are captured before a host installs its actor scope.
+const ActorReadableStream = withActorStreamCallbacks(globalThis.ReadableStream);
+const ActorTransformStream = withActorStreamCallbacks(globalThis.TransformStream);
+
+function withActorStreamCallbacks<T extends typeof ReadableStream | typeof TransformStream>(
+  Stream: T,
+): T {
+  return new Proxy(Stream, {
+    construct(target, args, newTarget) {
+      const context = tryCurrentIoContext();
+      const [source, ...strategies] = args;
+      if (
+        !context || source == null ||
+        (typeof source !== "object" && typeof source !== "function")
+      ) {
+        return Reflect.construct(target, args, newTarget);
+      }
+      // A separate target preserves frozen sources and inherited getters.
+      const callbacks = new Proxy({}, {
+        get(_target, name) {
+          const callback = Reflect.get(source, name, source);
+          if (typeof callback !== "function") return callback;
+          // start runs synchronously during construction, already inside the actor.
+          if (name === "start") return callback.bind(source);
+          if (name === "pull" || name === "transform" || name === "flush" || name === "cancel") {
+            return context.makeReentryCallback((_lock, ...values: unknown[]) =>
+              Reflect.apply(callback, source, values),
+            );
+          }
+          return callback;
+        },
+      });
+      return Reflect.construct(target, [callbacks, ...strategies], newTarget);
+    },
+  });
+}
 
 /** ← every `SubtleCrypto` member that returns a promise, as a value the binding can iterate. */
 const ASYNC_SUBTLE_METHODS = [
@@ -656,13 +701,8 @@ const ASYNC_SUBTLE_METHODS = [
  * exceeded` on the first row.
  */
 export function installActorScope(target: object, resolve: () => ActorGlobalScope): void {
-  const bindings = actorScopeBindings(resolve);
-  // Descriptors, not values: `crypto` is a getter, and reading it here would resolve the scope
-  // at install time — which is before the container exists on the facet path, where the whole
-  // arrangement is a late binding.
-  for (const [name, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(bindings))) {
-    // These are explicit actor capabilities, not web-platform globals.
-    if (name === "awaitIo" || name === "currentExternalEntry") continue;
-    Object.defineProperty(target, name, { ...descriptor, configurable: true });
+  const descriptors = Object.getOwnPropertyDescriptors(actorScopeBindings(resolve));
+  for (const name of ACTOR_SCOPE_GLOBALS) {
+    Object.defineProperty(target, name, { ...descriptors[name], configurable: true });
   }
 }

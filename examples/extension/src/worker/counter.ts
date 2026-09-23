@@ -245,11 +245,14 @@ export class Counter extends Agent<CounterEnv, CounterState> {
    * physical Durable Object alarm. The storage engine then tells the host's
    * alarm outlet (`ports.alarms`) before the local commit lands. The retry
    * ladder, backoff and abandonment are the host `AlarmScheduler`'s.
+   *
+   * `holdMs` keeps the wake's handler running that long, so the e2e can stop
+   * the service worker in the middle of a delivery.
    */
-  async armWake(delayMs: number): Promise<number> {
+  async armWake(delayMs: number, holdMs = 0): Promise<number> {
     this.#schema();
     const at = Date.now() + Math.max(0, delayMs);
-    await this.schedule(new Date(at), "scheduledIncrement");
+    await this.schedule(new Date(at), "scheduledIncrement", { holdMs });
     return at;
   }
 
@@ -262,7 +265,9 @@ export class Counter extends Agent<CounterEnv, CounterState> {
    * across a service-worker eviction, because the ladder is rows rather than
    * process memory.
    */
-  async scheduledIncrement(): Promise<void> {
+  async scheduledIncrement(payload?: { readonly holdMs?: number }): Promise<void> {
+    const holdMs = payload?.holdMs ?? 0;
+    if (holdMs > 0) await scheduler.wait(holdMs);
     this.#schema();
     this.#record("sdk-schedule");
     this.setState({ ...this.state, value: this.state.value + 1 });

@@ -1,5 +1,5 @@
 import sqlite3InitModule from "@sqlite.org/sqlite-wasm";
-import { createSqliteWasmProvider, type SqliteWasmHost } from "../../backends/sqlite-wasm";
+import { createSqliteWasmProvider, installSqliteWasmHost } from "../../backends/sqlite-wasm";
 
 export type CrashCommand = {
   readonly mode: "dirty" | "recover";
@@ -18,16 +18,12 @@ self.addEventListener("message", (event: MessageEvent<CrashCommand>) => {
 });
 
 async function run({ mode, poolName }: CrashCommand): Promise<void> {
-  const sqlite3 = await sqlite3InitModule();
-  const pool = await sqlite3.installOpfsSAHPoolVfs({
+  const host = await installSqliteWasmHost(await sqlite3InitModule(), {
     name: poolName,
     clearOnInit: mode === "dirty",
     initialCapacity: 4,
   });
-  const database = await createSqliteWasmProvider(
-    { pool, capi: sqlite3.capi } satisfies SqliteWasmHost,
-    { prefix: "/crash" },
-  ).open("root");
+  const database = await createSqliteWasmProvider(host, { prefix: "/crash" }).open("root");
 
   if (mode === "dirty") {
     database.exec("CREATE TABLE recovery (value TEXT NOT NULL)", []);
@@ -44,6 +40,6 @@ async function run({ mode, poolName }: CrashCommand): Promise<void> {
     return value;
   });
   database.close();
-  pool.pauseVfs();
+  host.pool.pauseVfs();
   self.postMessage({ kind: "recovered", rows } satisfies CrashReport);
 }

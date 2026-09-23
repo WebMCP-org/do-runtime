@@ -64,6 +64,8 @@ test("only one actor publishes into the await-to-resume gap", async () => {
   void secondPublication.then(() => {
     secondPublished = true;
   });
+  // Settle both outside either actor's checkpoint; a promise settled inside one continues there.
+  await portHop();
   firstSource.resolve();
   secondSource.resolve();
   await Promise.resolve();

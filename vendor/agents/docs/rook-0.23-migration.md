@@ -49,9 +49,9 @@ there is no partial upgrade.
    repo root the same lanes are `pnpm sdk:build`, `pnpm sdk:check`,
    `pnpm sdk:test`.
 2. **A `rook-sdk-<sha>` pre-release is cut from the merged commit.**
-   `pnpm sdk:pack` builds and packs the six packages into `dist/sdk/` under
+   `pnpm sdk:pack` builds and packs the six packages into `.sdk-pack/` under
    their upstream names; attach those tarballs to a GitHub release tagged
-   `rook-sdk-<source-commit>` at the tested commit (`do-runtime/README.md:509-515`).
+   `rook-sdk-<source-commit>` at the tested commit (see the "Development" section of `do-runtime/README.md`).
    Publish a new tag rather than replacing an existing release's assets.
 3. **A rollback lever exists.** That means the previous `rook-sdk-<sha>`
    tarballs _and_ exported OPFS database files for any profile that will wake on
