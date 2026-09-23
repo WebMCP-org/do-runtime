@@ -62,11 +62,28 @@ it("§1.2 fetch releases the input gate and its continuations resume gated", asy
   expect(await probe.call("readTrace")).toEqual(["fetch:enter", "setMarker", "fetch:exit"]);
 });
 
+it("§1.3 a fetched body read via pipeThrough(TextDecoderStream), getReader() and for-await resumes gated after every chunk", async () => {
+  const probe = await host.spawn("gate-fetched-body");
+  expect(await probe.call("readFetchedBody")).toEqual({
+    piped: ["fet", "ched"],
+    reader: ["fet", "ched"],
+    iterated: ["fet", "ched"],
+  });
+});
+
 it("§1.2 a local storage await HOLDS the input gate", async () => {
   // The asymmetry that shrinks the whole hazard surface: most awaits in agent
   // code are storage, and none of them is an interleaving point.
   const probe = await host.spawn("gate-storage");
   const slow = probe.post("gateViaStorage");
+  const fast = probe.post("setMarker");
+  await fast.settled;
+  expect(await slow.settled).toBe("A");
+});
+
+it("§1.2 a plain-value await HOLDS the input gate", async () => {
+  const probe = await host.spawn("gate-plain-value");
+  const slow = probe.post("gateViaPlainValue");
   const fast = probe.post("setMarker");
   await fast.settled;
   expect(await slow.settled).toBe("A");
@@ -104,6 +121,13 @@ it("§1.2 scheduler cancellation ignores synthetic abort and stopped source even
 it("§1.2 a continuation after crypto.subtle.digest can still touch storage", async () => {
   const probe = await host.spawn("gate-after-digest");
   expect(await probe.call("storageAfterDigest")).toBe("32");
+});
+
+it("§1.2 an actor-created ReadableStream re-enters its creator when an outside consumer pulls it", async () => {
+  const probe = await host.spawn("gate-stream-pull");
+  const stream = await probe.call<ReadableStream<Uint8Array>>("pullStream");
+  expect(await new Response(stream).text()).toBe("123");
+  expect(await probe.call("readPulls")).toBe(3);
 });
 
 it("§1.2 a setTimeout callback runs gated and can touch storage", async () => {

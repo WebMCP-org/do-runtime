@@ -77,16 +77,19 @@ if (typeof runtime.BrokenActorError !== "function" || typeof runtime.CanceledErr
 }
 if (
   typeof alarmCoordinator.BrowserAlarmCoordinator !== "function" ||
-  typeof alarmCoordinator.parseBrowserAlarmTransportJournal !== "function"
+  typeof alarmCoordinator.parseBrowserAlarmTransportJournal !== "function" ||
+  typeof alarmCoordinator.createBrowserAlarmProjector !== "function" ||
+  typeof alarmCoordinator.parseBrowserAlarmProjection !== "function"
 ) {
-  throw new Error("packed browser alarm entry does not export its coordinator and parser");
+  throw new Error("packed browser alarm entry does not export its coordinator, projector and parsers");
 }
 if (
   typeof messagePortWebSocket.MessagePortWebSocket !== "function" ||
   typeof messagePortWebSocket.createMessagePortWebSocketConstructor !== "function" ||
-  typeof messagePortWebSocket.serveMessagePortWebSockets !== "function"
+  typeof messagePortWebSocket.serveMessagePortWebSockets !== "function" ||
+  typeof modules.get("./browser").connectMessagePortWebSocket !== "function"
 ) {
-  throw new Error("packed MessagePort WebSocket entry does not export its host helpers");
+  throw new Error("packed MessagePort WebSocket entries do not export their host helpers");
 }
 if (typeof offscreenDocument.OffscreenDocumentCoordinator !== "function") {
   throw new Error("packed offscreen document entry does not export its coordinator");
@@ -97,8 +100,20 @@ if (typeof nodeBackend.createNodeSqlProvider !== "function") {
 if (typeof gate.__gate !== "function" || typeof gate.__gateAsyncIterable !== "function") {
   throw new Error("packed gate entry does not export its helpers");
 }
-if (typeof vite.doRuntimeAwaitTransform !== "function") {
-  throw new Error("packed Vite entry does not export doRuntimeAwaitTransform");
+if (typeof vite.doRuntimeAwaitTransform !== "function" || typeof vite.facetScopeBanner !== "function") {
+  throw new Error("packed Vite entry does not export doRuntimeAwaitTransform and facetScopeBanner");
+}
+if (new (modules.get("./cloudflare-email").EmailMessage)("a", "b", "c").to !== "b") {
+  throw new Error("packed cloudflare-email entry does not export its EmailMessage constructor");
+}
+// The plugin resolves what it injects to the very files the export map names, so an application
+// import of the same subpath is the same module instance.
+const { resolveId } = vite.doRuntimeAwaitTransform({ asyncContext: true });
+for (const subpath of ["./gate", "./browser/async-hooks"]) {
+  const target = fileURLToPath(new URL(manifest.exports[subpath].import, root));
+  if (resolveId.handler(`@mcp-b/do-runtime${subpath.slice(1)}`) !== target) {
+    throw new Error(`packed Vite plugin does not resolve its injected ${subpath} import to the export`);
+  }
 }
 
 // Compile and run the documented host against only the files npm will ship.

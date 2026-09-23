@@ -122,7 +122,10 @@ import {
  */
 export interface Timer {
   now(): number;
-  /** `kj::Timer::afterDelay`. The signal replaces kj's cancel-by-drop. */
+  /**
+   * `kj::Timer::afterDelay`. The signal replaces kj's cancel-by-drop: on abort the
+   * promise may stay pending or reject, but it must not resolve.
+   */
   afterDelay(ms: number, signal?: AbortSignal): Promise<void>;
 }
 

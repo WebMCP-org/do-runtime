@@ -29,12 +29,23 @@ it("§2.4 deleteAll removes ordinary values and the stored alarm", async () => {
 it("§2.4 rich values round-trip with their workerd types", async () => {
   const probe = await host.spawn("codec");
   expect(await probe.call("richValueRoundTrip")).toEqual({
-    when: "Date",
-    map: "Map",
-    set: "Set",
-    bytes: "ArrayBuffer",
-    re: "RegExp",
-    err: "Error",
+    when: 0,
+    map: [["k", 1]],
+    set: [1],
+    bytes: [1, 2, 3],
+    re: "/pattern/g",
+    err: "Error: boom",
+  });
+});
+
+it("§2.4 list() honours prefix with reverse and limit, start/startAfter/end, and delete([...]) returns the count", async () => {
+  const probe = await host.spawn("list-options");
+  expect(await probe.call("listOptions")).toEqual({
+    lastWithPrefix: ["p:3"],
+    startEnd: ["b", "c"],
+    startAfterEnd: ["c"],
+    deleted: 2,
+    remaining: ["c", "d", "p:1", "p:2", "p:3", "p;"],
   });
 });
 

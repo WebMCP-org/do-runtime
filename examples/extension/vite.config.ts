@@ -1,6 +1,6 @@
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
-import { doRuntimeAwaitTransform } from "@mcp-b/do-runtime/vite";
+import { doRuntimeAwaitTransform, facetScopeBanner } from "@mcp-b/do-runtime/vite";
 import agents from "agents/vite";
 import { defaultClientConditions, defineConfig } from "vite";
 
@@ -30,10 +30,7 @@ const actorPlugins = () => [
 
 const facetBanner = (chunk: { name: string }): string =>
   chunk.name === "counter-child" || chunk.name === "think-probe"
-    ? `const __facetKey = new URL(import.meta.url).searchParams.get("scope");
-const __facetScope = globalThis.__doRuntimeExtensionFacetScopes?.[__facetKey];
-if (__facetScope === undefined) throw new Error(\`facet module has no scope named \${__facetKey}\`);
-const { scheduler, setTimeout, clearTimeout, setInterval, clearInterval, fetch, crypto } = __facetScope;`
+    ? facetScopeBanner({ registry: "__doRuntimeExtensionFacetScopes" })
     : "";
 
 export default defineConfig(({ mode }) => ({
@@ -116,8 +113,6 @@ export default defineConfig(({ mode }) => ({
   resolve: {
     conditions: ["worker", ...defaultClientConditions],
     alias: {
-      "@mcp-b/do-runtime/browser/async-hooks": `${packageRoot}dist/browser/async-hooks.js`,
-      "@mcp-b/do-runtime/gate": `${packageRoot}dist/gate.js`,
       /**
        * The specifier a Workers module imports `DurableObject` and `RpcTarget`
        * from. No browser resolves it, so the host supplies it — exactly as
@@ -130,7 +125,7 @@ export default defineConfig(({ mode }) => ({
        * class beside the package build, and capnweb would refuse its instances.
        */
       "cloudflare:workers": cloudflareWorkersModule,
-      "cloudflare:email": `${packageRoot}examples/platform-shims/cloudflare-email.ts`,
+      "cloudflare:email": `${packageRoot}dist/cloudflare-email.js`,
       ...(mode === "think-probe"
         ? {
             "@cloudflare/shell": cloudflareShellModule,

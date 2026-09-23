@@ -44,6 +44,7 @@ import {
   type SupervisorRpc,
   type ThinkProbeStatus,
   type ThinkProbeSubmission,
+  type WakeProjection,
   type WorkerBoot,
 } from "../protocol";
 
@@ -98,16 +99,15 @@ worker.postMessage(
  * The actor worker uses the runtime's `newRpcSession`, which applies the
  * identity graft before it exposes its Workers targets.
  *
- * No local main is passed because nothing calls back: this example's alarm
- * scheduler lives in the actor's own worker, so the worker never needs to reach
- * the supervisor. A host with more than one actor would pass a target here, the
- * way the runtime's conformance page does.
+ * The worker calls back for one thing: its alarm scheduler lives in the actor's
+ * own worker, and each projected wake has to reach the service worker's alarm
+ * coordinator, because `chrome.alarms` is not exposed here.
  */
 class SupervisorTarget extends RpcTarget implements SupervisorRpc {
-  async projectWake(scheduledTime: number | null): Promise<void> {
+  async projectWake(projection: WakeProjection): Promise<void> {
     const response: unknown = await chrome.runtime.sendMessage({
       type: "project-wake",
-      scheduledTime,
+      projection,
     } satisfies ExtensionMessage);
     const result = parseExtensionResponse(response);
     if (!result.ok) throw new Error(result.error);
@@ -351,7 +351,10 @@ const ops = {
   ): Promise<ThinkProbeSubmission> => await host.submitThink(name, text, idempotencyKey),
   thinkStatus: async (name: string): Promise<ThinkProbeStatus> => await host.thinkStatus(name),
   stopThink: async (name: string): Promise<void> => await host.stopThink(name),
-  armWake: async (delayMs: number): Promise<number> => await host.armWake(delayMs),
+  armWake: async (delayMs: number, holdMs = 0): Promise<number> =>
+    await host.armWake(delayMs, holdMs),
+  fireAlarm: async (scheduledTime: number): Promise<WakeProjection> =>
+    await host.fireAlarm(scheduledTime),
   status: async (): Promise<HostStatus> => await host.status(),
   sdkIncrement: async (): Promise<number> => await (await connectedAgent()).call("increment"),
   sdkSetLegacyState: async (value: number): Promise<void> => {
@@ -446,7 +449,9 @@ async function runOp(op: HostOp, args: readonly unknown[]): Promise<unknown> {
     case "stopThink":
       return await ops.stopThink(stringArg(args, 0));
     case "armWake":
-      return await ops.armWake(integerArg(args, 0));
+      return await ops.armWake(integerArg(args, 0), args.length > 1 ? integerArg(args, 1) : 0);
+    case "fireAlarm":
+      return await ops.fireAlarm(integerArg(args, 0));
     case "status":
       return await ops.status();
     case "sdkIncrement":
@@ -497,6 +502,9 @@ window.__host = ops;
  * `return true` keeps `sendResponse` alive across the await, and it is returned
  * ONLY for a message this listener will actually answer — a listener that claims
  * every message holds the channel open for messages meant for someone else.
+ *
+ * `host-ping` is the service worker's readiness probe: registering this listener
+ * is the last thing the document does, so an answer means it can take `host-op`s.
  */
 if (typeof chrome !== "undefined" && chrome.runtime?.id !== undefined) {
   chrome.runtime.onMessage.addListener(
@@ -505,6 +513,10 @@ if (typeof chrome !== "undefined" && chrome.runtime?.id !== undefined) {
       _sender: chrome.runtime.MessageSender,
       sendResponse: (response: ExtensionResponse) => void,
     ): boolean => {
+      if (isRecord(message) && message.type === "host-ping") {
+        sendResponse({ ok: true, value: null });
+        return false;
+      }
       if (!isRecord(message) || message.type !== "host-op") return false;
       const operation =
         isHostOp(message.op) && Array.isArray(message.args)

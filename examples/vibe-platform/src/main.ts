@@ -273,7 +273,7 @@ async function stopAgent(): Promise<void> {
 
 async function restartAgent(initial = false): Promise<void> {
   // A normal replacement closes SQLite and pauses the VFS before termination.
-  // A crashed/reloaded worker cannot acknowledge teardown, so installPool still retries.
+  // A crashed/reloaded worker cannot acknowledge teardown, so installPool waits for its release.
   await stopAgent();
   const source = await bundleWorkspace(
     AGENT_ENTRY,
@@ -564,7 +564,8 @@ Run \`pnpm exec wrangler deploy\` when you are ready to deploy.
       private: true,
       type: "module",
       scripts: { deploy: "wrangler deploy", "deploy:dry": "wrangler deploy --dry-run" },
-      dependencies: { agents: "0.22.0" },
+      // The vendored fork's version; scripts/e2e.mjs checks it against the installed package.
+      dependencies: { agents: "0.23.0" },
       devDependencies: { wrangler: "^4.114.0" },
     },
     null,

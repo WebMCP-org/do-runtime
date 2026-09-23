@@ -8,12 +8,7 @@
  * closes.
  */
 
-import {
-  parseExtensionResponse,
-  type ExtensionMessage,
-  type ExtensionResponse,
-  type HostOp,
-} from "../protocol";
+import { parseExtensionResponse, type ExtensionMessage, type HostOp } from "../protocol";
 
 function mustFind<T extends Element>(selector: string): T {
   const element = document.querySelector<T>(selector);
@@ -33,35 +28,18 @@ function print(label: string, value: unknown): void {
  * `undefined` — the raw value, not a result — is how Chrome says "no listener
  * claimed this message". Every other answer is an `ExtensionResponse`, because
  * `sendResponse` cannot reject and the two sides settle rather than throw.
- */
-async function sendOnce(message: ExtensionMessage): Promise<ExtensionResponse | undefined> {
-  const response: unknown = await chrome.runtime.sendMessage(message);
-  return response === undefined ? undefined : parseExtensionResponse(response);
-}
-
-/**
- * One retry, and only for "nobody answered".
  *
- * `chrome.offscreen.createDocument` resolves when the document has loaded, but
- * an extension message sent immediately after can still arrive before that
- * page's `onMessage` listener is registered, and Chrome answers `undefined`
- * rather than queueing. Measured: the popup's first operation failed this way
- * while every later one succeeded.
- *
- * A real error from the other side is NOT retried — it comes straight out of
- * here, because retrying a call that failed on its merits would only hide it.
+ * Nothing is retried: `ensure-host` resolves only once the offscreen document
+ * answers, so a `host-op` sent after it always has a listener.
  */
 async function send(message: ExtensionMessage): Promise<unknown> {
-  let response = await sendOnce(message);
-  if (response === undefined) {
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    response = await sendOnce(message);
-  }
+  const response: unknown = await chrome.runtime.sendMessage(message);
   if (response === undefined) {
     throw new Error("no extension context answered; is the offscreen document up?");
   }
-  if (!response.ok) throw new Error(response.error);
-  return response.value;
+  const result = parseExtensionResponse(response);
+  if (!result.ok) throw new Error(result.error);
+  return result.value;
 }
 
 /**

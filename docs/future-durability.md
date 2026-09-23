@@ -88,11 +88,12 @@ at our SQLite seam, cheapest first:
   deterministically only if the statements are deterministic (`random()`,
   `CURRENT_TIMESTAMP`), and must also cover the runtime's own internal writes,
   which never pass the application regulator.
-- **(c) Session extension / preupdate hook — the right primitive, likely
-  unavailable.** `sqlite3session_changeset` is an LTX-shaped logical delta.
-  Needs compile-time `SQLITE_ENABLE_SESSION`; **verify before planning anything
-  on it** that the shipped `@sqlite.org/sqlite-wasm` exports `sqlite3session_*`.
-  If absent this means a custom wasm build and browser/Node divergence.
+- **(c) Session extension / preupdate hook — the right primitive, and
+  available.** `sqlite3session_changeset` is an LTX-shaped logical delta. It
+  needs compile-time `SQLITE_ENABLE_SESSION`, and both shipped engines have it
+  (verified September 2026): `@sqlite.org/sqlite-wasm` 3.53.4 exports the 16
+  `sqlite3session_*` functions, and Node 24.11's `DatabaseSync` has
+  `createSession()` and `applyChangeset()`. No custom wasm build is needed.
 - **(d) A VFS that tees `xWrite`.** Genuine page-level frames with no build
   flags, at the cost of owning a VFS.
 
@@ -142,8 +143,7 @@ whatever seam a future capture would attach to.
 Revisit when: a user loses actor data and it matters (OPFS is evictable — the
 likeliest first trigger); users want the same agent on two devices; a server
 component appears for any other reason, at which point a conditional-write
-record is marginal; a wasm build with the session extension becomes routine; or
-an actor must continue on another host while its device is offline. That last
+record is marginal; or an actor must continue on another host while its device is offline. That last
 requirement needs coordinated ownership and replication rather than snapshot
 backup. Local OPFS already survives ordinary tab closure. If it all stays
 single-device and the only worry is loss, start with snapshot backup.

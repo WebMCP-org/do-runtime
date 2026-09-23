@@ -12,6 +12,7 @@
  * and the jitter source is the `random` constructor option for the same reason.
  */
 
+import { setTimeout as sleep } from "node:timers/promises";
 import { describe, expect, test } from "vitest";
 import { createNodeSqlProvider } from "../../backends/node-sqlite";
 import {
@@ -1082,6 +1083,20 @@ describe("checkTimestamp", () => {
 
     await timer.advance(6_000);
     expect(actor.deliveries).toHaveLength(1);
+  });
+
+  test("a timer that rejects on abort is cancellation: no unhandled rejection, no task failure", async () => {
+    // node:timers/promises rejects an aborted wait with AbortError.
+    const scheduler = new AlarmScheduler({
+      timer: { now: Date.now, afterDelay: (ms, signal) => sleep(ms, undefined, { signal }) },
+      db: await newDatabase(),
+      getActor: () => new FakeActor(),
+    });
+    scheduler.setAlarm("a", Date.now() + 60_000);
+    scheduler.setAlarm("a", Date.now() + 120_000); // replaces the WAITING entry: aborts its wake
+    scheduler.deleteAlarm("a"); // aborts the replacement's wake
+    await settle();
+    expect(scheduler.taskFailure()).toBeUndefined();
   });
 });
 

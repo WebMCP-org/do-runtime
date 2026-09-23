@@ -34,6 +34,7 @@ await build({
         "backends/sqlite-wasm": new URL("backends/sqlite-wasm.ts", root).pathname,
         "backends/node-sqlite": new URL("backends/node-sqlite.ts", root).pathname,
         "cloudflare-workers": new URL("src/api/cloudflare-workers.ts", root).pathname,
+        "cloudflare-email": new URL("src/api/cloudflare-email.ts", root).pathname,
         gate: new URL("src/gate.ts", root).pathname,
         vite: new URL("src/vite.ts", root).pathname,
         conformance: new URL("conformance/host.ts", root).pathname,

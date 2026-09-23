@@ -1,3 +1,4 @@
+import { fileURLToPath } from "node:url";
 import MagicString from "magic-string";
 import {
   createFilter,
@@ -7,6 +8,11 @@ import {
   type FilterPattern,
   type Plugin,
 } from "vite";
+// `.js` here and in actor-scope-globals.ts keeps Vite's bundle config loader from printing its
+// four-line "unsupported by `configLoader: 'native'`" warning on every config load from source.
+// The native loader cannot load this file from source either way (that needs `.ts` specifiers
+// and `allowImportingTsExtensions`), and the built dist is unaffected.
+import { ACTOR_SCOPE_GLOBALS } from "./api/actor-scope-globals.js";
 
 const MARKER = "/* @do-runtime-gated */";
 const IMPORT =
@@ -14,7 +20,7 @@ const IMPORT =
 const OXC_ASYNC_GENERATOR = /^@oxc-project\+runtime@[^/]+\/helpers\/esm\/wrapAsyncGenerator\.js$/;
 
 function correctAsyncGeneratorReturn(code: string, id: string) {
-  // Oxc 0.144.0 repeats .return() after an await in finally, skipping cleanup.
+  // Oxc 0.149.0 repeats .return() after an await in finally, skipping cleanup.
   // Match Babel's distinction between await (k=0) and delegated yield (k=1):
   // https://github.com/babel/babel/blob/main/packages/babel-helpers/src/helpers/wrapAsyncGenerator.ts
   // Keep this shape check until Vite's bundled Oxc helper incorporates that fix.
@@ -41,12 +47,39 @@ function correctAsyncGeneratorReturn(code: string, id: string) {
   };
 }
 
+/**
+ * The prelude a same-realm host prefixes to each facet bundle. It binds the actor globals to the
+ * scope registered at `globalThis[registry][scope]`, where `scope` is the bundle URL's `scope`
+ * search parameter.
+ */
+export function facetScopeBanner({ registry }: { registry: string }): string {
+  return `const __facetKey = new URL(import.meta.url).searchParams.get("scope");
+const __facetScope = globalThis[${JSON.stringify(registry)}]?.[__facetKey];
+if (__facetScope === undefined) throw new Error(\`facet module has no scope named \${__facetKey}\`);
+const { ${ACTOR_SCOPE_GLOBALS.join(", ")} } = __facetScope;`;
+}
+
 export interface DoRuntimeAwaitTransformOptions {
   include?: FilterPattern;
   exclude?: FilterPattern;
   /** Lower async functions/generators so the browser async_hooks shim can bind continuations. */
   asyncContext?: boolean;
 }
+
+/**
+ * The package's own files for the imports this plugin injects: siblings of the built
+ * `dist/vite.js`. Node loads the plugin from its real path, which with Vite's default
+ * `preserveSymlinks` is the path Vite resolves an application import of the same subpath to,
+ * so both share one module instance. Run from source, the plugin leaves them to the host.
+ */
+const INJECTED_MODULES = new Map(
+  import.meta.url.endsWith(".js")
+    ? Object.entries({
+        "@mcp-b/do-runtime/gate": "./gate.js",
+        "@mcp-b/do-runtime/browser/async-hooks": "./browser/async-hooks.js",
+      }).map(([id, path]): [string, string] => [id, fileURLToPath(new URL(path, import.meta.url))])
+    : [],
+);
 
 function patterns(pattern: FilterPattern | undefined): readonly (string | RegExp)[] {
   if (pattern === undefined || pattern === null) return [];
@@ -107,6 +140,9 @@ export function doRuntimeAwaitTransform(options?: DoRuntimeAwaitTransformOptions
   return {
     name: "do-runtime-await-transform",
     enforce: "post",
+    // Ahead of aliases and Vite's own resolver, which cannot find this package from inside a
+    // strict pnpm dependency.
+    resolveId: { order: "pre", handler: (id) => INJECTED_MODULES.get(id) ?? null },
     configResolved(config) {
       development = config.command === "serve";
     },

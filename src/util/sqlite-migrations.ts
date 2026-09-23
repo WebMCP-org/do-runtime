@@ -55,20 +55,6 @@ export type RuntimeMigration = (db: SqlDatabase) => void;
 const MIGRATIONS: readonly RuntimeMigration[] = [];
 
 /**
- * Bring one just-opened runtime database to `RUNTIME_STORAGE_VERSION`. Called
- * by every seam that opens a runtime database, before anything reads it, with
- * the database's own name so a refusal says which file it is about. The last
- * two parameters exist for the tests in this module's test file; every real
- * caller takes the shipped defaults.
- *
- * A version newer than this release refuses — the analogue of
- * `hasCurrentSqliteTable`'s refusal, with the one remedy named. A version 0
- * database is from before versioning existed (the same shape as version 1) or
- * a fresh file; both enter the chain at 1. Pending steps and the stamp commit
- * as one transaction, so a failed step leaves the file exactly as it was and
- * the container placement fails with the step's error.
- */
-/**
  * Refuse a snapshot image stamped by a newer release at the import seam, where
  * the operation that brought the file in is the one that fails — instead of at
  * the next placement, far from the cause. `user_version` sits at byte 60 of
@@ -91,6 +77,20 @@ export function requireImportableRuntimeStorage(
   }
 }
 
+/**
+ * Bring one just-opened runtime database to `RUNTIME_STORAGE_VERSION`. Called
+ * by every seam that opens a runtime database, before anything reads it, with
+ * the database's own name so a refusal says which file it is about. The last
+ * two parameters exist for the tests in this module's test file; every real
+ * caller takes the shipped defaults.
+ *
+ * A version newer than this release refuses — the analogue of
+ * `hasCurrentSqliteTable`'s refusal, with the one remedy named. A version 0
+ * database is from before versioning existed (the same shape as version 1) or
+ * a fresh file; both enter the chain at 1. Pending steps and the stamp commit
+ * as one transaction, so a failed step leaves the file exactly as it was and
+ * the container placement fails with the step's error.
+ */
 export function ensureRuntimeStorageVersion(
   db: SqlDatabase,
   name: string,

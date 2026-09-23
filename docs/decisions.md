@@ -158,6 +158,8 @@ await is wrapped once at its shared owner with `awaitIo`; it is not repaired
 at every caller or by patching the realm. The await transform's tokenized
 continuation marker is the sole exception: it republishes the context captured
 from the exact slice, and readers ignore it once that context's lock is gone.
+The opt-in browser async-context import patches `Promise.prototype.then` for
+`AsyncLocalStorage` only, not for actor scope.
 
 ### §2.4 Storage contract
 
@@ -165,8 +167,10 @@ The public storage surface is the Workers TypeScript contract. Runtime
 internals use a small synchronous `SqlDatabase` seam, with `node:sqlite` and
 sqlite-wasm backends. A versioned browser-safe encoding preserves structured-
 clone value semantics and remains backward-readable with legacy JSON rows. A
-present browser SAH pool accepts only current actor/facet logical database names
-and SQLite-owned companions; an unknown name fails startup.
+browser SAH pool holds only current actor/facet logical database names and
+SQLite-owned companions. The runtime validates each name it opens but never
+scans the pool at startup, so failing startup on an unknown name is the host's
+obligation.
 
 Concrete local providers expose a host-owned, versioned snapshot of every
 database in one actor scope. Export and import require all handles closed; import
@@ -189,6 +193,8 @@ The projection retains active delivery deadlines through retry persistence and
 abandonment, including deliveries whose entry was cancelled. Hosts acknowledge
 a consumed wake only after the latest projection is accepted and runtime
 activity has settled; timer-first delivery must leave a wake for worker recovery.
+The library's projector waits on the latest projection and resends it first if
+it failed, so an idle scheduler cannot leave an old failure standing.
 
 Failed start or completion bookkeeping retries on that same scheduler's timer
 with bounded backoff. A completed handler result stays with the pending cleanup,
@@ -230,9 +236,11 @@ consumer peer dependencies retain one identity.
    gate.
 8. Carry explicit actor scope through application-owned code and route raw
    host promises through `awaitIo`. Do not add a generic async-context shim or
-   patch the realm with zones. The compile-time await transform may republish
-   only the exact context it captured, tokenized for one checkpoint and valid
-   only while that context still holds an input lock.
+   patch the realm with zones, beyond the opt-in
+   [browser async context](browser-async-context.md) import. The compile-time
+   await transform may republish only the exact context it captured, tokenized
+   for one checkpoint and valid only while that context still holds an input
+   lock.
 9. No stream pump or generic remote-facet protocol in the runtime. Facet
    placement is the host's; direct actor hops use native capabilities.
 10. Store per-connection host bridges by connection id. Never use the

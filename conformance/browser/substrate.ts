@@ -22,11 +22,13 @@
  * `clearOnInit` is safe for the same reason: it runs once, when the worker
  * installs its pool, and never again for the life of that actor. What it buys is
  * that a browser profile carrying pool files from an earlier run cannot make a
- * later one pass or fail for reasons the run itself did not create.
+ * later one pass or fail for reasons the run itself did not create. The restart
+ * specs are the exception by design: their replacement worker reopens the pool a
+ * terminated worker owned, with `clearOnInit: false`.
  */
 
 import sqlite3InitModule from "@sqlite.org/sqlite-wasm";
-import type { SqliteWasmHost } from "../../backends/sqlite-wasm";
+import { installSqliteWasmHost, type SqliteWasmHost } from "../../backends/sqlite-wasm";
 import type { Timer } from "../../src/index";
 
 /**
@@ -37,11 +39,13 @@ import type { Timer } from "../../src/index";
  */
 export const UNIQUE_KEY = "do-runtime-conformance-browser";
 
-export async function installPool(name: string): Promise<SqliteWasmHost> {
-  const sqlite3 = await sqlite3InitModule();
-  const pool = await sqlite3.installOpfsSAHPoolVfs({
+export async function installPool(
+  name: string,
+  { clearOnInit = true }: { readonly clearOnInit?: boolean } = {},
+): Promise<SqliteWasmHost> {
+  return await installSqliteWasmHost(await sqlite3InitModule(), {
     name,
-    clearOnInit: true,
+    clearOnInit,
     // One pool now holds the whole actor tree: the root's own database, the facet
     // tree index, one database per facet placed, and a rollback journal beside
     // each of those as a further file. The default of six is enough only until it
@@ -71,7 +75,6 @@ export async function installPool(name: string): Promise<SqliteWasmHost> {
     // decides whether the tree fits.
     initialCapacity: 64,
   });
-  return { pool, capi: sqlite3.capi };
 }
 
 /**

@@ -335,7 +335,7 @@ measured failure in the browser test lane:
    `globalThis.sqlite3ApiConfig = { disable: { vfs: { opfs: true, "opfs-wl": true } } }`
    before initializing sqlite. The host uses the SAH pool; the other OPFS VFSes
    spawn workers and arm watchdogs of their own.
-3. Run `sqlite3InitModule()` and `installOpfsSAHPoolVfs(...)` before
+3. Run `sqlite3InitModule()` and `installSqliteWasmHost(sqlite3, ...)` before
    `installActorScope`. The pool installer uses global timers during startup.
 4. Install the actor scope with a resolver that throws when its container is
    gone. A torn-down worker must refuse new work instead of falling through to
@@ -375,7 +375,9 @@ The runtime's own `_cf_` tables are versioned per database file in
 brings older files forward before any event enters and refuses storage written by
 a newer package version. Application SQL cannot access that runtime-owned stamp.
 
-The browser provider takes an already-installed OPFS SAH pool (`installOpfsSAHPoolVfs`; sync access handles in a dedicated worker — no cross-origin isolation or `SharedArrayBuffer` needed). One pool per worker; the root and each local facet get separate prefixes inside it. `SqliteWasmActorStorage` adds the close, physical delete, and clone operations a local placement host needs around one prefix. The Node provider uses in-memory databases by default and a directory when asked.
+The browser provider takes an already-installed OPFS SAH pool (`installSqliteWasmHost`; sync access handles in a dedicated worker — no cross-origin isolation or `SharedArrayBuffer` needed). One pool per worker; the root and each local facet get separate prefixes inside it. `SqliteWasmActorStorage` adds the close, physical delete, and clone operations a local placement host needs around one prefix. The Node provider uses in-memory databases by default and a directory when asked.
+
+Install every pool with `installSqliteWasmHost(sqlite3, options)` from `@mcp-b/do-runtime/backends/sqlite-wasm`, not with the driver's `installOpfsSAHPoolVfs`. It takes the same `name`, `directory`, `clearOnInit` and `initialCapacity` options and returns the `{ pool, capi }` host the provider expects. It also fixes two driver behaviours that lose data when the browser terminates a worker. A failed install deletes the pool's directory, so the helper first waits up to 10 seconds for the previous owner to release every file. The driver also never rolls back a transaction a terminated worker left open, so its uncommitted pages can overwrite committed rows; the helper makes SQLite roll the transaction back when the database is reopened. That fix applies to every SAH pool in the same sqlite3 instance and assumes one connection per database file, which is how this backend opens them.
 
 Both concrete providers also implement `SqlDatabaseSnapshotProvider`. After the host has stopped the actor, `provider.close()` releases every database handle; `exportSnapshot()` then returns the SQLite images for the whole actor storage scope, and `importSnapshot()` replaces an idle scope. The same snapshot can seed a cold local replica because SQLite images are portable between these providers. Node snapshots require a dedicated directory-backed provider. This is backup/restore and replica seeding, not Cloudflare's time-indexed PITR or continuously updated read replication.
 
@@ -385,9 +387,9 @@ The browser provider attempts to restore the original images when a snapshot imp
 
 Construct one `AlarmScheduler` per namespace over a `SqlDatabase` of its own. It owns `_cf_ALARM`, delivery, retry counts (`ALARM_RETRY_MAX_TRIES`), exponential backoff with jitter, and abandonment. Pass `scheduler.hooks(id)` as a root actor's `ports.alarms`, and give the scheduler a `getActor(id)` that places the actor if it is not running — an alarm is a reason to wake a Durable Object, not something that needs one awake already.
 
-A suspending browser host can project the scheduler's next wake through `BrowserAlarmCoordinator` from `@mcp-b/do-runtime/browser/alarm-coordinator`. The coordinator journals the physical hop, rejects stale projections, rearms a consumed watchdog, and reconciles after background-worker restart. The host supplies durable journal storage, the physical alarm calls, and delivery back into its scheduler; logical delivery policy remains in `AlarmScheduler`.
+A suspending browser host projects the scheduler's next wake through both halves of `@mcp-b/do-runtime/browser/alarm-coordinator`. In the background worker, `BrowserAlarmCoordinator` journals the physical hop, drops stale projections, rearms a consumed watchdog, and reconciles after restart; the host supplies durable journal storage, the physical alarm calls, and `deliver()`. Beside the scheduler, `createBrowserAlarmProjector()` supplies the scheduler's `projectWake` and the `acknowledge()` that `deliver()` returns across the host's transport; the background passes whatever arrives over that transport through `parseBrowserAlarmProjection()`, which returns `null` for a malformed projection, before `coordinator.project()`. Logical delivery policy remains in `AlarmScheduler`.
 
-The scheduler's `projectWake(when, activeDeliveries)` callback reports the earliest pending wake and the number of active delivery or cleanup attempts. Active attempts keep their original deadline projected through retry persistence and awaited abandonment, even after cancellation removes an entry. This keeps recovery armed when the scheduler's timer fires before the browser's physical alarm. A host can acknowledge a consumed watchdog only after its latest projection is durably acknowledged, activity is zero, and the pending wake is absent or later than the consumed deadline. If bookkeeping fails, the scheduler retries it with bounded backoff without redelivering a completed handler. The retained alarm stays projected as due so physical recovery can also reconstruct the scheduler from its durable row.
+The scheduler's `projectWake(when, activeDeliveries)` callback reports the earliest pending wake and the number of active delivery or cleanup attempts. Active attempts keep their original deadline projected through retry persistence and awaited abandonment, even after cancellation removes an entry. This keeps recovery armed when the scheduler's timer fires before the browser's physical alarm. `acknowledge()` releases a consumed watchdog only after its latest projection is durably acknowledged, activity is zero, and the pending wake is absent or later than the consumed deadline; if that projection failed, it is sent again first. The `nextGeneration()` given to `createBrowserAlarmProjector()` must be durable and strictly increasing across Worker restarts: `project()` resolves even when the coordinator silently drops a projection older than the generation it journaled, so an in-memory counter would stall every wake after a restart. Keep it in a host table beside `_cf_ALARM`. If bookkeeping fails, the scheduler retries it with bounded backoff without redelivering a completed handler. The retained alarm stays projected as due so physical recovery can also reconstruct the scheduler from its durable row.
 
 ### Facets
 
@@ -395,9 +397,9 @@ The scheduler's `projectWake(when, activeDeliveries)` callback reports the earli
 
 ### Actor-scoped I/O, and the one trap
 
-On workerd every awaitable thing is an io-context primitive, so "resuming from an await re-enters with a fresh input lock" never needs saying. Here it does. A raw `setTimeout` resolves a promise the runtime does not own; the continuation resumes with an empty invocation stack and the next `ctx.storage` call throws `no input lock available in this context`. That is by design — the alternative is a continuation that silently writes outside the gate.
+On workerd every awaitable thing is an io-context primitive, so "an await resumes under an input lock" never needs saying: a storage await keeps the lock it started with, and outbound I/O re-enters with a fresh one. Here it does. A raw `setTimeout` resolves a promise the runtime does not own; the continuation resumes with an empty invocation stack and the next `ctx.storage` call throws `no input lock available in this context`. That is by design — the alternative is a continuation that silently writes outside the gate.
 
-`container.globals` is the complete gated set, bound to that container: `setTimeout`/`clearTimeout`/`setInterval`/`clearInterval` capture the critical section when armed and re-enter when fired; `scheduler.wait()` and `scheduler.yield()` resume under the actor; `fetch()` waits for output locks and releases the input gate while in flight; `crypto` re-enters on async completion; and `WebSocketPair` creates runtime-owned socket halves. Install it as the worker's globals (`installActorScope`) when one worker hosts one root, or hand it to application code explicitly when it must not.
+`container.globals` is the gated platform set, bound to that container: `setTimeout`/`clearTimeout`/`setInterval`/`clearInterval` capture the critical section when armed and re-enter when fired; `scheduler.wait()` and `scheduler.yield()` resume under the actor; `fetch()` waits for output locks and releases the input gate while in flight; `crypto` re-enters on async completion; and `WebSocketPair` creates runtime-owned socket halves. Install it as the worker's globals (`installActorScope`) when one worker hosts one root. When it must not, hand application code `actorScopeBindings(() => container.globals)` instead: it adds the `ReadableStream` and `TransformStream` constructors whose callbacks re-enter the actor, which `container.globals` itself does not carry.
 
 ### Hibernatable WebSockets
 
@@ -411,7 +413,10 @@ raw socket reference plus copied tags and attachment bytes, drops the old
 placement, and supplies that snapshot as `webSockets` on the replacement. The
 registry is populated before the constructor, so SDKs can lazily rebuild their
 connection wrappers without another upgrade or connect hook. Closed sockets are
-removed before `webSocketClose` runs.
+removed before `webSocketClose` runs. A host transport in that snapshot, such as
+a fresh `MessagePortWebSocket` after a Worker restart, reaches the actor as one
+stable socket whose sends wait for storage confirmation, while host callbacks
+keep naming the transport.
 
 `HibernationMirror` is the package's in-memory reference implementation. Seed a
 replacement mirror with the prior socket snapshot and auto-response pair, then
@@ -422,12 +427,21 @@ Hosts whose actor lives in another Worker can use `MessagePortWebSocket`,
 `createMessagePortWebSocketConstructor`, and `serveMessagePortWebSockets` from
 `@mcp-b/do-runtime/browser/message-port-websocket`; binary frames stay in
 structured clone and each socket gets one dedicated `MessagePort`.
+`connectMessagePortWebSocket(bridge, url, fetch)` from `@mcp-b/do-runtime/browser`
+routes one socket through a Workers-style router such as `routeAgentRequest()`.
+A missing route closes the client 1011, and a refused upgrade closes it 1008
+with the refusal's text when it is printable ASCII of at most 123 bytes. It does
+not tell the peer the socket opened: `serveMessagePortWebSockets(port, (bridge, url) => …)`
+sends that to clients from `createMessagePortWebSocketConstructor`, and a host
+with its own port protocol opens its end itself.
 
 `container.quiescence()` reports armed timers, pending `waitUntil` work, input
 lock state, and output-gate breakage without waiting. `drainWaitUntil()` is for
 shutdown and intentionally never settles while a live interval remains armed.
 
-Actor bundles can also install `doRuntimeAwaitTransform()` from `@mcp-b/do-runtime/vite`. A production build checks the final module graph and fails with transformed/total counts for any included module with an uncovered await; the development transform warns once per module if a transformed await reaches its fail-open path without an actor lock.
+Actor bundles can also install `doRuntimeAwaitTransform()` from `@mcp-b/do-runtime/vite`. Transformed awaits follow workerd's rule, with the exceptions in [gating coverage](docs/gating-coverage.md#transform). An await that settles while the actor still holds its input lock continues in the same checkpoint and keeps the lock and the implicit transaction: storage calls, plain values, and resumptions the runtime already admitted. An await on foreign I/O re-enters through a fresh input lock. A production build checks the final module graph and fails with transformed/total counts for any included module with an uncovered await; the development transform warns once per module if a transformed await reaches its fail-open path without an actor lock.
+
+The plugin resolves the imports it injects (`@mcp-b/do-runtime/gate`, `@mcp-b/do-runtime/browser/async-hooks`) to this package's own files, ahead of any host alias for them. `asyncContext: true` lowers async functions for the browser `AsyncLocalStorage`. Any dependency importing `cloudflare:workers`, `cloudflare:email` (a data-only `EmailMessage`) or `node:async_hooks`, including one Vite pre-bundles, still needs host aliases to `@mcp-b/do-runtime/cloudflare-workers`, `/cloudflare-email` and `/browser/async-hooks`. A host that loads facet bundles by URL into its root's realm prefixes each with `facetScopeBanner({ registry })`, which binds every name `installActorScope` writes (`ACTOR_SCOPE_GLOBALS`) to `globalThis[registry][scope]`, where `scope` is the bundle URL's `?scope=` parameter.
 
 ## What is not supported
 
@@ -442,7 +456,7 @@ The browser cannot reproduce every workerd facility. Unsupported runtime APIs th
 | Outbound `new WebSocket(url)` inside actor globals | Refused before opening a connection because the native handshake cannot wait for the output gate. `WebSocketPair` and host-owned transports remain supported. |
 | `cloudflare:workers` tracing | No-op spans expose the current API. Active span identity follows synchronous callbacks only; there is no observer or propagation across awaits. |
 | Stored value wire bytes | Browser-safe versioned structured-clone encoding rather than V8's private format; public value types align and legacy JSON rows remain readable. |
-| SQL row counters | Local `rowsRead`/`rowsWritten`, including `sql.ingest()`, use returned rows and SQLite changes; workerd uses unavailable libsql billing counters. |
+| SQL row counters | Local `rowsRead`/`rowsWritten`, including `sql.ingest()`, use returned rows and SQLite's `changes()`, so schema, index, trigger and FK-action writes are not counted; workerd's libsql counters include them. |
 | Reserved SQL names | `_cf_` detected from tokenized SQL text, which can reject more than workerd's authorizer. `ANALYZE` on a reserved table is refused where workerd allows it. |
 | Authorizer-only SQL forms | `ATTACH`, `DETACH`, the temp-schema creations (both `CREATE TEMP …` and the `temp.` qualifier), `VACUUM`, and virtual-table modules outside upstream's four (`fts5`, `fts5vocab`, `rtree`, `rtree_i32`) are refused from the leading keyword, with workerd's own messages. These reach the authorizer's own decisions — action codes and its temp-schema rule — rather than `SqlStorageRegulator` callbacks, so porting the regulator did not carry them. The refused and allowed forms are matched through SQLite's identifier quoting, whitespace or none. `EXPLAIN` in front of a refused form still compiles here, where workerd's authorizer refuses it. |
 | SQL function allowlist | Not enforced. Workerd's authorizer denies any function outside its 138-name `ALLOWED_SQLITE_FUNCTIONS` list; this runtime allows every function the backend compiled, including build-detail readers such as `sqlite_version()` and `sqlite_source_id()`. |
@@ -466,7 +480,7 @@ This is `0.x`. The public surface is what [`src/index.ts`](src/index.ts) and the
 | `src/io/` | Gates, invocation context, actor storage engine, ids, Worker channels |
 | `src/api/` | Workers-facing APIs: `DurableObjectState`, SQL, WebSocket, Worker Loader, `cloudflare:workers` |
 | `src/server/` | Actor containers, facet lifecycle, deletion recovery, alarm scheduling |
-| `src/browser/` | Physical alarm projection, offscreen-document recovery, and MessagePort-backed WebSockets for browser hosts |
+| `src/browser/` | Physical alarm projection, offscreen-document recovery, MessagePort-backed WebSockets, and the opt-in `async_hooks` shim ([browser async context](docs/browser-async-context.md)) for browser hosts |
 | `src/transport/` | The one `MessagePort` Cap'n Web session adapter |
 | `backends/` | `node:sqlite` and sqlite-wasm/OPFS `SqlDatabaseProvider`s |
 | `conformance/` | One suite, three hosts: workerd, Node, browser; plus the probe fixture and benchmarks |
@@ -479,14 +493,16 @@ The `util → io → api → server` direction follows workerd's own layering, e
 ## Tests
 
 ```bash
-pnpm test:unit                  # workerd's own unit tests, ported module by module
-pnpm test:conformance-workerd   # the oracle: the suite on real workerd, importing nothing from src/
-pnpm test:conformance-node      # the suite on this runtime over node:sqlite
-pnpm test:conformance-browser   # the suite in headless Chromium over sqlite-wasm + OPFS, with a real Cap'n Web session
-pnpm test                       # all of the above
+pnpm test:unit                              # workerd's own unit tests, ported module by module
+pnpm test:conformance-workerd               # the oracle: the suite on real workerd, importing nothing from src/
+pnpm test:conformance-node                  # the suite on this runtime over node:sqlite
+pnpm test:conformance-browser               # the suite in headless Chromium over sqlite-wasm + OPFS, with a real Cap'n Web session
+pnpm test:conformance-node-transformed      # the Node suite with the probe compiled by the await transform, as a consumer builds actors
+pnpm test:conformance-browser-transformed   # the browser suite, compiled the same way
+pnpm test                                   # all of the above
 ```
 
-The workerd lane is what makes the others mean something: every row it passes is a contract the Node and browser lanes must also pass, including cross-root RPC gate release and resumption. The browser smoke lane also fills the real OPFS SAH pool to capacity and proves visible failure, no leaked slot, and recovery. A substrate that lacks a feature asserts the named refusal instead of skipping the row. `pnpm bench:node` and `pnpm bench:browser` measure `sql.exec` latency over a realistic message store on each substrate.
+The workerd lane is what makes the others mean something: every row it passes is a contract the Node and browser lanes must also pass, including cross-root RPC gate release and resumption. The browser smoke lane also fills the real OPFS SAH pool to capacity and proves visible failure, no leaked slot, and recovery. Three of its smoke specs terminate a real worker mid-operation: `actor-crash` (the hot journal is rolled back and acknowledged writes survive), `alarm-recovery` (an interrupted alarm is redelivered exactly once), and `hibernation-worker-restart` (hibernated sockets survive through transferred `MessagePort`s). A substrate that lacks a feature asserts the named refusal instead of skipping the row. `pnpm bench:node` and `pnpm bench:browser` measure `sql.exec` latency over a realistic message store on each substrate.
 
 ## Development
 
@@ -506,7 +522,7 @@ and Rook's six-package Agents SDK fork in
 built `agents` package through a `file:` dependency, which resolves their
 own peer dependencies without installing a second SDK implementation.
 
-`pnpm sdk:pack` builds and packs the six SDK packages into `dist/sdk/` with
+`pnpm sdk:pack` builds and packs the six SDK packages into `.sdk-pack/` with
 their upstream names. After the SDK and consumer gates pass, attach these
 tarballs to a GitHub release tagged `rook-sdk-<source-commit>` at the tested
 commit. Rook pins those release asset URLs and their lockfile integrity;

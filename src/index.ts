@@ -17,8 +17,10 @@
  * reason: it is what `server/` implements and `api/` consumes, and the seam a
  * consumer fills is `FacetHost` below it.
  *
- * Refusal messages used by conformance tests are exported so their specified
- * fail-closed behavior cannot drift. `createActorContainer` is asynchronous
+ * Refusal messages are exported as the public names of the runtime's
+ * fail-closed refusals. Unit tests pin them where they are thrown; the
+ * conformance suite cannot, because its workerd lane imports nothing from
+ * `src/`. `createActorContainer` is asynchronous
  * because `SqlDatabaseProvider.open` is asynchronous; a returned container has
  * usable state and no hidden half-started storage phase.
  */
@@ -37,10 +39,12 @@ export { BrokenActorError, type Timer } from "./io/io-context";
 export { CanceledError } from "./io/io-gate";
 /**
  * The Worker Loader (§1.11, decision 15). Exported where the `api/` classes are
- * not, and for the reason `AlarmScheduler` is: this one is a **binding**, so a
- * host has to construct it and put it in `env` — upstream compiles it from
- * `Global::WorkerLoader{channel}` the same way (`server/workerd-api.c++:748`) —
- * where every other `api/` class reaches a consumer through `container.state`.
+ * not because this one is a **binding**: the host puts it in `env` — upstream
+ * compiles it from `Global::WorkerLoader{channel}` (`server/workerd-api.c++:748`)
+ * — where every other `api/` class reaches a consumer through `container.state`.
+ * A host does not construct it: the constructor takes the `IoContext` this
+ * facade withholds, so `container.workerLoader()` builds one bound to the right
+ * context, and the class is exported as that method's return type.
  *
  * What a host supplies is `IsolateChannelFactory`, which is the whole substrate
  * seam: `loadIsolate` and the calling worker's own outbound. The scaffolding's
@@ -199,6 +203,7 @@ export type {
   Scheduler,
   SchedulerWaitOptions,
 } from "./api/global-scope";
+export { ACTOR_SCOPE_GLOBALS } from "./api/actor-scope-globals";
 export {
   actorScopeBindings,
   FOREIGN_SLICE_MESSAGE,

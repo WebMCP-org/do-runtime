@@ -1,5 +1,5 @@
 import { expect, test } from "vitest";
-import { __gate } from "../../src/gate";
+import { __gateAwait, __resumeAwait } from "../../src/gate";
 import { InputGate, OutputGate } from "../../src/io/io-gate";
 import { IoContext, type Actor, type Timer } from "../../src/io/io-context";
 
@@ -38,7 +38,8 @@ async function measure(kind: "plain" | "awaitIo" | "transformed"): Promise<numbe
     for (let index = 0; index < ITERATIONS; index++) {
       if (kind === "plain") value = await value + 1;
       else if (kind === "awaitIo") value = await context.awaitIo(Promise.resolve(value + 1));
-      else value = await __gate(Promise.resolve(value + 1));
+      // The shape `doRuntimeAwaitTransform` emits for `await x`.
+      else value = __resumeAwait(await __gateAwait(Promise.resolve(value + 1)));
     }
     return value;
   });

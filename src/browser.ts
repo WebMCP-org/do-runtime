@@ -1,4 +1,5 @@
 import { AcceptedWebSocket, markWebSocketUsed, type RawWebSocket } from "./api/web-socket";
+import { bridgeWebSocket, type MessagePortWebSocket } from "./browser/message-port-websocket";
 
 export type UpgradeWebSocket = EventTarget &
   RawWebSocket & {
@@ -55,6 +56,49 @@ export function upgradeWebSocket(response: Response): UpgradeWebSocket | undefin
   const host = socket.coupleToHost();
   upgradedSockets.set(response, host);
   return host;
+}
+
+/**
+ * Route one MessagePort socket through a Workers-style `fetch`, such as the
+ * Agents SDK's `(request) => routeAgentRequest(request, env, { onBeforeConnect: withWebSocketUpgrade })`,
+ * and bridge the socket it upgrades to. Install the upgrade globals first so
+ * the handler can answer 101.
+ *
+ * The bridge closes 1011 when nothing routes the request or routing throws,
+ * and 1008 when the upgrade is refused, carrying the response text as the
+ * reason when it is printable ASCII of at most 123 bytes. The returned promise
+ * rejects in each of those cases.
+ *
+ * It does not tell the peer that the socket opened. `serveMessagePortWebSockets`
+ * sends that signal to clients made by `createMessagePortWebSocketConstructor`;
+ * a host running its own port protocol opens its end itself.
+ */
+export async function connectMessagePortWebSocket(
+  bridge: MessagePortWebSocket,
+  url: string,
+  fetch: (request: Request) => Promise<Response | null | undefined>,
+): Promise<void> {
+  try {
+    const request = withWebSocketUpgrade(new Request(url.replace(/^ws/, "http")));
+    const response = await fetch(request);
+    if (response == null) {
+      bridge.close(1011, "No WebSocket route matched");
+      throw new Error(`No WebSocket route matched ${request.url}`);
+    }
+    const socket = upgradeWebSocket(response);
+    if (response.status !== 101 || socket === undefined) {
+      const detail = await response.text().catch(() => "");
+      const reason = /^[\x20-\x7E]{1,123}$/u.test(detail) ? detail : "WebSocket upgrade rejected";
+      bridge.close(1008, reason);
+      throw new Error(
+        `WebSocket upgrade failed with ${response.status} for ${request.url}${detail ? `: ${detail}` : ""}`,
+      );
+    }
+    bridgeWebSocket(socket, bridge);
+  } catch (error) {
+    bridge.close(1011, "WebSocket connection failed");
+    throw error;
+  }
 }
 
 /** Preserve the upgrade signal across browser `Request.clone()` calls. */

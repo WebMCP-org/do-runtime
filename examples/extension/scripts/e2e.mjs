@@ -22,8 +22,15 @@ const repoRoot = fileURLToPath(new URL("../../../", import.meta.url));
 const dist = `${example}dist`;
 const profile = `${example}.e2e-profile`;
 
-/** How long to wait for the alarm to be delivered. It is armed for 2s. */
+/** How long to wait for an alarm to recreate the host or finish its delivery. */
 const ALARM_TIMEOUT_MS = 15_000;
+/**
+ * How long the held wake's handler runs. It covers the alarm's latency, the
+ * journal poll and the CDP calls that stop the service worker mid-delivery.
+ */
+const HELD_DELIVERY_MS = 10_000;
+/** The coordinator's `chrome.storage.local` journal, owned by `src/background.ts`. */
+const WAKE_JOURNAL = "do-runtime-wake-journal";
 /** How long to wait for the first op, which pays for wasm init and the OPFS pool. */
 const BOOT_TIMEOUT_MS = 30_000;
 
@@ -181,6 +188,49 @@ async function pollOp(page, name, args, predicate, timeoutMs = BOOT_TIMEOUT_MS) 
   throw (
     lastError ?? new Error(`${name} did not reach the expected state: ${JSON.stringify(value)}`)
   );
+}
+
+/** Poll a value read inside an extension context without sending the host anything. */
+async function pollEvaluate(target, read, predicate, timeoutMs, arg) {
+  const deadline = Date.now() + timeoutMs;
+  let value;
+  while (Date.now() < deadline) {
+    value = await target.evaluate(read, arg);
+    if (predicate(value)) return value;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(`the extension did not reach the expected state: ${JSON.stringify(value)}`);
+}
+
+async function offscreenDocuments() {
+  return (await chrome.runtime.getContexts({ contextTypes: ["OFFSCREEN_DOCUMENT"] })).length;
+}
+
+async function wakeJournal(key) {
+  return (await chrome.storage.local.get(key))[key] ?? null;
+}
+
+/**
+ * Stop the extension service worker the way Chrome's idle timeout does. Chrome
+ * keeps the worker's target across the restart, so Playwright's existing handle
+ * reaches the new instance and no new `serviceworker` event fires.
+ */
+async function stopServiceWorker(context, extensionId) {
+  const page = await context.newPage();
+  const session = await context.newCDPSession(page);
+  try {
+    const { targetInfos } = await session.send("Target.getTargets");
+    const target = targetInfos.find(
+      ({ type, url }) =>
+        type === "service_worker" && url.startsWith(`chrome-extension://${extensionId}/`),
+    );
+    if (target === undefined) throw new Error("the extension service worker target is missing");
+    const { success } = await session.send("Target.closeTarget", { targetId: target.targetId });
+    if (!success) throw new Error("Chrome did not stop the extension service worker");
+  } finally {
+    await session.detach();
+    await page.close();
+  }
 }
 
 /** Poll the popup's output pane until it shows something matching `pattern`. */
@@ -415,8 +465,10 @@ async function main() {
     );
 
     // ---------------------------------------------------------------------
-    // 3. A real alarm: armed in the actor's storage, delivered by the
-    //    AlarmScheduler's own database in the same worker.
+    // 3. A real alarm with only chrome.alarms to deliver it. The wake is armed
+    //    in Agent storage, then the whole host is removed, and no host
+    //    operation is sent until well past its time: the physical alarm must
+    //    recreate the host, and the new Worker's scheduler must deliver it.
     const childArmedFor = await op(popup, "armSubAgentWake", [5000]);
     if (typeof childArmedFor !== "number") {
       fail("a sub-agent answers its scheduled time", String(childArmedFor));
@@ -441,19 +493,37 @@ async function main() {
     await worker.evaluate(async () => chrome.offscreen.closeDocument());
     pass("the offscreen host was removed before the durable wake");
 
-    const deadline = Date.now() + ALARM_TIMEOUT_MS;
-    let alarms = 0;
-    while (Date.now() < deadline) {
-      try {
-        snapshot = await op(popup, "snapshot");
-        alarms = snapshot.events.filter((event) => event.kind === "sdk-schedule").length;
-        if (alarms > 0) break;
-      } catch {
-        // Expected until chrome.alarms wakes the service worker and it recreates the host.
-      }
-      await new Promise((resolve) => setTimeout(resolve, 250));
+    try {
+      await pollEvaluate(worker, offscreenDocuments, (count) => count === 1, ALARM_TIMEOUT_MS);
+      pass("chrome.alarms recreated the offscreen host");
+    } catch (error) {
+      fail("chrome.alarms recreated the offscreen host", error.message);
     }
-    check("chrome.alarms recreated the host and delivered the alarm", alarms, 1);
+    // Reading the journal from the service worker sends the host nothing.
+    const latestWake = Math.max(armedFor, childArmedFor);
+    try {
+      await pollEvaluate(
+        worker,
+        wakeJournal,
+        (journal) =>
+          journal?.delivery === null &&
+          (journal.projection.when === null || journal.projection.when > latestWake),
+        BOOT_TIMEOUT_MS,
+        WAKE_JOURNAL,
+      );
+      pass("the coordinator acknowledged both wakes");
+    } catch (error) {
+      fail("the coordinator acknowledged both wakes", error.message);
+    }
+    const firstOperationAt = Date.now();
+    snapshot = await op(popup, "snapshot");
+    const wakes = snapshot.events.filter((event) => event.kind === "sdk-schedule");
+    check("the recreated host delivered the alarm", wakes.length, 1);
+    check(
+      "the alarm was delivered before any host operation",
+      wakes.length > 0 && wakes.every((event) => event.at < firstOperationAt),
+      true,
+    );
     check("the alarm handler's write landed", snapshot.value, 21);
     check(
       "the recreated host delivered durable work to the sub-agent",
@@ -724,6 +794,66 @@ async function main() {
         (await chrome.runtime.getContexts({ contextTypes: ["OFFSCREEN_DOCUMENT"] })).length,
     );
     check("the service worker created one offscreen document", offscreenContexts, 1);
+
+    // ---------------------------------------------------------------------
+    // 8. Chrome stops the service worker in the middle of an alarm delivery.
+    //    The coordinator armed a watchdog before handing the wake over. Until
+    //    the delivery is acknowledged the test only reads extension storage
+    //    from the popup, which wakes nothing, so only the watchdog alarm can
+    //    restart the coordinator's `fire()`, the one path that clears it.
+    const beforeHeld = await op(popup, "snapshot");
+    await worker.evaluate(() => {
+      globalThis.__stoppedServiceWorker = true;
+    });
+    const heldFor = await op(popup, "armWake", [2000, HELD_DELIVERY_MS]);
+    const delivering = await pollEvaluate(
+      popup,
+      wakeJournal,
+      (journal) => journal?.delivery != null,
+      ALARM_TIMEOUT_MS,
+      WAKE_JOURNAL,
+    );
+    const watchdog = await popup.evaluate(
+      async () => (await chrome.alarms.get("do-runtime-wake"))?.scheduledTime ?? null,
+    );
+    check(
+      "the coordinator armed its watchdog before delivering",
+      watchdog,
+      delivering.delivery.wake,
+    );
+    await stopServiceWorker(context, extensionId);
+    // The running delivery stays projected at its alarm's own time, which the
+    // SDK rounds down to the second, so it bounds the hold better than heldFor.
+    check(
+      "the service worker stopped while the delivery was held",
+      Date.now() < delivering.projection.when + HELD_DELIVERY_MS,
+      true,
+    );
+    try {
+      await pollEvaluate(
+        popup,
+        wakeJournal,
+        (journal) => journal?.delivery === null,
+        BOOT_TIMEOUT_MS,
+        WAKE_JOURNAL,
+      );
+      pass("the watchdog completed the held delivery's acknowledgement");
+    } catch (error) {
+      fail("the watchdog completed the held delivery's acknowledgement", error.message);
+    }
+    check(
+      "a restarted service worker acknowledged it",
+      await worker.evaluate(() => globalThis.__stoppedServiceWorker === undefined),
+      true,
+    );
+    const afterHeld = await op(popup, "snapshot");
+    check("the held alarm ran exactly once", afterHeld.value - beforeHeld.value, 1);
+    check(
+      "the held alarm recorded one event",
+      afterHeld.events.filter((event) => event.kind === "sdk-schedule" && event.at >= heldFor)
+        .length,
+      1,
+    );
   } catch (error) {
     fail("the run threw", error?.stack ?? String(error));
   } finally {

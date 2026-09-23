@@ -69,8 +69,15 @@ jobs:
       - name: Test browser conformance
         run: pnpm test:conformance-browser
 
-      - name: Build examples
-        run: pnpm examples:build
+      - name: Test transformed Node conformance
+        run: pnpm test:conformance-node-transformed
+
+      - name: Test transformed browser conformance
+        run: pnpm test:conformance-browser-transformed
+
+      # The extension e2e builds the extension itself; vibe's e2e uses the dev server.
+      - name: Build vibe-platform for production
+        run: pnpm --filter do-runtime-example-vibe-platform build
 
       - name: Test examples
         run: pnpm test:examples
