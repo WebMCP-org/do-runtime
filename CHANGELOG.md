@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.10.0
+
+### Minor Changes
+
+- 6ed7e95: Align the runtime with workerd 1.20261002.1: allow multiple output-gate failure
+  observers, raise SQLite values to 8 MiB plus serialization padding, and support
+  chainable tracing span name and status updates. Pin the conformance oracle and
+  Workers types to the October 2 release.
+
+### Patch Changes
+
+- c305763: Preserve native async-method identity when lowering browser awaits. This lets the Agents SDK keep synchronous methods synchronous while starting a cold Agent before its async methods run; lowered continuations still restore browser async context.
+
 ## 0.9.0
 
 ### Minor Changes
