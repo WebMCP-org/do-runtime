@@ -1,11 +1,95 @@
-# workerd sync: September 7, 2026
+# workerd sync: October 2, 2026
 
-**September 11 re-pin.** The oracle is now pinned to `v1.20260911.1`
+The oracle is now pinned to `v1.20261002.1`
+([`51a48a5bb786`](https://github.com/cloudflare/workerd/tree/51a48a5bb7863fbeab791358bee8dff22c3ce83f)),
+with Workers types `5.20261002.1`. The September audit below records the prior
+behavioral baseline; the October audit covers the previously unaudited
+[`v1.20260907.1...v1.20261002.1`](https://github.com/cloudflare/workerd/compare/v1.20260907.1...v1.20261002.1)
+range.
+
+## October audit
+
+The [official release](https://github.com/cloudflare/workerd/releases/tag/v1.20261002.1)
+and [npm latest metadata](https://registry.npmjs.org/workerd/latest) agreed on
+`1.20261002.1`, commit `51a48a5bb7863fbeab791358bee8dff22c3ce83f`, when checked
+on October 2. The source audit starts at September 7, rather than the September
+11 oracle pin, to include the four days that had only been conformance-tested.
+The range contains **688 commits: 537 non-merge commits and 151 merges**. The
+endpoint diff changes 1,013 files, with 89,535 insertions and 16,719 deletions.
+
+The [commit ledger](workerd-sync-2026-10-02.csv) records every SHA, its parents,
+subject, changed paths, and disposition. History was fetched without a shallow
+boundary; `git log --full-history` preserves merged changes. Every commit's
+subject and changed paths were screened. Applicable source patches, callers,
+and regression tests were inspected, then checked against endpoint diffs so
+reverts and intermediate implementations do not become separate port work.
+The ledger distinguishes this scope review from the behavioral ports below:
+it does not claim that every line of a native engine or unrelated product was
+translated or independently verified.
+
+### Behavioral ports
+
+| Upstream change | Local result and evidence |
+| --- | --- |
+| [SQLite row limit, `1b9b6ea02`](https://github.com/cloudflare/workerd/commit/1b9b6ea023367d92591c1b51658d89eca4b41a23) | The shared length constant is now `8 * 1024 * 1024 + 34`, including upstream's V8 serialization allowance. It feeds both the WASM native `sqlite3_limit` call and Node's bound/returned-value checks. The upstream large-key regression failed at 8,000,000 bytes before the port. The shared oracle probe accepts exactly 8 MiB + 34 and rejects the next byte in workerd, Node, and the browser. Node's existing inability to constrain aggregate rows or unreturned computed values remains a host limitation. |
+| [Sticky gate notifications, `275f7b2a4`](https://github.com/cloudflare/workerd/commit/275f7b2a47e95109c9d51a2b8ee6fc5ef7ff4782) | `OutputGate.onBroken()` permits multiple observers. Existing observers receive the first failure; observers registered after another failure receive the latest exception. The second-observer upstream regression failed before the port. The obsolete SQLite-test harness workaround for the one-observer restriction was removed. InputGate already supported multiple observers and retained the latest exception; no new gate abstraction was needed. |
+| [Tracing span updates, `1f6faa79b`](https://github.com/cloudflare/workerd/commit/1f6faa79bc3dfc266c3bc1d2f9149699e6c5f819) | The existing no-op tracing surface now has chainable `updateName()` and `setStatus()`. `setStatus()` validates `unset`, `ok`, and `error`, including on an ended span. The shared conformance row measures the same synchronous contract in all three runtimes. Native span-update delivery, observers, and asynchronous tracing propagation remain outside the local no-op contract. |
+
+These changes retain the existing compatibility dates. Updating the oracle and
+ambient Workers types does not automatically opt local hosts into newer
+compatibility-date policy.
+
+### Reviewed host and protocol changes
+
+| Surface | Disposition |
+| --- | --- |
+| Actor storage, transactions, Sync-KV, alarms | Endpoint changes outside the length limit are span tags, native ownership, or diagnostics. [Weak transaction/context captures, `1c246981e`](https://github.com/cloudflare/workerd/commit/1c246981e264c05b623c692b1773baafc5d61b24), [owned actor/alarm keys, `7b1bf6ed6`](https://github.com/cloudflare/workerd/commit/7b1bf6ed627f4993fe8b1cce5d02e94a834df54b), and [Sync-KV prefix move, `1c21cdb55`](https://github.com/cloudflare/workerd/commit/1c21cdb558aa43fe37435e1a2d8bceadc9bce39a) repair borrowed C++ lifetimes; local immutable strings and GC-owned contexts already retain those values. [In-memory alarm cancellation, `5d450132f`](https://github.com/cloudflare/workerd/commit/5d450132f6e3b69616d8609d74f4e1fb784c23e1) avoids destroying a running KJ callback; JavaScript promises do not have that destruction behavior, and the local scheduler owns completion/replacement bookkeeping. |
+| SQLite VFS and observers | [Open-time VFS exceptions, `7d9d512c9`](https://github.com/cloudflare/workerd/commit/7d9d512c96e5f150b576c570652c434013fd4a45), [internal database context, `757419a73`](https://github.com/cloudflare/workerd/commit/757419a73abd634d278b5c8db2a52a4d2bd1abe2), [prepare-failure query events, `42a71fe42`](https://github.com/cloudflare/workerd/commit/42a71fe42268ef9af0ce489a22e21eb1eb33f85f), and Sentry routing change workerd's native VFS/observer channel. Local driver-open failures already propagate; the port has neither that VFS exception tunnel nor a SqliteObserver/Sentry delivery backend. The previously documented function/default-expression authorizer gap remains unresolved. |
+| Facets | [Facet access timestamp lifetime, `95edab081`](https://github.com/cloudflare/workerd/commit/95edab081eef9c3517ee499a701b80d6b70d1c1f) shares a root-owned allocation so a surviving native facet channel cannot dereference a destroyed parent. Local facets already use explicit owned contexts and a root-owned tree index. There is no native expiration timestamp or borrowed parent pointer to repair. Facet limits, clone/delete semantics, and storage ownership are unchanged in the endpoint diff. |
+| Worker Loader | Its API source has no endpoint change. [Shared module source ownership, `a745140dc`](https://github.com/cloudflare/workerd/commit/a745140dc8543085dabdf13cbfd9c2e233556924) and promise-returning native synthetic-module callbacks change JSG compilation ownership; local WorkerSource retains JS strings, copied byte inputs, and compiled modules. Server loader linking now includes configured Workflow namespaces, whose service is not implemented here. |
+| WebSockets and hibernation | The sole WebSocket implementation change [narrows abort-task logging, `d8b5cacc5`](https://github.com/cloudflare/workerd/commit/d8b5cacc599c7323baef800ad3f0506c8ee0e916). [Hibernatable socket count, `d07b3e558`](https://github.com/cloudflare/workerd/commit/d07b3e55822c3e0c3e605e058d3aa950cccfb00b) is native embedder introspection that avoids waking parked wrappers. Local registry/mirror entries already hold live references and have no native wakeup operation. No application-facing frame, close, attachment, tag, or auto-response semantic changed. |
+| Wait-until and eviction | [Task lifetime handles, `718f53105`](https://github.com/cloudflare/workerd/commit/718f53105ec99d2f9f0c88b66316e6b611fa2a2f) add an optional host-supplied tracker attached until each task settles/cancels. Local `waitUntilTaskCount()`, `quiescence().pendingWaitUntil`, and `drainWaitUntil()` already expose task lifetime. There is no local timed idle-eviction service or bounded per-task protection policy to port. The final `durable_object_io_tasks_prevent_eviction` enable date is October 1: `1132cf4b1` temporarily moved it and `50226a61a` reverted that move. |
+| Final request cleanup | [`6cd3cd4f6`](https://github.com/cloudflare/workerd/commit/6cd3cd4f6c391d4980d66912a6756183f64f64d9) cancels stateless final-context work before reporting the request outcome. `38a710968` gated it and `d099c3f21` removed the rollout gate; the endpoint still excludes shared actor contexts. Local actor `waitUntil` therefore retains its existing lifetime. |
+| Distributed Durable Object fetch/RPC retries | The STOR-5489/STOR-5615 sequence adds owned replay plans, payload eligibility, retry-token claims, predecessor/committed-failure classification, replay-memory budgets, attempt observers, configurable counts/timeouts, property-read retries, cancellation, and output-gate coordination. Claim placement moves before construction in `f6cc0d14c`, then back after construction in [the final design, `354a44cfd`](https://github.com/cloudflare/workerd/commit/354a44cfdda95115b6931d30d7f493915826441b). Local calls have no claim/deduplication or replay protocol. Repeating them after an arbitrary error could duplicate side effects, so none of this sequence is approximated with generic retries. |
+| `@retryable` | [`bc75cc988`](https://github.com/cloudflare/workerd/commit/bc75cc988c6c0945ace821db0b9267d3206dd479) adds a standard method decorator in the new `cloudflare:durable-objects` module; [`946ff26b0`](https://github.com/cloudflare/workerd/commit/946ff26b028f644960e8d2d7f8bc5f1c4e788654) carries its marker to the retry-token claim. That module has no local alias, so use already fails closed at resolution. No no-op decorator is exported and no retry support is claimed. |
+| Native streams and RPC transport | The range changes BYOB ownership, tee/backpressure, transform settlement, compression chunks, stream adapter teardown, prototype-pollution protection, and [RPC stream cancellation, `d1cee9e1c`](https://github.com/cloudflare/workerd/commit/d1cee9e1cc2ccfef3e3d5807a39c3ddce616831f). The runtime uses host WHATWG streams and Cap'n Web rather than workerd's KJ pumps/Cap'n Proto stream membranes. [Pipe abort algorithms, `fdfeb0431`](https://github.com/cloudflare/workerd/commit/fdfeb04318a0ed9544e101c73f6b72f98cba9a81) reinforce the native stream implementation; the locally owned cancellation paths already use the private dependent signal in `onAbort`. Gated BYOB remains explicitly unsupported. |
+| Separate services and native runtime | Workflow exports/createBatch/subscription types, Docker Containers, TCP/UDP/TLS/connect handlers, shared memory cache, R2, Workers AI, Browser Run, Analytics SQL, and artifact bindings require separate host services. New ambient declarations arrive through Workers types. Node compatibility, Python/Pyodide, JSG/V8/cppgc, Rust/KJ event-loop and CLI changes remain native host implementations. The full ledger records each commit, including tests, build changes, releases, and merges. |
+
+### Security review
+
+The security-labelled commits were inspected independently of their path
+classification. [AsyncResource creation-context binding, `66b794d36`](https://github.com/cloudflare/workerd/commit/66b794d363157eaebd4e81392b8dd817abc57ba3)
+changes `AsyncResource.bind()` and `runInAsyncScope()`; the browser shim already
+rejects `new AsyncResource()` by name. Its documented Node-like
+AsyncLocalStorage contract is unchanged. [Reentrant rejection-handler lifetime,
+`d9e597e34`](https://github.com/cloudflare/workerd/commit/d9e597e347f0c835a23241de9600e0655c00ce4d)
+fixes workerd's V8 warned-rejection table, absent locally. [Encrypted DER export,
+`ea2f6d1fa`](https://github.com/cloudflare/workerd/commit/ea2f6d1fae8deba6bc9d536d9ae0c78316515977)
+fixes workerd's Node crypto implementation, also absent locally. Native wrapper
+identity checks and serializer pointer ownership were checked alongside these;
+local JavaScript wrappers carry no cppgc pointers or V8 serializer externals.
+
+### Focused validation
+
+The changed gate regression failed before implementation and passed afterward;
+217 gate, actor-SQLite, and Worker Loader unit tests passed together. The
+8,000,000-byte SQLite regression failed before implementation and passed
+afterward; 143 SQLite-KV, actor-SQLite, and WASM-backend tests passed together.
+The SQL conformance file passed all 14 tests in each of workerd, Node, and the
+browser, including the exact new length boundary. These unit selections overlap
+and are not an aggregate count. Integrated runtime validation then passed: 1,021 unit tests; 82 workerd,
+82 Node, and 95 browser conformance/smoke tests; and 82 tests in each transformed
+Node/browser lane. Package and SDK validation are tracked separately from this
+runtime audit.
+
+## September audit
+
+**September 11 re-pin.** The oracle was pinned to `v1.20260911.1`
 ([`925464ba9fe5`](https://github.com/cloudflare/workerd/tree/925464ba9fe5751e4468626ce77f7a5810df274f)),
 with Workers types `5.20260911.1` and `@sqlite.org/sqlite-wasm` `3.53.4-build1`
 (SQLite 3.53.4), since 0.8.2. Conformance was re-validated on those pins, but the
 [`v1.20260907.1...v1.20260911.1`](https://github.com/cloudflare/workerd/compare/v1.20260907.1...v1.20260911.1)
-upstream range has not been audited the way this document audits the July range.
+upstream range had not yet been source-audited. The October audit above now includes it.
 A direct probe on SQLite 3.53.4 reproduced the default-expression findings below,
 so the [engine work](#sqlite-engine-work-still-required) is unchanged.
 
