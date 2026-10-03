@@ -95,7 +95,7 @@
     "sdk:build": "pnpm --dir vendor/agents build",
     "sdk:sync": "pnpm sdk:build && pnpm install --filter \"do-runtime-example-*\" --frozen-lockfile --ignore-scripts",
     "sdk:check": "pnpm --dir vendor/agents check",
-    "sdk:test": "pnpm --dir vendor/agents test",
+    "sdk:test": "node scripts/test-sdk.mjs",
     "build": "pnpm build:package",
     "typecheck": "pnpm build:package && tsc -b tsconfig.json && tsc -p conformance/tsconfig.json && tsc -p examples/extension/tsconfig.page.json && tsc -p examples/extension/tsconfig.worker.json && tsc -p examples/vibe-platform/tsconfig.page.json && tsc -p examples/vibe-platform/tsconfig.worker.json",
     "test": "pnpm test:unit && pnpm test:conformance",

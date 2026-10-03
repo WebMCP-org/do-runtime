@@ -4,10 +4,14 @@ import type {
   Attachment as ChatAttachment,
   Author as ChatAuthor,
   ChatConfig,
+  ConcurrencyConfig,
+  ConcurrencyStrategy,
+  Lock as ChatLock,
   Message as ChatMessage,
+  SerializedThread,
   Thread as ChatThread
 } from "chat";
-import { Chat } from "chat";
+import { Chat, Message, ThreadImpl } from "chat";
 import type {
   Agent,
   FiberContext,
@@ -37,16 +41,52 @@ import {
 } from "./events";
 import {
   deliverMessengerReply,
+  EMPTY_MESSENGER_RESPONSE,
+  INTERRUPTED_MESSENGER_RESPONSE,
   MESSENGER_REPLY_FIBER_NAME,
   messengerReplyRecoveryMode,
   messengerReplySnapshot,
   parseMessengerReplySnapshot,
+  type MessengerReplySnapshot,
   type MessengerDeliveryPolicy,
   type MessengerDeliverySurface,
   type MessengerDeliveryTarget
 } from "./delivery";
 
 export class ThinkMessengerStateAgent extends ChatSdkStateAgent {}
+
+/**
+ * Adapters without native streaming would otherwise post `"..."` and edit it,
+ * and platforms such as Slack keep that first text as the notification
+ * preview. Delivery already shows a typing indicator before the reply starts.
+ */
+const FALLBACK_STREAMING_PLACEHOLDER_TEXT = null;
+
+/** The posts that deliver a recovered messenger reply, in order. */
+function recoveredReplyPosts(
+  definition: { delivery?: MessengerDeliveryPolicy },
+  input: {
+    outcome: "completed" | "interrupted";
+    text?: string;
+    partialPosted?: boolean;
+  }
+): Array<string | { markdown: string }> {
+  if (input.outcome === "interrupted") {
+    return [
+      definition.delivery?.interruptedResponseText ??
+        INTERRUPTED_MESSENGER_RESPONSE
+    ];
+  }
+  const text = input.text?.trim() ? input.text : "";
+  if (!text) {
+    return input.partialPosted
+      ? []
+      : [definition.delivery?.emptyResponseText ?? EMPTY_MESSENGER_RESPONSE];
+  }
+  return (definition.delivery?.splitText?.(text) ?? [text]).map((chunk) => ({
+    markdown: chunk
+  }));
+}
 
 export type MessengerRespondTo =
   | "action"
@@ -100,6 +140,56 @@ export interface MessengerDefinition {
 
 export type ThinkMessengers = Record<string, MessengerDefinition>;
 
+/** The Chat SDK `concurrency` setting for a Think agent's messengers. */
+export type MessengerConcurrency = ConcurrencyStrategy | ConcurrencyConfig;
+
+/**
+ * How long a message queued behind a running reply stays answerable. The
+ * Chat SDK default (90 seconds) drops follow-ups sent early in a long turn,
+ * so Think applies this unless `queueEntryTtlMs` is set explicitly.
+ */
+export const MESSENGER_QUEUE_ENTRY_TTL_MS = 30 * 60 * 1000;
+
+export const DEFAULT_MESSENGER_CONCURRENCY: MessengerConcurrency = {
+  debounceMs: 600,
+  queueEntryTtlMs: MESSENGER_QUEUE_ENTRY_TTL_MS,
+  strategy: "burst"
+};
+
+/** The Chat SDK's thread lock TTL (`DEFAULT_LOCK_TTL_MS`). */
+const CHAT_SDK_LOCK_TTL_MS = 30_000;
+
+/**
+ * Private `Chat` methods the post-recovery drain reuses so a stranded queue
+ * is dispatched exactly as the SDK would (lock scope, expiry, `skipped`).
+ * Feature-checked at runtime: a `chat` release without them skips the drain.
+ */
+interface ChatSdkQueueInternals {
+  getLockKey(adapter: Adapter, threadId: string): Promise<string>;
+  drainQueue(
+    lock: ChatLock,
+    adapter: Adapter,
+    threadId: string,
+    lockKey: string
+  ): Promise<void>;
+}
+
+/** Fill in Think's queue-entry TTL where the setting leaves it unset. */
+export function withMessengerQueueTtl(
+  concurrency: MessengerConcurrency
+): MessengerConcurrency {
+  if (typeof concurrency === "string") {
+    return {
+      queueEntryTtlMs: MESSENGER_QUEUE_ENTRY_TTL_MS,
+      strategy: concurrency
+    };
+  }
+  return {
+    ...concurrency,
+    queueEntryTtlMs: concurrency.queueEntryTtlMs ?? MESSENGER_QUEUE_ENTRY_TTL_MS
+  };
+}
+
 export interface NormalizedMessengerDefinition extends MessengerDefinition {
   id: string;
   path: string;
@@ -122,6 +212,14 @@ export interface ChatSdkMessengerEventInput {
   eventKind: MessengerEventKind;
   message?: ChatMessage;
   raw?: unknown;
+  /**
+   * Earlier messages the Chat SDK's concurrency strategy folded into this one,
+   * oldest first (`MessageContext.skipped`). The runtime's `burst` strategy
+   * answers only the newest message of a quick run and reports the rest here.
+   * {@link defaultChatSdkEvent} carries them on the event's `skipped` so they
+   * reach the model; a custom `toEvent` that ignores them drops them.
+   */
+  skipped?: readonly ChatMessage[];
   thread: ChatThread;
 }
 
@@ -151,6 +249,8 @@ export interface MessengerThinkHost extends MessengerThinkTarget {
     agentClass: SubAgentClass<T>,
     name: string
   ): Promise<SubAgentStub<T>>;
+  /** Keep the host alive while background messenger work runs. */
+  keepAliveWhile?<T>(fn: () => Promise<T>): Promise<T>;
 }
 
 export interface MessengerFiberStartResult {
@@ -196,10 +296,16 @@ export class ThinkMessengerRuntime {
   >();
   private readonly definitions: NormalizedMessengerDefinition[];
 
+  private readonly concurrency: MessengerConcurrency;
+
   constructor(
     definitions: ThinkMessengers,
-    private readonly host: MessengerThinkHost
+    private readonly host: MessengerThinkHost,
+    options?: { concurrency?: MessengerConcurrency }
   ) {
+    this.concurrency = withMessengerQueueTtl(
+      options?.concurrency ?? DEFAULT_MESSENGER_CONCURRENCY
+    );
     this.definitions = normalizeMessengers(definitions);
     for (const definition of this.definitions) {
       this.definitionsByAdapterName.set(definition.adapterName, definition);
@@ -266,6 +372,12 @@ export class ThinkMessengerRuntime {
       persistRecoverySnapshot?: (
         snapshot: ReturnType<typeof messengerReplySnapshot>
       ) => Promise<void> | void;
+      /**
+       * Whether the caller replays this recovery after it throws `error`.
+       * Messages queued behind the reply are drained only once it settles,
+       * so they are never answered ahead of it. Default: no replay.
+       */
+      retriesAfter?: (error: unknown) => boolean;
     }
   ): Promise<boolean> {
     if (ctx.name !== MESSENGER_REPLY_FIBER_NAME) {
@@ -284,7 +396,39 @@ export class ThinkMessengerRuntime {
       );
     }
 
-    const thread = this.reviveChatObject<ChatThread>(snapshot.thread);
+    const thread = this.reviveThread(definition, snapshot.thread);
+    let handled: boolean;
+    try {
+      handled = await this.recoverReply(
+        ctx,
+        definition,
+        thread,
+        snapshot,
+        options
+      );
+    } catch (error) {
+      if (!options?.retriesAfter?.(error)) {
+        this.drainQueuedMessagesInBackground(definition, thread.id);
+      }
+      throw error;
+    }
+    this.drainQueuedMessagesInBackground(definition, thread.id);
+    return handled;
+  }
+
+  private async recoverReply(
+    ctx: FiberRecoveryContext,
+    definition: NormalizedMessengerDefinition,
+    thread: ChatThread,
+    snapshot: MessengerReplySnapshot,
+    options:
+      | {
+          persistRecoverySnapshot?: (
+            snapshot: ReturnType<typeof messengerReplySnapshot>
+          ) => Promise<void> | void;
+        }
+      | undefined
+  ): Promise<boolean> {
     const mode = messengerReplyRecoveryMode(snapshot);
 
     if (mode === "answer") {
@@ -312,7 +456,7 @@ export class ThinkMessengerRuntime {
     if (mode === "apologize") {
       await thread.post(
         definition.delivery?.interruptedResponseText ??
-          "Sorry, my reply was interrupted. Please send your message again if you'd like me to retry."
+          INTERRUPTED_MESSENGER_RESPONSE
       );
       if (!options?.persistRecoverySnapshot) {
         await this.host.resolveFiber(ctx.id, { status: "completed" });
@@ -326,6 +470,69 @@ export class ThinkMessengerRuntime {
     return true;
   }
 
+  /**
+   * Messages queued behind a reply are drained only by the Chat SDK handler
+   * holding the thread lock. When the isolate running that reply dies, the
+   * queue is stranded until another message arrives, so recovery drains it:
+   * once the dead holder's lock expires, take the lock and hand the queue to
+   * the SDK's own drain. A live holder drains the queue itself, which ends
+   * the wait.
+   */
+  private drainQueuedMessagesInBackground(
+    definition: NormalizedMessengerDefinition,
+    threadId: string
+  ): void {
+    const drain = () => this.drainQueuedMessages(definition, threadId);
+    const running = this.host.keepAliveWhile?.(drain) ?? drain();
+    void running.catch((error: unknown) => {
+      console.error(
+        `[Think] Failed to drain messages queued on ${threadId} after recovery`,
+        error
+      );
+    });
+  }
+
+  private async drainQueuedMessages(
+    definition: NormalizedMessengerDefinition,
+    threadId: string
+  ): Promise<void> {
+    const chat = (this.chat ??= this.createChat());
+    const internals = chat as unknown as Partial<ChatSdkQueueInternals>;
+    if (
+      typeof internals.getLockKey !== "function" ||
+      typeof internals.drainQueue !== "function"
+    ) {
+      return;
+    }
+    await chat.initialize();
+    const state = chat.getState();
+    const lockKey = await internals.getLockKey.call(
+      chat,
+      definition.adapter,
+      threadId
+    );
+    const deadline = Date.now() + CHAT_SDK_LOCK_TTL_MS + 5_000;
+    while ((await state.queueDepth(lockKey)) > 0) {
+      const lock = await state.acquireLock(lockKey, CHAT_SDK_LOCK_TTL_MS);
+      if (lock) {
+        try {
+          await internals.drainQueue.call(
+            chat,
+            lock,
+            definition.adapter,
+            threadId,
+            lockKey
+          );
+        } finally {
+          await state.releaseLock(lock);
+        }
+        return;
+      }
+      if (Date.now() >= deadline) return;
+      await new Promise((resolve) => setTimeout(resolve, 1_000));
+    }
+  }
+
   private createChat(): Chat<Record<string, Adapter>> {
     const adapters = Object.fromEntries(
       this.definitions.map((definition) => [
@@ -335,17 +542,21 @@ export class ThinkMessengerRuntime {
     ) as Record<string, Adapter>;
     const chat = new Chat({
       adapters,
-      concurrency: { debounceMs: 600, strategy: "burst" },
+      concurrency: this.concurrency,
+      fallbackStreamingPlaceholderText: FALLBACK_STREAMING_PLACEHOLDER_TEXT,
       state: createChatSdkState({
         agent: ThinkMessengerStateAgent,
         keyShard: (key) => this.shardStateKey(key),
+        // The Chat SDK never extends its 30 second thread lock while a
+        // handler runs; a Think turn often takes longer.
+        lockHeartbeat: true,
         parent: this.host as unknown as ChatSdkStateAdapterOptions["parent"],
         shardKey: (threadId) => this.shardThread(threadId)
       }),
       userName: this.definitions[0]?.userName ?? "think"
     } satisfies ChatConfig<Record<string, Adapter>>);
 
-    chat.onDirectMessage(async (thread, message) => {
+    chat.onDirectMessage(async (thread, message, _channel, context) => {
       const definition = this.definitionForThread(thread);
       if (!definition) return;
       if (definition.respondTo.includes("direct-message")) {
@@ -354,6 +565,7 @@ export class ThinkMessengerRuntime {
           await this.toEvent(definition, {
             eventKind: "direct-message",
             message,
+            skipped: context?.skipped,
             thread
           }),
           thread
@@ -361,7 +573,7 @@ export class ThinkMessengerRuntime {
       }
     });
 
-    chat.onNewMention(async (thread, message) => {
+    chat.onNewMention(async (thread, message, context) => {
       const definition = this.definitionForThread(thread);
       if (!definition) return;
       if (definition.subscribeOnMention) {
@@ -373,6 +585,7 @@ export class ThinkMessengerRuntime {
           await this.toEvent(definition, {
             eventKind: "mention",
             message,
+            skipped: context?.skipped,
             thread
           }),
           thread
@@ -380,18 +593,46 @@ export class ThinkMessengerRuntime {
       }
     });
 
-    chat.onSubscribedMessage(async (thread, message) => {
+    // A burst is routed on its newest message only. When an earlier message
+    // in an unsubscribed thread mentioned the bot, answer the burst as that
+    // mention instead of letting it fall through unanswered.
+    chat.onNewMessage(/[\s\S]*/, async (thread, message, context) => {
+      const definition = this.definitionForThread(thread);
+      if (!definition || !definition.respondTo.includes("mention")) return;
+      if (!context?.skipped.some((skipped) => mentionsBot(definition, skipped)))
+        return;
+      if (definition.subscribeOnMention) {
+        await thread.subscribe();
+      }
+      await this.enqueueReply(
+        definition,
+        await this.toEvent(definition, {
+          eventKind: "mention",
+          message,
+          skipped: context.skipped,
+          thread
+        }),
+        thread
+      );
+    });
+
+    chat.onSubscribedMessage(async (thread, message, context) => {
       const definition = this.definitionForThread(thread);
       if (!definition) return;
+      const mentioned =
+        message.isMention ||
+        (context?.skipped.some((skipped) => mentionsBot(definition, skipped)) ??
+          false);
       if (
         definition.respondTo.includes("subscribed-thread") ||
-        (message.isMention && definition.respondTo.includes("mention"))
+        (mentioned && definition.respondTo.includes("mention"))
       ) {
         await this.enqueueReply(
           definition,
           await this.toEvent(definition, {
-            eventKind: message.isMention ? "mention" : "subscribed-message",
+            eventKind: mentioned ? "mention" : "subscribed-message",
             message,
+            skipped: context?.skipped,
             thread
           }),
           thread
@@ -540,6 +781,37 @@ export class ThinkMessengerRuntime {
     return chat.thread(threadId) satisfies MessengerDeliverySurface;
   }
 
+  /**
+   * Post what chat recovery produced for an interrupted messenger turn: the
+   * text the thread has not seen yet, or the interrupted apology when
+   * recovery gave up. The reply may span several posts; this posts only post
+   * number `chunk` (skipped when out of range) and returns how many there
+   * are, so the caller can checkpoint between posts.
+   */
+  async deliverRecoveredReply(input: {
+    messengerId: string;
+    threadId: string;
+    outcome: "completed" | "interrupted";
+    text?: string;
+    partialPosted?: boolean;
+    chunk: number;
+  }): Promise<{ chunks: number }> {
+    const definition = this.definitionsById.get(input.messengerId);
+    const surface = await this.resolveDeliverySurface(
+      input.messengerId,
+      input.threadId
+    );
+    if (!definition || !surface) {
+      throw new Error(
+        `No messenger delivery surface for ${input.messengerId} thread ${input.threadId}`
+      );
+    }
+    const posts = recoveredReplyPosts(definition, input);
+    const post = posts[input.chunk];
+    if (post !== undefined) await surface.post(post);
+    return { chunks: posts.length };
+  }
+
   private async resolveTarget(
     definition: NormalizedMessengerDefinition,
     event: MessengerEvent
@@ -567,10 +839,17 @@ export class ThinkMessengerRuntime {
       (this.host.constructor as unknown as SubAgentClass<
         Agent & MessengerThinkTarget
       >);
-    return (await this.host.subAgent(
+    const stub = (await this.host.subAgent(
       agentClass,
       target.name
-    )) as unknown as MessengerDeliveryTarget;
+    )) as unknown as Required<MessengerThinkTarget>;
+    // A live thread cannot cross the sub-agent RPC boundary, so the stub's
+    // `bindActiveDeliverySurface` must not be offered to delivery.
+    return {
+      cancelChat: (requestId, reason) => stub.cancelChat(requestId, reason),
+      chatWithMessengerDelivery: (userMessage, callback, context, surface) =>
+        stub.chatWithMessengerDelivery(userMessage, callback, context, surface)
+    };
   }
 
   private definitionForThread(
@@ -633,15 +912,37 @@ export class ThinkMessengerRuntime {
     return defaultKeyShard(key, (threadId) => this.shardThread(threadId));
   }
 
-  private reviveChatObject<T>(value: unknown): T {
+  /**
+   * `ThreadImpl.fromJSON` (what `chat.reviver()` calls) builds the thread
+   * without the Chat's streaming config, so a recovered reply would fall back to
+   * the `"..."` placeholder. Rebuild it from the same fields with that config.
+   */
+  private reviveThread(
+    definition: NormalizedMessengerDefinition,
+    value: unknown
+  ): ChatThread {
     if (value === undefined) {
       throw new Error(
         "Messenger recovery snapshot is missing chat object data"
       );
     }
-    const chat = this.chat ?? this.createChat();
-    this.chat = chat;
-    return JSON.parse(JSON.stringify(value), chat.reviver()) as T;
+    const chat = (this.chat ??= this.createChat());
+    const json = JSON.parse(JSON.stringify(value)) as SerializedThread;
+    // Bound explicitly: a lazy thread resolves its adapter from the
+    // module-global Chat singleton on first use, which another runtime in
+    // this isolate can replace while recovery awaits.
+    return new ThreadImpl({
+      adapter: definition.adapter,
+      stateAdapter: chat.getState(),
+      channelId: json.channelId,
+      channelVisibility: json.channelVisibility,
+      currentMessage: json.currentMessage
+        ? Message.fromJSON(json.currentMessage)
+        : undefined,
+      fallbackStreamingPlaceholderText: FALLBACK_STREAMING_PLACEHOLDER_TEXT,
+      id: json.id,
+      isDM: json.isDM
+    });
   }
 
   private async toEvent(
@@ -737,22 +1038,27 @@ export function defaultChatSdkEvent(
   definition: NormalizedMessengerDefinition,
   input: ChatSdkMessengerEventInput
 ): MessengerEvent {
-  const message = input.message && toMessengerMessage(input.message);
-  if (message) {
+  const convert = (chatMessage: ChatMessage): MessengerMessage => {
+    const message = toMessengerMessage(chatMessage);
     message.text = resolveSelfMention(
       message.text,
       definition.adapter.botUserId,
       definition.userName
     );
-  }
+    return message;
+  };
+  const skipped = input.skipped?.length
+    ? input.skipped.map(convert)
+    : undefined;
   return {
     capabilities: definition.capabilities ?? {},
     action: input.action && toMessengerAction(input.action),
     kind: input.eventKind,
-    message,
+    message: input.message && convert(input.message),
     messengerId: definition.id,
     provider: definition.provider,
     raw: input.raw ?? input.message?.raw,
+    ...(skipped && { skipped }),
     thread: toMessengerThread(input.thread)
   };
 }
@@ -783,6 +1089,27 @@ export function resolveSelfMention(
   return text
     .replace(new RegExp(`<@!?${id}>`, "g"), replacement)
     .replace(new RegExp(`@${id}\\b`, "g"), replacement);
+}
+
+/**
+ * Whether a message mentions the bot. The Chat SDK only runs its own mention
+ * detection on the message it dispatches, so messages a burst folded into
+ * `skipped` carry `isMention` only when their adapter set it. This mirrors the
+ * SDK's check (`@userName`, `@botUserId`, `<@botUserId>`) for them.
+ */
+export function mentionsBot(
+  definition: Pick<NormalizedMessengerDefinition, "adapter" | "userName">,
+  message: Pick<ChatMessage, "isMention" | "text">
+): boolean {
+  if (message.isMention) return true;
+  const userName = definition.adapter.userName || definition.userName;
+  const patterns = [new RegExp(`@${escapeRegExp(userName)}\\b`, "i")];
+  const botUserId = definition.adapter.botUserId;
+  if (botUserId) {
+    const id = escapeRegExp(botUserId);
+    patterns.push(new RegExp(`@${id}\\b`, "i"), new RegExp(`<@!?${id}>`, "i"));
+  }
+  return patterns.some((pattern) => pattern.test(message.text));
 }
 
 function escapeRegExp(value: string): string {
@@ -836,20 +1163,24 @@ export function toMessengerAttachment(
   attachment: ChatAttachment
 ): MessengerAttachment {
   const fetchMetadata = attachment.fetchMetadata;
+  const inline: unknown = attachment.data;
+  const data =
+    inline instanceof ArrayBuffer || ArrayBuffer.isView(inline)
+      ? attachmentBytes(inline)
+      : undefined;
+  const blob = inline instanceof Blob ? inline : undefined;
   return {
+    data,
     fetch: attachment.fetchData
       ? async () => {
-          const data = await attachment.fetchData?.();
-          if (!data) {
-            return new ArrayBuffer(0);
-          }
-          const copy = data.buffer.slice(
-            data.byteOffset,
-            data.byteOffset + data.byteLength
-          );
-          return copy instanceof ArrayBuffer ? copy : new ArrayBuffer(0);
+          const fetched = await attachment.fetchData?.();
+          return fetched ? attachmentBytes(fetched) : new ArrayBuffer(0);
         }
-      : undefined,
+      : data
+        ? () => Promise.resolve(data)
+        : blob
+          ? () => blob.arrayBuffer()
+          : undefined,
     fetchMetadata: fetchMetadata ? { ...fetchMetadata } : undefined,
     id: identifierFromFetchMetadata(fetchMetadata),
     mediaType: attachment.mimeType,
@@ -858,6 +1189,29 @@ export function toMessengerAttachment(
     size: attachment.size,
     url: attachment.url
   };
+}
+
+/**
+ * `chat` adapters resolve `fetchData` to a `Buffer` or, from `chat@4.41`
+ * (inside this package's `^4.31.0` range), a plain `ArrayBuffer`. A `Buffer` is
+ * a view that may share a pooled or `SharedArrayBuffer` backing store with
+ * unrelated bytes, so only its own range is copied out; a view spanning its
+ * whole `ArrayBuffer` hands that buffer over as is.
+ */
+function attachmentBytes(data: ArrayBuffer | ArrayBufferView): ArrayBuffer {
+  if (data instanceof ArrayBuffer) {
+    return data;
+  }
+  if (
+    data.buffer instanceof ArrayBuffer &&
+    data.byteOffset === 0 &&
+    data.byteLength === data.buffer.byteLength
+  ) {
+    return data.buffer;
+  }
+  const copy = new Uint8Array(data.byteLength);
+  copy.set(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
+  return copy.buffer;
 }
 
 const FETCH_METADATA_ID_KEYS = ["id", "fileId", "mediaId", "fileUniqueId"];

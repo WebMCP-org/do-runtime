@@ -16,6 +16,7 @@ import {
 import { ACTOR_SCOPE_GLOBALS } from "./api/actor-scope-globals.js";
 
 const MARKER = "/* @do-runtime-gated */";
+const ASYNC_METHOD = "/* @do-runtime-async-method */";
 const IMPORT =
   'import { __gateAsyncIterable, __gateAwait, __resumeAwait } from "@mcp-b/do-runtime/gate";';
 const OXC_ASYNC_GENERATOR = /^@oxc-project\+runtime@[^/]+\/helpers\/esm\/wrapAsyncGenerator\.js$/;
@@ -130,6 +131,47 @@ function countAwaitCoverage(program: ESTree.Program): AwaitCoverage {
   return { total, transformed };
 }
 
+/** Keep native method identity after Oxc has lowered every continuation in its body. */
+function restoreAsyncMethods(code: string, program: ESTree.Program, expected: number): string {
+  const source = new MagicString(code);
+  let restored = 0;
+  const restore = (node: ESTree.Node, isStatic = false) => {
+    const start = code.lastIndexOf(ASYNC_METHOD, node.start);
+    if (start < 0) return;
+    const between = code.slice(start + ASYNC_METHOD.length, node.start);
+    // Only consume our own compiler metadata immediately before an AST method/function.
+    if (!/^\s*$/.test(between)) return;
+    if (/[\r\n]/.test(between)) {
+      throw new Error(
+        "do-runtime: Oxc moved async-method metadata; review async identity preservation",
+      );
+    }
+    const end = node.start + (isStatic ? "static".length : 0);
+    const prefix = isStatic ? "static async" : "async";
+    // Equal-width, single-line replacement leaves Oxc's composed source map valid.
+    source.overwrite(start, end, prefix.padEnd(end - start));
+    restored += 1;
+  };
+  new Visitor({
+    MethodDefinition(node) {
+      restore(node, node.static);
+    },
+    Property(node) {
+      if (node.method) restore(node);
+    },
+    // Oxc moves private methods to standalone functions when targeting ES2016.
+    FunctionDeclaration(node) {
+      restore(node);
+    },
+  }).visit(program);
+  if (restored !== expected) {
+    throw new Error(
+      `do-runtime: Oxc preserved ${restored}/${expected} async-method markers; review async identity preservation`,
+    );
+  }
+  return source.toString();
+}
+
 /** Rewrite syntactic awaits in selected actor-bundled modules to re-enter their input gate. */
 export function doRuntimeAwaitTransform(options?: DoRuntimeAwaitTransformOptions): Plugin {
   const filter = createFilter(options?.include, [
@@ -162,8 +204,26 @@ export function doRuntimeAwaitTransform(options?: DoRuntimeAwaitTransformOptions
 
       const source = new MagicString(code);
       let transformed = false;
+      let asyncMethods = 0;
+      const markAsyncMethod = (node: ESTree.Node, value: ESTree.Node) => {
+        if (
+          options?.asyncContext &&
+          value.type === "FunctionExpression" &&
+          value.async &&
+          !value.generator
+        ) {
+          source.prependLeft(node.start, `${ASYNC_METHOD} `);
+          asyncMethods += 1;
+        }
+      };
       const program = this.parse(code);
       new Visitor({
+        MethodDefinition(node) {
+          markAsyncMethod(node, node.value);
+        },
+        Property(node) {
+          if (node.method) markAsyncMethod(node, node.value);
+        },
         AwaitExpression(node) {
           source.prependLeft(node.start, "__resumeAwait((");
           source.prependLeft(node.argument.start, "__gateAwait((");
@@ -193,12 +253,18 @@ export function doRuntimeAwaitTransform(options?: DoRuntimeAwaitTransformOptions
         source.appendLeft(insertionPoint, 'import "@mcp-b/do-runtime/browser/async-hooks";\n');
         // Native await never calls Promise.prototype.then. Oxc's generator
         // helpers do, making each continuation an ordinary bound callback.
-        return await transformWithOxc(
+        const lowered = await transformWithOxc(
           source.toString(),
           id,
           { target: "es2016", lang: "js" },
           source.generateMap({ hires: "boundary", includeContent: true, source: id }),
         );
+        // No native await remains in these shells: promise adoption needs no user-code
+        // continuation. Preserve AsyncFunction identity used by RPC lifecycle dispatch.
+        if (asyncMethods > 0) {
+          lowered.code = restoreAsyncMethods(lowered.code, this.parse(lowered.code), asyncMethods);
+        }
+        return lowered;
       }
       return {
         code: source.toString(),

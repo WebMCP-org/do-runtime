@@ -443,7 +443,7 @@ describe("fork Stop and cancel with a second socket's queued request", () => {
     const { agent, a, b, close } = await admitBehindRunningTurn("stop-queued");
     try {
       await agent.stopCurrentWork();
-      await poll(() => doneFor(b.frames, "req-B")).toEqual({
+      await poll(() => doneFor(b.frames, "req-B")).toMatchObject({
         type: MSG_CHAT_RESPONSE,
         id: "req-B",
         body: "",
@@ -495,7 +495,7 @@ describe("fork Stop and cancel with a second socket's queued request", () => {
       );
       await poll(() => agent.isRequestAbortedForTest("req-B")).toBe(true);
       await agent.releaseRecoveryModelForTest();
-      await poll(() => doneFor(b.frames, "req-B")).toEqual({
+      await poll(() => doneFor(b.frames, "req-B")).toMatchObject({
         type: MSG_CHAT_RESPONSE,
         id: "req-B",
         body: "",

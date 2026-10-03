@@ -101,13 +101,14 @@ type Harness = {
   target: EventTarget;
 };
 
-async function mount(name: string): Promise<Harness> {
+async function mount(name: string, resume = true): Promise<Harness> {
   const { agent, sentMessages, target } = createFakeAgent(name);
 
   function TestComponent() {
     const chat = useAgentChat({
       agent,
       getInitialMessages: null,
+      resume,
       messages: [
         { id: "u1", parts: [{ text: "hi", type: "text" }], role: "user" }
       ] as UIMessage[]
@@ -123,6 +124,11 @@ async function mount(name: string): Promise<Harness> {
         <div data-testid="status">{chat.status}</div>
         <div data-testid="error">{String(chat.error?.message ?? "")}</div>
         <div data-testid="chars">{assistantText.length}</div>
+        <div data-testid="metadata">
+          {JSON.stringify(
+            chat.messages.find((m) => m.id === "asst-1")?.metadata
+          )}
+        </div>
       </div>
     );
   }
@@ -223,7 +229,8 @@ describe("#1913 — resume replay burst", () => {
     // A second disconnect can arrive before the coalescing window closes.
     // Content already received must not be lost — it was visible before the
     // batch existed, because each chunk was enqueued on arrival and a closed
-    // stream still yields whatever it has queued.
+    // stream still yields whatever it has queued. The close itself still
+    // surfaces as an interrupted turn (#2013).
     const h = await mount("replay-close");
     await vi.waitFor(() =>
       expect(countType(h.sentMessages, RESUME_REQUEST)).toBe(1)
@@ -243,7 +250,7 @@ describe("#1913 — resume replay burst", () => {
       error: h.read("error")
     }).toEqual({
       chars: String(expectedChars(120)),
-      error: ""
+      error: "WebSocket closed mid-stream"
     });
   });
 
@@ -280,6 +287,70 @@ describe("#1913 — resume replay burst", () => {
     });
   });
 
+  it.each([true, false])(
+    "keeps canonical metadata published before done (resume: %s)",
+    async (resume) => {
+      const h = await mount(`canonical-before-done-${resume}`, resume);
+      if (resume) {
+        await vi.waitFor(() =>
+          expect(countType(h.sentMessages, RESUME_REQUEST)).toBe(1)
+        );
+        dispatch(h.target, { id: "req-metadata", type: RESUMING });
+        await sleep(10);
+      }
+      for (const body of [
+        {
+          type: "start",
+          messageId: "asst-1",
+          messageMetadata: { status: "streaming" }
+        },
+        { type: "text-start", id: "t1" },
+        { type: "text-delta", id: "t1", delta: "hello" },
+        { type: "text-end", id: "t1" }
+      ])
+        dispatch(h.target, {
+          type: CHAT_RESPONSE,
+          id: "req-metadata",
+          body: JSON.stringify(body),
+          done: false
+        });
+      await vi.waitFor(() => expect(h.read("chars")).toBe("5"));
+      const metadata = {
+        status: "complete",
+        createdAt: "server-time",
+        durationMs: 42
+      };
+      dispatch(h.target, {
+        type: "cf_agent_chat_messages",
+        messages: [
+          { id: "u1", role: "user", parts: [{ type: "text", text: "hi" }] },
+          {
+            id: "asst-1",
+            role: "assistant",
+            parts: [{ type: "text", text: "hello" }],
+            metadata
+          }
+        ]
+      });
+      dispatch(h.target, {
+        type: CHAT_RESPONSE,
+        id: "req-metadata",
+        body: JSON.stringify({ type: "finish", finishReason: "stop" }),
+        done: false
+      });
+      dispatch(h.target, {
+        type: CHAT_RESPONSE,
+        id: "req-metadata",
+        body: "",
+        done: true
+      });
+      await vi.waitFor(() => {
+        expect(h.read("status")).toBe("ready");
+        expect(JSON.parse(h.read("metadata") ?? "null")).toEqual(metadata);
+      });
+    }
+  );
+
   it("delivers live chunks after a replayed burst in order", async () => {
     const h = await mount("replay-then-live");
     await vi.waitFor(() =>
@@ -300,7 +371,8 @@ describe("#1913 — resume replay burst", () => {
       replayComplete: true,
       type: CHAT_RESPONSE
     });
-    // Replayed prefix paints without any live chunk triggering another update.
+    // Replayed prefix is applied at the boundary, before any live chunk is
+    // sent. It renders on the chat throttle's schedule, so wait for it.
     await vi.waitFor(() =>
       expect(h.read("chars")).toBe(String(expectedChars(80)))
     );

@@ -7,7 +7,12 @@ if (typeof version !== "string" || !/^\d+\.\d+\.\d+$/.test(version)) {
   throw new Error("package.json must pin workerd to an exact release");
 }
 const typesVersion = `5.${version.split(".").slice(1).join(".")}`;
-for (const path of ["package.json", "examples/extension/package.json", "examples/vibe-platform/package.json"]) {
+for (const path of [
+  "package.json",
+  "vendor/agents/package.json",
+  "examples/extension/package.json",
+  "examples/vibe-platform/package.json",
+]) {
   const manifest = JSON.parse(await readFile(new URL(path, root), "utf8"));
   if (manifest.devDependencies?.["@cloudflare/workers-types"] !== typesVersion) {
     throw new Error(`${path} must pin @cloudflare/workers-types to ${typesVersion}`);

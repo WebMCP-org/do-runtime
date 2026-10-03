@@ -1,5 +1,6 @@
 import { fileURLToPath } from "node:url";
 import { workersModuleAliases } from "@mcp-b/do-runtime/vite";
+import nodeStdlib from "node-stdlib-browser";
 import { defineConfig } from "vite";
 
 const repoRoot = fileURLToPath(new URL("../../", import.meta.url));
@@ -30,6 +31,17 @@ const crossOriginIsolation = {
 };
 
 export default defineConfig({
+  define: { global: "globalThis", "process.env": "{}" },
+  worker: {
+    rollupOptions: {
+      transform: {
+        inject: {
+          process: nodeStdlib.process,
+          Buffer: [nodeStdlib.buffer, "Buffer"],
+        },
+      },
+    },
+  },
   resolve: {
     alias: [
       // The package's own `cloudflare:workers` and `cloudflare:email`, so
@@ -37,6 +49,11 @@ export default defineConfig({
       // identity, while authored source keeps the exact platform specifier it
       // will deploy with.
       ...workersModuleAliases(),
+      // Agents sessions hash stored content synchronously, including in browsers.
+      ...(["crypto", "buffer", "stream", "events"] as const).flatMap((name) => [
+        { find: name, replacement: nodeStdlib[name] },
+        { find: `node:${name}`, replacement: nodeStdlib[name] },
+      ]),
       { find: "node:async_hooks", replacement: "unenv/node/async_hooks" },
       { find: "node:diagnostics_channel", replacement: "unenv/node/diagnostics_channel" },
       { find: "node:os", replacement: "unenv/node/os" },

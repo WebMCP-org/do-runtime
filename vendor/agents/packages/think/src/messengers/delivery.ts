@@ -2,7 +2,11 @@ import { RpcTarget } from "cloudflare:workers";
 import type { FiberContext } from "agents";
 import { TextSegmentJoiner } from "agents/chat";
 import type { UIMessage } from "ai";
-import type { ChatStartEvent, StreamCallback } from "../think";
+import type {
+  ChatInterruptedInfo,
+  ChatStartEvent,
+  StreamCallback
+} from "../think";
 import type { MessengerEvent } from "./events";
 import { toMessengerUserMessage } from "./events";
 
@@ -18,11 +22,17 @@ export const INTERRUPTED_MESSENGER_RESPONSE =
 type Wake = () => void;
 
 export interface TextStreamCallbackOptions {
+  /**
+   * Streamed as the reply when a turn completes without text, so surfaces that
+   * wait for the first chunk before posting never post an empty message.
+   */
+  emptyText?: string;
   onVisibleStart?: () => Promise<void> | void;
   visibleSoftLimit?: number;
 }
 
 export class TextStreamCallback extends RpcTarget implements StreamCallback {
+  private readonly emptyText?: string;
   private readonly onVisibleStart?: () => Promise<void> | void;
   private readonly textSegmentJoiner = new TextSegmentJoiner();
   private readonly visibleChunks: string[] = [];
@@ -32,6 +42,7 @@ export class TextStreamCallback extends RpcTarget implements StreamCallback {
   private closed = false;
   private completed = false;
   private interrupted = false;
+  private recoveredReplyDelivered = false;
   private error?: Error;
   private text = "";
   private visibleClosed = false;
@@ -41,6 +52,7 @@ export class TextStreamCallback extends RpcTarget implements StreamCallback {
 
   constructor(options: TextStreamCallbackOptions = {}) {
     super();
+    this.emptyText = options.emptyText;
     this.onVisibleStart = options.onVisibleStart;
     this.visibleSoftLimit = options.visibleSoftLimit;
   }
@@ -65,25 +77,38 @@ export class TextStreamCallback extends RpcTarget implements StreamCallback {
 
   onDone(): void {
     this.completed = true;
-    this.close();
+    this.complete();
   }
 
   onError(error: string): void {
     this.fail(new Error(error));
   }
 
-  onInterrupted(): void {
+  onInterrupted(info?: ChatInterruptedInfo): void {
     // The attempt was interrupted and a continuation (not this callback) owns
-    // the real answer — delivered only to WebSocket connections, never to this
-    // surface. Mark interrupted and stop the visible stream WITHOUT failing it,
-    // so delivery surfaces the interrupted apology instead of treating the
-    // partial as the final reply (#1644).
+    // the real answer. Mark interrupted and stop the visible stream WITHOUT
+    // failing it, so delivery does not treat the partial as the final reply
+    // (#1644).
     this.interrupted = true;
+    this.recoveredReplyDelivered = info?.deliversRecoveredReply === true;
     this.close();
   }
 
   wasInterrupted(): boolean {
     return this.interrupted;
+  }
+
+  /** Whether the target posts the recovered reply to the thread itself. */
+  targetDeliversRecoveredReply(): boolean {
+    return this.recoveredReplyDelivered;
+  }
+
+  /** Ends a completed turn, streaming `emptyText` if it produced no text. */
+  complete(): void {
+    if (!this.closed && this.emptyText !== undefined && !this.hasText()) {
+      this.visibleChunks.push(this.emptyText);
+    }
+    this.close();
   }
 
   close(): void {
@@ -105,6 +130,20 @@ export class TextStreamCallback extends RpcTarget implements StreamCallback {
 
   wasCompleted(): boolean {
     return this.completed;
+  }
+
+  /**
+   * Resolves `true` once there is visible text to post, or `false` when the
+   * stream ends without any, so a caller can avoid posting an empty reply.
+   */
+  async hasVisibleOutput(): Promise<boolean> {
+    while (true) {
+      if (this.visibleChunks.length > 0) return true;
+      if (this.error || this.closed || this.visibleClosed) return false;
+      await new Promise<void>((resolve) => {
+        this.wakeups.push(resolve);
+      });
+    }
   }
 
   remainingText(): string {
@@ -415,7 +454,30 @@ export interface MessengerDeliveryPolicy {
     surface: MessengerDeliverySurface
   ): Promise<void> | void;
   splitText?(text: string): string[];
+  /**
+   * How often, in milliseconds, the typing indicator is re-sent until the
+   * reply's first text is posted. Platforms expire the indicator after a few
+   * seconds. `0` sends it once.
+   * @default 4000
+   */
+  typingRefreshMs?: number;
   visibleSoftLimit?: number;
+}
+
+const DEFAULT_TYPING_REFRESH_MS = 4_000;
+/** Longest the reply waits on a typing request an adapter never settles. */
+const TYPING_SETTLE_TIMEOUT_MS = 1_000;
+
+async function settleTyping(pending: Promise<void> | undefined) {
+  if (!pending) return;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    pending,
+    new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, TYPING_SETTLE_TIMEOUT_MS);
+    })
+  ]);
+  clearTimeout(timer);
 }
 
 export interface DeliverMessengerReplyOptions {
@@ -448,6 +510,7 @@ export async function deliverMessengerReply(
     });
 
   const callback = new TextStreamCallback({
+    emptyText: emptyResponseText,
     onVisibleStart: async () => {
       await checkpoint(
         messengerReplySnapshot(
@@ -459,8 +522,44 @@ export async function deliverMessengerReply(
     },
     visibleSoftLimit: options.policy?.visibleSoftLimit
   });
-  const post = options.surface
-    .post(callback.stream())
+
+  // The typing indicator is cosmetic: a failure to show it must not stop the
+  // turn. It is re-sent until the reply's first text is posted, one request
+  // at a time so a slow one cannot land after the post and re-show it.
+  let typingInFlight: Promise<void> | undefined;
+  let typingStopped = false;
+  const sendTyping = (): Promise<void> => {
+    if (typingStopped) return Promise.resolve();
+    typingInFlight ??= (async () => {
+      try {
+        await options.surface.startTyping?.("Thinking...");
+      } catch (error) {
+        console.warn("[Think] Messenger typing indicator failed", error);
+      } finally {
+        typingInFlight = undefined;
+      }
+    })();
+    return typingInFlight;
+  };
+  const typingRefreshMs =
+    options.policy?.typingRefreshMs ?? DEFAULT_TYPING_REFRESH_MS;
+  let typingTimer: ReturnType<typeof setInterval> | undefined;
+  const stopTyping = () => {
+    typingStopped = true;
+    clearInterval(typingTimer);
+    typingTimer = undefined;
+  };
+
+  // Posting waits for the first visible text: a stream that ends without any
+  // (an interrupted turn, a failure) would otherwise post a blank message
+  // ahead of the apology on adapters without native streaming.
+  const post = callback
+    .hasVisibleOutput()
+    .then(async (visible) => {
+      stopTyping();
+      await settleTyping(typingInFlight);
+      return visible ? options.surface.post(callback.stream()) : undefined;
+    })
     .catch(async (error: unknown) => {
       if (options.policy?.isExpectedDeliveryCompletion?.(error, callback)) {
         return;
@@ -477,7 +576,10 @@ export async function deliverMessengerReply(
     });
 
   try {
-    await options.surface.startTyping?.("Thinking...");
+    if (options.surface.startTyping && typingRefreshMs > 0) {
+      typingTimer = setInterval(() => void sendTyping(), typingRefreshMs);
+    }
+    await settleTyping(sendTyping());
     const userMessage =
       options.userMessage ?? toMessengerUserMessage(options.event);
     await options.target.chatWithMessengerDelivery(
@@ -488,16 +590,18 @@ export async function deliverMessengerReply(
     );
     if (callback.wasInterrupted()) {
       // The model turn was interrupted and routed into bounded recovery; the
-      // recovered answer is produced later by a scheduled continuation and
-      // broadcast only to WebSocket connections, NOT to this one-shot messenger
-      // delivery. Do NOT mark the turn complete or finalize the truncated
-      // partial as the reply — surface the interrupted apology so the user
-      // knows to retry (#1644). `completedModelTurn` stays false.
+      // recovered answer is produced later by a scheduled continuation. Do NOT
+      // mark the turn complete or finalize the truncated partial as the reply
+      // (#1644). When the target posts the recovered answer (or the apology,
+      // if recovery gives up) itself, stay quiet (#2106); otherwise surface
+      // the interrupted apology so the user knows to retry.
       callback.close();
-      await post.catch(() => undefined);
-      await options.surface
-        .post(interruptedResponseText)
-        .catch(() => undefined);
+      const streamRejected = await post.then(
+        () => false,
+        () => true
+      );
+      // Checkpoint before the post: a reset after it must not let recovery
+      // (which apologizes for a `streaming` snapshot) post a second apology.
       await checkpoint(
         messengerReplySnapshot(
           "completed",
@@ -505,14 +609,25 @@ export async function deliverMessengerReply(
           options.snapshotThread
         )
       );
+      if (callback.targetDeliversRecoveredReply()) {
+        // The target subtracts every streamed character from the recovered
+        // reply, including any past `visibleSoftLimit` or in a rejected
+        // stream post, so post that text now.
+        for (const chunk of options.policy?.splitText?.(
+          streamRejected ? callback.textSoFar() : callback.remainingText()
+        ) ?? []) {
+          await options.surface.post(chunk).catch(() => undefined);
+        }
+        return;
+      }
+      await options.surface
+        .post(interruptedResponseText)
+        .catch(() => undefined);
       return;
     }
     completedModelTurn = true;
-    callback.close();
+    callback.complete();
     await post;
-    if (!callback.hasText()) {
-      await options.surface.post(emptyResponseText);
-    }
     for (const chunk of options.policy?.splitText?.(callback.remainingText()) ??
       []) {
       await options.surface.post(chunk);
@@ -550,17 +665,13 @@ export async function deliverMessengerReply(
       return;
     }
 
+    await checkpoint(
+      messengerReplySnapshot("completed", snapshotEvent, options.snapshotThread)
+    );
     if (failureMode === "apologize") {
       await options.surface
         .post(interruptedResponseText)
         .catch(() => undefined);
-      await checkpoint(
-        messengerReplySnapshot(
-          "completed",
-          snapshotEvent,
-          options.snapshotThread
-        )
-      );
       return;
     }
 
@@ -569,9 +680,8 @@ export async function deliverMessengerReply(
         markdown: errorResponseText
       })
       .catch(() => undefined);
-    await checkpoint(
-      messengerReplySnapshot("completed", snapshotEvent, options.snapshotThread)
-    );
+  } finally {
+    stopTyping();
   }
 }
 

@@ -406,8 +406,10 @@ describe("awaited agent-tool cancellation at the child boundary", () => {
           .toBeGreaterThan(changes);
         expect(await parent.resultForTest("recovery")).toBeNull();
         await parent.releaseReplayReadForTest("run");
+        // Milestone replay now performs its own read-only inspection. The
+        // child still holds it, so the bounded two-second replay read expires.
         await expect
-          .poll(() => parent.resultForTest("recovery"))
+          .poll(() => parent.resultForTest("recovery"), { timeout: 4_000 })
           .toMatchObject({
             status: "interrupted",
             reason: "window-exceeded",

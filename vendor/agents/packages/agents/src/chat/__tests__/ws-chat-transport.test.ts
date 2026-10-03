@@ -67,7 +67,12 @@ describe("WebSocketChatTransport unacknowledged request replay", () => {
     agent.close();
     const stream = await resumed;
     expect(stream).not.toBeNull();
-    await expect(stream!.getReader().read()).resolves.toEqual({
+    const reader = stream!.getReader();
+    await expect(reader.read()).resolves.toEqual({
+      done: false,
+      value: { type: "error", errorText: "WebSocket closed mid-stream" }
+    });
+    await expect(reader.read()).resolves.toEqual({
       done: true,
       value: undefined
     });

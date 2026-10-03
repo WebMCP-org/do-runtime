@@ -1,7 +1,10 @@
 import { applyChunkToParts, type MessagePart } from "./message-builder";
+import { isChunkTooLargeToStore } from "./chunk-size";
 import {
   AGENT_TOOL_MILESTONE_PART,
-  AGENT_TOOL_PROGRESS_PART
+  AGENT_TOOL_PROGRESS_PART,
+  isAgentToolLifecycleChunk,
+  isPositionlessAgentToolChunk
 } from "../agent-tool-types";
 import type {
   AgentToolEventMessage,
@@ -194,10 +197,14 @@ export class AgentToolProgressEmitter {
       ...(typeof progress.phase === "string" ? { phase: progress.phase } : {}),
       ...(progress.data !== undefined ? { data: progress.data } : {})
     };
+    // Identical payloads must not dedupe against each other on a client that
+    // keeps seen keys for its connection's lifetime, including across a child
+    // restart, so the id is unique rather than a per-instance counter.
     this.hooks.broadcast(
       requestId,
       JSON.stringify({
         type: AGENT_TOOL_PROGRESS_PART,
+        id: crypto.randomUUID(),
         transient: true,
         data: { ...wire, at: now }
       })
@@ -277,11 +284,18 @@ function emptyRun<Part extends AgentToolRunPart>(
   return undefined;
 }
 
+// Live-only oversized chunks cannot be recovered from a persisted snapshot.
+// Keep their positions on the immutable client projection, without exposing
+// the retained raw payload in serialized public state.
+const retainedUnstored = Symbol("retainedUnstored");
+type RetainedUnstored = { [retainedUnstored]?: AgentToolStoredChunk[] };
+
 function applyToRun<Part extends AgentToolRunPart>(
   prev: AgentToolRunState<Part> | undefined,
   message: AgentToolEventMessage
 ): AgentToolRunState<Part> | undefined {
-  const seeded = prev ?? emptyRun(message);
+  let seeded: (AgentToolRunState<Part> & RetainedUnstored) | undefined =
+    prev ?? emptyRun(message);
   const { event } = message;
 
   switch (event.kind) {
@@ -312,7 +326,14 @@ function applyToRun<Part extends AgentToolRunPart>(
             progress: undefined,
             milestones: undefined
           };
-          for (const chunk of replay.chunks) {
+          const chunks = [
+            ...(seeded?.[retainedUnstored] ?? []),
+            ...replay.chunks.map((chunk, index) => ({
+              ...chunk,
+              sequence: index + 1
+            }))
+          ].sort((a, b) => a.sequence - b.sequence);
+          for (const chunk of chunks) {
             next =
               applyToRun(next, {
                 ...message,
@@ -375,6 +396,22 @@ function applyToRun<Part extends AgentToolRunPart>(
         parsed = JSON.parse(event.body);
       } catch {
         return seeded;
+      }
+      if (event.unstoredId !== undefined) {
+        const retained = seeded[retainedUnstored] ?? [];
+        if (retained.some((chunk) => chunk.unstoredId === event.unstoredId))
+          return seeded;
+        seeded = {
+          ...seeded,
+          [retainedUnstored]: [
+            ...retained,
+            {
+              sequence: message.sequence,
+              body: event.body,
+              unstoredId: event.unstoredId
+            }
+          ]
+        };
       }
       const milestone = readAgentToolMilestoneChunk(parsed);
       // Deduplicate before the generic data-part reducer appends anything.
@@ -484,6 +521,54 @@ export function createAgentToolEventState<
   };
 }
 
+/**
+ * Identity of an agent-tool event for replay-vs-live dedupe. Ordinary chunks
+ * key on the broadcast `sequence`, which is their stored-chunk position on
+ * both the live and replay paths. Lifecycle events key on their content: a
+ * reattached run can be interrupted again with a different reason, and the
+ * reducer overwrites on lifecycle events, so re-applying one is harmless.
+ * Milestones key on their own persisted sequence. Progress frames and chunks
+ * too large to store reuse the next stored chunk's sequence without consuming
+ * it and are never replayed, so they key on their own emitter-assigned id.
+ */
+export function agentToolEventDedupeKey(
+  message: AgentToolEventMessage
+): string {
+  const { event } = message;
+  let identity: string;
+  if (event.kind !== "chunk") {
+    identity = `event:${JSON.stringify(event)}`;
+  } else if (event.unstoredId !== undefined) {
+    identity = `unstored:${event.unstoredId}`;
+  } else {
+    let milestone: AgentToolMilestone | undefined;
+    let progressId: string | undefined;
+    let progress = false;
+    if (
+      event.body.includes(AGENT_TOOL_MILESTONE_PART) ||
+      event.body.includes(AGENT_TOOL_PROGRESS_PART)
+    ) {
+      try {
+        const parsed: unknown = JSON.parse(event.body);
+        milestone = readAgentToolMilestoneChunk(parsed);
+        progress = readAgentToolProgressChunk(parsed) !== undefined;
+        const id = (parsed as { id?: unknown }).id;
+        if (typeof id === "string") progressId = id;
+      } catch {
+        milestone = undefined;
+      }
+    }
+    identity = milestone
+      ? `milestone:${milestone.sequence}`
+      : progress
+        ? progressId !== undefined
+          ? `progress:${progressId}`
+          : `progress:${message.sequence}:${event.body}`
+        : `seq:${message.sequence}`;
+  }
+  return [message.parentToolCallId ?? "", event.runId, identity].join("\0");
+}
+
 export function applyAgentToolEvent<
   Part extends AgentToolRunPart = AgentToolRunPart
 >(
@@ -523,6 +608,8 @@ export function applyAgentToolEvent<
   return { ...state, runsById, ...rebuildIndexes(runsById) };
 }
 
+export { isPositionlessAgentToolChunk };
+
 export type {
   AgentToolEvent,
   AgentToolCollectionMessage,
@@ -542,7 +629,8 @@ export interface AgentToolBroadcastHooks {
   /** Live tailers per run; iterated to forward each progress chunk. */
   forwarders: Map<string, Set<(chunk: AgentToolStoredChunk) => void>>;
   /**
-   * Per-run forwarded-chunk counter; advanced even with no tailer attached.
+   * Per-run live counter of stored chunks; advanced even with no tailer
+   * attached, so a stored chunk's live sequence equals its stored chunk_index.
    *
    * This is deliberately a SEPARATE counter from the resumable stream's stored
    * chunk_index — do NOT try to "simplify" it away by sequencing off the store
@@ -561,10 +649,22 @@ export interface AgentToolBroadcastHooks {
   epoch?: string;
   /** Per-run last error body, captured for replay to a late-attaching tailer. */
   lastErrors: Map<string, string>;
+  /**
+   * Called after a run's error body is captured, so the host can record it
+   * durably on the still-open run row (the in-memory {@link lastErrors} entry
+   * is lost if the DO is evicted before the run is finalized).
+   */
+  onError?: (runId: string, body: string) => void;
   /** The host's use-chat-response wire type (`CHAT_MESSAGE_TYPES.USE_CHAT_RESPONSE`). */
   responseType: string;
   /** Resolve the agent-tool run that owns a turn request id, or null. */
   runForRequest: (requestId: string) => string | null;
+  /**
+   * Runs whose chunks the host suppresses (`eventDelivery: "terminal"`). Keeps
+   * inspection on after a restart empties the other maps, so a recovered
+   * turn's chunks are still attributed and suppressed.
+   */
+  terminalOnlyRuns?: ReadonlySet<string>;
 }
 
 /**
@@ -579,13 +679,18 @@ export interface AgentToolBroadcastHooks {
  * error capture never depends on tailer timing. A frame belongs to a run iff it
  * carries that run's turn request id, so concurrent runs can't cross-contaminate
  * each other's progress or error state.
+ *
+ * Returns the run id when the frame is one of that run's content chunks, so a
+ * host can skip broadcasting chunks no client is watching.
  */
 export function interceptAgentToolBroadcast(
   msg: string | ArrayBuffer | ArrayBufferView,
   hooks: AgentToolBroadcastHooks
-): void {
+): string | null {
   if (
-    (hooks.forwarders.size > 0 || hooks.liveSequences.size > 0) &&
+    (hooks.forwarders.size > 0 ||
+      hooks.liveSequences.size > 0 ||
+      (hooks.terminalOnlyRuns?.size ?? 0) > 0) &&
     typeof msg === "string"
   ) {
     try {
@@ -600,17 +705,22 @@ export function interceptAgentToolBroadcast(
         if (runId !== null) {
           if (parsed.error === true && typeof parsed.body === "string") {
             hooks.lastErrors.set(runId, parsed.body);
+            hooks.onError?.(runId, parsed.body);
           } else if (
             typeof parsed.body === "string" &&
             parsed.body.length > 0
           ) {
-            // Advance the live sequence even with no tailer attached so a tailer
-            // registering mid-run resumes at the right offset.
+            // Every emitted frame advances the live cursor, including frames
+            // absent from storage; atomic replay uses this separate boundary.
             const sequence = hooks.liveSequences.get(runId) ?? 0;
             hooks.liveSequences.set(runId, sequence + 1);
             const chunk: AgentToolStoredChunk = {
               sequence,
               body: parsed.body,
+              ...(!isAgentToolLifecycleChunk(parsed.body) &&
+              isChunkTooLargeToStore(parsed.body)
+                ? { unstoredId: crypto.randomUUID() }
+                : {}),
               ...(hooks.epoch !== undefined && {
                 cursor: { epoch: hooks.epoch, sequence }
               })
@@ -619,6 +729,7 @@ export function interceptAgentToolBroadcast(
             if (forwarders) {
               for (const forward of forwarders) forward(chunk);
             }
+            return runId;
           }
         }
       }
@@ -626,4 +737,5 @@ export function interceptAgentToolBroadcast(
       // Non-chat frames pass through unchanged.
     }
   }
+  return null;
 }

@@ -47,7 +47,8 @@ import {
 import {
   CF_SUB_AGENT_OUTER_URL_KEY,
   CF_SUB_AGENT_TAGS_KEY,
-  SUB_AGENT_OUTER_URL_HEADER
+  SUB_AGENT_OUTER_URL_HEADER,
+  rejectSubAgentWebSocket
 } from "./dynamic-agents/dynamic-agents";
 import { logicalNameFromPathV2Identity } from "./dynamic-agents/identity";
 import { DynamicAgentsInternal } from "./dynamic-agents/dynamic-agents";
@@ -195,7 +196,8 @@ export {
 import {
   agentToolRunMayExecute,
   AGENT_TOOL_MILESTONE_PART,
-  AGENT_TOOL_PROGRESS_PART
+  AGENT_TOOL_PROGRESS_PART,
+  isAgentToolLifecycleChunk
 } from "./agent-tool-types";
 import type {
   AgentToolCancellationResult,
@@ -229,6 +231,7 @@ export type {
   AgentToolCollectionState,
   AgentToolDisplayMetadata,
   AgentToolEvent,
+  AgentToolEventDelivery,
   AgentToolEventMessage,
   AgentToolEventState,
   AgentToolFailure,
@@ -697,9 +700,9 @@ const FIBER_RECOVERY_BACKOFF_MAX_EXP = 20;
 // budget abandoned healthy, still-advancing children); only a genuinely
 // silent/hung child seals `interrupted` after a full no-progress window.
 const DEFAULT_AGENT_TOOL_REATTACH_NO_PROGRESS_TIMEOUT_MS = 120_000;
-// Optional hard wall-clock ceiling on a single re-attach. Defaults to NO cap,
-// mirroring chat-recovery's `maxRecoveryWork: Infinity` (#1672): the SDK does
-// not impose an implicit wall-clock bound on a child that keeps making forward
+// Optional hard wall-clock ceiling on a single re-attach. Defaults to NO cap
+// (#1672): the SDK does not impose an implicit wall-clock bound on a child that
+// keeps making forward
 // progress — a re-attached parent follows a healthy, still-streaming child for
 // as long as it advances, exactly as it would on the live (never-evicted) path.
 // A hung/silent child is already bounded by the progress-keyed no-progress
@@ -763,7 +766,7 @@ type AgentToolRecoveryInspection =
  * every capability uses for its own schema version) and checks it on wake to
  * skip DDL on established DOs.
  */
-const CURRENT_SCHEMA_VERSION = 11;
+const CURRENT_SCHEMA_VERSION = 14;
 const SCHEMA_VERSION_KEY = "cf_agents:schema_version";
 
 // Before the State capability owned `cf_agents_state`, Agent kept its schema
@@ -875,9 +878,9 @@ export const DEFAULT_AGENT_STATIC_OPTIONS = {
   /**
    * Optional hard wall-clock ceiling (ms) on a single agent-tool re-attach
    * (#1630). Caps the total wait even as the no-progress budget re-arms across
-   * stream-closes. Defaults to `Infinity` (no implicit cap), mirroring
-   * chat-recovery's `maxRecoveryWork` (#1672): a healthy, still-advancing child
-   * is followed for as long as it makes progress — a hung child is bounded by
+   * stream-closes. Defaults to `Infinity` (no implicit cap, #1672): a healthy,
+   * still-advancing child is followed for as long as it makes progress — a
+   * hung child is bounded by
    * the no-progress budget, and a content-runaway by the child's own
    * `maxRecoveryWork` / `shouldKeepRecovering`. Set a finite value to impose a
    * wall-clock cap (which also tears the child down on `window-exceeded`).
@@ -966,9 +969,9 @@ export interface AgentStaticOptions {
   /**
    * Optional hard wall-clock ceiling in milliseconds on a single agent-tool
    * re-attach (#1630). Caps the total wait even as the no-progress budget
-   * re-arms across stream-closes. Default: `Infinity` (no implicit cap),
-   * mirroring chat-recovery's `maxRecoveryWork` (#1672) — a healthy,
-   * still-advancing child is followed for as long as it makes progress, exactly
+   * re-arms across stream-closes. Default: `Infinity` (no implicit cap,
+   * #1672) — a healthy, still-advancing child is followed for as long as it
+   * makes progress, exactly
    * as on the live (never-evicted) path. Set a finite value to impose a
    * wall-clock cap (which also tears the child down on `window-exceeded`); `0`
    * also disables the ceiling.
@@ -1023,12 +1026,18 @@ export const getCurrentAgent = getCurrentLifecycleAgent as <
   T extends DurableObject = Agent<Cloudflare.Env>
 >() => CurrentAgentContext<T, AgentEmail>;
 
-const originalAgentMethods = new WeakMap<Function, Function>();
+/** Functions produced by {@link withAgentContext}, so they are wrapped once. */
+const agentContextWrappers = new WeakSet<Function>();
 
 /**
  * Restore Agent context when a public method is entered outside a Lifecycle
  * hook, notably through native Durable Object RPC or cross-Agent re-entry.
  * Lifecycle already owns context for its capability and semantic user hooks.
+ *
+ * Native RPC bypasses the lifecycle's runtime handlers, so an `async` method
+ * entered from outside this Agent's context first starts the lifecycle when
+ * the call is the one that wakes a cold instance. Synchronous methods are
+ * never deferred, so they keep their synchronous return type.
  */
 
 // oxlint-disable-next-line @typescript-eslint/no-explicit-any -- generic callable constraint
@@ -1038,7 +1047,7 @@ function withAgentContext<T extends (...args: any[]) => any>(
   this: Agent<Cloudflare.Env, unknown>,
   ...args: Parameters<T>
 ) => ReturnType<T> {
-  const wrappedMethod = function (
+  const enter = function (
     this: Agent<Cloudflare.Env, unknown>,
     ...args: Parameters<T>
   ): ReturnType<T> {
@@ -1063,11 +1072,27 @@ function withAgentContext<T extends (...args: any[]) => any>(
     );
   };
 
-  originalAgentMethods.set(
-    wrappedMethod,
-    originalAgentMethods.get(method) ?? method
-  );
-  return wrappedMethod;
+  // A browser build lowers async arrows, so deriving the constructor from an
+  // async-arrow sentinel would also classify synchronous functions as async.
+  if (Object.prototype.toString.call(method) !== "[object AsyncFunction]") {
+    agentContextWrappers.add(enter);
+    return enter;
+  }
+
+  const enterStarted = async function (
+    this: Agent<Cloudflare.Env, unknown>,
+    ...args: Parameters<T>
+  ): Promise<unknown> {
+    if (getCurrentAgent().agent !== this && !this.lifecycle.isStarted()) {
+      await this.lifecycle.start();
+    }
+    return enter.apply(this, args);
+  };
+  agentContextWrappers.add(enterStarted);
+  return enterStarted as unknown as (
+    this: Agent<Cloudflare.Env, unknown>,
+    ...args: Parameters<T>
+  ) => ReturnType<T>;
 }
 
 /**
@@ -1093,7 +1118,7 @@ type WorkflowName<E> = WorkflowBinding<E> | (string & {});
 export class Agent<
   Env extends Cloudflare.Env = Cloudflare.Env,
   TState = unknown,
-  Props extends Record<string, unknown> = Record<string, unknown>
+  Props extends object = object
 > extends DurableObject<Env> {
   /**
    * Runtime lifecycle and reusable durable capabilities for this Agent.
@@ -1640,7 +1665,10 @@ export class Agent<
           id TEXT PRIMARY KEY NOT NULL,
           name TEXT NOT NULL,
           snapshot TEXT,
-          created_at INTEGER NOT NULL
+          created_at INTEGER NOT NULL,
+          completed_at INTEGER,
+          outcome TEXT,
+          error_message TEXT
         )
       `;
 
@@ -1787,6 +1815,23 @@ export class Agent<
       // reconcile can deliver them after eviction, not only the warm tail.
       addColumnIfNotExists(
         "ALTER TABLE cf_agent_tool_runs ADD COLUMN detached_on_milestones TEXT"
+      );
+      // A legacy fiber body that settled whose row delete then failed. Recovery
+      // deletes it without calling `onFiberRecovered()` (#2305).
+      addColumnIfNotExists(
+        "ALTER TABLE cf_agents_runs ADD COLUMN completed_at INTEGER"
+      );
+      // How that settled body ended, so recovery settles a managed ledger
+      // whose own settle write failed with the body's real outcome.
+      addColumnIfNotExists(
+        "ALTER TABLE cf_agents_runs ADD COLUMN outcome TEXT"
+      );
+      addColumnIfNotExists(
+        "ALTER TABLE cf_agents_runs ADD COLUMN error_message TEXT"
+      );
+      // `runAgentTool({ eventDelivery: "terminal" })`: NULL means "full".
+      addColumnIfNotExists(
+        "ALTER TABLE cf_agent_tool_runs ADD COLUMN event_delivery TEXT"
       );
 
       // Mark schema as up-to-date
@@ -2263,6 +2308,18 @@ export class Agent<
           // connection. When disabled, no identity/state/MCP text frames
           // are sent — useful for binary-only clients (e.g. MQTT devices).
           if (this.shouldSendProtocolMessages(connection, ctx)) {
+            const wasExcludedFromStateInitBroadcast =
+              this._protocolBroadcastExcludeIds.has(connection.id);
+            let currentState: TState | undefined;
+            this._protocolBroadcastExcludeIds.add(connection.id);
+            try {
+              currentState = this.state;
+            } finally {
+              if (!wasExcludedFromStateInitBroadcast) {
+                this._protocolBroadcastExcludeIds.delete(connection.id);
+              }
+            }
+
             // Send agent identity first so client knows which instance it's connected to
             // Can be disabled via static options for security-sensitive instance names
             if (this._resolvedOptions.sendIdentityOnConnect) {
@@ -2295,25 +2352,11 @@ export class Agent<
               }
               // Agent's public identity: the logical name (a facet's routed
               // name is an internal encoding of it) and the exported class.
-              this._webSockets.sendIdentity(connection, {
+              this._webSockets.sendConnectFrames(connection, {
                 name: this.name,
                 agent: camelCaseToKebabCase(this._ParentClass.name)
               });
-            }
-
-            const wasExcludedFromStateInitBroadcast =
-              this._protocolBroadcastExcludeIds.has(connection.id);
-            let currentState: TState | undefined;
-            this._protocolBroadcastExcludeIds.add(connection.id);
-            try {
-              currentState = this.state;
-            } finally {
-              if (!wasExcludedFromStateInitBroadcast) {
-                this._protocolBroadcastExcludeIds.delete(connection.id);
-              }
-            }
-
-            if (currentState !== undefined) {
+            } else if (currentState !== undefined) {
               this._webSockets.sendState(connection);
             }
 
@@ -2967,14 +3010,6 @@ export class Agent<
     }
   }
 
-  /** @internal Compare a method with its base implementation before automatic context wrapping. */
-  protected _isAgentMethodOverride(
-    method: Function,
-    baseMethod: Function
-  ): boolean {
-    return (originalAgentMethods.get(method) ?? method) !== baseMethod;
-  }
-
   /**
    * Wrap public subclass methods that may be entered outside Lifecycle, such as
    * native Durable Object RPC. Lifecycle hooks already have Agent context.
@@ -2993,12 +3028,16 @@ export class Agent<
         proto = Object.getPrototypeOf(proto);
       }
     }
-    // Get all methods from the current instance's prototype chain
+    // The nearest descriptor for a name is authoritative: a subclass getter
+    // or field that shadows an inherited method must not be replaced by a
+    // wrapper around the inherited method.
+    const seen = new Set<string>();
     let proto = Object.getPrototypeOf(this);
-    let depth = 0;
-    while (proto && proto !== Object.prototype && depth < 10) {
+    while (proto && proto !== Agent.prototype && proto !== Object.prototype) {
       const methodNames = Object.getOwnPropertyNames(proto);
       for (const methodName of methodNames) {
+        if (seen.has(methodName)) continue;
+        seen.add(methodName);
         const descriptor = Object.getOwnPropertyDescriptor(proto, methodName);
 
         // Skip if it's a private method, a base method, a getter, or not a function,
@@ -3007,25 +3046,22 @@ export class Agent<
           methodName.startsWith("_") ||
           !descriptor ||
           !!descriptor.get ||
-          typeof descriptor.value !== "function"
+          typeof descriptor.value !== "function" ||
+          agentContextWrappers.has(descriptor.value)
         ) {
           continue;
         }
 
-        // Now, methodName is confirmed to be a custom method/function
-        // Wrap the custom method with context
+        const method = descriptor.value as Function;
         /* oxlint-disable @typescript-eslint/no-explicit-any -- dynamic method wrapping requires any */
         const wrappedFunction = withAgentContext(
-          this[methodName as keyof this] as (...args: any[]) => any
+          method as (...args: any[]) => any
         ) as any;
         /* oxlint-enable @typescript-eslint/no-explicit-any */
 
         // if the method is callable, copy the metadata from the original method
         if (this._isCallable(methodName)) {
-          copyCallableMetadata(
-            this[methodName as keyof this] as Function,
-            wrappedFunction
-          );
+          copyCallableMetadata(method, wrappedFunction);
         }
 
         // set the wrapped function on the prototype
@@ -3033,7 +3069,6 @@ export class Agent<
       }
 
       proto = Object.getPrototypeOf(proto);
-      depth++;
     }
   }
 
@@ -3196,10 +3231,11 @@ export class Agent<
   }
 
   /** Single native-RPC aperture for routed Lifecycle capabilities. */
-  _cf_routeLifecycle(
+  async _cf_routeLifecycle(
     target: LifecycleRouteAddress | undefined,
     envelope: LifecycleRouteEnvelope
   ): Promise<unknown> {
+    await this.__unsafe_ensureInitialized();
     return this._dynamicAgents.routeLifecycle(target, envelope);
   }
 
@@ -3222,6 +3258,7 @@ export class Agent<
   async _cf_cleanupFacetPrefix(
     ownerPath: ReadonlyArray<AgentPathStep>
   ): Promise<void> {
+    await this.__unsafe_ensureInitialized();
     await this._dynamicAgents.cleanupPrefix(ownerPath);
   }
 
@@ -3231,9 +3268,10 @@ export class Agent<
    * physical alarm, so this lets facet work use the root alarm heartbeat.
    * @internal
    */
-  _cf_acquireFacetKeepAlive(
+  async _cf_acquireFacetKeepAlive(
     ownerPath: ReadonlyArray<AgentPathStep>
   ): Promise<string> {
+    await this.__unsafe_ensureInitialized();
     return this._dynamicAgents.acquireKeepAlive(ownerPath);
   }
 
@@ -3242,8 +3280,9 @@ export class Agent<
    * Idempotent so disposer calls can safely race or run twice.
    * @internal
    */
-  _cf_releaseFacetKeepAlive(token: string): Promise<void> {
-    return this._dynamicAgents.releaseKeepAlive(token);
+  async _cf_releaseFacetKeepAlive(token: string): Promise<void> {
+    await this.__unsafe_ensureInitialized();
+    await this._dynamicAgents.releaseKeepAlive(token);
   }
 
   /**
@@ -3252,22 +3291,24 @@ export class Agent<
    * The facet remains authoritative for snapshots and recovery hooks.
    * @internal
    */
-  _cf_registerFacetRun(
+  async _cf_registerFacetRun(
     ownerPath: ReadonlyArray<AgentPathStep>,
     runId: string
   ): Promise<void> {
-    return this._dynamicAgents.registerRun(ownerPath, runId);
+    await this.__unsafe_ensureInitialized();
+    await this._dynamicAgents.registerRun(ownerPath, runId);
   }
 
   /**
    * Remove a completed facet fiber from the root-side index.
    * @internal
    */
-  _cf_unregisterFacetRun(
+  async _cf_unregisterFacetRun(
     ownerPath: ReadonlyArray<AgentPathStep>,
     runId: string
   ): Promise<void> {
-    return this._dynamicAgents.unregisterRun(ownerPath, runId);
+    await this.__unsafe_ensureInitialized();
+    await this._dynamicAgents.unregisterRun(ownerPath, runId);
   }
 
   /**
@@ -4302,6 +4343,9 @@ export class Agent<
 
     let root: RootFacetRpcSurface | undefined;
     let registeredFacetRun = false;
+    let bodyOutcome:
+      | { status: "completed" | "error" | "aborted"; error: string | null }
+      | undefined;
     let dispose: () => void = () => {};
     try {
       if ("initialSnapshot" in (options ?? {})) {
@@ -4320,9 +4364,19 @@ export class Agent<
       };
 
       try {
-        const result = await _fiberALS.run({ id, signal, stash }, () =>
-          fn({ id, signal, stash, snapshot: null })
-        );
+        let result: T;
+        try {
+          result = await _fiberALS.run({ id, signal, stash }, () =>
+            fn({ id, signal, stash, snapshot: null })
+          );
+        } catch (error) {
+          bodyOutcome = {
+            status: signal.aborted ? "aborted" : "error",
+            error: this._fiberErrorMessage(error)
+          };
+          throw error;
+        }
+        bodyOutcome = { status: "completed", error: null };
         options?.beforeRunCleanup?.({ ok: true });
         this._emit("fiber:run:completed", {
           fiberId: id,
@@ -4344,6 +4398,7 @@ export class Agent<
       }
     } finally {
       this._runFiberActiveFibers.delete(id);
+      let rowDeleted = false;
       try {
         this._withAgentSpan(
           "finalize_fiber",
@@ -4353,9 +4408,23 @@ export class Agent<
             "cloudflare.agents.fiber.name": name
           },
           () => {
+            if (bodyOutcome) {
+              try {
+                this.sql`
+                  UPDATE cf_agents_runs
+                  SET completed_at = ${Date.now()},
+                      outcome = ${bodyOutcome.status},
+                      error_message = ${bodyOutcome.error}
+                  WHERE id = ${id}
+                `;
+              } catch {
+                // The delete below is still worth attempting.
+              }
+            }
             this.sql`DELETE FROM cf_agents_runs WHERE id = ${id}`;
           }
         );
+        rowDeleted = true;
       } catch (error) {
         console.error(
           `[Agent] Failed to finalize fiber "${name}" (${id}); leaving run row for recovery:`,
@@ -4363,7 +4432,9 @@ export class Agent<
         );
       }
       dispose();
-      if (root && registeredFacetRun) {
+      // The root's registration is what brings recovery back to an idle facet,
+      // so it stays until the leftover row is gone.
+      if (root && registeredFacetRun && rowDeleted) {
         try {
           await root._cf_unregisterFacetRun(this.selfPath, id);
         } catch (e) {
@@ -4457,7 +4528,14 @@ export class Agent<
         name: string;
         snapshot: string | null;
         created_at: number;
-      }>`SELECT id, name, snapshot, created_at FROM cf_agents_runs`;
+        completed_at: number | null;
+        outcome: "completed" | "error" | "aborted" | null;
+        error_message: string | null;
+      }>`
+        SELECT id, name, snapshot, created_at, completed_at, outcome,
+               error_message
+        FROM cf_agents_runs
+      `;
 
       for (const row of rows) {
         if (scanDeadlineMs > 0 && Date.now() - scanStartedAt > scanDeadlineMs) {
@@ -4471,6 +4549,38 @@ export class Agent<
         }
         if (this._runFiberActiveFibers.has(row.id)) continue;
 
+        const managedRow = this._readFiber(row.id);
+        // A managed row needs the recorded outcome; without it the ledger
+        // can't be settled truthfully, so it falls through to recovery.
+        if (
+          row.completed_at !== null &&
+          (!managedRow || row.outcome !== null)
+        ) {
+          // The body settled and only its cleanup failed: nothing to recover.
+          // A managed ledger still non-terminal here means its settle write
+          // failed too, so record the body's own outcome.
+          if (managedRow) {
+            this.sql`
+              UPDATE cf_agents_fibers
+              SET status = ${row.outcome},
+                  error_message = ${row.error_message},
+                  completed_at = ${row.completed_at}
+              WHERE fiber_id = ${row.id}
+                AND status IN ('pending', 'running')
+            `;
+          }
+          this.sql`DELETE FROM cf_agents_runs WHERE id = ${row.id}`;
+          madeProgress = true;
+          if (managedRow) this._notifyManagedFiberTerminal(row.id);
+          continue;
+        }
+        if (managedRow && this._isTerminalFiberStatus(managedRow.status)) {
+          this.sql`DELETE FROM cf_agents_runs WHERE id = ${row.id}`;
+          madeProgress = true;
+          this._notifyManagedFiberTerminal(row.id);
+          continue;
+        }
+
         const snapshot = this._parseFiberRecoverySnapshot(row.id, row.snapshot);
         const ctx: FiberRecoveryContext = {
           id: row.id,
@@ -4480,7 +4590,6 @@ export class Agent<
           recoveryReason: "interrupted"
         };
 
-        const managedRow = this._readFiber(row.id);
         this._emit("fiber:recovery:detected", {
           ...this._fiberRecoveryPayload(ctx, managedRow),
           elapsedMs: Date.now() - row.created_at
@@ -4493,13 +4602,6 @@ export class Agent<
           elapsedMs: Date.now() - row.created_at
         });
         if (managedRow) {
-          if (this._isTerminalFiberStatus(managedRow.status)) {
-            this.sql`DELETE FROM cf_agents_runs WHERE id = ${row.id}`;
-            madeProgress = true;
-            this._notifyManagedFiberTerminal(row.id);
-            continue;
-          }
-
           const completedAt = Date.now();
           this.sql`
             UPDATE cf_agents_fibers
@@ -4686,10 +4788,11 @@ export class Agent<
    * cleanup as `parent.deleteSubAgent(Cls, name)` from the parent.
    * @internal
    */
-  _cf_destroyDescendantFacet(
+  async _cf_destroyDescendantFacet(
     targetPath: ReadonlyArray<AgentPathStep>
   ): Promise<void> {
-    return this._dynamicAgents.destroyDescendant(targetPath);
+    await this.__unsafe_ensureInitialized();
+    await this._dynamicAgents.destroyDescendant(targetPath);
   }
 
   /**
@@ -4733,6 +4836,21 @@ export class Agent<
    */
   private async _syncHostJobs(): Promise<void> {
     if (this._destroyed) return;
+    if (this._isFacet) {
+      // A facet has no alarm slot (`setAlarm()` throws): the root holds its
+      // keepAlive refs and facet-run leases, and facets never write the
+      // destroy marker. Earlier releases could persist a host job here
+      // before the re-arm threw; drop it so it cannot re-arm again.
+      const work = this.lifecycle.jobs;
+      for (const id of [
+        HOST_JOB_DESTROY_ID,
+        HOST_JOB_KEEP_ALIVE_ID,
+        HOST_JOB_HOUSEKEEPING_ID
+      ]) {
+        if (work.get(id)) await work.cancel(id);
+      }
+      return;
+    }
     await this._withAgentSpan("schedule_agent_alarm", "alarm", {}, async () => {
       const work = this.lifecycle.jobs;
       const nowMs = Date.now();
@@ -4942,10 +5060,16 @@ export class Agent<
       className: match.childClass,
       name: match.childName
     });
-    if (decision instanceof Response) return decision;
+    const isWebSocketUpgrade =
+      request.headers.get("Upgrade")?.toLowerCase() === "websocket";
+    if (decision instanceof Response) {
+      return isWebSocketUpgrade && !decision.webSocket
+        ? rejectSubAgentWebSocket(decision)
+        : decision;
+    }
     const forwardReq = decision instanceof Request ? decision : request;
 
-    if (request.headers.get("Upgrade")?.toLowerCase() === "websocket") {
+    if (isWebSocketUpgrade) {
       const acceptHeaders = new Headers(forwardReq.headers);
       const routedUrl = new URL(forwardReq.url);
       routedUrl.pathname = new URL(request.url).pathname;
@@ -5023,34 +5147,48 @@ export class Agent<
     message: string | ArrayBuffer | ArrayBufferView,
     without?: string[]
   ): Promise<void> {
+    await this.__unsafe_ensureInitialized();
     await this._dynamicAgents.broadcastToPath(ownerPath, message, without);
   }
 
-  _cf_subAgentConnectionMetas(
+  async _cf_subAgentConnectionMetas(
     ownerPath: ReadonlyArray<AgentPathStep>
   ): Promise<SubAgentConnectionMeta[]> {
+    await this.__unsafe_ensureInitialized();
     return this._dynamicAgents.connectionMetas(ownerPath);
   }
 
-  _cf_sendToSubAgentConnection(
+  async _cf_sendToSubAgentConnection(
     connectionId: string,
     message: string | ArrayBuffer | ArrayBufferView
   ): Promise<void> {
-    return this._dynamicAgents.sendToConnection(connectionId, message);
+    await this.__unsafe_ensureInitialized();
+    await this._dynamicAgents.sendToConnection(connectionId, message);
   }
 
-  _cf_closeSubAgentConnection(
+  async _cf_closeSubAgentConnection(
     connectionId: string,
     code?: number,
     reason?: string
   ): Promise<void> {
-    return this._dynamicAgents.closeConnection(connectionId, code, reason);
+    await this.__unsafe_ensureInitialized();
+    await this._dynamicAgents.closeConnection(connectionId, code, reason);
   }
 
-  _cf_setSubAgentConnectionState(
+  async _cf_closeSubAgentConnectionsForPrefix(
+    prefix: ReadonlyArray<AgentPathStep>,
+    code: number,
+    reason: string
+  ): Promise<void> {
+    await this.__unsafe_ensureInitialized();
+    this._dynamicAgents.closeConnectionsForPrefix(prefix, code, reason);
+  }
+
+  async _cf_setSubAgentConnectionState(
     connectionId: string,
     state: unknown
   ): Promise<unknown> {
+    await this.__unsafe_ensureInitialized();
     return this._dynamicAgents.setConnectionState(connectionId, state);
   }
 
@@ -5635,6 +5773,17 @@ export class Agent<
     const runId = options.runId;
     const agentType = cls.name;
     const detached = this._parseDetachedOption(options.detached);
+    const eventDelivery = options.eventDelivery ?? "full";
+    if (eventDelivery !== "full" && eventDelivery !== "terminal") {
+      throw new Error(
+        `runAgentTool: eventDelivery must be "full" or "terminal", got ${JSON.stringify(eventDelivery)}.`
+      );
+    }
+    if (detached && eventDelivery === "terminal") {
+      throw new Error(
+        'runAgentTool: eventDelivery "terminal" is not supported for detached runs.'
+      );
+    }
 
     const existing = this._readAgentToolRun(runId);
     if (existing) {
@@ -5794,13 +5943,14 @@ export class Agent<
         input_redacted, status, display_metadata, display_order, started_at,
         detached, detached_on_finish, detached_notify_source,
         detached_max_budget_at, detached_no_progress_budget_ms,
-        detached_on_milestones
+        detached_on_milestones, event_delivery
       ) VALUES (
         ${runId}, ${options.parentToolCallId ?? null}, ${agentType},
         ${inputPreviewJson}, 1, 'starting', ${displayJson}, ${displayOrder},
         ${startedAt}, ${detached ? 1 : 0}, ${detached?.onFinishName ?? null},
         ${detached?.notifySource ?? null}, ${detachedMaxBudgetAt},
-        ${detachedNoProgressBudgetMs}, ${detachedOnMilestonesJson}
+        ${detachedNoProgressBudgetMs}, ${detachedOnMilestonesJson},
+        ${eventDelivery === "terminal" ? "terminal" : null}
       )
     `;
 
@@ -5863,7 +6013,10 @@ export class Agent<
       startedPublished = true;
       this._markAgentToolRunning(runId);
       adapter = this._asAgentToolChildAdapter<Input, Output>(child);
-      childStart = await adapter.startAgentToolRun(options.input, { runId });
+      childStart = await adapter.startAgentToolRun(options.input, {
+        runId,
+        ...(eventDelivery === "terminal" ? { eventDelivery } : {})
+      });
     } catch (error) {
       const row = this._readAgentToolRun(runId);
       const result: RunAgentToolResult<Output> =
@@ -7213,17 +7366,30 @@ export class Agent<
     replay?: true,
     connection?: Connection
   ): number {
+    const terminalOnly = this._isTerminalOnlyAgentToolRun(runId);
     let next = sequence;
     for (const chunk of chunks) {
+      // Stored chunks are numbered by store position (`started` is 0, stored
+      // chunk i is i + 1) on both the live and replay paths, so they dedupe
+      // against each other. A skipped chunk still takes its sequence.
+      const chunkSequence = next++;
+      if (terminalOnly && !isAgentToolLifecycleChunk(chunk.body)) continue;
       this._broadcastAgentToolEvent(
         parentToolCallId,
-        next++,
+        chunkSequence,
         { kind: "chunk", runId, body: chunk.body, cursor: chunk.cursor },
         replay,
         connection
       );
     }
     return next;
+  }
+
+  private _isTerminalOnlyAgentToolRun(runId: string): boolean {
+    const rows = this.sql<{ event_delivery: string | null }>`
+      SELECT event_delivery FROM cf_agent_tool_runs WHERE run_id = ${runId}
+    `;
+    return rows[0]?.event_delivery === "terminal";
   }
 
   private async _broadcastAgentToolStoredChunks(
@@ -7233,17 +7399,38 @@ export class Agent<
     >,
     sequence: number,
     replay?: true,
-    connection?: Connection
+    connection?: Connection,
+    timeoutMs?: number
   ): Promise<number> {
-    const child = await this._cf_resolveSubAgent(row.agent_type, row.run_id);
+    const deadline = this._agentToolRecoveryDeadline(timeoutMs);
+    const resolving = this._cf_resolveSubAgent(row.agent_type, row.run_id);
+    const child =
+      deadline === undefined
+        ? await resolving
+        : await this._settleWithinRecoveryTimeout(resolving, deadline());
+    if (child === undefined) return sequence;
     const adapter = this._asAgentToolChildAdapter(child);
     return this._broadcastAgentToolStoredChunksFromAdapter(
       adapter,
       row,
       sequence,
       replay,
-      connection
+      connection,
+      deadline?.()
     );
+  }
+
+  /**
+   * One budget shared by every step of a bounded recovery read, so a run's
+   * total time stays within `timeoutMs`. Returns the remaining milliseconds,
+   * never below 1 because a non-positive timeout means "unbounded".
+   */
+  private _agentToolRecoveryDeadline(
+    timeoutMs?: number
+  ): (() => number) | undefined {
+    if (timeoutMs === undefined || timeoutMs <= 0) return undefined;
+    const deadline = Date.now() + timeoutMs;
+    return () => Math.max(1, deadline - Date.now());
   }
 
   private async _broadcastAgentToolStoredChunksFromAdapter(
@@ -7254,20 +7441,75 @@ export class Agent<
     connection?: Connection,
     timeoutMs?: number
   ): Promise<number> {
+    const deadline = this._agentToolRecoveryDeadline(timeoutMs);
     const chunks = await this._getAgentToolChunksForRecovery(
       adapter,
       row.run_id,
+      deadline?.()
+    );
+    const next = chunks
+      ? this._broadcastAgentToolChunks(
+          row.parent_tool_call_id ?? undefined,
+          row.run_id,
+          chunks,
+          sequence,
+          replay,
+          connection
+        )
+      : sequence;
+    return this._broadcastAgentToolMilestones(
+      adapter,
+      row,
+      next,
+      replay,
+      connection,
+      deadline?.()
+    );
+  }
+
+  /**
+   * Milestones are persisted on the child run rather than in its chunk log, so
+   * replay re-emits them from the child's inspection. The client dedupes them
+   * on the milestone's own sequence, so a milestone already seen live is a no-op.
+   * They carry the next stored-chunk sequence without consuming it, matching
+   * the live path.
+   */
+  private async _broadcastAgentToolMilestones(
+    adapter: AgentToolChildAdapter,
+    row: Pick<AgentToolRunStorageRow, "run_id" | "parent_tool_call_id">,
+    sequence: number,
+    replay?: true,
+    connection?: Connection,
+    timeoutMs?: number
+  ): Promise<number> {
+    // Read-only: replaying milestones must never seal a stale child run.
+    const inspection = await this._settleWithinRecoveryTimeout(
+      adapter.inspectAgentToolRun(row.run_id, { reconcile: false }),
       timeoutMs
     );
-    if (!chunks) return sequence;
-    return this._broadcastAgentToolChunks(
-      row.parent_tool_call_id ?? undefined,
-      row.run_id,
-      chunks,
-      sequence,
-      replay,
-      connection
-    );
+    const milestones: AgentToolMilestone[] = inspection?.milestones ?? [];
+    for (const milestone of milestones) {
+      this._broadcastAgentToolEvent(
+        row.parent_tool_call_id ?? undefined,
+        sequence,
+        {
+          kind: "chunk",
+          runId: row.run_id,
+          body: JSON.stringify({
+            type: AGENT_TOOL_MILESTONE_PART,
+            data: {
+              name: milestone.name,
+              sequence: milestone.sequence,
+              at: milestone.at,
+              ...(milestone.data !== undefined ? { data: milestone.data } : {})
+            }
+          })
+        },
+        replay,
+        connection
+      );
+    }
+    return sequence;
   }
 
   private async _forwardAgentToolStream(
@@ -7277,9 +7519,14 @@ export class Agent<
     sequence: number,
     signal?: AbortSignal,
     idleTimeoutMs?: number
-  ): Promise<{ next: number; ended: "done" | "idle" | "aborted" }> {
+  ): Promise<{
+    next: number;
+    ended: "done" | "idle" | "aborted";
+    forwarded: boolean;
+  }> {
     let next = sequence;
-    if (signal?.aborted) return { next, ended: "aborted" };
+    let forwarded = false;
+    if (signal?.aborted) return { next, ended: "aborted", forwarded };
     // How the forward loop ended, so the re-attach caller can re-arm ONLY on a
     // clean stream-close (`done`) and never abandon a fresh reader per idle
     // cycle: `idle` = a full no-progress window elapsed (stalled), `aborted` =
@@ -7327,14 +7574,28 @@ export class Agent<
     // produces output (a silent/hung child forwards nothing → no credit → the
     // parent still exhausts on its own no-progress timer).
     let forwardedSinceProgress = false;
+    const terminalOnly = this._isTerminalOnlyAgentToolRun(runId);
     try {
       const forwardChunk = (chunk: AgentToolStoredChunk) => {
-        this._broadcastAgentToolEvent(parentToolCallId, next++, {
-          kind: "chunk",
-          runId,
-          body: chunk.body,
-          cursor: chunk.cursor
-        });
+        // Progress/milestone frames and chunks too large to store are
+        // broadcast-only on the child and never replayed from its store, so
+        // they must not consume a stored-chunk sequence or live and replayed
+        // numbering drift apart (#2364).
+        const lifecycle = isAgentToolLifecycleChunk(chunk.body);
+        const unstoredId =
+          typeof chunk.unstoredId === "string" ? chunk.unstoredId : undefined;
+        const chunkSequence =
+          lifecycle || unstoredId !== undefined ? next : next++;
+        forwarded = true;
+        if (!terminalOnly || lifecycle) {
+          this._broadcastAgentToolEvent(parentToolCallId, chunkSequence, {
+            kind: "chunk",
+            runId,
+            body: chunk.body,
+            cursor: chunk.cursor,
+            ...(unstoredId !== undefined ? { unstoredId } : {})
+          });
+        }
         // A reserved `data-agent-progress` frame fires the parent `onProgress`
         // hook + refreshes the cached liveness timestamp. Best-effort: never
         // let a progress observation break the forward loop.
@@ -7441,7 +7702,7 @@ export class Agent<
       // The re-attach loop re-arms only on `ended === "done"`, so at most ONE
       // such read is ever left pending per re-attach (no per-cycle leak).
     }
-    return { next, ended };
+    return { next, ended, forwarded };
   }
 
   /**
@@ -7686,7 +7947,15 @@ export class Agent<
   ): Promise<RunAgentToolResult<Output>> {
     let sequence = 1;
     try {
-      sequence = await this._broadcastAgentToolStoredChunks(row, sequence);
+      // A stalled transcript or milestone read must not prevent the parent
+      // from publishing the interruption it has already decided to retain.
+      sequence = await this._broadcastAgentToolStoredChunks(
+        row,
+        sequence,
+        undefined,
+        undefined,
+        DEFAULT_AGENT_TOOL_RECOVERY_TIMEOUT_MS
+      );
     } catch {
       // Interruption is still the honest parent state if replay fails.
     }
@@ -7790,9 +8059,9 @@ export class Agent<
    * dies and recovers again during deploy churn is still collected. A genuinely
    * silent/hung child can never block recovery forever: it seals `interrupted`
    * after one `noProgressTimeoutMs` window. `maxWindowMs` is an OPTIONAL hard
-   * wall-clock ceiling (default `Infinity` — uncapped, mirroring #1672's
-   * `maxRecoveryWork`); set it finite to also bound a child that keeps
-   * progressing, which seals `window-exceeded` and tears the child down.
+   * wall-clock ceiling (default `Infinity` — uncapped, #1672); set it finite
+   * to also bound a child that keeps progressing, which seals
+   * `window-exceeded` and tears the child down.
    *
    * Returns the terminal `result` (and `completedAt`) when the child reaches a
    * terminal status, plus the advanced broadcast `sequence`. Returns
@@ -7914,6 +8183,9 @@ export class Agent<
         // after this point keeps the live stream correct without dupes.
         let afterSequence = -1;
         let afterCursor: AgentToolReplayCursor | undefined;
+        // Tailed chunks continue the stored-position numbering replay uses, so
+        // clients that already saw the stored chunks don't dedupe new ones away.
+        let storedCount = 0;
         try {
           waitSignal.throwIfAborted();
           const existing = await raceWithSignal(
@@ -7925,14 +8197,16 @@ export class Agent<
             afterSequence = last.sequence;
             afterCursor = last.cursor;
           }
+          storedCount = existing.length;
         } catch {
           // Fall back to a full tail if the chunk probe fails.
         }
+        nextSequence = storedCount + 1;
 
-        const beforeSequence = nextSequence;
         // Defaults to a non-`done` end so a tail that throws below does NOT
         // re-arm (we only re-arm on a verified clean stream-close).
         let streamEnded: "done" | "idle" | "aborted" = "idle";
+        let forwardedAny = false;
         try {
           // NOTE: the ceiling signal is NOT forwarded to `tailAgentToolRun` — an
           // AbortSignal can't be serialized across the child-facet DO RPC. We
@@ -7963,6 +8237,7 @@ export class Agent<
           );
           nextSequence = forwarded.next;
           streamEnded = forwarded.ended;
+          forwardedAny = forwarded.forwarded;
         } catch {
           // Tail failures fall through to an inspect; the child remains
           // authoritative for terminal status and durable chunk replay.
@@ -7985,7 +8260,7 @@ export class Agent<
         // abandon a fresh pending reader every cycle. No progress likewise
         // seals.
         if (streamEnded !== "done") break;
-        if (nextSequence <= beforeSequence) break;
+        if (!forwardedAny) break;
       }
     } finally {
       if (ceilingTimer !== undefined) clearTimeout(ceilingTimer);
@@ -8063,17 +8338,23 @@ export class Agent<
                 row.run_id
               );
               const adapter = this._asAgentToolChildAdapter(child);
+              const terminalOnly = this._isTerminalOnlyAgentToolRun(row.run_id);
               const inspection = await adapter.inspectAgentToolRun(row.run_id, {
-                includeChunks: true
+                includeChunks: !terminalOnly,
+                reconcile: false
               });
               if (!inspection)
                 throw new Error("retained child did not return this run");
               return {
                 progress: inspection.progress,
                 milestones: inspection.milestones,
-                replay: inspection.replay ?? {
-                  chunks: await adapter.getAgentToolChunks(row.run_id)
-                }
+                // Terminal-only delivery applies to reconnect snapshots as
+                // well as live chunks; progress and milestones still replay.
+                replay: terminalOnly
+                  ? { chunks: [] }
+                  : (inspection.replay ?? {
+                      chunks: await adapter.getAgentToolChunks(row.run_id)
+                    })
               };
             })();
             const details = await Promise.race([
@@ -8086,8 +8367,8 @@ export class Agent<
               })
             ]);
             if (!current()) return;
-            // Inspection may reconcile child state, but the accepted parent
-            // outcome remains authoritative, including cancellation races.
+            // The child read can yield while the parent accepts cancellation.
+            // Read that accepted outcome again before publishing the snapshot.
             const retained = this._readAgentToolRun(row.run_id);
             if (!retained) return;
             this._broadcastAgentToolEvent(
@@ -8503,14 +8784,25 @@ export class Agent<
     runId: string,
     timeoutMs?: number
   ): Promise<AgentToolStoredChunk[] | undefined> {
-    const chunks = adapter.getAgentToolChunks(runId).catch(() => undefined);
-    if (timeoutMs === undefined || timeoutMs <= 0) return chunks;
+    return this._settleWithinRecoveryTimeout(
+      adapter.getAgentToolChunks(runId),
+      timeoutMs
+    );
+  }
+
+  /** Resolve to `undefined` when `promise` rejects or outlasts `timeoutMs`. */
+  private async _settleWithinRecoveryTimeout<T>(
+    promise: Promise<T>,
+    timeoutMs?: number
+  ): Promise<T | undefined> {
+    const settled = promise.catch(() => undefined);
+    if (timeoutMs === undefined || timeoutMs <= 0) return settled;
 
     let timeoutId: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<undefined>((resolve) => {
       timeoutId = setTimeout(() => resolve(undefined), timeoutMs);
     });
-    const result = await Promise.race([chunks, timeout]);
+    const result = await Promise.race([settled, timeout]);
     if (timeoutId !== undefined) clearTimeout(timeoutId);
     return result;
   }

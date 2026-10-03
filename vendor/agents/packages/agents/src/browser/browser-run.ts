@@ -1,4 +1,4 @@
-import { CdpSession } from "./cdp-session";
+import { CdpConnection } from "./cdp-connection";
 
 /**
  * A Browser Rendering binding. Structural so it accepts both the classic
@@ -7,6 +7,24 @@ import { CdpSession } from "./cdp-session";
  */
 export interface BrowserBinding {
   fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response>;
+}
+
+/**
+ * Browser Run [hostname guardrails](https://developers.cloudflare.com/browser-run/features/guardrails/):
+ * restrict which hostnames the session's HTTP/HTTPS requests may reach. Fixed
+ * at session launch for every connection to the session, including Live View.
+ * Omitted entirely, the platform default applies: all hostnames are allowed.
+ * Not supported by Kitesurf.
+ */
+export interface BrowserSessionGuardrails {
+  /**
+   * Hostname patterns the browser may request — bare hostnames only (no
+   * protocol, port, or path). `*.example.com` matches subdomains; add
+   * `example.com` separately to allow the apex.
+   */
+  allowedDomains?: string[];
+  /** Named Cloudflare-maintained domain sets, e.g. `"common-cdns"`. */
+  allowedDomainSets?: string[];
 }
 
 export interface BrowserTargetInfo {
@@ -25,7 +43,10 @@ export interface BrowserSessionInfo {
   webSocketDebuggerUrl?: string;
 }
 
-export interface ConnectBrowserOptions {
+/** {@link connectBrowser} options for the default Chromium engine. */
+export interface ConnectChromiumBrowserOptions {
+  /** Select the browser engine. Defaults to Chromium. */
+  browser?: "chromium";
   timeoutMs?: number;
   keepAliveMs?: number;
   includeTargets?: boolean;
@@ -36,12 +57,26 @@ export interface ConnectBrowserOptions {
    * {@link getBrowserRecording}.
    */
   recording?: boolean;
-  /**
-   * Select the browser engine. Defaults to Chromium. Use `"kitesurf"` for
-   * Cloudflare's connection-scoped, agent-first browser engine.
-   */
-  browser?: "kitesurf";
 }
+
+/**
+ * {@link connectBrowser} options for Kitesurf, Cloudflare's connection-scoped,
+ * agent-first browser engine. A Kitesurf browser lives and dies with its
+ * WebSocket, so the Chromium-only options (`keepAliveMs`, `includeTargets`,
+ * `recording`) do not exist on this arm.
+ */
+export interface ConnectKitesurfBrowserOptions {
+  browser: "kitesurf";
+  timeoutMs?: number;
+}
+
+/**
+ * Engine-discriminated {@link connectBrowser} options: selecting
+ * `browser: "kitesurf"` removes the Chromium-only options at the type level.
+ */
+export type ConnectBrowserOptions =
+  | ConnectChromiumBrowserOptions
+  | ConnectKitesurfBrowserOptions;
 
 /** An rrweb session recording for a closed Browser Run session. */
 export interface BrowserRecording {
@@ -63,6 +98,17 @@ export class BrowserRenderingError extends Error {
     super(message);
     this.name = "BrowserRenderingError";
   }
+}
+
+/**
+ * Whether an error means the platform session is gone: Browser Run uses 404
+ * for unknown ids and 410 after `keep_alive` expiry.
+ */
+export function isMissingBrowserSession(error: unknown): boolean {
+  return (
+    error instanceof BrowserRenderingError &&
+    (error.status === 404 || error.status === 410)
+  );
 }
 
 function browserSessionEndpoint(
@@ -128,11 +174,22 @@ export async function createBrowserSession(
     keepAliveMs?: number;
     includeTargets?: boolean;
     recording?: boolean;
+    guardrails?: BrowserSessionGuardrails;
   }
 ): Promise<BrowserSessionInfo> {
+  // Guardrails ride the acquire request's JSON body (the query string only
+  // carries scalar options). The endpoint accepts an empty `{}` body —
+  // verified against the live acquire API — so the request shape stays
+  // uniform whether or not guardrails are set.
   const response = await browser.fetch(
     browserSessionEndpoint(undefined, options),
-    { method: "POST" }
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(
+        options?.guardrails ? { guardrails: options.guardrails } : {}
+      )
+    }
   );
 
   if (!response.ok) {
@@ -187,30 +244,37 @@ export async function deleteBrowserSession(
 export async function connectBrowser(
   browser: BrowserBinding,
   options?: number | ConnectBrowserOptions
-): Promise<CdpSession> {
-  const normalizedOptions =
+): Promise<CdpConnection> {
+  const normalizedOptions: ConnectBrowserOptions =
     typeof options === "number" ? { timeoutMs: options } : (options ?? {});
-  const isKitesurf = normalizedOptions.browser === "kitesurf";
-  if (
-    isKitesurf &&
-    (normalizedOptions.keepAliveMs ||
-      normalizedOptions.includeTargets ||
-      normalizedOptions.recording)
-  ) {
-    throw new Error(
-      "Kitesurf does not support keepAliveMs, includeTargets, or recording"
-    );
+  if (normalizedOptions.browser === "kitesurf") {
+    // The options union already rejects these at the type level for literal
+    // call sites; plain-JS callers and spreads can still smuggle them in.
+    // Explicitly disabled values are tolerated but never sent — `keep_alive=0`
+    // is not a valid Kitesurf query parameter.
+    const smuggled = normalizedOptions as {
+      keepAliveMs?: number;
+      includeTargets?: boolean;
+      recording?: boolean;
+    };
+    if (smuggled.keepAliveMs || smuggled.includeTargets || smuggled.recording) {
+      throw new Error(
+        "Kitesurf does not support keepAliveMs, includeTargets, or recording"
+      );
+    }
   }
 
   const response = await browser.fetch(
-    browserSessionEndpoint(undefined, {
-      // Explicitly disabled Chromium-only options are accepted but never sent:
-      // `keep_alive=0` is not a valid Kitesurf query parameter.
-      keepAliveMs: isKitesurf ? undefined : normalizedOptions.keepAliveMs,
-      includeTargets: normalizedOptions.includeTargets,
-      recording: normalizedOptions.recording,
-      browser: normalizedOptions.browser
-    }),
+    browserSessionEndpoint(
+      undefined,
+      normalizedOptions.browser === "kitesurf"
+        ? { browser: "kitesurf" }
+        : {
+            keepAliveMs: normalizedOptions.keepAliveMs,
+            includeTargets: normalizedOptions.includeTargets,
+            recording: normalizedOptions.recording
+          }
+    ),
     { headers: { Upgrade: "websocket" } }
   );
 
@@ -227,7 +291,7 @@ export async function connectBrowser(
     // an ID for analytics correlation, but it cannot be used with the
     // session-scoped reconnect or delete endpoints.
     ws.accept();
-    return new CdpSession(ws, normalizedOptions.timeoutMs);
+    return new CdpConnection(ws, { timeoutMs: normalizedOptions.timeoutMs });
   }
 
   const sessionId = response.headers.get("cf-browser-session-id");
@@ -238,10 +302,9 @@ export async function connectBrowser(
   }
 
   ws.accept();
-  return new CdpSession(
-    ws,
-    normalizedOptions.timeoutMs,
-    () => {
+  return new CdpConnection(ws, {
+    timeoutMs: normalizedOptions.timeoutMs,
+    onClose: () => {
       deleteBrowserSession(browser, sessionId).catch((error: unknown) => {
         console.warn(
           `[agents/browser] Failed to delete one-shot Browser Run session ${sessionId}`,
@@ -250,7 +313,7 @@ export async function connectBrowser(
       });
     },
     sessionId
-  );
+  });
 }
 
 /**
@@ -299,25 +362,159 @@ export async function getBrowserRecording(options: {
   return recording as BrowserRecording;
 }
 
+export interface ConnectBrowserSessionOptions {
+  timeoutMs?: number;
+  /**
+   * Invoked once when the returned {@link CdpConnection} reaches a terminal
+   * state — an explicit `close()`, peer closure, or a socket error. The
+   * session itself is never deleted on close — pass an `onClose` that
+   * deletes it for one-shot (create-and-close) semantics.
+   */
+  onClose?: () => void;
+  /**
+   * Invoked on every CDP command sent over the returned {@link CdpConnection} —
+   * an activity signal for idle tracking. Keep it cheap and synchronous;
+   * throttle any I/O it triggers.
+   */
+  onActivity?: () => void;
+}
+
 /**
  * Connect to an existing Browser Rendering session without deleting it on close.
  */
 export async function connectBrowserSession(
   browser: BrowserBinding,
   sessionId: string,
+  options?: ConnectBrowserSessionOptions
+): Promise<CdpConnection>;
+/**
+ * @deprecated Pass `{ timeoutMs }` instead of a bare number — the numeric
+ * form will be removed.
+ */
+export async function connectBrowserSession(
+  browser: BrowserBinding,
+  sessionId: string,
   timeoutMs?: number
-): Promise<CdpSession> {
+): Promise<CdpConnection>;
+export async function connectBrowserSession(
+  browser: BrowserBinding,
+  sessionId: string,
+  options?: number | ConnectBrowserSessionOptions
+): Promise<CdpConnection> {
+  const normalized =
+    typeof options === "number" ? { timeoutMs: options } : (options ?? {});
   const response = await browser.fetch(browserSessionEndpoint(sessionId), {
     headers: { Upgrade: "websocket" }
   });
 
   const ws = response.webSocket;
   if (!ws) {
-    throw new Error(
-      `Browser Rendering binding did not return a WebSocket for session ${sessionId}`
+    // Carry the upgrade status: a 404/410 here means the browser expired
+    // after the caller last saw it alive (see isMissingBrowserSession).
+    throw new BrowserRenderingError(
+      `Browser Rendering binding did not return a WebSocket for session ${sessionId} (${response.status})`,
+      response.status
     );
   }
 
   ws.accept();
-  return new CdpSession(ws, timeoutMs, undefined, sessionId);
+  return new CdpConnection(ws, {
+    timeoutMs: normalized.timeoutMs,
+    onClose: normalized.onClose,
+    sessionId,
+    onActivity: normalized.onActivity
+  });
+}
+
+/** One-shot session options for the default Chromium engine. */
+export interface OneShotChromiumSessionOptions {
+  /** Select the browser engine. Defaults to Chromium. */
+  browser?: "chromium";
+  timeoutMs?: number;
+  /** Platform `keep_alive` in milliseconds. */
+  keepAliveMs?: number;
+  /** Opt into Browser Run session recording (rrweb capture). */
+  recording?: boolean;
+  /** Hostname guardrails, fixed at launch. */
+  guardrails?: BrowserSessionGuardrails;
+}
+
+/**
+ * One-shot session options for Kitesurf. The Chromium-only options —
+ * `guardrails`, `keepAliveMs`, `recording` — do not exist on this arm:
+ * Kitesurf does not support them.
+ */
+export interface OneShotKitesurfSessionOptions {
+  browser: "kitesurf";
+  timeoutMs?: number;
+}
+
+/**
+ * Engine-discriminated {@link openOneShotBrowserSession} options: selecting
+ * `browser: "kitesurf"` removes the Chromium-only options at the type level.
+ */
+export type OneShotBrowserSessionOptions =
+  | OneShotChromiumSessionOptions
+  | OneShotKitesurfSessionOptions;
+
+/**
+ * Open a one-shot browser session: create, connect, and delete the platform
+ * session when the returned {@link CdpConnection} closes. No store involved —
+ * one-shot sessions have no name and no durability.
+ */
+export async function openOneShotBrowserSession(
+  browser: BrowserBinding,
+  options: OneShotBrowserSessionOptions = {}
+): Promise<CdpConnection> {
+  if (options.browser === "kitesurf") {
+    // The options union already rejects these at the type level for literal
+    // call sites; plain-JS callers and spreads can still smuggle them in, so
+    // fail loudly in one place with one message.
+    const smuggled = options as {
+      guardrails?: unknown;
+      keepAliveMs?: unknown;
+      recording?: unknown;
+    };
+    if (smuggled.guardrails || smuggled.keepAliveMs || smuggled.recording) {
+      throw new Error(
+        "Kitesurf does not support guardrails, keepAliveMs, or recording"
+      );
+    }
+    // Kitesurf browsers are scoped to their WebSocket — connectBrowser is
+    // already one-shot there.
+    return connectBrowser(browser, {
+      browser: "kitesurf",
+      timeoutMs: options.timeoutMs
+    });
+  }
+
+  const info = await createBrowserSession(browser, {
+    keepAliveMs: options.keepAliveMs,
+    recording: options.recording,
+    guardrails: options.guardrails
+  });
+  try {
+    return await connectBrowserSession(browser, info.sessionId, {
+      timeoutMs: options.timeoutMs,
+      onClose: () => {
+        deleteBrowserSession(browser, info.sessionId).catch(
+          (error: unknown) => {
+            console.warn(
+              `[agents/browser] Failed to delete one-shot Browser Run session ${info.sessionId}`,
+              error
+            );
+          }
+        );
+      }
+    });
+  } catch (error) {
+    // The session was allocated but never got its delete-on-close owner —
+    // reclaim it now instead of leaving it to expire.
+    try {
+      await deleteBrowserSession(browser, info.sessionId);
+    } catch {
+      // Best-effort: keep_alive expiry reclaims it.
+    }
+    throw error;
+  }
 }
