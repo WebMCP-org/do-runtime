@@ -23,9 +23,8 @@
  *     `kj::Own<void> deferredDelete` going out of scope is
  *     `deferredDelete.drop()`, and a transaction going out of scope without
  *     `commit()` is `txn.drop()`.
- *  4. **`gate.onBroken()` may be called once**, upstream's own `KJ_REQUIRE`, so
- *     the harness calls it and exposes `gateBroken` rather than each test
- *     calling it. `monitorOutputGate` keeps its meaning: with it on, `finish()`
+ *  4. **The harness shares a `gateBroken` observer.**
+ *     `monitorOutputGate` keeps its meaning: with it on, `finish()`
  *     fails the test if the gate broke and nothing said so.
  *  5. **`SQLITE_NOMEM` via `PRAGMA hard_heap_limit` becomes `SQLITE_FULL` via
  *     `PRAGMA max_page_count`**, the technique Section 3's critical-error tests
@@ -121,12 +120,6 @@ type Call = {
 
 type ActorSqliteTestOptions = {
   monitorOutputGate?: boolean;
-  /**
-   * Leave `gate.onBroken()` for someone else to take. Upstream's own
-   * `KJ_REQUIRE` allows exactly one caller, and an `IoContext` built on this
-   * gate takes it in its constructor.
-   */
-  outputGateBrokenTakenElsewhere?: boolean;
   /** Caps the database so a large write raises SQLITE_FULL and SQLite auto-rolls-back. */
   maxPageCount?: number;
 };
@@ -137,7 +130,7 @@ class ActorSqliteTest {
   readonly actor: ActorSqlite;
   readonly calls: Call[] = [];
 
-  /** ← the harness's `gateBrokenPromise`, taken once because `onBroken()` may be called once. */
+  /** ← the harness's `gateBrokenPromise`. */
   readonly gateBroken: Promise<never>;
   brokenException: unknown | undefined;
 
@@ -159,10 +152,7 @@ class ActorSqliteTest {
         scheduleRun: (scheduledTime, priorTask) => this.#scheduleRun(scheduledTime, priorTask),
       },
     );
-    this.gateBroken =
-      options.outputGateBrokenTakenElsewhere === true
-        ? new Promise<never>(() => {})
-        : this.gate.onBroken();
+    this.gateBroken = this.gate.onBroken();
     void this.gateBroken.catch((exception: unknown) => {
       this.brokenException = exception;
     });
@@ -2797,7 +2787,7 @@ async function countCommits(
 }
 
 test("§1.7.1 a storage await does not end the implicit transaction", async () => {
-  const harness = await newActorSqliteTest({ outputGateBrokenTakenElsewhere: true });
+  const harness = await newActorSqliteTest();
   const ctx = new IoContext(new TestActor(harness.gate), idleTimer);
 
   const commits = await countCommits(harness, ctx, async () => {
@@ -2812,7 +2802,7 @@ test("§1.7.1 a storage await does not end the implicit transaction", async () =
 });
 
 test("§1.7.1 a timer or outbound await commits and begins a new transaction", async () => {
-  const harness = await newActorSqliteTest({ outputGateBrokenTakenElsewhere: true });
+  const harness = await newActorSqliteTest();
   const ctx = new IoContext(new TestActor(harness.gate), idleTimer);
 
   const commits = await countCommits(harness, ctx, async () => {
@@ -2828,7 +2818,7 @@ test("§1.7.1 a timer or outbound await commits and begins a new transaction", a
 });
 
 test("§1.7.1 a storage await between a put and a setAlarm keeps them in one transaction", async () => {
-  const harness = await newActorSqliteTest({ outputGateBrokenTakenElsewhere: true });
+  const harness = await newActorSqliteTest();
   const ctx = new IoContext(new TestActor(harness.gate), idleTimer);
 
   const commits = await countCommits(harness, ctx, async () => {
@@ -2854,7 +2844,7 @@ test("§1.7.1 a storage await between a put and a setAlarm keeps them in one tra
  * one transaction is a boundary nobody chose, and nothing else in this file would notice.
  */
 test("decision 4 a critical section spanning hand-offs commits per hand-off, not per section", async () => {
-  const harness = await newActorSqliteTest({ outputGateBrokenTakenElsewhere: true });
+  const harness = await newActorSqliteTest();
   const ctx = new IoContext(new TestActor(harness.gate), idleTimer);
 
   let sectionEnded = false;
@@ -2894,7 +2884,7 @@ test("decision 4 a critical section spanning hand-offs commits per hand-off, not
 test("decision 4 a storage await inside a critical section keeps its writes in one transaction", async () => {
   // The §1.7.1 discrimination has to survive being nested, or every boot phase that reads its own
   // state back loses atomicity exactly where it is least observable.
-  const harness = await newActorSqliteTest({ outputGateBrokenTakenElsewhere: true });
+  const harness = await newActorSqliteTest();
   const ctx = new IoContext(new TestActor(harness.gate), idleTimer);
 
   const commits = await countCommits(harness, ctx, async () => {

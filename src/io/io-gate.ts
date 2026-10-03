@@ -699,6 +699,7 @@ export class OutputGate {
   #pastLocksPromise: Promise<void> = Promise.resolve();
   /** A fulfiller for onBroken(), or an exception if already broken. */
   #brokenState: BrokenState = { kind: "none" };
+  #brokenPromise: Promise<never> | undefined;
 
   constructor(hooks: OutputGateHooks = DEFAULT_OUTPUT_GATE_HOOKS) {
     this.#hooks = hooks;
@@ -773,18 +774,15 @@ export class OutputGate {
   /**
    * Rejects if and when calls to `wait()` become broken due to a failed lockWhile(). The actor
    * should be shut down in this case. This promise never resolves, only rejects.
-   *
-   * This method can only be called once.
+   * Multiple observers are supported (workerd 275f7b2a4).
    */
   onBroken(): Promise<never> {
-    if (this.#brokenState.kind === "fulfiller") {
-      throw new Error("onBroken() can only be called once");
-    }
-
     if (this.#brokenState.kind === "exception") {
       return Promise.reject(this.#brokenState.exception);
     } else {
+      if (this.#brokenPromise !== undefined) return this.#brokenPromise;
       const { promise, reject } = Promise.withResolvers<never>();
+      this.#brokenPromise = promise;
       this.#brokenState = { kind: "fulfiller", reject };
       void promise.catch(() => {});
       return promise;

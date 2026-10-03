@@ -227,7 +227,6 @@ function newHarness(options?: {
     compatDateValidation: options?.compatDateValidation ?? "codeVersion",
     allowExperimentalFeatures: options?.allowExperimentalFeatures ?? true,
   });
-  // `IoContext`'s constructor already takes the one `onBroken()` branch each gate allows.
   return {
     ctx,
     channel,
