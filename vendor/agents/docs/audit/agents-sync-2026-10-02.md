@@ -62,29 +62,47 @@ already require. Existing examples use named objects.
 
 ## Storage and rollout
 
+Upgrades are forward-only. Downgrading package pins against an upgraded actor
+database is unsupported; rollback machinery and downgrade/re-upgrade tests are
+outside this fork's maintenance scope. Keep the forward migrations that read
+existing state, messages and queued work without losing data.
+
 The 0.24 → 0.26 migrations add nullable Sessions `content_hash`, Think submission
 message identity, parent/child Agent-tool `event_delivery`, and legacy fiber
 `completed_at`, `outcome` and `error_message` columns. Existing rows remain
 readable; timestamp-aware fork decoding stays intact. No additional destructive
 migration is introduced by this refresh.
 
-Additive schema does not guarantee a safe write-capable downgrade. A 0.24
-Sessions update changes content without updating `content_hash`; after
-re-upgrade, 0.26 trusts a matching non-null digest and can incorrectly skip an
-update. This follows directly from
-[the digest change](https://github.com/cloudflare/agents/commit/040458edb8f2c87a25e5ac446709054a5f553e14)
-and the prior update statement. A downgrade/re-upgrade procedure must invalidate
-those digests before 0.26 writes resume. Similarly, 0.24 does not understand a
-completed legacy-fiber marker left after failed cleanup and can rerun its
-recovery hook. No downgrade/re-upgrade integration gate was run in this refresh;
-the verified migration direction is forward.
+The downgrade findings remain historical evidence for this policy. A 0.24
+Sessions update changes content without updating `content_hash`; 0.26 then
+trusts a matching non-null digest and can incorrectly skip a later update.
+[The digest change](https://github.com/cloudflare/agents/commit/040458edb8f2c87a25e5ac446709054a5f553e14)
+and the prior update statement establish that limitation. Similarly, 0.24 does
+not understand a completed legacy-fiber marker left after failed cleanup and
+can rerun its recovery hook. These findings do not create a pending rollback
+implementation project.
 
-The existing 0.24 migration remains a rollout constraint: legacy schedules and
-queues move into Lifecycle jobs, the old Think workflow-notification outbox is
-removed, and invalid legacy queue payloads require the fork's preservation
-policy. A rollback to pre-0.24 does not reconstruct those jobs. Deployments
-already on the recorded 0.24 pin have passed that boundary; older deployments
-must account for it before skipping directly to 0.26.
+The existing 0.24 forward migration remains a rollout constraint: legacy
+schedules and queues move into Lifecycle jobs, the old Think workflow-notification
+outbox is removed, and invalid legacy queue payloads require the fork's
+preservation policy. Deployments already on the recorded 0.24 pin have passed
+that boundary; older deployments must account for it before skipping directly
+to 0.26. The lossless forward migrations and their regressions remain maintained.
+
+## Optional evaluation runner exclusion
+
+The fork excludes Evalite, the `packages/agents/evals/` credentialed scheduling
+evaluation, and its `evals` command. This was the runner's sole consumer in the
+retained package closure and was outside the deterministic SDK gate. Maintaining
+its separate application dependency graph to fix development-server advisories
+would add work without exercising this fork's runtime contracts.
+
+The local workspace manifests and Agents package snapshot own this exclusion.
+Future upstream syncs must continue to omit the runner, evaluation file and
+command. Runtime scheduling and its deterministic regressions remain in scope;
+[the live fork inventory](../fork-diff.md#local-maintenance-policy) records the
+same boundary. This removal closes the optional-tooling decision rather than
+leaving an Evalite upgrade or replacement on the maintenance backlog.
 
 ## Verification
 
@@ -113,8 +131,8 @@ the security overrides and pending-resume ownership/terminal-order fixes:
 Think includes all 105 messenger tests. The final `sdk:check` also passes all six
 package export checks, formatting, lint and TypeScript checks. These are the
 maintained suites named in `package.json`, not an exhaustive upstream test run;
-provider-backed integrations, the optional Pi harness and a write-capable
-rollback/re-upgrade were not exercised by this gate.
+provider-backed integrations and the optional Pi harness were not exercised by
+this gate. Downgrade/re-upgrade is outside the forward-only support policy.
 
 Final review restored the pre-stream admission cleanup around a failed terminal
 record deletion. Its new regression failed before the restoration and then

@@ -15,6 +15,23 @@ The [current audit](audit/vendor-fork-audit.md) owns measured costs, upstream
 issue findings and unresolved coverage questions. Test names below describe
 inspected coverage; fresh follow-up results are identified explicitly in the audit.
 
+## Local maintenance policy
+
+Upgrades are forward-only. The fork preserves the migrations and regression
+coverage needed to read existing actor data and queued work on upgrade.
+Downgrading code against upgraded storage is unsupported; historical downgrade
+limitations below explain this boundary and are not a rollback implementation
+backlog.
+
+The workspace manifests and Agents package snapshot exclude Evalite,
+`packages/agents/evals/`, and the `evals` command. The sole retained evaluation
+required model credentials and was outside the deterministic SDK gate. Removing
+its unused runner avoids maintaining a separate development-server dependency
+graph. Keep this exclusion during upstream syncs; runtime scheduling and its
+deterministic tests remain maintained. The
+[October audit](audit/agents-sync-2026-10-02.md#optional-evaluation-runner-exclusion)
+records the decision and scope.
+
 ## 2026-09-14 — Preserve completion across a cold restart
 
 - `packages/think/src/think.ts`: both chat streaming paths persist the assistant
@@ -161,18 +178,17 @@ changes the browser runtime.
   `default-throttle.test.tsx` verifies one identity across streamed messages;
   retire when upstream returns the same stable command.
 
-The four SDK SQL lifts drop their source tables. A 0.22 rollback requires
-restoring pre-upgrade actor databases, not only package pins.
-[The migration guide](rook-0.23-migration.md) records each lift and the Rook
-backup/canary requirements. Completed-request receipts now survive until the
+The four SDK SQL lifts drop their source tables; selecting a 0.22 package pin
+does not reconstruct them.
+[The migration guide](rook-0.23-migration.md) records each historical lift. Completed-request receipts now survive until the
 next stream starts, rather than a timed completed-buffer window.
 
 0.24's first wake is also one-way. `cf_agents_queues` rows become Lifecycle jobs
 and the table is dropped; Agent's `cf_schema_version` row moves to KV
 `cf_agents:schema_version`; `State` and `Queue` record their own KV schema
 versions. A 0.23 build on that database recreates an empty queue table, but its
-job driver drops due `queue` jobs, so a rollback again means restoring pre-upgrade
-actor databases. Upstream marks the queue-table lift as temporary (removed in the
+job driver drops due `queue` jobs. This is another historical reason the fork
+supports forward upgrades only. Upstream marks the queue-table lift as temporary (removed in the
 next minor, so a deployment must pass through 0.24) and it drops legacy rows whose
 payload is not valid JSON. `Agent.queue()` returns before its callback runs; the
 callback runs from the next alarm.
@@ -220,7 +236,7 @@ Think 0.20 requires AI SDK 7 and React SDK 4. Agents adds optional Pi/provider
 peers; the new Pi integration is not a runtime dependency for other consumers.
 Sessions adds a nullable content hash; Think adds submission message identity and
 child event-delivery fields. Existing tables migrate in place. The previous
-0.24 lifecycle-queue migration and its rollback limitations still apply.
+0.24 lifecycle-queue migration remains required under the forward-only policy.
 
 TanStack AI 0.54 infers the browser tool's JSON-schema input as unknown. The
 adapter retains its browser input contract and explicit literal tool name; the

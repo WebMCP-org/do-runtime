@@ -27,8 +27,6 @@ version. A selector stops applying once its parent resolves a newer version.
 | `fast-uri@>=3 <3.1.8` | `3.1.8` | Both | [High-severity affected range](https://github.com/advisories/GHSA-qw65-cvwx-89v3), [latest affected range](https://github.com/advisories/GHSA-hrr3-gc8f-f4qj) |
 | `ip-address@>=10 <10.7.1` | `10.7.1` | Both | [High-severity affected range](https://github.com/advisories/GHSA-mwp4-54f8-5fhr), [latest affected range](https://github.com/advisories/GHSA-j6r3-76f7-8jcv) |
 | `ws@>=8 <8.21.0` | `8.21.0` | Vendor | [Affected versions below 8.21.0](https://github.com/advisories/GHSA-96hv-2xvq-fx4p) |
-| `fastify@>=5 <5.12.5` | `5.12.5` | Vendor | [High-severity affected range](https://github.com/advisories/GHSA-667r-xxjv-c9mm), [latest affected range](https://github.com/advisories/GHSA-4mh8-r7rc-xpvc) |
-| `find-my-way@>=9 <9.7.0` | `9.7.0` | Vendor | [HTTP/2 denial of service](https://github.com/advisories/GHSA-c96f-x56v-gq3h); npm has no 9.6.1 release, so 9.7.0 is the first published release satisfying the fixed range |
 | `hono@>=4 <4.13.7` | `4.13.7` | Vendor | [Latest affected range](https://github.com/advisories/GHSA-hxh3-vqpv-xpqv) |
 | `@hono/node-server@>=1 <1.19.15` | `1.19.15` | Vendor | [Affected versions below 1.19.15](https://github.com/advisories/GHSA-frvp-7c67-39w9) |
 | `qs@>=6 <6.16.0` | `6.16.0` | Vendor | [Latest affected range](https://github.com/advisories/GHSA-4mjr-xmp4-gh2g) |
@@ -40,26 +38,36 @@ are reported advisories, not separate exploitable application paths. The
 initial scan includes the new example crypto shims, so it differs from the
 older 17/61 scan taken before those dependencies were installed.
 
-| Workspace | Before | After |
-| --- | --- | --- |
-| Root | 18: 5 high, 9 moderate, 4 low | 1 low; no high or moderate findings |
-| Vendor | 62: 23 high, 34 moderate, 5 low | 6: 1 high, 4 moderate, 1 low |
+| Workspace | Before | After compatible fixes | After Evalite removal |
+| --- | --- | --- | --- |
+| Root | 18: 5 high, 9 moderate, 4 low | 1 low | 1 low |
+| Vendor | 62: 23 high, 34 moderate, 5 low | 6: 1 high, 4 moderate, 1 low | 1 low |
 
-The remaining findings are explicit exclusions from the compatible overrides:
+Both workspaces now have no reported high or moderate findings. The optional
+Evalite runner, its command and its sole credentialed scheduling evaluation
+were removed. That live-model quality sample was outside the maintained test
+gate; runtime scheduling and its deterministic regression coverage remain.
+Removing unused tooling avoids carrying or migrating another development
+framework. Its now-unused Fastify and find-my-way overrides were removed too.
+The regenerated lockfile drops 76 package versions and adds none.
+
+The removal resolves these previously deferred findings:
 
 - **Evalite's static server:** `evalite@0.19.0 > @fastify/static@8.3.0`
-  has one [high route-guard bypass](https://github.com/advisories/GHSA-83w8-p2f5-377r)
+  had one [high route-guard bypass](https://github.com/advisories/GHSA-83w8-p2f5-377r)
   and three moderate findings
   ([directory traversal](https://github.com/advisories/GHSA-pr96-94w5-mx2h),
   [encoded separators](https://github.com/advisories/GHSA-x428-ghpx-8j92),
   [noncanonical paths](https://github.com/advisories/GHSA-8pvw-jcv7-9cmj)).
   Fixing all four requires static 10.1.2 or newer, outside Evalite's `^8.2.0`
-  range. The [latest stable Evalite](https://registry.npmjs.org/evalite/latest)
-  remains 0.19.0; its 1.0 prerelease is a separate tool migration. This is
-  development evaluation tooling, not a runtime package dependency.
-- **Evalite's file detector:** `evalite@0.19.0 > file-type@19.6.0` has a
+  range. Stable Evalite was 0.19.0 at the audit; its 1.0 prerelease would
+  require a separate tool migration.
+- **Evalite's file detector:** `evalite@0.19.0 > file-type@19.6.0` had a
   [moderate malformed-ASF infinite loop](https://github.com/advisories/GHSA-5v7r-6r5c-r473).
   Its fix requires 21.3.1 or newer, outside Evalite's `^19.6.0` range.
+
+The remaining finding is:
+
 - **Browser crypto:** `node-stdlib-browser > crypto-browserify > elliptic@6.6.1`
   has a [low cryptographic-implementation finding](https://github.com/advisories/GHSA-848j-6mx2-7j84).
   The advisory names 6.6.2, but [npm metadata](https://registry.npmjs.org/elliptic)
@@ -70,8 +78,8 @@ The remaining findings are explicit exclusions from the compatible overrides:
 
 The dependency audit is not a claim that every reported vulnerability is
 reachable, nor that the remaining packages are safe for arbitrary inputs.
-Removing these exclusions requires an evaluation-tool migration, a smaller
-browser crypto adapter, or upstream fixes with validation for those surfaces.
+Removing the remaining finding requires a smaller browser crypto adapter or
+an upstream fix with validation for that surface.
 
 The removed `fast-glob > micromatch > braces@3.0.3` dependency had a
 [high deeply-nested-pattern denial of service](https://github.com/advisories/GHSA-vfj7-8cjw-p6xm).
@@ -87,3 +95,9 @@ runs through the affected Workers test pool and its overridden dependencies.
 The Node 24 export checker also passed for all six maintained SDK packages
 after their build. The broader SDK, browser, and example validation is recorded
 with the sync.
+
+After Evalite removal, both frozen lockfile installs, all six SDK builds and
+`sdk:check` passed. The retained scheduling and schedules-capability suites
+passed all 70 tests on the same October 2 workerd binary. Fresh audits confirmed
+one low-severity elliptic finding in each workspace and no high or moderate
+findings. No runtime implementation or maintained test was removed.

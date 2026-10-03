@@ -43,6 +43,14 @@ existing compatible versions; updating Wrangler alone would leave the pool's
 older transitive copies installed. The export checker uses Node's built-in glob
 instead of an otherwise-unused dependency.
 
+The optional Evalite runner and its single credentialed scheduling evaluation
+were removed after the user delegated that decision. Neither was part of the
+maintained regression gate. This removes the remaining high and moderate
+development-tooling advisories and two obsolete overrides without adding a
+replacement framework. Runtime scheduling and its deterministic tests remain.
+The lockfile drops 76 package versions and adds none; both workspaces now report
+only the existing low-severity elliptic finding.
+
 ## Verification
 
 | Gate | Result |
@@ -52,10 +60,11 @@ instead of an otherwise-unused dependency.
 | Node conformance | 82 passed |
 | Chromium conformance | 95 passed |
 | Transformed Node / Chromium conformance | 82 passed in each lane |
-| SDK regression gate | 3,161 passed: React 103, chat 639, Agents 989, AI Chat 111, Think 1,032, Voice 21, Shell 194, browser 72 |
+| SDK regression gate | 3,162 passed in Linux CI: React 103, chat 639, Agents 989, AI Chat 111, Think 1,033, Voice 21, Shell 194, browser 72 |
 | Final admission-failure regression | All 28 reconnect tests passed, including a new test proving an identical request can retry after terminal-state cleanup fails |
 | Native browser connector | 24 passed with the local Browser Rendering simulator; teardown now targets only listening processes |
 | SDK exports, formatting, lint and TypeScript | Passed for the maintained six-package closure |
+| Evalite removal follow-up | Both frozen installs, all six SDK builds, `sdk:check` and 70 retained scheduling tests passed; fresh audits have no high or moderate findings |
 | Runtime and example TypeScript | Passed |
 | Runtime package | Build, publint, declaration checks and installed-package smoke passed |
 | SDK packages | All six release tarballs packed; export targets exist and release dependency ranges contain no workspace/file references |
@@ -68,7 +77,7 @@ conformance lanes after the full runtime gate. Windows launcher syntax was
 reviewed; Windows execution was not tested. These are maintained
 regression gates, not every optional upstream evaluation or live-provider test.
 
-## Rollout decisions
+## Rollout policy
 
 The release can proceed for existing 0.24 consumers without a browser export
 migration: no retained package subpath was removed, `CdpSession` remains an
@@ -76,19 +85,17 @@ alias, and the deleted interaction contract was unexported. Think's AI 7 / React
 SDK 4 peer floor already matches this fork. Native RPC users with unnamed
 Durable Object IDs must adopt named addressing.
 
-- **Rollback requirement:** if deployment must allow writes on 0.24 after a
-  downgrade, define and verify that procedure before rollout. Old writes leave
-  the new Sessions content digest stale on re-upgrade, and old recovery code
-  does not recognize completed legacy-fiber markers. The
+- **Forward-only upgrades:** the user explicitly chose not to support
+  downgrades of migrated stores. Fixes roll forward; no downgrade compatibility
+  layer or rollback project will be added. Existing forward migrations remain
+  necessary to preserve stored user data during upgrades. Old 0.24 writes can
+  leave the new Sessions content digest stale, and old recovery code does not
+  recognize completed legacy-fiber markers. The
   [SDK audit](../vendor/agents/docs/audit/agents-sync-2026-10-02.md#storage-and-rollout)
-  gives the exact source and scope; forward migration is tested, downgrade and
-  re-upgrade are not. Deployments older than 0.24 also retain that release's
-  irreversible queue/schedule migration constraint.
-- **Optional evaluation tooling:** the retained Evalite development runner has
-  advisory fixes that require a separate tool migration. Keep it pending an
-  upstream-compatible release, migrate it with evaluation coverage, or remove
-  the optional runner. It is not a runtime package dependency. Details and
-  remaining browser-crypto findings are in the security review.
+  retains the exact source and scope of those unsupported downgrade behaviors.
+- **Optional evaluation tooling:** remove Evalite and its optional live-model
+  scheduling sample. The remaining low-severity browser-crypto finding is
+  recorded in the security review; there is no pending Evalite migration.
 
 No release was published and no application deployment or stored user data was
 modified by this refresh. Work was isolated from the original checkout's

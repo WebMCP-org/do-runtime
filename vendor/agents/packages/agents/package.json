@@ -460,7 +460,6 @@
   },
   "scripts": {
     "build": "tsx ./scripts/build.ts",
-    "evals": "(cd evals; evalite)",
     "test": "vitest --run",
     "test:node": "vitest --project node",
     "test:react": "vitest --project react",

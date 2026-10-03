@@ -316,13 +316,15 @@ pnpm run test:e2e       # or: pnpm exec vitest run -c src/e2e-tests/vitest.confi
 End-to-end tests that start real workers and exercise managed-fiber and facet
 recovery across process termination.
 
-### Evals (`evals/`)
+### Excluded upstream evaluation tooling
 
-```bash
-pnpm run evals          # runs evalite inside evals/
-```
-
-AI evaluation suite (scheduling accuracy, etc.). Requires API keys in `.env`.
+This fork omits Evalite, `evals/` and the `evals` command. The sole scheduling
+evaluation required model credentials and was outside the maintained gate;
+keeping its runner would maintain an otherwise-unused application dependency
+graph. Preserve this exclusion on upstream syncs. Scheduling behavior remains
+covered by the deterministic `src/tests/schedule.test.ts` and
+`src/tests/schedules/capability.test.ts` suites in the workspace's `test:agents`
+command. See [the local maintenance policy](../../docs/fork-diff.md#local-maintenance-policy).
 
 ## Key architecture notes
 
