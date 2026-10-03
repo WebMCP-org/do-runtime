@@ -30,8 +30,8 @@ const render: typeof _render = async (...args) => {
 // oxlint-disable-next-line @typescript-eslint/no-explicit-any -- tests don't need strict agent typing
 type TestAgent = ReturnType<typeof useAgent<any>>;
 
-afterEach(() => {
-  cleanup();
+afterEach(async () => {
+  await cleanup();
 });
 
 /**
@@ -442,18 +442,20 @@ describe("useAgent RPC robustness", () => {
     it("composes user shouldReconnectOnClose with terminal close policy", async () => {
       const { host, protocol } = getTestWorkerHost();
       let latestAgent: TestAgent | null = null;
+      const onIdentity = vi.fn();
       const shouldReconnectOnClose = vi.fn((event: CloseEvent) => {
         return event.code !== 4001;
       });
 
-      render(
+      await render(
         <ControlledAgentComponent
           initialOptions={{
             agent: "TestCallableAgent",
             name: `terminal-predicate-${crypto.randomUUID()}`,
             host,
             protocol,
-            shouldReconnectOnClose
+            shouldReconnectOnClose,
+            onIdentity
           }}
           onAgent={(agent) => {
             latestAgent = agent;
@@ -473,17 +475,19 @@ describe("useAgent RPC robustness", () => {
         latestAgent!.call("closeConnectionsForTest", [1011, "nonterminal"])
       ).resolves.toBeGreaterThan(0);
 
+      // The RPC response arrives before its deferred close. The original
+      // identity can still be true here, so require a fresh identity before
+      // sending the next close request.
       await vi.waitFor(
         () => {
+          expect(shouldReconnectOnClose).toHaveBeenCalledWith(
+            expect.objectContaining({ code: 1011, reason: "nonterminal" })
+          );
+          expect(onIdentity).toHaveBeenCalledTimes(2);
           expect(latestAgent?.identified).toBe(true);
         },
         { timeout: 10000 }
       );
-      await vi.waitFor(() => {
-        expect(shouldReconnectOnClose).toHaveBeenCalledWith(
-          expect.objectContaining({ code: 1011, reason: "nonterminal" })
-        );
-      });
       const reconnectedAgent = latestAgent as unknown as TestAgent;
       expect(reconnectedAgent.connectionError).toBeNull();
 
@@ -492,6 +496,9 @@ describe("useAgent RPC robustness", () => {
       ).resolves.toBeGreaterThan(0);
 
       await vi.waitFor(() => {
+        expect(shouldReconnectOnClose).toHaveBeenCalledWith(
+          expect.objectContaining({ code: 4001, reason: "user-stop" })
+        );
         expect(latestAgent?.connectionError).toMatchObject({
           code: 4001,
           reason: "user-stop"

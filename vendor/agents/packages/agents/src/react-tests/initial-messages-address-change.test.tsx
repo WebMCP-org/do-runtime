@@ -76,8 +76,8 @@ function historyFor(name: string): UIMessage[] {
 }
 
 describe("useAgentChat when the agent address changes", () => {
-  afterEach(() => {
-    cleanup();
+  afterEach(async () => {
+    await cleanup();
     vi.restoreAllMocks();
   });
 
@@ -140,7 +140,25 @@ describe("useAgentChat when the agent address changes", () => {
   });
 
   it("never sends the previous token to the new agent from the default loader", async () => {
-    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    const originalFetch = globalThis.fetch;
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockImplementation(async (input, init) => {
+        const url = new URL(
+          input instanceof Request ? input.url : String(input)
+        );
+        if (
+          url.pathname !==
+            "/agents/test-state-agent/address-fetch-a/get-messages" &&
+          url.pathname !==
+            "/agents/test-state-agent/address-fetch-b/get-messages"
+        ) {
+          return originalFetch(input, init);
+        }
+        // Exercise the default loader with a history response for each address.
+        // TestStateAgent has no history endpoint; its cold 404 is unrelated here.
+        return Response.json(historyFor(url.pathname.split("/").at(-2)!));
+      });
     const controls = await mountChat({
       initial: { name: "address-fetch-a", token: "token-a" }
     });
@@ -155,12 +173,21 @@ describe("useAgentChat when the agent address changes", () => {
       ).toBe(true)
     );
 
+    expect(controls.renders.at(-1)?.messageIds).toEqual([
+      "address-fetch-a-message"
+    ]);
+
     fetchSpy.mockClear();
     await act(async () => {
       controls.setAddress?.({ name: "address-fetch-b", token: "token-b" });
     });
 
-    await vi.waitFor(() => expect(getMessagesUrls().length).toBeGreaterThan(0));
+    await vi.waitFor(() =>
+      expect(controls.renders.at(-1)?.messageIds).toEqual([
+        "address-fetch-b-message"
+      ])
+    );
+    expect(getMessagesUrls().length).toBeGreaterThan(0);
     for (const url of getMessagesUrls()) {
       expect(url).toContain("/agents/test-state-agent/address-fetch-b/");
       expect(url).toContain("token=token-b");
