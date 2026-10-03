@@ -75,8 +75,8 @@ export interface SqlDatabaseStatement {
 
 export const SQL_WRONG_BINDINGS_MESSAGE = "Wrong number of parameter bindings for SQL query.";
 
-/** ← `SQLITE_LIMIT_LENGTH`, raised from 2.2 MB to 4 MiB in workerd 2026-08-20. */
-export const SQLITE_LENGTH_LIMIT = 4 * 1024 * 1024;
+/** ← workerd 1b9b6ea02 `MAX_ROW_LENGTH`: 8 MiB plus V8 serialization padding. */
+export const SQLITE_LENGTH_LIMIT = 8 * 1024 * 1024 + 34;
 
 export const SQLITE_TOOBIG_MESSAGE = "string or blob too big: SQLITE_TOOBIG";
 

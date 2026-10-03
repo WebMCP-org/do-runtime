@@ -241,7 +241,7 @@ Web Worker and supply the sqlite-wasm backend shown in the runnable examples.
 For a standalone TypeScript host, install the ambient Node and Workers types:
 
 ```bash
-pnpm add -D typescript @types/node @cloudflare/workers-types@5.20260911.1
+pnpm add -D typescript @types/node @cloudflare/workers-types@5.20261002.1
 ```
 
 Use the following `tsconfig.json`. An existing Workers project can keep its
@@ -490,7 +490,7 @@ The browser cannot reproduce every workerd facility. Unsupported runtime APIs th
 | SQL function allowlist | Not enforced. Workerd's authorizer denies any function outside its 138-name `ALLOWED_SQLITE_FUNCTIONS` list; this runtime allows every function the backend compiled, including build-detail readers such as `sqlite_version()` and `sqlite_source_id()`. |
 | SQLite internal functions and default expressions | The current engines lack workerd's internal-function and default-expression authorizer patches. Native authorizer callbacks exist in both engines, but the runtime does not wire them into its SQL policy. See the [engine findings](docs/workerd-sync.md#sqlite-engine-work-still-required). |
 | PRAGMA allowlist | Workerd's allowlist enforced from tokenized SQL text. A `pragma_*` table-valued function with a string or bound argument is authorized by pragma name only, where workerd's authorizer also sees the resolved argument; the pinned conformance row is the contract. |
-| Node SQLite length limit | Bound and returned strings and blobs are capped at 4 MiB; `node:sqlite` cannot cap an unreturned SQL-computed value. The browser backend uses SQLite's native limit. |
+| Node SQLite length limit | Bound and returned strings and blobs are capped at 8 MiB plus 34 bytes of serialization padding; `node:sqlite` cannot cap an unreturned SQL-computed value. The browser backend uses SQLite's native limit. |
 | Response BYOB readers | Refused; their continuation cannot be re-gated. Use a default reader or `arrayBuffer()`. |
 | Facet `setAlarm()` | Refused synchronously, where workerd breaks the actor asynchronously ([workerd#6810](https://github.com/cloudflare/workerd/issues/6810)). |
 | Alarm exception provenance | Unclassified handler failures stay retryable; browser errors lack jsg provenance. |
@@ -558,7 +558,7 @@ it does not need a sibling checkout, SDK source aliases, or a local candidate
 archive. Publish a new source tag for each SDK change instead of replacing
 an existing release's assets. The runtime's npm release remains independent.
 
-Change runtime behaviour with the corresponding workerd source open (line citations use release `v1.20260713.1`; the conformance oracle is pinned to `v1.20260911.1`). Ask the workerd lane an observable question before inventing a local rule; record any intentional divergence in the table above and in a conformance row. Keep host seams small and typed, keep gates internal, and keep product knowledge out of the port. See [`docs/decisions.md`](docs/decisions.md) for the invariants the code cites.
+Change runtime behaviour with the corresponding workerd source open (line citations use release `v1.20260713.1`; the conformance oracle is pinned to `v1.20261002.1`). Ask the workerd lane an observable question before inventing a local rule; record any intentional divergence in the table above and in a conformance row. Keep host seams small and typed, keep gates internal, and keep product knowledge out of the port. See [`docs/decisions.md`](docs/decisions.md) for the invariants the code cites.
 
 ## Acknowledgements
 

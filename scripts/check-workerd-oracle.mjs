@@ -6,6 +6,13 @@ const version = packageJson.devDependencies?.workerd;
 if (typeof version !== "string" || !/^\d+\.\d+\.\d+$/.test(version)) {
   throw new Error("package.json must pin workerd to an exact release");
 }
+const typesVersion = `5.${version.split(".").slice(1).join(".")}`;
+for (const path of ["package.json", "examples/extension/package.json", "examples/vibe-platform/package.json"]) {
+  const manifest = JSON.parse(await readFile(new URL(path, root), "utf8"));
+  if (manifest.devDependencies?.["@cloudflare/workers-types"] !== typesVersion) {
+    throw new Error(`${path} must pin @cloudflare/workers-types to ${typesVersion}`);
+  }
+}
 
 const workspace = await readFile(new URL("pnpm-workspace.yaml", root), "utf8");
 const platforms = [
@@ -20,6 +27,9 @@ for (const name of platforms) {
   if (!workspace.includes(`- "${name}@${version}"`)) {
     throw new Error(`pnpm-workspace.yaml must exclude ${name}@${version} from the release-age gate`);
   }
+}
+if (!workspace.includes(`- "@cloudflare/workers-types@${typesVersion}"`)) {
+  throw new Error(`pnpm-workspace.yaml must exclude @cloudflare/workers-types@${typesVersion} from the release-age gate`);
 }
 
 const readme = await readFile(new URL("README.md", root), "utf8");

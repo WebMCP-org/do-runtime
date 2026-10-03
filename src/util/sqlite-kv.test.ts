@@ -127,8 +127,8 @@ describe("SQLite-KV", () => {
   test("large key", async () => {
     const kv = new SqliteKv(await openDatabase());
 
-    // Workerd documents a 4 MB limit and configures SQLite to 4 MiB.
-    const closeToLimitString = "x".repeat(4_000_000);
+    // Workerd documents an 8 MB limit; SQLite permits 8 MiB plus serialization padding.
+    const closeToLimitString = "x".repeat(8_000_000);
     kv.put(closeToLimitString, bytes("hello"));
 
     expect(text(kv.get(closeToLimitString) as Uint8Array)).toBe("hello");
