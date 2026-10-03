@@ -3,16 +3,24 @@ packages:
 linkWorkspacePackages: true
 preferWorkspacePackages: true
 overrides:
+  # Security fixes stay within each installed major; see ../../docs/dependency-security.md.
+  "sharp@0.35.2": "0.35.4"
+  "undici@>=7 <7.29.1": "7.29.1"
+  "brace-expansion@>=5 <5.0.12": "5.0.12"
+  "fast-uri@>=3 <3.1.8": "3.1.8"
+  "ip-address@>=10 <10.7.1": "10.7.1"
+  "ws@>=8 <8.21.0": "8.21.0"
+  "hono@>=4 <4.13.7": "4.13.7"
+  "@hono/node-server@>=1 <1.19.15": "1.19.15"
+  "qs@>=6 <6.16.0": "6.16.0"
   "@babel/core": "7.29.7"
 peerDependencyRules:
   allowedVersions:
     # Agents' Vite plugin still calls Babel 7 APIs while its decorator plugin
     # declares only Babel 8. The maintained browser suite exercises this pair.
     "@babel/core": "^7.29.0"
-    # The 0.22 source pin typechecks against this Workers contract.
-    "@cloudflare/workers-types": "5.20260914.1"
-    # Think supports AI SDK 6 and 7; Chat's stale peer range names only 6.
-    ai: "^7.0.0"
+    # The maintained fork typechecks against this Workers contract.
+    "@cloudflare/workers-types": "5.20261002.1"
 patchedDependencies:
   vitest-browser-react@2.3.0: patches/vitest-browser-react+2.3.0.patch
 allowBuilds:

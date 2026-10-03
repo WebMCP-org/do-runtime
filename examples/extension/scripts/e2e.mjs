@@ -782,14 +782,15 @@ async function main() {
     );
     check("recovery kept one user message", recoveredThinkStatus.userMessages, 1);
     check(
-      "recovery retained the partial and completed continuation",
+      "recovery reconciled the partial and continuation into one assistant message",
       recoveredThinkStatus.assistantMessages,
-      2,
+      1,
     );
     check(
-      "the recovered continuation reached its final chunk",
-      recoveredThinkStatus.assistantText.includes("chunk12"),
-      true,
+      "recovery retained the exact durable prefix and complete continuation",
+      recoveredThinkStatus.assistantText,
+      recoveredThinkStatus.recoveryPartial +
+        Array.from({ length: 12 }, (_, index) => `chunk${index + 1} `).join(""),
     );
 
     const finalStatus = await op(popup, "status");

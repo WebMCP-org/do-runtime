@@ -373,7 +373,9 @@ describe("reconnect-driven stream resume", () => {
         .element(
           screen.getByText(
             "Before continuation|Live suffix still live after remount",
-            { exact: true }
+            {
+              exact: true
+            }
           )
         )
         .toBeVisible();

@@ -1,4 +1,3 @@
-import { Validator, type OutputUnit, type Schema } from "@cfworker/json-schema";
 import {
   CodemodeConnector,
   type ConnectorTool,
@@ -7,7 +6,13 @@ import {
   type PassEndStatus,
   type ToolExecuteContext
 } from "@cloudflare/codemode";
-import { CdpSession, connectUrl } from "./cdp-session";
+import {
+  CDP_METHOD_NOT_FOUND,
+  CdpConnection,
+  CdpProtocolError,
+  connectUrl
+} from "./cdp-connection";
+import { validateConnectorArgs } from "./connector-validation";
 import {
   connectBrowser,
   connectBrowserSession,
@@ -19,12 +24,20 @@ import {
   type BrowserSessionInfo,
   type BrowserTargetInfo
 } from "./browser-run";
+import {
+  applyLiveViewMode,
+  LIVE_VIEW_URL_TTL_MS,
+  createLiveView,
+  type BrowserLiveView,
+  type BrowserLiveViewUrl,
+  type LiveViewMode
+} from "./live-view";
 import { loadCdpSpec, type SearchableCdpSpec } from "./spec";
 import type {
   BrowserSessionStore,
   StoredBrowserSession
-} from "./session-manager";
-import { DEFAULT_SWEEP_IDLE_MS } from "./session-manager";
+} from "./session-store";
+import { DEFAULT_SWEEP_IDLE_MS } from "./session-store";
 
 /** Browser session lifecycle for the connector (binding-backed only). */
 export interface BrowserConnectorSessionOptions {
@@ -111,47 +124,12 @@ export interface BrowserConnectorSweepResult {
   swept: Array<{ key: string; sessionId: string }>;
 }
 
-/**
- * Live View rendering mode (the `mode` query param the hosted UI at
- * `live.browser.run` understands):
- *
- * - `"tab"` — a standalone, interactive page view (best for handing control
- *   to a human).
- * - `"devtools"` — the full DevTools inspector panel (Elements, Console,
- *   Network, …).
- *
- * Omit it to use whatever mode the binding's `devtoolsFrontendUrl` defaults
- * to.
- */
-export type LiveViewMode = "tab" | "devtools";
-
-/** A single tab's Live View URL. */
-export interface BrowserLiveViewUrl {
-  /** Open this in a browser to watch/control the tab in real time. */
-  url: string;
-  /** CDP target (tab) id the URL points at. */
-  targetId: string;
-  /** Milliseconds the URL stays valid from when it was generated (~5 min). */
-  expiresInMs: number;
-}
-
-export interface BrowserLiveViewTarget {
-  targetId: string;
-  /** Embeddable Live View URL (the `devtoolsFrontendUrl`) for this tab. */
-  url: string;
-  /** The page the tab is currently showing (e.g. `https://example.com`). */
-  pageUrl?: string;
-  title?: string;
-  type?: string;
-}
-
-/** Live View URLs for every tab in a (shared) session. */
-export interface BrowserLiveView {
-  sessionId: string;
-  targets: BrowserLiveViewTarget[];
-  /** Milliseconds the URLs stay valid from when they were generated (~5 min). */
-  expiresInMs: number;
-}
+export type {
+  BrowserLiveView,
+  BrowserLiveViewTarget,
+  BrowserLiveViewUrl,
+  LiveViewMode
+} from "./live-view";
 
 const EXEC_KEY_PREFIX = "cdp:exec:";
 /**
@@ -177,13 +155,6 @@ export const DEFAULT_EXEC_SWEEP_IDLE_MS = 24 * 60 * 60 * 1000;
  */
 const EXEC_TOUCH_INTERVAL_MS = 60 * 1000;
 
-/**
- * Browser Run mints `devtoolsFrontendUrl`s (the Live View links) that are
- * valid for ~5 minutes. We surface the window so callers can decide how long
- * a shared link is good for before re-listing targets.
- */
-const LIVE_VIEW_URL_TTL_MS = 5 * 60 * 1000;
-
 function isMissingBrowserSession(error: unknown): boolean {
   // Browser Run uses 404 for unknown ids and 410 after keep_alive expiry.
   return (
@@ -192,44 +163,8 @@ function isMissingBrowserSession(error: unknown): boolean {
   );
 }
 
-function formatToolValidationError(
-  connector: string,
-  tool: string,
-  errors: OutputUnit[]
-): string {
-  // A failing property emits both a generic parent `properties` error and a
-  // specific child error. Prefer the latter so the model sees what to fix.
-  const specific = errors.filter((error) => error.keyword !== "properties");
-  const relevant = specific.length > 0 ? specific : errors;
-  const details = relevant.map((error) => {
-    const location = error.instanceLocation
-      .replace(/^#\/?/, "")
-      .replaceAll("~1", "/")
-      .replaceAll("~0", "~")
-      .replaceAll("/", ".");
-    return `${location ? ` at ${location}` : ""}: ${error.error}`;
-  });
-  return `Invalid arguments for ${connector}.${tool}${details.join(";")}`;
-}
-
-/**
- * Rewrite the hosted Live View UI's `mode` query param (`tab` | `devtools`).
- * The raw `devtoolsFrontendUrl` is returned unchanged when no mode is asked
- * for or the URL can't be parsed.
- */
-function applyLiveViewMode(rawUrl: string, mode?: LiveViewMode): string {
-  if (!mode) return rawUrl;
-  try {
-    const url = new URL(rawUrl);
-    url.searchParams.set("mode", mode === "devtools" ? "devtools" : "tab");
-    return url.toString();
-  } catch {
-    return rawUrl;
-  }
-}
-
 interface CachedSocket {
-  session: CdpSession;
+  session: CdpConnection;
   /** Browser Run session id the socket is attached to (undefined for cdpUrl). */
   browserSessionId?: string;
   /**
@@ -272,7 +207,7 @@ const ATTACH_HANDLE_PREFIX = "target:";
 export class BrowserConnector extends CodemodeConnector {
   #options: BrowserConnectorOptions;
   #sockets = new Map<string, CachedSocket>();
-  #connecting = new Map<string, Promise<CdpSession>>();
+  #connecting = new Map<string, Promise<CdpConnection>>();
 
   constructor(
     ctx: DurableObjectState | ExecutionContext,
@@ -327,7 +262,7 @@ export class BrowserConnector extends CodemodeConnector {
       );
     } else {
       lines.push(
-        "Use cdp.spec() to discover commands, events, and types when unsure.",
+        "Use cdp.spec() to look up commands, their parameters, events, and types when unsure.",
         "When a step needs a human (login, MFA, CAPTCHA, sensitive input), call cdp.getLiveViewUrl() to get a link they can open to control the browser live — surface it, then make an approval-gated call so the run pauses until they're done."
       );
     }
@@ -348,27 +283,7 @@ export class BrowserConnector extends CodemodeConnector {
   }
 
   protected override tool(name: string, tool: ConnectorTool): ConnectorTool {
-    if (!tool.inputSchema) return tool;
-
-    // Both types describe draft-7 schemas, but @cfworker's `Schema` type is
-    // narrower than JSONSchema7 around boolean subschemas.
-    const schema = tool.inputSchema as unknown as Schema;
-    const validator = new Validator(schema, "7", false);
-    return {
-      ...tool,
-      execute: async (args, ctx) => {
-        // Browser's argumentless tools are documented as `cdp.spec()` etc.;
-        // treat an omitted argument as the empty object their schemas expect.
-        const input = args === undefined ? {} : args;
-        const result = validator.validate(input);
-        if (!result.valid) {
-          throw new Error(
-            formatToolValidationError(this.name(), name, result.errors)
-          );
-        }
-        return await tool.execute(input, ctx);
-      }
-    };
+    return validateConnectorArgs(this.name(), name, tool);
   }
 
   protected tools(): ConnectorTools {
@@ -424,8 +339,8 @@ export class BrowserConnector extends CodemodeConnector {
             // sent), or a page-scoped command went to the browser-level
             // session because no sessionId was passed.
             if (
-              err instanceof Error &&
-              /-32601|wasn't found/.test(err.message)
+              err instanceof CdpProtocolError &&
+              err.code === CDP_METHOD_NOT_FOUND
             ) {
               if (await this.#isSpecEvent(method)) {
                 throw new Error(
@@ -488,7 +403,7 @@ export class BrowserConnector extends CodemodeConnector {
 
       spec: {
         description:
-          "Return the searchable Chrome DevTools Protocol spec: domains with their commands, events, and types. Use it to discover method names and capabilities.",
+          "Return the searchable Chrome DevTools Protocol spec: domains with their commands (parameters and returns), events, and types. Use it to find a method and exactly how to call it.",
         replay: "reexecute",
         inputSchema: { type: "object", properties: {} },
         execute: async (): Promise<SearchableCdpSpec> => {
@@ -767,20 +682,7 @@ export class BrowserConnector extends CodemodeConnector {
   }): Promise<BrowserLiveView | undefined> {
     const info = await this.sessionInfo();
     if (!info) return undefined;
-    const targets = (info.targets ?? [])
-      .filter((target) => target.devtoolsFrontendUrl)
-      .map((target) => ({
-        targetId: target.id,
-        url: applyLiveViewMode(target.devtoolsFrontendUrl!, options?.mode),
-        pageUrl: target.url,
-        title: target.title,
-        type: target.type
-      }));
-    return {
-      sessionId: info.sessionId,
-      targets,
-      expiresInMs: LIVE_VIEW_URL_TTL_MS
-    };
+    return createLiveView(info.sessionId, info.targets ?? [], options?.mode);
   }
 
   /** Close the shared (reuse/promoted) session, if one exists. */
@@ -1027,7 +929,7 @@ export class BrowserConnector extends CodemodeConnector {
    * uses Promise.all) share one in-flight connect instead of racing and
    * leaking the loser's WebSocket.
    */
-  #socket(executionId: string): Promise<CdpSession> {
+  #socket(executionId: string): Promise<CdpConnection> {
     const inFlight = this.#connecting.get(executionId);
     if (inFlight) return inFlight;
     const promise = this.#socketInner(executionId).finally(() => {
@@ -1039,7 +941,7 @@ export class BrowserConnector extends CodemodeConnector {
     return promise;
   }
 
-  async #socketInner(executionId: string): Promise<CdpSession> {
+  async #socketInner(executionId: string): Promise<CdpConnection> {
     if (this.#options.cdpUrl) {
       const cached = this.#sockets.get(executionId);
       if (cached) return cached.session;
@@ -1097,11 +999,9 @@ export class BrowserConnector extends CodemodeConnector {
     }
     if (cached) this.#dropSocket(executionId);
 
-    const session = await connectBrowserSession(
-      browser,
-      stored.sessionId,
-      this.#options.timeout
-    );
+    const session = await connectBrowserSession(browser, stored.sessionId, {
+      timeoutMs: this.#options.timeout
+    });
     this.#sockets.set(executionId, {
       session,
       browserSessionId: stored.sessionId,

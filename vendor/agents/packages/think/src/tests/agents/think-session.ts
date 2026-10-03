@@ -21,6 +21,7 @@ import type {
   ChatResponseResult,
   SaveMessagesOptions,
   SaveMessagesResult,
+  ChatErrorClassification,
   ChatRecoveryConfig,
   ChatRecoveryContext,
   ChatRecoveryExhaustedContext,
@@ -46,8 +47,12 @@ import type {
   ActionAuthorizationContext,
   ActionAuthorizationDecision,
   StepContext,
-  ChunkContext
+  ChunkContext,
+  ActiveTurn,
+  CancelSubmissionResult,
+  ThinkModel
 } from "../../think";
+import type { MessengerContext } from "../../messengers";
 import {
   CHAT_MESSAGE_TYPES,
   CHAT_RECOVERY_TASK_NAME,
@@ -164,19 +169,15 @@ async function runRecoveryWorkForTest(
     await waitForThinkIdleForTest(agent);
     return;
   }
-  // Vendor divergence: the fork merges upstream's two `*Detached` bodies into
-  // one `_runScheduledChatRecovery` so the Stop cutoff checks cannot drift
-  // apart between them.
   const host = agent as unknown as {
-    _runScheduledChatRecovery(
-      recovery: { kind: "continue" | "retry"; data: unknown },
-      onTurnStarted?: () => void
-    ): Promise<void>;
+    _chatRecoveryContinueDetached(data: unknown): Promise<void>;
+    _chatRecoveryRetryDetached(data: unknown): Promise<void>;
   };
-  await host._runScheduledChatRecovery({
-    kind: callback === "_chatRecoveryContinue" ? "continue" : "retry",
-    data: JSON.parse(payload)
-  });
+  if (callback === "_chatRecoveryContinue") {
+    await host._chatRecoveryContinueDetached(JSON.parse(payload));
+  } else {
+    await host._chatRecoveryRetryDetached(JSON.parse(payload));
+  }
 }
 
 // ── Mock LanguageModel (v3 format) ──────────────────────────────
@@ -235,8 +236,30 @@ function captureModelCallSettings(options: unknown): CapturedModelCallSettings {
   };
 }
 
-function createMockModel(
-  response: string,
+/** Typed model-call subset used by prompt-sensitive test models. */
+export type MockModelCallOptions = {
+  prompt?: Array<{
+    role?: string;
+    content?: string | Array<{ type?: string; text?: string }>;
+  }>;
+};
+
+/** A model call's prompt as `role: text` lines, for prompt assertions. */
+function promptLinesForTest(callOptions: MockModelCallOptions): string[] {
+  return (callOptions.prompt ?? []).map((message) => {
+    const text =
+      typeof message.content === "string"
+        ? message.content
+        : (message.content ?? [])
+            .map((part) => (part.type === "text" ? (part.text ?? "") : ""))
+            .join("");
+    return `${message.role}: ${text}`;
+  });
+}
+
+/** Create a streaming text model with static or prompt-derived output. */
+export function createMockModel(
+  response: string | ((callOptions: MockModelCallOptions) => string),
   options: MockModelOptions = {}
 ): LanguageModel {
   return {
@@ -247,8 +270,10 @@ function createMockModel(
     doGenerate() {
       throw new Error("doGenerate not implemented in mock");
     },
-    doStream(callOptions: unknown) {
+    doStream(callOptions: MockModelCallOptions) {
       options.onCall?.(captureModelCallSettings(callOptions));
+      const responseText =
+        typeof response === "function" ? response(callOptions) : response;
       _mockCallCount++;
       const callId = _mockCallCount;
       const stream = new ReadableStream({
@@ -258,7 +283,7 @@ function createMockModel(
           controller.enqueue({
             type: "text-delta",
             id: `t-${callId}`,
-            delta: response
+            delta: responseText
           });
           controller.enqueue({ type: "text-end", id: `t-${callId}` });
           controller.enqueue({
@@ -603,6 +628,23 @@ class TestCollectingCallback implements StreamCallback {
 // beforeTurn/onStepFinish/onChunk (instrumentation),
 // _transformInferenceResult (error injection).
 
+type GatewayCallForTest = {
+  kind: "run" | "gateway";
+  model: string | null;
+  gateway: GatewayOptions | null;
+};
+
+type TurnIdentityLogEntry = {
+  input: string;
+  requestId: string | null;
+  trigger: string | null;
+  hasAbortSignal: boolean;
+  activeRequestId: string | null;
+  activeTrigger: string | null;
+  messengerThreadId: string | null;
+  getMessengerThreadId: string | null;
+};
+
 export class ThinkTestAgent extends Think {
   private _assistantRowsAtDone: number[] = [];
   private _completionFrames: string[] = [];
@@ -650,18 +692,56 @@ export class ThinkTestAgent extends Think {
   private _errorConfig: {
     afterChunks: number;
     message: string;
+    inStream?: boolean;
+    /** Thrown (or handed to `onError` in-stream) instead of a plain error. */
+    error?: unknown;
+    /** Abort the turn right before it fails. */
+    abortFirst?: boolean;
   } | null = null;
+  // #2085: when set, only the first N inferences error (then the recovery
+  // continuation streams normally). `null` = every inference errors.
+  private _errorAttemptsRemaining: number | null = null;
   private _stripTextResponseForTest = false;
   private _stallAfterChunks: number | null = null;
   // #1626 stall-recovery: when set, only the first N inferences stall (then the
   // continuation streams normally). `null` = every inference stalls (the
   // original terminal-watchdog behavior).
   private _stallAttemptsRemaining: number | null = null;
+  // The stalling attempt streams only an internal final-answer tool call, which
+  // persistence strips, before it hangs.
+  private _stallWithFinalAnswerOnlyForTest = false;
   private _streamChunkDelayMs: number | null = null;
   private _holdAgentToolModel = false;
   private _cancellationErrorForTest: string | null = null;
   private _agentToolOutputForTest = new Map<string, unknown>();
   private _responseLog: ChatResponseResult[] = [];
+  private _recoveryHookForTest: ChatRecoveryOptions | "throw" | null = null;
+  private _recoveryCallsForTest: Array<{
+    recoveryKind: ChatRecoveryContext["recoveryKind"];
+    attempt: number;
+    partialText: string;
+    recoveryData: string | null;
+    createdAt: number;
+  }> = [];
+  private _stashInBeforeTurnForTest: string | undefined;
+  private _turnIdentityLog: TurnIdentityLogEntry[] = [];
+
+  override async onChatRecovery(
+    ctx: ChatRecoveryContext
+  ): Promise<ChatRecoveryOptions> {
+    this._recoveryCallsForTest.push({
+      recoveryKind: ctx.recoveryKind,
+      attempt: ctx.attempt,
+      partialText: ctx.partialText,
+      recoveryData:
+        typeof ctx.recoveryData === "string" ? ctx.recoveryData : null,
+      createdAt: ctx.createdAt
+    });
+    if (this._recoveryHookForTest === "throw") {
+      throw new Error("recovery hook boom");
+    }
+    return this._recoveryHookForTest ?? {};
+  }
 
   override onChatError(error: unknown): unknown {
     const msg = error instanceof Error ? error.message : String(error);
@@ -855,6 +935,24 @@ export class ThinkTestAgent extends Think {
     this._progressInjection = { runId, progressBody, milestoneBody };
   }
 
+  /** Persist a milestone the way `reportProgress({ milestone })` does. */
+  persistAgentToolMilestoneForTest(
+    runId: string,
+    name: string,
+    data: unknown
+  ): number {
+    return (
+      this as unknown as {
+        _persistAgentToolMilestone(
+          runId: string,
+          name: string,
+          data: unknown,
+          at: number
+        ): number;
+      }
+    )._persistAgentToolMilestone(runId, name, data, Date.now());
+  }
+
   /**
    * Bounded-poll until the live child turn has bound its request id (written to
    * the child-run row at turn start) and opened its resumable stream, so a test
@@ -880,11 +978,21 @@ export class ThinkTestAgent extends Think {
     return null;
   }
 
+  private _failNextChunkRead = false;
+
+  failNextAgentToolChunkReadForTest(): void {
+    this._failNextChunkRead = true;
+  }
+
   override async getAgentToolChunks(
     runId: string,
     options?: { afterSequence?: number }
   ): Promise<AgentToolStoredChunk[]> {
     await this._waitForTailOverlapSnapshot(runId);
+    if (this._failNextChunkRead) {
+      this._failNextChunkRead = false;
+      throw new Error("chunk read failed");
+    }
     const chunks = await super.getAgentToolChunks(runId, options);
 
     const race = this._attachRaceInjection;
@@ -1034,6 +1142,434 @@ export class ThinkTestAgent extends Think {
     };
   }
 
+  /**
+   * Inspect a stale `running` child-run row (no live run, no recovery) with
+   * `reconcile: false`. Returns the reported and the stored status afterwards.
+   */
+  async inspectStaleRunReadOnlyForTest(): Promise<{
+    reported: string | undefined;
+    stored: string | undefined;
+  }> {
+    const runId = crypto.randomUUID();
+    this["_ensureAgentToolChildRunTable"]();
+    this.sql`
+      INSERT INTO cf_agent_tool_child_runs (run_id, status, started_at)
+      VALUES (${runId}, 'running', ${Date.now()})
+    `;
+    const inspection = await this.inspectAgentToolRun(runId, {
+      reconcile: false
+    });
+    return {
+      reported: inspection?.status,
+      stored: this["_readAgentToolChildRun"](runId)?.status
+    };
+  }
+
+  /**
+   * A child turn that streams error text, then an in-band error, and persists
+   * its assistant reply — but is "evicted" before `startAgentToolRun`'s
+   * finalizer seals the row `error`. Holds the finalizer at the point the turn
+   * returns, drops the run's in-memory state as an eviction would, then
+   * inspects (reconciling the stale `running` row).
+   */
+  async reconcileEvictedErroredRunForTest(): Promise<{
+    before: string | null;
+    assistantText: string;
+    inspection: Awaited<ReturnType<Think["inspectAgentToolRun"]>>;
+  }> {
+    const runId = crypto.randomUUID();
+    const self = this as unknown as {
+      _runProgrammaticMessagesTurn: (...args: unknown[]) => Promise<unknown>;
+    };
+    const original = self._runProgrammaticMessagesTurn;
+    let reached!: () => void;
+    let release!: () => void;
+    const reachedGate = new Promise<void>((resolve) => {
+      reached = resolve;
+    });
+    const released = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    self._runProgrammaticMessagesTurn = async (...args) => {
+      self._runProgrammaticMessagesTurn = original;
+      const result = await original.apply(this, args);
+      reached();
+      await released;
+      return result;
+    };
+    this._inBandErrorResponse = {
+      errorText: "model exploded",
+      textChunks: ["Sorry, something went wrong."]
+    };
+    try {
+      await this.startAgentToolRun("fail midway", { runId });
+      await reachedGate;
+      this["_agentToolAbortControllers"].delete(runId);
+      this["_agentToolLastErrors"].delete(runId);
+      this["_agentToolLiveSequences"].delete(runId);
+      this["_agentToolPreTurnAssistantIds"].delete(runId);
+      this["_agentToolRunsByRequestId"].clear();
+      const before = this["_readAgentToolChildRun"](runId)?.status ?? null;
+      const assistantText = this.messages
+        .filter((message) => message.role === "assistant")
+        .flatMap((message) => message.parts)
+        .map((part) => (part.type === "text" ? part.text : ""))
+        .join("");
+      const inspection = await this.inspectAgentToolRun(runId);
+      return { before, assistantText, inspection };
+    } finally {
+      this._inBandErrorResponse = null;
+      release();
+    }
+  }
+
+  /**
+   * Post-restart cold-counter realign: seed a RUNNING run with a stored backlog
+   * 0..2, wipe the in-memory live sequence, tail after `afterSequence` (parent
+   * recovery passes the last stored index), then broadcast a new chunk. Returns
+   * the live counter after the drain and the forwarded chunk (null if dropped).
+   */
+  async coldCounterReattachForTest(afterSequence: number): Promise<{
+    liveSequenceAfterDrain: number | undefined;
+    postRestart: { sequence: number; body: string } | null;
+  }> {
+    const runId = crypto.randomUUID();
+    const requestId = crypto.randomUUID();
+    this["_ensureAgentToolChildRunTable"]();
+    const streamId = this["_resumableStream"].start(requestId);
+    const backlog = ["a", "b", "c"].map((delta) =>
+      JSON.stringify({ type: "text-delta", id: "t", delta })
+    );
+    for (const body of backlog) {
+      this["_resumableStream"].storeChunk(streamId, body);
+    }
+    this["_resumableStream"].flushBuffer();
+    this.sql`
+      INSERT INTO cf_agent_tool_child_runs
+        (run_id, request_id, stream_id, status, started_at)
+      VALUES (${runId}, ${requestId}, ${streamId}, 'running', ${Date.now()})
+    `;
+    this["_agentToolLiveSequences"].delete(runId);
+
+    const stream = (await this.tailAgentToolRun(runId, {
+      afterSequence
+    })) as unknown as ReadableStream<Uint8Array>;
+    const reader = stream.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    const readLine = async (timeoutMs: number): Promise<string | null> => {
+      const deadline = Date.now() + timeoutMs;
+      for (;;) {
+        const nl = buffer.indexOf("\n");
+        if (nl >= 0) {
+          const line = buffer.slice(0, nl);
+          buffer = buffer.slice(nl + 1);
+          if (line) return line;
+          continue;
+        }
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) return null;
+        const next = await Promise.race([
+          reader.read(),
+          new Promise<"timeout">((resolve) =>
+            setTimeout(() => resolve("timeout"), remaining)
+          )
+        ]);
+        if (next === "timeout" || next.done) return null;
+        buffer += decoder.decode(next.value, { stream: true });
+      }
+    };
+    for (let i = afterSequence + 1; i < backlog.length; i++) {
+      if ((await readLine(2000)) === null) break;
+    }
+    const deadline = Date.now() + 500;
+    while (
+      this["_agentToolLiveSequences"].get(runId) !== backlog.length &&
+      Date.now() < deadline
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    const liveSequenceAfterDrain = this["_agentToolLiveSequences"].get(runId);
+
+    const postBody = JSON.stringify({
+      type: "text-delta",
+      id: "t",
+      delta: "post-restart"
+    });
+    this["_resumableStream"].storeChunk(streamId, postBody);
+    this.broadcast(
+      JSON.stringify({
+        type: "cf_agent_use_chat_response",
+        id: requestId,
+        body: postBody,
+        done: false
+      })
+    );
+    const postLine = await readLine(500);
+    await reader.cancel();
+    return {
+      liveSequenceAfterDrain,
+      postRestart:
+        postLine === null
+          ? null
+          : (JSON.parse(postLine) as { sequence: number; body: string })
+    };
+  }
+
+  /**
+   * A warm run that streamed a chunk too large to store, then a tail
+   * re-attaching while a stored chunk is broadcast during its drain, followed
+   * by another oversized chunk and a stored one. Returns what the tail
+   * forwarded (oversized deltas summarized).
+   */
+  async skippedChunkReattachForTest(): Promise<
+    Array<{ sequence: number; delta: string; unstored: boolean }>
+  > {
+    const runId = crypto.randomUUID();
+    const requestId = crypto.randomUUID();
+    this["_ensureAgentToolChildRunTable"]();
+    const streamId = this["_resumableStream"].start(requestId);
+    this.sql`
+      INSERT INTO cf_agent_tool_child_runs
+        (run_id, request_id, stream_id, status, started_at)
+      VALUES (${runId}, ${requestId}, ${streamId}, 'running', ${Date.now()})
+    `;
+    this["_agentToolLiveSequences"].set(runId, 0);
+    const broadcast = (body: string) =>
+      this.broadcast(
+        JSON.stringify({
+          type: "cf_agent_use_chat_response",
+          id: requestId,
+          body,
+          done: false
+        })
+      );
+    const send = (body: string) => {
+      this["_resumableStream"].storeChunk(streamId, body);
+      broadcast(body);
+    };
+    const delta = (value: string) =>
+      JSON.stringify({ type: "text-delta", id: "t", delta: value });
+    const oversized = delta("x".repeat(1_900_000));
+
+    send(delta("a"));
+    send(delta("b"));
+    send(oversized);
+    this["_resumableStream"].storeChunk(streamId, delta("c"));
+    this["_resumableStream"].flushBuffer();
+
+    const tail = this.tailAgentToolRun(runId, { afterSequence: -1 });
+    broadcast(delta("c"));
+    const reader = (
+      (await tail) as unknown as ReadableStream<Uint8Array>
+    ).getReader();
+    send(oversized);
+    send(delta("d"));
+
+    const decoder = new TextDecoder();
+    let buffer = "";
+    const deadline = Date.now() + 500;
+    for (;;) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      const next = await Promise.race([
+        reader.read(),
+        new Promise<"timeout">((resolve) =>
+          setTimeout(() => resolve("timeout"), remaining)
+        )
+      ]);
+      if (next === "timeout" || next.done) break;
+      buffer += decoder.decode(next.value, { stream: true });
+    }
+    await reader.cancel();
+    this["_agentToolLiveSequences"].delete(runId);
+    return buffer
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => {
+        const chunk = JSON.parse(line) as AgentToolStoredChunk;
+        const { delta: value } = JSON.parse(chunk.body) as { delta: string };
+        return {
+          sequence: chunk.sequence,
+          delta: value.length > 10 ? "<oversized>" : value,
+          unstored: chunk.unstoredId !== undefined
+        };
+      });
+  }
+
+  /**
+   * A running run with a cold live counter (as after a restart) and a stored
+   * backlog 0..2, tailed while the recovered turn stores and broadcasts a new
+   * chunk after the drain read its snapshot. Returns the forwarded sequences
+   * and the new chunk (null if dropped).
+   */
+  async broadcastDuringDrainForTest(): Promise<{
+    drained: number[];
+    postRestart: { sequence: number; body: string } | null;
+  }> {
+    const runId = crypto.randomUUID();
+    const requestId = crypto.randomUUID();
+    this["_ensureAgentToolChildRunTable"]();
+    const streamId = this["_resumableStream"].start(requestId);
+    const backlog = ["a", "b", "c"].map((delta) =>
+      JSON.stringify({ type: "text-delta", id: "t", delta })
+    );
+    for (const body of backlog) {
+      this["_resumableStream"].storeChunk(streamId, body);
+    }
+    this["_resumableStream"].flushBuffer();
+    this.sql`
+      INSERT INTO cf_agent_tool_child_runs
+        (run_id, request_id, stream_id, status, started_at)
+      VALUES (${runId}, ${requestId}, ${streamId}, 'running', ${Date.now()})
+    `;
+    this["_agentToolLiveSequences"].delete(runId);
+
+    const self = this;
+    const original = self.inspectAgentToolRun;
+    let reached!: () => void;
+    const afterSnapshot = new Promise<void>((resolve) => {
+      reached = resolve;
+    });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    self.inspectAgentToolRun = async (id, options) => {
+      const inspection = await original.call(this, id, options);
+      reached();
+      await gate;
+      return inspection;
+    };
+
+    try {
+      const tail = this.tailAgentToolRun(runId, { afterSequence: -1 });
+      await afterSnapshot;
+      const postBody = JSON.stringify({
+        type: "text-delta",
+        id: "t",
+        delta: "post-restart"
+      });
+      this["_resumableStream"].storeChunk(streamId, postBody);
+      this.broadcast(
+        JSON.stringify({
+          type: "cf_agent_use_chat_response",
+          id: requestId,
+          body: postBody,
+          done: false
+        })
+      );
+      release();
+
+      const reader = (
+        (await tail) as unknown as ReadableStream<Uint8Array>
+      ).getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      const deadline = Date.now() + 500;
+      for (;;) {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) break;
+        const next = await Promise.race([
+          reader.read(),
+          new Promise<"timeout">((resolve) =>
+            setTimeout(() => resolve("timeout"), remaining)
+          )
+        ]);
+        if (next === "timeout" || next.done) break;
+        buffer += decoder.decode(next.value, { stream: true });
+      }
+      await reader.cancel();
+      const chunks = buffer
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as { sequence: number; body: string });
+      return {
+        drained: chunks
+          .filter((chunk) => chunk.body !== postBody)
+          .map((chunk) => chunk.sequence),
+        postRestart: chunks.find((chunk) => chunk.body === postBody) ?? null
+      };
+    } finally {
+      release();
+      self.inspectAgentToolRun = original;
+      this["_agentToolLiveSequences"].delete(runId);
+    }
+  }
+
+  /**
+   * A warm run that already broadcast a progress frame, then a tail attaching
+   * while a progress frame and a chunk (stored before the attach) are
+   * broadcast during its drain. Returns every body the tail forwarded.
+   */
+  async progressDuringDrainForTest(): Promise<string[]> {
+    const runId = crypto.randomUUID();
+    const requestId = crypto.randomUUID();
+    this["_ensureAgentToolChildRunTable"]();
+    const streamId = this["_resumableStream"].start(requestId);
+    this.sql`
+      INSERT INTO cf_agent_tool_child_runs
+        (run_id, request_id, stream_id, status, started_at)
+      VALUES (${runId}, ${requestId}, ${streamId}, 'running', ${Date.now()})
+    `;
+    this["_agentToolLiveSequences"].set(runId, 0);
+    const broadcast = (body: string) =>
+      this.broadcast(
+        JSON.stringify({
+          type: "cf_agent_use_chat_response",
+          id: requestId,
+          body,
+          done: false
+        })
+      );
+    const progress = (message: string) =>
+      JSON.stringify({
+        type: "data-agent-progress",
+        transient: true,
+        data: { message }
+      });
+
+    const stored = ["a", "b", "c"].map((delta) =>
+      JSON.stringify({ type: "text-delta", id: "t", delta })
+    );
+    for (const body of stored.slice(0, 2)) {
+      this["_resumableStream"].storeChunk(streamId, body);
+      broadcast(body);
+    }
+    broadcast(progress("before-attach"));
+    this["_resumableStream"].storeChunk(streamId, stored[2]);
+    this["_resumableStream"].flushBuffer();
+
+    const tail = this.tailAgentToolRun(runId, { afterSequence: -1 });
+    broadcast(progress("during-drain"));
+    broadcast(stored[2]);
+    const reader = (
+      (await tail) as unknown as ReadableStream<Uint8Array>
+    ).getReader();
+
+    const decoder = new TextDecoder();
+    let buffer = "";
+    const deadline = Date.now() + 500;
+    for (;;) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      const next = await Promise.race([
+        reader.read(),
+        new Promise<"timeout">((resolve) =>
+          setTimeout(() => resolve("timeout"), remaining)
+        )
+      ]);
+      if (next === "timeout" || next.done) break;
+      buffer += decoder.decode(next.value, { stream: true });
+    }
+    await reader.cancel();
+    this["_agentToolLiveSequences"].delete(runId);
+    return buffer
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => (JSON.parse(line) as { body: string }).body);
+  }
+
   private _beforeTurnLog: Array<{
     system: string;
     toolNames: string[];
@@ -1043,9 +1579,15 @@ export class ThinkTestAgent extends Think {
   private _beforeTurnMessagesJson: string[] = [];
   private _capturedTurnChannels: string[] = [];
   private _capturedTurnMetadata: (Record<string, unknown> | undefined)[] = [];
+  private _beforeTurnThrowChannel: string | null = null;
 
   override configureChannels() {
     return {
+      web: {
+        kind: "web" as const,
+        ingress: { transport: "websocket" as const },
+        instructions: "WEB MODE"
+      },
       voice: {
         kind: "voice" as const,
         ingress: { transport: "voice" as const },
@@ -1071,6 +1613,7 @@ export class ThinkTestAgent extends Think {
   private _releaseBeforeStepGate: (() => void) | null = null;
   private _beforeStepGateEntered = false;
   private _lastModelCallSettings: CapturedModelCallSettings | null = null;
+  private _modelPromptsForTest: string[][] = [];
   private _reasoningResponse: { response: string; reasoning: string } | null =
     null;
   private _inBandErrorResponse: {
@@ -1092,7 +1635,9 @@ export class ThinkTestAgent extends Think {
     return this._agentToolOutputForTest.get(runId);
   }
 
-  override beforeTurn(ctx: TurnContext): TurnConfig | void {
+  override beforeTurn(
+    ctx: TurnContext
+  ): TurnConfig | void | Promise<TurnConfig | void> {
     this._beforeTurnLog.push({
       system: ctx.system,
       toolNames: Object.keys(ctx.tools),
@@ -1100,13 +1645,299 @@ export class ThinkTestAgent extends Think {
       body: ctx.body as RpcJsonObject | undefined
     });
     this._beforeTurnMessagesJson.push(JSON.stringify(ctx.messages));
+    const lastUser = [...ctx.messages].reverse().find((m) => m.role === "user");
+    this._turnIdentityLog.push({
+      input: JSON.stringify(lastUser?.content ?? null),
+      requestId: ctx.requestId ?? null,
+      trigger: ctx.trigger ?? null,
+      hasAbortSignal: ctx.abortSignal instanceof AbortSignal,
+      activeRequestId: this.activeTurn?.requestId ?? null,
+      activeTrigger: this.activeTurn?.trigger ?? null,
+      messengerThreadId: ctx.messenger?.thread.id ?? null,
+      getMessengerThreadId: this.getMessengerContext()?.thread.id ?? null
+    });
     this._capturedTurnChannels.push(this.activeChannel?.channelId ?? "");
     this._capturedTurnMetadata.push(this.activeTurnMetadata);
+    if (
+      this._beforeTurnThrowChannel !== null &&
+      this.activeChannel?.channelId === this._beforeTurnThrowChannel
+    ) {
+      throw new Error(`beforeTurn failed on ${this._beforeTurnThrowChannel}`);
+    }
+    if (this._stashInBeforeTurnForTest !== undefined) {
+      this.stash(this._stashInBeforeTurnForTest);
+    }
+    const hold = this._messengerTurnHold;
+    if (hold) {
+      this._messengerTurnHold = undefined;
+      return this._holdMessengerTurn(hold);
+    }
     if (this._turnConfigOverride) return this._turnConfigOverride;
+  }
+
+  private _messengerTurnHold:
+    | { entered: () => void; release: Promise<void> }
+    | undefined;
+  private _heldMessengerThreadId: string | null = null;
+
+  private async _holdMessengerTurn(hold: {
+    entered: () => void;
+    release: Promise<void>;
+  }): Promise<TurnConfig | void> {
+    hold.entered();
+    await hold.release;
+    this._heldMessengerThreadId = this.getMessengerContext()?.thread.id ?? null;
+    if (this._turnConfigOverride) return this._turnConfigOverride;
+  }
+
+  async getHeldMessengerThreadIdForTest(): Promise<string | null> {
+    return this._heldMessengerThreadId;
   }
 
   async getCapturedTurnChannelsForTest(): Promise<string[]> {
     return this._capturedTurnChannels;
+  }
+
+  async getTurnIdentityLogForTest(): Promise<TurnIdentityLogEntry[]> {
+    return this._turnIdentityLog;
+  }
+
+  async getResponseRequestIdsForTest(): Promise<string[]> {
+    return this._responseLog.map((response) => response.requestId);
+  }
+
+  async getActiveTurnForTest(): Promise<ActiveTurn | null> {
+    return this.activeTurn ?? null;
+  }
+
+  private _gatewayForTest: GatewayOptions | undefined;
+  private _fakeAIBinding: Ai | undefined;
+  private _gatewayModels: string[] = [];
+
+  override getGateway(model: string): GatewayOptions | undefined {
+    this._gatewayModels.push(model);
+    return this._gatewayForTest;
+  }
+
+  override getAIBinding(): Ai {
+    if (this._missingAIBindingForTest) {
+      throw new Error("no AI binding in this test");
+    }
+    return this._fakeAIBinding ?? super.getAIBinding();
+  }
+
+  private _stringModelForTest: string | undefined;
+  private _missingAIBindingForTest = false;
+
+  /**
+   * The default model is a string with no AI binding to build it, and
+   * `beforeTurn` supplies its own model: the turn must not resolve the default.
+   */
+  async testChatWithBeforeTurnModelOverrideForTest(): Promise<{
+    result: TestChatResult;
+    gatewayModels: string[];
+  }> {
+    this._stringModelForTest = "@cf/meta/llama-3.1-8b-instruct";
+    this._missingAIBindingForTest = true;
+    this._gatewayModels = [];
+    this._turnConfigOverride = { model: createMockModel("from override") };
+    try {
+      const result = await this.testChat("override the model");
+      return { result, gatewayModels: this._gatewayModels };
+    } finally {
+      this._stringModelForTest = undefined;
+      this._missingAIBindingForTest = false;
+      this._turnConfigOverride = null;
+    }
+  }
+
+  async resolveModelWithAsyncGatewayForTest(): Promise<string> {
+    const gateway = Promise.resolve({ id: "async" });
+    this.getGateway = () => gateway as unknown as GatewayOptions;
+    try {
+      this.resolveModel("@cf/meta/llama-3.1-8b-instruct");
+      return "resolved";
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    } finally {
+      delete (this as { getGateway?: unknown }).getGateway;
+    }
+  }
+
+  /**
+   * #2321: a stamped `createdAt` must survive the recovery continuation that
+   * extends the interrupted assistant message. `continuationMetadata` is
+   * added by the continuation's writer on top of the original stamp.
+   */
+  async testRecoveryExtensionMetadataForTest(
+    continuationMetadata: Record<string, unknown> = { resumed: true }
+  ): Promise<{
+    assistantMessages: number;
+    metadata: string;
+    originalCreatedAt: unknown;
+    writerCalls: Array<{ createdAt: number; continuation: boolean }>;
+  }> {
+    const writerCalls: Array<{ createdAt: number; continuation: boolean }> = [];
+    let originalCreatedAt: unknown;
+    this.messageMetadata = ({ part, continuation }) => {
+      if (part.type !== "start") return undefined;
+      if (continuation) {
+        originalCreatedAt = (
+          this.messages.find((message) => message.role === "assistant")
+            ?.metadata as Record<string, unknown> | undefined
+        )?.createdAt;
+      }
+      const stamp = { createdAt: writerCalls.length + 1, continuation };
+      writerCalls.push(stamp);
+      return continuation ? { ...stamp, ...continuationMetadata } : stamp;
+    };
+    try {
+      const result = await this.testChatWithStallThenRecover(3, 50);
+      const assistant = (await this.getMessages()).filter(
+        (message) => message.role === "assistant"
+      );
+      return {
+        assistantMessages: result.assistantMessages,
+        metadata: JSON.stringify(assistant.at(-1)?.metadata ?? null),
+        writerCalls,
+        originalCreatedAt
+      };
+    } finally {
+      this.messageMetadata = undefined;
+    }
+  }
+
+  /**
+   * Resolve a string model against a fake AI binding and report what reached
+   * the binding: `run` options on the Workers AI path, or the gateway id on
+   * the catalog gateway path. The fake throws, so no response is parsed.
+   */
+  async resolveModelGatewayForTest(
+    model: string,
+    gateway: GatewayOptions | null
+  ): Promise<{ models: string[]; calls: GatewayCallForTest[] }> {
+    const calls = this._installFakeAIBindingForTest();
+    this._gatewayForTest = gateway ?? undefined;
+    this._gatewayModels = [];
+    const resolved = this.resolveModel(model) as unknown as {
+      doStream(options: { prompt: unknown[] }): Promise<unknown>;
+    };
+    await resolved
+      .doStream({
+        prompt: [{ role: "user", content: [{ type: "text", text: "hi" }] }]
+      })
+      .catch(() => {});
+    return { models: this._gatewayModels, calls };
+  }
+
+  /** Resolve `model` without a fake binding and report the thrown message. */
+  async resolveModelErrorForTest(model: string): Promise<string | null> {
+    this._fakeAIBinding = undefined;
+    try {
+      this.resolveModel(model);
+      return null;
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  /** Whether `resolveModel` returns a `LanguageModel` object unchanged. */
+  async resolveModelPassesThroughObjectForTest(): Promise<boolean> {
+    const model = createMockModel("pass-through");
+    return this.resolveModel(model) === model;
+  }
+
+  /**
+   * Run a turn whose `beforeTurn` (or `beforeStep`) returns a string `model`
+   * and report what reached the fake AI binding. The fake throws, so the turn
+   * itself errors after the model is resolved and called.
+   */
+  async runTurnWithStringModelForTest(
+    hook: "beforeTurn" | "beforeStep",
+    model: string
+  ): Promise<{ models: string[]; calls: GatewayCallForTest[] }> {
+    const calls = this._installFakeAIBindingForTest();
+    this._gatewayForTest = undefined;
+    this._gatewayModels = [];
+    if (hook === "beforeTurn") {
+      this._turnConfigOverride = { model };
+    } else {
+      this._stepConfigOverride = { model };
+    }
+    try {
+      await this.runTurn({ input: "hi" });
+    } catch {
+      // The fake binding throws; only the resolved calls matter here.
+    } finally {
+      this._turnConfigOverride = null;
+      this._stepConfigOverride = null;
+    }
+    return { models: this._gatewayModels, calls };
+  }
+
+  private _installFakeAIBindingForTest(): GatewayCallForTest[] {
+    const calls: GatewayCallForTest[] = [];
+    this._fakeAIBinding = {
+      run: async (
+        runModel: string,
+        _inputs: unknown,
+        options?: { gateway?: GatewayOptions }
+      ) => {
+        calls.push({
+          kind: "run",
+          model: runModel,
+          gateway: options?.gateway ?? null
+        });
+        throw new Error("fake AI binding");
+      },
+      gateway: (id: string) => {
+        calls.push({ kind: "gateway", model: null, gateway: { id } });
+        return {
+          run: async () => {
+            throw new Error("fake AI gateway");
+          }
+        };
+      }
+    } as unknown as Ai;
+    return calls;
+  }
+
+  async runConcurrentMessengerTurnsForTest(): Promise<void> {
+    const context = (threadId: string): MessengerContext => ({
+      capabilities: {},
+      kind: "direct-message",
+      messengerId: "fake",
+      provider: "fake",
+      thread: {
+        id: threadId,
+        isDirectMessage: true,
+        providerThreadId: threadId
+      }
+    });
+    let entered!: () => void;
+    const enteredA = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let release!: () => void;
+    this._messengerTurnHold = {
+      entered,
+      release: new Promise<void>((resolve) => {
+        release = resolve;
+      })
+    };
+    const turnA = this.chatWithMessengerContext(
+      "from thread a",
+      new TestCollectingCallback(),
+      context("thread-a")
+    );
+    await enteredA;
+    const turnB = this.chatWithMessengerContext(
+      "from thread b",
+      new TestCollectingCallback(),
+      context("thread-b")
+    );
+    release();
+    await Promise.all([turnA, turnB]);
   }
 
   async getCapturedTurnMetadataForTest(): Promise<
@@ -1137,10 +1968,13 @@ export class ThinkTestAgent extends Think {
       this as unknown as {
         _persistIncomingMessage(
           m: UIMessage,
-          serverMessages: readonly UIMessage[]
+          stored: ReadonlyMap<string, UIMessage>
         ): Promise<void>;
       }
-    )._persistIncomingMessage(msg, this.messages);
+    )._persistIncomingMessage(
+      msg,
+      new Map(this.messages.map((message) => [message.id, message]))
+    );
   }
 
   async runChannelTurnForTest(options: {
@@ -1171,8 +2005,49 @@ export class ThinkTestAgent extends Think {
     return this.getMessages();
   }
 
+  /**
+   * Queue continuations, in order, behind a held turn so none of them starts
+   * before the last is admitted.
+   */
+  async runQueuedContinuationsForTest(
+    channels: Array<string | undefined>
+  ): Promise<void> {
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const queue = (
+      this as unknown as {
+        _turnQueue: {
+          enqueue(id: string, fn: () => Promise<void>): Promise<unknown>;
+        };
+      }
+    )._turnQueue;
+    const blocker = queue.enqueue(crypto.randomUUID(), () => gate);
+    const runs: Promise<unknown>[] = [];
+    for (const channel of channels) {
+      runs.push(this.continueLastTurn(undefined, { channel }));
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    release();
+    await Promise.all([blocker, ...runs]);
+  }
+
+  async getAutoContinuationChannelForTest(): Promise<string | undefined> {
+    return (
+      this as unknown as { _channelForAutoContinuation(): string | undefined }
+    )._channelForAutoContinuation();
+  }
+
   async resetCapturedTurnChannelsForTest(): Promise<void> {
     this._capturedTurnChannels = [];
+  }
+
+  /** Make `beforeTurn` throw for turns on `channel` (null disables). */
+  async setBeforeTurnThrowChannelForTest(
+    channel: string | null
+  ): Promise<void> {
+    this._beforeTurnThrowChannel = channel;
   }
 
   async setTurnConfigOverride(config: TurnConfig | null): Promise<void> {
@@ -1192,6 +2067,41 @@ export class ThinkTestAgent extends Think {
    */
   async setTurnConfigOutputText(): Promise<void> {
     this._turnConfigOverride = { output: Output.text(), activeTools: [] };
+  }
+
+  /** Like `setTurnConfigOutputText`, with an `Output.object` spec. */
+  async setTurnConfigOutputObject(): Promise<void> {
+    this._turnConfigOverride = {
+      output: Output.object({
+        schema: z.object({ answer: z.string() }),
+        name: "Answer"
+      }),
+      activeTools: []
+    };
+  }
+
+  /** Run a wait-mode turn and return its result fields. */
+  async runTurnWaitForTest(
+    input: string,
+    options?: { continuation?: boolean }
+  ): Promise<{
+    status: string;
+    error?: string;
+    outputJson?: string;
+    messageText?: string;
+  }> {
+    const result = await this.runTurn(
+      options?.continuation ? { continuation: true } : { input }
+    );
+    const text = result.message?.parts
+      .map((part) => (part.type === "text" ? part.text : ""))
+      .join("");
+    return {
+      status: result.status,
+      ...(result.error !== undefined && { error: result.error }),
+      ...("output" in result && { outputJson: JSON.stringify(result.output) }),
+      ...(text !== undefined && { messageText: text })
+    };
   }
 
   /**
@@ -1328,6 +2238,11 @@ export class ThinkTestAgent extends Think {
     return this._lastModelCallSettings;
   }
 
+  /** Each model call's prompt as `role: text` lines, oldest first. */
+  async getModelPromptsForTest(): Promise<string[][]> {
+    return this._modelPromptsForTest;
+  }
+
   async getBeforeStepLog(): Promise<
     Array<{
       stepNumber: number;
@@ -1354,7 +2269,14 @@ export class ThinkTestAgent extends Think {
     )
       return result;
 
-    const config = this._errorConfig;
+    let config = this._errorConfig;
+    if (config && this._errorAttemptsRemaining != null) {
+      if (this._errorAttemptsRemaining > 0) {
+        this._errorAttemptsRemaining--;
+      } else {
+        config = null;
+      }
+    }
     const stripText = this._stripTextResponseForTest;
     // Per-inference stall gating: if attempt-limited (#1626), only stall while
     // attempts remain (decrement here so the continuation inference streams).
@@ -1367,10 +2289,25 @@ export class ThinkTestAgent extends Think {
       }
     }
     const stallAfter = willStall ? this._stallAfterChunks : null;
+    const stallPrefix: unknown[] =
+      willStall && this._stallWithFinalAnswerOnlyForTest
+        ? [
+            { type: "start" },
+            {
+              type: "tool-input-start",
+              toolCallId: "final-answer-1",
+              toolName: "think_final_answer"
+            }
+          ]
+        : [];
     const chunkDelayMs = this._streamChunkDelayMs;
+    const abortAll = () => this.cancelAllChats();
 
     return {
-      toUIMessageStream(options?: { sendReasoning?: boolean }) {
+      toUIMessageStream(options?: {
+        sendReasoning?: boolean;
+        onError?: (error: unknown) => string;
+      }) {
         // `StreamableResult.toUIMessageStream()` returns an `AsyncIterable`
         // (not a `ReadableStream`), so consume it via its async iterator
         // rather than `getReader()`.
@@ -1379,11 +2316,16 @@ export class ThinkTestAgent extends Think {
         )[Symbol.asyncIterator]();
         let chunkCount = 0;
         let shouldThrow = false;
+        let erroredInStream = false;
 
         const wrapped: AsyncIterable<unknown> = {
           [Symbol.asyncIterator]() {
             return {
               async next() {
+                const prefix = stallPrefix.shift();
+                if (prefix !== undefined) {
+                  return { done: false as const, value: prefix };
+                }
                 // Simulate a parked/hung provider: emit `stallAfter` chunks,
                 // then never resolve. The stall watchdog must abort the turn.
                 if (stallAfter != null && chunkCount >= stallAfter) {
@@ -1395,10 +2337,28 @@ export class ThinkTestAgent extends Think {
                 if (chunkDelayMs != null) {
                   await new Promise((r) => setTimeout(r, chunkDelayMs));
                 }
+                if (erroredInStream) {
+                  return { done: true as const, value: undefined };
+                }
                 while (true) {
                   if (shouldThrow && config) {
                     await iterator.return?.();
-                    throw new SimulatedChatError(config.message);
+                    if (config.abortFirst) abortAll();
+                    if (config.inStream) {
+                      erroredInStream = true;
+                      const errorText =
+                        config.error === undefined
+                          ? config.message
+                          : (options?.onError?.(config.error) ??
+                            config.message);
+                      return {
+                        done: false as const,
+                        value: { type: "error", errorText }
+                      };
+                    }
+                    throw (
+                      config.error ?? new SimulatedChatError(config.message)
+                    );
                   }
                   const { done, value } = await iterator.next();
                   if (done) return { done: true as const, value: undefined };
@@ -1492,6 +2452,187 @@ export class ThinkTestAgent extends Think {
     this._resumableStream.flushBuffer();
   }
 
+  private _heldCutoverForTest = false;
+  private _releaseCutoverForTest: (() => void) | undefined;
+
+  holdNextAssistantCutoverForTest(): void {
+    const host = this as unknown as {
+      _persistAssistantMessageWithCutover(...args: unknown[]): Promise<unknown>;
+    };
+    const persist = host._persistAssistantMessageWithCutover;
+    host._persistAssistantMessageWithCutover = async (...args) => {
+      host._persistAssistantMessageWithCutover = persist;
+      this._heldCutoverForTest = true;
+      try {
+        await new Promise<void>((resolve) => {
+          this._releaseCutoverForTest = resolve;
+        });
+        return await persist.apply(this, args);
+      } finally {
+        this._heldCutoverForTest = false;
+        this._releaseCutoverForTest = undefined;
+      }
+    };
+  }
+
+  isAssistantCutoverHeldForTest(): boolean {
+    return this._heldCutoverForTest;
+  }
+
+  releaseAssistantCutoverForTest(): void {
+    this._releaseCutoverForTest?.();
+  }
+
+  /**
+   * Offer a live stream to the connection, which never ACKs, then end the
+   * stream with `close` and broadcast its done frame on the chat channel.
+   */
+  async testEndStreamOfferedWithoutAck(
+    requestId: string,
+    close: "finish" | "complete" | "error"
+  ): Promise<void> {
+    const streamId = this._resumableStream.start(requestId);
+    const [connection] = [...this.getConnections()];
+    if (!connection) {
+      throw new Error(
+        "ThinkTestAgent.testEndStreamOfferedWithoutAck requires a connection"
+      );
+    }
+    // SAFETY: This test-only method drives Think's private resume and
+    // broadcast paths with a real connection returned by this Agent instance.
+    const internals = this as unknown as {
+      _notifyStreamResuming(connection: Connection): void;
+      _broadcastChat(message: Record<string, unknown>): void;
+    };
+    internals._notifyStreamResuming(connection);
+    if (close === "finish") {
+      this._finishResumableStream(streamId);
+      this._resumableStream.finalizePending();
+    } else if (close === "complete") {
+      this._completeResumableStream(streamId);
+    } else {
+      this._errorResumableStream(streamId);
+    }
+    internals._broadcastChat({
+      type: CHAT_MESSAGE_TYPES.USE_CHAT_RESPONSE,
+      id: requestId,
+      done: true,
+      body: ""
+    });
+  }
+
+  /** A failed terminal delete must release admission so identical bytes can retry. */
+  async testRetryAfterTerminalClearFailure(): Promise<{
+    error: string | undefined;
+    claimedAfterFailure: boolean;
+    originRetainedAfterFailure: boolean;
+    rolesAfterRetry: string[];
+    assistantText: string;
+  }> {
+    const requestId = "retry-terminal-clear";
+    const connection = { id: "c-terminal-clear", send() {} };
+    const event = {
+      type: "chat-request",
+      id: requestId,
+      init: {
+        method: "POST",
+        body: JSON.stringify({
+          messages: [
+            {
+              id: "u-terminal-clear",
+              role: "user",
+              parts: [{ type: "text", text: "Retry this accepted request" }]
+            }
+          ]
+        })
+      }
+    };
+    const self = this as unknown as {
+      _clearChatTerminal(): Promise<void>;
+      _handleChatRequest(connection: unknown, event: unknown): Promise<void>;
+      _preStream: { hasRequest(id: string): boolean };
+      _requestOriginMessageIds: Map<string, string[]>;
+    };
+    const clear = self._clearChatTerminal;
+    self._clearChatTerminal = async () => {
+      throw new Error("terminal delete failed");
+    };
+    let error: string | undefined;
+    try {
+      await self._handleChatRequest(connection, event);
+    } catch (cause) {
+      error = cause instanceof Error ? cause.message : String(cause);
+    } finally {
+      self._clearChatTerminal = clear;
+    }
+    const claimedAfterFailure = self._preStream.hasRequest(requestId);
+    const originRetainedAfterFailure =
+      self._requestOriginMessageIds.has(requestId);
+    await self._handleChatRequest(connection, event);
+    const messages = await this.getMessages();
+    return {
+      error,
+      claimedAfterFailure,
+      originRetainedAfterFailure,
+      rolesAfterRetry: messages.map((message) => message.role),
+      assistantText: messages
+        .filter((message) => message.role === "assistant")
+        .flatMap((message) => message.parts)
+        .map((part) => (part.type === "text" ? part.text : ""))
+        .join("")
+    };
+  }
+
+  /** Exercise terminal ownership against a real pending resume offer. */
+  async testResumeTerminalOwnership(options: {
+    requestId: string;
+    unrelatedTerminal?: "active" | "closed";
+    exclude?: boolean;
+  }): Promise<{ stillPending: boolean }> {
+    const streamId = this._resumableStream.start(options.requestId);
+    for (const chunk of [
+      { type: "text-start", id: "terminal-text" },
+      { type: "text-delta", id: "terminal-text", delta: "retained text" },
+      { type: "text-end", id: "terminal-text" }
+    ])
+      this._resumableStream.storeChunk(streamId, JSON.stringify(chunk));
+    const [connection] = [...this.getConnections()];
+    if (!connection) throw new Error("requires a connection");
+    const internals = this as unknown as {
+      _pendingResumeConnections: Map<string, string>;
+      _notifyStreamResuming(connection: Connection): void;
+      _broadcastChat(
+        message: Record<string, unknown>,
+        exclude?: string[]
+      ): void;
+    };
+    internals._notifyStreamResuming(connection);
+    if (options.unrelatedTerminal === "closed")
+      this._completeResumableStream(streamId);
+    if (options.unrelatedTerminal) {
+      internals._broadcastChat({
+        type: CHAT_MESSAGE_TYPES.USE_CHAT_RESPONSE,
+        id: "unrelated-request",
+        done: true,
+        error: true,
+        body: "pre-stream persistence failed"
+      });
+    }
+    const stillPending = internals._pendingResumeConnections.has(connection.id);
+    if (options.unrelatedTerminal !== "closed")
+      this._completeResumableStream(streamId);
+    internals._broadcastChat(
+      {
+        type: CHAT_MESSAGE_TYPES.USE_CHAT_RESPONSE,
+        id: options.requestId,
+        done: true,
+        body: ""
+      },
+      options.exclude ? [connection.id] : undefined
+    );
+    return { stillPending };
+  }
+
   /** Emit the real resume notification followed by a terminal broadcast. */
   async testSendStreamResumingBeforeTerminal(requestId: string): Promise<void> {
     const streamId = this._resumableStream.start(requestId);
@@ -1540,6 +2681,36 @@ export class ThinkTestAgent extends Think {
         ) => Promise<void>;
       }
     )._recordTerminalChatStatus("interrupted", requestId, body);
+  }
+
+  /**
+   * Stand in for a child restarted mid-run (#2298): a persisted in-flight
+   * agent-tool run with empty in-memory state, rebound to a recovery turn's
+   * request id, whose chunk is then broadcast.
+   */
+  async broadcastRecoveredAgentToolChunkForTest(
+    eventDelivery: "full" | "terminal"
+  ): Promise<void> {
+    const internals = this as unknown as {
+      _ensureAgentToolChildRunTable(): void;
+      _rebindAgentToolChildRunRequestId(requestId: string): void;
+    };
+    internals._ensureAgentToolChildRunTable();
+    this.sql`
+      INSERT INTO cf_agent_tool_child_runs
+        (run_id, request_id, status, started_at, event_delivery)
+      VALUES (${crypto.randomUUID()}, 'pre-restart', 'running', ${Date.now()},
+        ${eventDelivery === "terminal" ? "terminal" : null})
+    `;
+    internals._rebindAgentToolChildRunRequestId("recovered-request");
+    this.broadcast(
+      JSON.stringify({
+        type: "cf_agent_use_chat_response",
+        id: "recovered-request",
+        body: JSON.stringify({ type: "text-delta", id: "t", delta: "hi" }),
+        done: false
+      })
+    );
   }
 
   /** Read the durable terminal record (#1645) so a test can assert it is
@@ -1623,14 +2794,13 @@ export class ThinkTestAgent extends Think {
     if (path === "continue") {
       // A non-leaf `targetAssistantId` → benign "conversation_changed" skip
       // that still reaches the `finally`.
-      await this._runScheduledChatRecovery({
-        kind: "continue",
-        data: { targetAssistantId: "no-such-leaf" }
+      await this._chatRecoveryContinueDetached({
+        targetAssistantId: "no-such-leaf"
       });
     } else {
       // No `recoveredRequestId` (avoids the pre-`try` early return) + a non-user
       // leaf (or empty transcript) → benign skip that still reaches `finally`.
-      await this._runScheduledChatRecovery({ kind: "retry", data: {} });
+      await this._chatRecoveryRetryDetached({});
     }
     return { before, after: this._readChildRunStatusForTest(runId) };
   }
@@ -1830,6 +3000,11 @@ export class ThinkTestAgent extends Think {
     }
   }
 
+  /** The close outcome recorded on the request's latest chat stream. */
+  async getStreamOutcomeForTest(requestId: string): Promise<string | null> {
+    return this._resumableStream.getOutcome(requestId) ?? null;
+  }
+
   /**
    * #1626: the FIRST inference hangs after `afterChunks` chunks (watchdog
    * aborts it), which must now route into bounded recovery instead of failing
@@ -1838,6 +3013,30 @@ export class ThinkTestAgent extends Think {
    * scheduled-continue count, and the recovered transcript so a test can assert
    * the turn recovered. chatRecovery stays at its default (`true`).
    */
+  async armStallOnceForTest(
+    afterChunks: number,
+    timeoutMs: number
+  ): Promise<void> {
+    this._stallAfterChunks = afterChunks;
+    this._stallAttemptsRemaining = 1;
+    this.chatStreamStallTimeoutMs = timeoutMs;
+  }
+
+  /** Run the queued stall continuation, then disarm the stall. */
+  async runStallContinuationForTest(): Promise<number> {
+    try {
+      const scheduled = recoveryWorkCountForTest(this, "_chatRecoveryContinue");
+      if (scheduled > 0) {
+        await runRecoveryWorkForTest(this, "_chatRecoveryContinue");
+      }
+      return scheduled;
+    } finally {
+      this._stallAfterChunks = null;
+      this._stallAttemptsRemaining = null;
+      this.chatStreamStallTimeoutMs = 0;
+    }
+  }
+
   async testChatWithStallThenRecover(
     afterChunks: number,
     timeoutMs: number
@@ -1884,6 +3083,631 @@ export class ThinkTestAgent extends Think {
     } finally {
       this._stallAfterChunks = null;
       this._stallAttemptsRemaining = null;
+      this.chatStreamStallTimeoutMs = 0;
+    }
+  }
+
+  /**
+   * Stall the first inference after `afterChunks` chunks, then report what
+   * recovery did: which callback it scheduled, what `onChatRecovery` saw, and
+   * (after running the scheduled work) the final transcript. `recovery` is what
+   * `onChatRecovery` returns, or `"throw"` to make it throw.
+   */
+  async testStallRecoveryForTest(options: {
+    afterChunks: number;
+    timeoutMs: number;
+    recovery?: ChatRecoveryOptions | "throw";
+    stash?: string;
+    finalAnswerOnly?: boolean;
+  }): Promise<{
+    first: TestChatResult;
+    scheduledContinues: number;
+    scheduledRetries: number;
+    recoveryCalls: ThinkTestAgent["_recoveryCallsForTest"];
+    rolesAfterStall: string[];
+    finalRoles: string[];
+    finalAssistantText: string;
+    finalStreamingParts: number;
+  }> {
+    this._stallAfterChunks = options.afterChunks;
+    this._stallAttemptsRemaining = 1;
+    this.chatStreamStallTimeoutMs = options.timeoutMs;
+    this._recoveryHookForTest = options.recovery ?? null;
+    this._recoveryCallsForTest = [];
+    this._stashInBeforeTurnForTest = options.stash;
+    this._stallWithFinalAnswerOnlyForTest = options.finalAnswerOnly ?? false;
+    try {
+      const first = await this.testChat("stall recovery");
+      const rolesAfterStall = (await this.getMessages()).map((m) => m.role);
+      const scheduledContinues = recoveryWorkCountForTest(
+        this,
+        "_chatRecoveryContinue"
+      );
+      const scheduledRetries = recoveryWorkCountForTest(
+        this,
+        "_chatRecoveryRetry"
+      );
+      this._stashInBeforeTurnForTest = undefined;
+      if (scheduledContinues > 0) {
+        await runRecoveryWorkForTest(this, "_chatRecoveryContinue");
+      }
+      if (scheduledRetries > 0) {
+        await runRecoveryWorkForTest(this, "_chatRecoveryRetry");
+      }
+      const messages = await this.getMessages();
+      const finalAssistant = messages
+        .filter((m) => m.role === "assistant")
+        .at(-1);
+      return {
+        first,
+        scheduledContinues,
+        scheduledRetries,
+        recoveryCalls: this._recoveryCallsForTest,
+        rolesAfterStall,
+        finalRoles: messages.map((m) => m.role),
+        finalAssistantText: (finalAssistant?.parts ?? [])
+          .map((p) => (p.type === "text" ? p.text : ""))
+          .join(""),
+        finalStreamingParts: (finalAssistant?.parts ?? []).filter(
+          (p) => "state" in p && p.state === "streaming"
+        ).length
+      };
+    } finally {
+      this._stallAfterChunks = null;
+      this._stallAttemptsRemaining = null;
+      this.chatStreamStallTimeoutMs = 0;
+      this._recoveryHookForTest = null;
+      this._stashInBeforeTurnForTest = undefined;
+      this._stallWithFinalAnswerOnlyForTest = false;
+    }
+  }
+
+  /** Stall the next inference after `afterChunks` chunks (one attempt only). */
+  /**
+   * #2085: the first inference fails after `afterChunks` chunks (thrown, or as
+   * an in-stream error chunk), and `classifyChatError` returns
+   * `classification` for every error. Pair with
+   * {@link runScheduledRecoveryForTest}, which reads the scheduled delay and
+   * clears this setup.
+   */
+  async armTransientErrorForTest(options: {
+    classification: ChatErrorClassification | undefined;
+    inStream?: boolean;
+    afterChunks?: number;
+    message?: string;
+  }): Promise<void> {
+    this._errorConfig = {
+      afterChunks: options.afterChunks ?? 2,
+      message: options.message ?? "upstream connection reset",
+      inStream: options.inStream
+    };
+    this._errorAttemptsRemaining = 1;
+    this.classifyChatError = () => options.classification;
+  }
+
+  async testChatWithTransientErrorForTest(
+    options: Parameters<ThinkTestAgent["armTransientErrorForTest"]>[0]
+  ): Promise<{
+    first: TestChatResult;
+    scheduledContinues: number;
+    scheduledRetries: number;
+    delaySeconds: number | null;
+    assistantMessages: number;
+    finalAssistantText: string;
+  }> {
+    await this.armTransientErrorForTest(options);
+    const first = await this.testChat("trigger transient error");
+    const recovered = await this.runScheduledRecoveryForTest();
+    const assistant = (await this.getMessages()).filter(
+      (m) => m.role === "assistant"
+    );
+    const finalAssistantText = (assistant.at(-1)?.parts ?? [])
+      .filter((p): p is { type: "text"; text: string } => p.type === "text")
+      .map((p) => p.text)
+      .join("");
+    return {
+      first,
+      scheduledContinues: recovered.scheduledContinues,
+      scheduledRetries: recovered.scheduledRetries,
+      delaySeconds: recovered.delaySeconds,
+      assistantMessages: assistant.length,
+      finalAssistantText
+    };
+  }
+
+  /**
+   * An in-stream error with reactive overflow on, classified by a hook that
+   * only answers `"transient"` the first time it is asked.
+   */
+  async testSingleStreamErrorClassificationForTest(): Promise<{
+    classifications: number;
+    error: string | undefined;
+    scheduledContinues: number;
+  }> {
+    await this.armTransientErrorForTest({
+      classification: "transient",
+      inStream: true
+    });
+    let classifications = 0;
+    this.classifyChatError = () =>
+      ++classifications === 1 ? "transient" : "fatal";
+    this.contextOverflow = { reactive: true };
+    try {
+      const first = await this.testChat("trigger transient error");
+      const scheduledContinues = recoveryWorkCountForTest(
+        this,
+        "_chatRecoveryContinue"
+      );
+      return { classifications, error: first.error, scheduledContinues };
+    } finally {
+      this.contextOverflow = undefined;
+      this._errorConfig = null;
+      this._errorAttemptsRemaining = null;
+      Reflect.deleteProperty(this, "classifyChatError");
+    }
+  }
+
+  /** A submission whose first stream fails transiently, then recovers. */
+  async testTransientSubmissionForTest(): Promise<{
+    afterFailure: string | undefined;
+    final: string | undefined;
+    finalAssistantText: string;
+  }> {
+    await this.armTransientErrorForTest({
+      classification: "transient",
+      inStream: true
+    });
+    const submissionId = `transient-sub-${crypto.randomUUID()}`;
+    await this.submitMessages(
+      [
+        {
+          id: crypto.randomUUID(),
+          role: "user",
+          parts: [{ type: "text", text: "trigger transient error" }]
+        }
+      ],
+      { submissionId }
+    );
+    const settle = async (done: () => boolean) => {
+      const deadline = Date.now() + 5_000;
+      while (!done() && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+    };
+    await settle(
+      () =>
+        recoveryWorkCountForTest(this, "_chatRecoveryContinue") +
+          recoveryWorkCountForTest(this, "_chatRecoveryRetry") >
+        0
+    );
+    await waitForThinkIdleForTest(this);
+    const afterFailure = (await this.inspectSubmission(submissionId))?.status;
+    await this.runScheduledRecoveryForTest();
+    let final: string | undefined;
+    await settle(() => false);
+    final = (await this.inspectSubmission(submissionId))?.status;
+    const finalAssistantText = (
+      (await this.getMessages()).filter((m) => m.role === "assistant").at(-1)
+        ?.parts ?? []
+    )
+      .filter((p): p is { type: "text"; text: string } => p.type === "text")
+      .map((p) => p.text)
+      .join("");
+    return { afterFailure, final, finalAssistantText };
+  }
+
+  /** Fail the turn and `failures - 1` recoveries fast; collect each delay. */
+  async collectTransientBackoffForTest(failures: number): Promise<{
+    delays: Array<number | null>;
+    keyed: boolean[];
+    incidentStatuses: string[];
+    finalRoles: string[];
+  }> {
+    await this.armTransientErrorForTest({
+      classification: "transient",
+      inStream: true
+    });
+    this._errorAttemptsRemaining = failures;
+    await this.testChat("trigger transient error");
+    const delays: Array<number | null> = [];
+    const keyed: boolean[] = [];
+    const incidentStatuses: string[] = [];
+    for (let i = 0; i <= failures; i++) {
+      const continues = recoveryWorkCountForTest(this, "_chatRecoveryContinue");
+      const retries = recoveryWorkCountForTest(this, "_chatRecoveryRetry");
+      if (continues === 0 && retries === 0) break;
+      const pending = this.sql<{
+        delay: number | null;
+        idempotency_key: string | null;
+      }>`
+        SELECT json_extract(input, '$.delaySeconds') AS delay, idempotency_key
+        FROM cf_agents_task_runs
+        WHERE definition = ${CHAT_RECOVERY_TASK_NAME}
+          AND state IN ('pending', 'waiting')
+        ORDER BY created_at DESC
+        LIMIT 1
+      `[0];
+      delays.push(pending?.delay ?? null);
+      keyed.push(pending?.idempotency_key != null);
+      await runRecoveryWorkForTest(
+        this,
+        continues > 0 ? "_chatRecoveryContinue" : "_chatRecoveryRetry"
+      );
+      const incidents = await this.ctx.storage.list<{ status: string }>({
+        prefix: "cf:chat-recovery:incident:"
+      });
+      incidentStatuses.push(
+        [...incidents.values()].map((incident) => incident.status).join(",") ||
+          "none"
+      );
+    }
+    this._errorConfig = null;
+    this._errorAttemptsRemaining = null;
+    Reflect.deleteProperty(this, "classifyChatError");
+    return {
+      delays,
+      keyed,
+      incidentStatuses,
+      finalRoles: (await this.getMessages()).map((m) => m.role)
+    };
+  }
+
+  async armStallForTest(afterChunks: number, timeoutMs: number): Promise<void> {
+    this._stallAfterChunks = afterChunks;
+    this._stallAttemptsRemaining = 1;
+    this.chatStreamStallTimeoutMs = timeoutMs;
+  }
+
+  async runScheduledRecoveryForTest(): Promise<{
+    scheduledContinues: number;
+    scheduledRetries: number;
+    delaySeconds: number | null;
+    finalRoles: string[];
+  }> {
+    const delaySeconds =
+      this.sql<{ delay: number | null }>`
+        SELECT json_extract(input, '$.delaySeconds') AS delay
+        FROM cf_agents_task_runs
+        WHERE definition = ${CHAT_RECOVERY_TASK_NAME}
+        ORDER BY created_at DESC
+        LIMIT 1
+      `[0]?.delay ?? null;
+    const scheduledContinues = recoveryWorkCountForTest(
+      this,
+      "_chatRecoveryContinue"
+    );
+    const scheduledRetries = recoveryWorkCountForTest(
+      this,
+      "_chatRecoveryRetry"
+    );
+    if (scheduledContinues > 0) {
+      await runRecoveryWorkForTest(this, "_chatRecoveryContinue");
+    }
+    if (scheduledRetries > 0) {
+      await runRecoveryWorkForTest(this, "_chatRecoveryRetry");
+    }
+    this._stallAfterChunks = null;
+    this._stallAttemptsRemaining = null;
+    this.chatStreamStallTimeoutMs = 0;
+    this._errorConfig = null;
+    this._errorAttemptsRemaining = null;
+    Reflect.deleteProperty(this, "classifyChatError");
+    return {
+      scheduledContinues,
+      scheduledRetries,
+      delaySeconds,
+      finalRoles: (await this.getMessages()).map((m) => m.role)
+    };
+  }
+
+  private async _recoveryIncidentsForTest(): Promise<
+    Array<{
+      status: string;
+      reason?: string;
+      requestId: string;
+      recoveryRootRequestId?: string;
+      transientRetries?: number;
+    }>
+  > {
+    const incidents = await this.ctx.storage.list<{
+      status: string;
+      reason?: string;
+      requestId: string;
+      recoveryRootRequestId?: string;
+      transientRetries?: number;
+    }>({ prefix: "cf:chat-recovery:incident:" });
+    return [...incidents.values()];
+  }
+
+  /**
+   * The stream finishes, then persisting its message fails, under a
+   * classifier that calls every error transient. The failure is past the
+   * stream, so it must stay terminal (a retry would re-run a finished turn).
+   */
+  async testPostStreamPersistFailureForTest(): Promise<{
+    first: TestChatResult;
+    scheduled: number;
+    responses: number;
+    status: string | undefined;
+    streamStates: string[];
+  }> {
+    this.classifyChatError = () => "transient";
+    const self = this as unknown as {
+      _persistAssistantMessageWithCutover(...args: unknown[]): Promise<void>;
+    };
+    const original = self._persistAssistantMessageWithCutover;
+    self._persistAssistantMessageWithCutover = async () => {
+      self._persistAssistantMessageWithCutover = original;
+      throw new Error("simulated persist failure");
+    };
+    this._responseLog = [];
+    const rpcStatus = this._captureRpcTurnStatusForTest();
+    try {
+      const first = await this.testChat("persist fails after the stream");
+      return {
+        first,
+        scheduled:
+          recoveryWorkCountForTest(this, "_chatRecoveryContinue") +
+          recoveryWorkCountForTest(this, "_chatRecoveryRetry"),
+        responses: this._responseLog.length,
+        status: rpcStatus.read(),
+        streamStates: this.sql<{ state: string }>`
+          SELECT state FROM cf_agents_streams
+        `.map((row) => row.state)
+      };
+    } finally {
+      rpcStatus.restore();
+      self._persistAssistantMessageWithCutover = original;
+      Reflect.deleteProperty(this, "classifyChatError");
+    }
+  }
+
+  /**
+   * The terminal-status write inside the response hook throws once, before
+   * `onChatResponse` runs. Returns what the live turn delivered, then the
+   * responses after a startup replay of owed hooks.
+   */
+  async testResponseHookBookkeepingFailureForTest(): Promise<{
+    first: TestChatResult;
+    status: string | undefined;
+    liveResponses: string[];
+    replayedResponses: string[];
+  }> {
+    const self = this as unknown as {
+      _recordTerminalChatStatus(...args: unknown[]): Promise<void>;
+      _replayPendingResponseHooks(): Promise<void>;
+    };
+    const original = self._recordTerminalChatStatus;
+    self._recordTerminalChatStatus = async () => {
+      self._recordTerminalChatStatus = original;
+      throw new Error("simulated terminal-status write failure");
+    };
+    this._responseLog = [];
+    const rpcStatus = this._captureRpcTurnStatusForTest();
+    try {
+      const first = await this.testChat("hook bookkeeping fails");
+      const liveResponses = this._responseLog.map((r) => r.status);
+      await self._replayPendingResponseHooks();
+      return {
+        first,
+        status: rpcStatus.read(),
+        liveResponses,
+        replayedResponses: this._responseLog.map((r) => r.status)
+      };
+    } finally {
+      rpcStatus.restore();
+      self._recordTerminalChatStatus = original;
+    }
+  }
+
+  /** Record the status the RPC stream consumer returns for the next turn. */
+  private _captureRpcTurnStatusForTest(): {
+    read(): string | undefined;
+    restore(): void;
+  } {
+    const self = this as unknown as {
+      _streamResultToRpcCallback(
+        ...args: unknown[]
+      ): Promise<{ status: string }>;
+    };
+    const original = self._streamResultToRpcCallback;
+    let status: string | undefined;
+    self._streamResultToRpcCallback = async (...args) => {
+      const result = await original.apply(this, args);
+      status = result.status;
+      return result;
+    };
+    return {
+      read: () => status,
+      restore: () => {
+        self._streamResultToRpcCallback = original;
+      }
+    };
+  }
+
+  /**
+   * One transient-classified failure with a custom setup: `error` is the
+   * failure itself (thrown, or given to the stream's `onError` in-stream),
+   * `abortFirst` aborts the turn right before it fails, and
+   * `failIncidentBegin` makes routing into recovery throw.
+   */
+  async testTransientScenarioForTest(options: {
+    classification: "transient" | "rate_limit" | "structural";
+    inStream: boolean;
+    error?: "api-call-503" | "code-update-reset" | "storage-reset";
+    retryAfter?: string;
+    abortFirst?: boolean;
+    failIncidentBegin?: boolean;
+  }): Promise<{
+    first: TestChatResult;
+    scheduled: number;
+    delaySeconds: number | null;
+    classified: string[];
+  }> {
+    let error: unknown;
+    if (options.error === "api-call-503") {
+      error = Object.assign(new Error("Service Unavailable"), {
+        name: "AI_APICallError",
+        statusCode: 503,
+        isRetryable: true,
+        ...(options.retryAfter
+          ? { responseHeaders: { "retry-after": options.retryAfter } }
+          : {})
+      });
+    } else if (options.error === "code-update-reset") {
+      error = new Error("Durable Object reset because its code was updated.");
+    } else if (options.error === "storage-reset") {
+      error = new Error(
+        "Internal error in Durable Object storage caused object to be reset."
+      );
+    }
+    await this.armTransientErrorForTest({
+      classification: undefined,
+      inStream: options.inStream
+    });
+    if (this._errorConfig) {
+      this._errorConfig.error = error;
+      this._errorConfig.abortFirst = options.abortFirst;
+    }
+    const classified: string[] = [];
+    this.classifyChatError = (err: unknown) => {
+      classified.push(
+        err instanceof Error ? err.name : typeof err === "string" ? err : "?"
+      );
+      if (options.classification !== "structural") {
+        return options.classification;
+      }
+      // A structural classifier: needs the provider error object, not text.
+      return typeof err === "object" &&
+        err !== null &&
+        "statusCode" in err &&
+        err.statusCode === 503
+        ? "transient"
+        : "fatal";
+    };
+    const self = this as unknown as {
+      _beginChatRecoveryIncident(...args: unknown[]): Promise<unknown>;
+    };
+    if (options.failIncidentBegin) {
+      self._beginChatRecoveryIncident = async () => {
+        throw new Error("incident write failed");
+      };
+    }
+    try {
+      const first = await this.testChat("trigger transient scenario");
+      const delaySeconds =
+        this.sql<{ delay: number | null }>`
+          SELECT json_extract(input, '$.delaySeconds') AS delay
+          FROM cf_agents_task_runs
+          WHERE definition = ${CHAT_RECOVERY_TASK_NAME}
+          ORDER BY created_at DESC
+          LIMIT 1
+        `[0]?.delay ?? null;
+      return {
+        first,
+        scheduled:
+          recoveryWorkCountForTest(this, "_chatRecoveryContinue") +
+          recoveryWorkCountForTest(this, "_chatRecoveryRetry"),
+        delaySeconds,
+        classified
+      };
+    } finally {
+      Reflect.deleteProperty(this, "_beginChatRecoveryIncident");
+      this._errorConfig = null;
+      this._errorAttemptsRemaining = null;
+      Reflect.deleteProperty(this, "classifyChatError");
+    }
+  }
+
+  /**
+   * A transient failure schedules a backed-off continuation; the user cancels
+   * the turn during the backoff. The scheduled continuation must not run.
+   */
+  async testCancelDuringBackoffForTest(): Promise<{
+    textBeforeCancel: string;
+    finalText: string;
+    incident: { status: string; reason?: string } | undefined;
+  }> {
+    await this.armTransientErrorForTest({
+      classification: "transient",
+      inStream: true
+    });
+    const assistantText = async () =>
+      (
+        (await this.getMessages()).filter((m) => m.role === "assistant").at(-1)
+          ?.parts ?? []
+      )
+        .map((p) => (p.type === "text" ? p.text : ""))
+        .join("");
+    try {
+      await this.testChat("trigger transient error");
+      const textBeforeCancel = await assistantText();
+      const [scheduled] = await this._recoveryIncidentsForTest();
+      this.cancelChat(
+        scheduled?.recoveryRootRequestId ?? scheduled?.requestId ?? ""
+      );
+      const deadline = Date.now() + 5_000;
+      while (Date.now() < deadline) {
+        const [incident] = await this._recoveryIncidentsForTest();
+        if (incident?.status !== "scheduled") break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      await runRecoveryWorkForTest(this, "_chatRecoveryContinue");
+      const [incident] = await this._recoveryIncidentsForTest();
+      return {
+        textBeforeCancel,
+        finalText: await assistantText(),
+        incident: incident && {
+          status: incident.status,
+          reason: incident.reason
+        }
+      };
+    } finally {
+      this._errorConfig = null;
+      this._errorAttemptsRemaining = null;
+      Reflect.deleteProperty(this, "classifyChatError");
+    }
+  }
+
+  /**
+   * Every inference streams a little, then stalls. Each attempt makes
+   * progress, so only the transient counter bounds the loop. Returns how many
+   * recoveries ran before nothing more was scheduled.
+   */
+  async testRepeatedStallAfterProgressForTest(maxRounds: number): Promise<{
+    rounds: number;
+    scheduledAtEnd: number;
+    statuses: string[];
+  }> {
+    this._stallAfterChunks = 3;
+    this._stallAttemptsRemaining = null;
+    this.chatStreamStallTimeoutMs = 50;
+    try {
+      await this.testChat("stall after progress, repeatedly");
+      let rounds = 0;
+      for (; rounds < maxRounds; rounds++) {
+        const continues = recoveryWorkCountForTest(
+          this,
+          "_chatRecoveryContinue"
+        );
+        const retries = recoveryWorkCountForTest(this, "_chatRecoveryRetry");
+        if (continues === 0 && retries === 0) break;
+        await runRecoveryWorkForTest(
+          this,
+          continues > 0 ? "_chatRecoveryContinue" : "_chatRecoveryRetry"
+        );
+      }
+      return {
+        rounds,
+        scheduledAtEnd:
+          recoveryWorkCountForTest(this, "_chatRecoveryContinue") +
+          recoveryWorkCountForTest(this, "_chatRecoveryRetry"),
+        statuses: (await this._recoveryIncidentsForTest()).map(
+          (incident) => incident.status
+        )
+      };
+    } finally {
+      this._stallAfterChunks = null;
       this.chatStreamStallTimeoutMs = 0;
     }
   }
@@ -2420,7 +4244,8 @@ export class ThinkTestAgent extends Think {
     this._reasoningResponse = { response, reasoning };
   }
 
-  override getModel(): LanguageModel {
+  override getModel(): ThinkModel {
+    if (this._stringModelForTest) return this._stringModelForTest;
     const midStream = this._midStreamGate;
     if (midStream) {
       return new MockLanguageModelV3({
@@ -2529,11 +4354,17 @@ export class ThinkTestAgent extends Think {
     if (this._finalAnswerResponse !== undefined) {
       return createFinalAnswerMockModel(this._finalAnswerResponse);
     }
-    return createMockModel(this._response, {
-      onCall: (settings) => {
-        this._lastModelCallSettings = settings;
+    return createMockModel(
+      (callOptions) => {
+        this._modelPromptsForTest.push(promptLinesForTest(callOptions));
+        return this._response;
+      },
+      {
+        onCall: (settings) => {
+          this._lastModelCallSettings = settings;
+        }
       }
-    });
+    );
   }
 
   async getChatErrorLog(): Promise<string[]> {
@@ -2542,6 +4373,10 @@ export class ThinkTestAgent extends Think {
 
   async getStoredMessages(): Promise<UIMessage[]> {
     return this.getMessages();
+  }
+
+  async getBranchesForTest(messageId: string): Promise<UIMessage[]> {
+    return (await this.session.getBranches(messageId)) as UIMessage[];
   }
 
   async getCachedMessagesForTest(): Promise<UIMessage[]> {
@@ -2554,6 +4389,14 @@ export class ThinkTestAgent extends Think {
 
   async syncMessagesFromStorageForTest(): Promise<UIMessage[]> {
     return this.syncMessagesFromStorage();
+  }
+
+  /**
+   * Probe a stored row by id. Overlays exist only on history reads, so a
+   * `compaction_` id resolves here only if it was filed as a real row.
+   */
+  async getSessionMessageForTest(id: string): Promise<UIMessage | null> {
+    return (await this.session.getMessage(id)) as UIMessage | null;
   }
 
   async deliverNoticeErrorForTest(
@@ -3251,7 +5094,8 @@ export class ThinkAgentToolParent extends Agent {
     progressBody: string,
     milestoneBody: string,
     chunkDelayMs: number,
-    runId = crypto.randomUUID()
+    runId = crypto.randomUUID(),
+    eventDelivery?: "full" | "terminal"
   ): Promise<{ result: RunAgentToolResult; events: AgentToolEventMessage[] }> {
     this.events = [];
     this.finishes = [];
@@ -3262,9 +5106,54 @@ export class ThinkAgentToolParent extends Agent {
       runId,
       parentToolCallId: "think-tool-call",
       input,
-      inputPreview: input
+      inputPreview: input,
+      ...(eventDelivery ? { eventDelivery } : {})
     });
     return { result, events: this.events };
+  }
+
+  async persistChildMilestoneForTest(
+    runId: string,
+    name: string,
+    data: unknown
+  ): Promise<number> {
+    const child = await this.subAgent(ThinkTestAgent, runId);
+    return child.persistAgentToolMilestoneForTest(runId, name, data);
+  }
+
+  async failNextChildChunkReadForTest(runId: string): Promise<void> {
+    const child = await this.subAgent(ThinkTestAgent, runId);
+    await child.failNextAgentToolChunkReadForTest();
+  }
+
+  /** Replay this parent's agent-tool events to a fresh connection. */
+  async replayAgentToolEventsForTest(): Promise<AgentToolEventMessage[]> {
+    const sent: AgentToolEventMessage[] = [];
+    const connection = {
+      id: "replay-probe",
+      send(body: string) {
+        sent.push(JSON.parse(body) as AgentToolEventMessage);
+      }
+    };
+    await (
+      this as unknown as {
+        _replayAgentToolRuns(connection: unknown): Promise<void>;
+      }
+    )._replayAgentToolRuns(connection);
+    return sent;
+  }
+
+  async runThinkChildDetachedTerminalForTest(): Promise<string | null> {
+    try {
+      await this.runAgentTool(ThinkTestAgent, {
+        input: "detached terminal",
+        detached: true,
+        eventDelivery: "terminal"
+      });
+      return null;
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
   }
 
   /**
@@ -4178,6 +6067,73 @@ export class ThinkSystemPromptSkillsWarningAgent extends Think {
   }
 }
 
+// Repro for #2165: Agent's context wrapper writes inherited methods onto the
+// concrete prototype. A skills-enabled subclass that keeps Think's default
+// system prompt must not be mistaken for an override.
+function mapReadingSkills() {
+  return [
+    skills.fromManifest({
+      id: "default-prompt-test-skills",
+      fingerprint: "v1",
+      skills: [
+        {
+          name: "map-reading",
+          description: "How to read a map.",
+          body: "Check the scale before measuring distance."
+        }
+      ]
+    })
+  ];
+}
+
+export class ThinkDefaultSystemPromptSkillsAgent extends ThinkSessionTestAgent {
+  override getSkills() {
+    return mapReadingSkills();
+  }
+}
+
+class ThinkInheritedSystemPromptAgent extends ThinkSessionTestAgent {
+  override getSystemPrompt(): string {
+    return "You are an experienced cartographer.";
+  }
+}
+
+export class ThinkInheritedSystemPromptSkillsAgent extends ThinkInheritedSystemPromptAgent {
+  override getSkills() {
+    return mapReadingSkills();
+  }
+}
+
+export class ThinkSystemPromptFieldSkillsAgent extends ThinkSessionTestAgent {
+  override getSkills() {
+    return mapReadingSkills();
+  }
+
+  override getSystemPrompt = () => "You are an experienced cartographer.";
+}
+
+class ThinkClassifierTestAgent extends ThinkSessionTestAgent {
+  override contextOverflow = { reactive: true };
+
+  override getModel(): LanguageModel {
+    return createInBandErrorMockModel("prompt is too long");
+  }
+}
+
+export class ThinkMissingClassifierWarningAgent extends ThinkClassifierTestAgent {}
+
+export class ThinkClassifierMethodAgent extends ThinkClassifierTestAgent {
+  override classifyChatError(): undefined {
+    return undefined;
+  }
+}
+
+export class ThinkInheritedClassifierAgent extends ThinkClassifierMethodAgent {}
+
+export class ThinkClassifierFieldAgent extends ThinkClassifierTestAgent {
+  override classifyChatError = () => undefined;
+}
+
 // ── ThinkAsyncConfigSessionAgent ─────────────────────────────
 // Tests async configureSession — simulates reading config before setup.
 
@@ -4344,8 +6300,10 @@ export class ThinkConfigInSessionAgent extends Think<Cloudflare.Env> {
 // Extends Think with tools configured for tool integration testing.
 // Uses a mock model that calls the "echo" tool on first invocation.
 
-function createToolCallingMockModel(
-  toolInput = JSON.stringify({ message: "hello" })
+/** Create a two-step model that calls `echo` before its final text answer. */
+export function createToolCallingMockModel(
+  toolInput = JSON.stringify({ message: "hello" }),
+  onPrompt?: (prompt: string) => void
 ): LanguageModel {
   let callCount = 0;
   return {
@@ -4359,6 +6317,7 @@ function createToolCallingMockModel(
     doStream(options: Record<string, unknown>) {
       callCount++;
       const messages = (options as { prompt?: unknown[] }).prompt ?? [];
+      onPrompt?.(JSON.stringify(messages));
       const hasToolResult = messages.some(
         (m: unknown) =>
           typeof m === "object" &&
@@ -4484,8 +6443,12 @@ function createAttachReplyMockModel(): LanguageModel {
 
 // Calls the `pauseAction` durable-pause action on the first model step, then
 // emits text on every later step (within the parking turn and on the
-// connection-independent continuation after approval).
-function createDurablePauseMockModel(): LanguageModel {
+// connection-independent continuation after approval). While the latest tool
+// result is still paused, that text (and a reasoning part) describes the
+// pending state, as a real model would.
+function createDurablePauseMockModel(
+  onPrompt?: (prompt: string) => void
+): LanguageModel {
   let callCount = 0;
   return new MockLanguageModelV3({
     provider: "test",
@@ -4497,11 +6460,16 @@ function createDurablePauseMockModel(): LanguageModel {
     doStream(options) {
       callCount++;
       const messages = (options as { prompt?: unknown[] }).prompt ?? [];
-      const hasToolResult = messages.some(
+      onPrompt?.(JSON.stringify(messages));
+      const toolMessages = messages.filter(
         (m: unknown) =>
           typeof m === "object" &&
           m !== null &&
           (m as Record<string, unknown>).role === "tool"
+      );
+      const hasToolResult = toolMessages.length > 0;
+      const pausePending = JSON.stringify(toolMessages.at(-1) ?? "").includes(
+        '"status":"paused"'
       );
       // Only park when a user explicitly asked for it on this turn — so a
       // post-resolution continuation (driven by provider-projected framework
@@ -4554,11 +6522,23 @@ function createDurablePauseMockModel(): LanguageModel {
             });
           } else {
             const id = `dp-text-${callCount}`;
+            if (pausePending) {
+              const reasoningId = `dp-reasoning-${callCount}`;
+              controller.enqueue({ type: "reasoning-start", id: reasoningId });
+              controller.enqueue({
+                type: "reasoning-delta",
+                id: reasoningId,
+                delta: "The action is waiting for approval."
+              });
+              controller.enqueue({ type: "reasoning-end", id: reasoningId });
+            }
             controller.enqueue({ type: "text-start", id });
             controller.enqueue({
               type: "text-delta",
               id,
-              delta: "acknowledged"
+              delta: pausePending
+                ? "Once approved, the change will be applied."
+                : "acknowledged"
             });
             controller.enqueue({ type: "text-end", id });
             controller.enqueue({
@@ -4699,6 +6679,136 @@ export class ThinkToolsTestAgent extends Think {
         0
       )
     });
+    if (this._approveParkedInNextStepForTest && ctx.stepNumber > 0) {
+      this._approveParkedInNextStepForTest = false;
+      const [pending] = this._listActionPendingRowsForTest();
+      if (pending) void this.approveExecution(pending.execution_id);
+    }
+    if (this._rejectParkedInNextStepForTest && ctx.stepNumber > 0) {
+      const options = this._rejectParkedInNextStepForTest;
+      this._rejectParkedInNextStepForTest = null;
+      const [pending] = this._listActionPendingRowsForTest();
+      if (pending) {
+        void this.rejectExecution(
+          pending.execution_id,
+          "not now",
+          options
+        ).catch(() => {});
+      }
+    }
+  }
+
+  private _approveParkedInNextStepForTest = false;
+  private _rejectParkedInNextStepForTest: { autoContinue?: boolean } | null =
+    null;
+
+  /** Reject the parked action from `beforeStep` of the step after it parks. */
+  async rejectParkedInNextStepForTest(options: {
+    autoContinue?: boolean;
+  }): Promise<void> {
+    this._rejectParkedInNextStepForTest = options;
+  }
+
+  /**
+   * Approve the parked action from `beforeStep` of the step after it parks,
+   * so the outcome lands while the parking turn is still streaming.
+   */
+  async approveParkedInNextStepForTest(): Promise<void> {
+    this._approveParkedInNextStepForTest = true;
+  }
+
+  /** Keep a resolved pause's connectionless continuation from running. */
+  async holdConnectionlessContinuationForTest(): Promise<void> {
+    (
+      this as unknown as { _queueConnectionlessContinuation(): Promise<void> }
+    )._queueConnectionlessContinuation = () => Promise.resolve();
+  }
+
+  /** Skip the next resolved-pause drop, as a restart right before it would. */
+  async skipNextResolvedPauseDropForTest(): Promise<void> {
+    const self = this as unknown as {
+      _dropGenerationAfterResolvedPause(toolCallId: string): Promise<void>;
+    };
+    const original = self._dropGenerationAfterResolvedPause;
+    self._dropGenerationAfterResolvedPause = async () => {
+      self._dropGenerationAfterResolvedPause = original;
+    };
+  }
+
+  /** Skip the next transcript tool update, as a restart right before it would. */
+  async skipNextToolUpdateForTest(): Promise<void> {
+    const self = this as unknown as {
+      _applyToolUpdateToMessages(update: unknown): Promise<void>;
+    };
+    const original = self._applyToolUpdateToMessages;
+    self._applyToolUpdateToMessages = async () => {
+      self._applyToolUpdateToMessages = original;
+    };
+  }
+
+  /** Keep only the newest `count` messages in memory, as a windowed hydration. */
+  async windowCachedMessagesForTest(count: number): Promise<void> {
+    const self = this as unknown as {
+      _cachedMessages: UIMessage[];
+      _cacheCoversActivePath: boolean;
+    };
+    self._cachedMessages = self._cachedMessages.slice(-count);
+    self._cacheCoversActivePath = false;
+  }
+
+  /** Reconcile and persist a client transcript, as a chat request does. */
+  async persistClientMessagesForTest(messages: UIMessage[]): Promise<void> {
+    await (
+      this as unknown as {
+        _reconcileAndPersistIncoming(
+          messages: UIMessage[],
+          options: {
+            requestId: string;
+            isRegeneration: boolean;
+            isCurrent: () => boolean;
+          }
+        ): Promise<unknown>;
+      }
+    )._reconcileAndPersistIncoming(messages, {
+      requestId: crypto.randomUUID(),
+      isRegeneration: false,
+      isCurrent: () => true
+    });
+  }
+
+  async getDurableMessagesForTest(): Promise<UIMessage[]> {
+    return (await this.session.getHistory()) as UIMessage[];
+  }
+
+  /** Fail the next storage read of `key`. */
+  async failNextStorageGetForTest(key: string): Promise<void> {
+    const storage = this.ctx.storage as unknown as {
+      get(key: string): Promise<unknown>;
+    };
+    const get = storage.get.bind(storage);
+    storage.get = async (requested: string) => {
+      if (requested !== key) return get(requested);
+      storage.get = get;
+      throw new Error("simulated storage read failure");
+    };
+  }
+
+  /** Drop in-memory deferred-pause state, as an eviction would. */
+  async forgetDeferredResolvedPausesForTest(): Promise<void> {
+    const state = this as unknown as {
+      _deferredResolvedPauses: Map<string, unknown>;
+      _deferredResolvedPausesLoad: Promise<void> | undefined;
+    };
+    state._deferredResolvedPauses.clear();
+    state._deferredResolvedPausesLoad = undefined;
+  }
+
+  private _listActionPendingRowsForTest(): Array<{ execution_id: string }> {
+    return (
+      this as unknown as {
+        _listActionPendingRows: () => Array<{ execution_id: string }>;
+      }
+    )._listActionPendingRows();
   }
 
   async getBeforeStepLog(): Promise<
@@ -4713,9 +6823,18 @@ export class ThinkToolsTestAgent extends Think {
 
   override getModel(): LanguageModel {
     if (this._useAttachReplyAction) return createAttachReplyMockModel();
-    if (this._useDurablePauseAction) return createDurablePauseMockModel();
+    if (this._useDurablePauseAction) {
+      return createDurablePauseMockModel((prompt) =>
+        this._durablePausePrompts.push(prompt)
+      );
+    }
     if (this._repairToolCalls) {
       return createToolCallingMockModel('```json\n{"message":"repaired"}\n```');
+    }
+    if (this._echoExecuteMode === "validated-output") {
+      return createToolCallingMockModel(undefined, (prompt) =>
+        this._toolPrompts.push(prompt)
+      );
     }
     return createToolCallingMockModel();
   }
@@ -4794,6 +6913,31 @@ export class ThinkToolsTestAgent extends Think {
             this._echoExecuteCount++;
             return `echo: ${message}`;
           }
+        })
+      };
+    }
+    if (mode === "validated-output") {
+      const outputSchema = z.object({
+        rows: z.array(z.object({ id: z.string(), title: z.string() }))
+      });
+      return {
+        echo: tool({
+          description: "List rows",
+          inputSchema: z.object({ message: z.string() }),
+          outputSchema,
+          execute: async () => {
+            this._echoExecuteCount++;
+            return {
+              rows: Array.from({ length: 40 }, (_, i) => ({
+                id: `row-${i}`,
+                title: `Row ${i} `.padEnd(60, "x")
+              }))
+            };
+          },
+          toModelOutput: ({ output }) => ({
+            type: "json",
+            value: outputSchema.parse(output)
+          })
         })
       };
     }
@@ -5041,7 +7185,9 @@ export class ThinkToolsTestAgent extends Think {
     | "sync-iterable"
     | "async-generator"
     | "needs-approval"
-    | "add-messages" = "default";
+    | "add-messages"
+    | "validated-output" = "default";
+  private _toolPrompts: string[] = [];
 
   /** Counts how many times the `echo` tool's `execute` actually runs. */
   private _echoExecuteCount = 0;
@@ -5081,6 +7227,7 @@ export class ThinkToolsTestAgent extends Think {
     | "permission-noop"
     | "attach-then-throw" = "two";
   private _useDurablePauseAction = false;
+  private _durablePausePrompts: string[] = [];
   private _durablePauseApproval: boolean | "predicate-hello" | undefined =
     undefined;
   private _durablePauseIdempotencyKey: string | null = null;
@@ -5111,8 +7258,14 @@ export class ThinkToolsTestAgent extends Think {
       | "async-generator"
       | "needs-approval"
       | "add-messages"
+      | "validated-output"
   ): Promise<void> {
     this._echoExecuteMode = mode;
+  }
+
+  /** Model prompts recorded in `validated-output` mode, as JSON. */
+  async getToolPrompts(): Promise<string[]> {
+    return this._toolPrompts;
   }
 
   /** How many times the `echo` tool's `execute` body actually ran. */
@@ -5172,6 +7325,22 @@ export class ThinkToolsTestAgent extends Think {
 
   async clearResponseLogForTest(): Promise<void> {
     this._responseLog.length = 0;
+  }
+
+  async getResponseStatusesForTest(): Promise<
+    Array<Pick<ChatResponseResult, "status" | "continuation" | "error">>
+  > {
+    return this._responseLog.map(({ status, continuation, error }) => ({
+      status,
+      continuation,
+      error
+    }));
+  }
+
+  private _failContinuationBeforeStream = false;
+
+  async failContinuationBeforeStreamForTest(): Promise<void> {
+    this._failContinuationBeforeStream = true;
   }
 
   async mutateLastResponseAttachmentForTest(): Promise<void> {
@@ -5335,6 +7504,14 @@ export class ThinkToolsTestAgent extends Think {
     this._useDurablePauseAction = false;
   }
 
+  async getDurablePauseModelCallCount(): Promise<number> {
+    return this._durablePausePrompts.length;
+  }
+
+  async waitUntilStableForTest(): Promise<boolean> {
+    return this.waitUntilStable({ timeout: 5_000 });
+  }
+
   async getDurablePauseExecCount(): Promise<number> {
     return this._durablePauseExecCount;
   }
@@ -5436,6 +7613,17 @@ export class ThinkToolsTestAgent extends Think {
     return this._beforeStepLog.length - before;
   }
 
+  /** The serialized prompt of every durable-pause model call, in order. */
+  async getDurablePausePromptsForTest(): Promise<string[]> {
+    return this._durablePausePrompts;
+  }
+
+  async appendMessagesForTest(messages: UIMessage[]): Promise<void> {
+    for (const message of messages) {
+      await this.appendMessageToHistory(message);
+    }
+  }
+
   /** Simulate compaction removing a durable-pause action's tool part. */
   async stripDurablePausePartsForTest(): Promise<void> {
     for (const message of this.messages) {
@@ -5501,9 +7689,10 @@ export class ThinkToolsTestAgent extends Think {
 
   async rejectExecutionForTest(
     executionId: string,
-    reason?: string
+    reason?: string,
+    options?: { autoContinue?: boolean }
   ): Promise<unknown> {
-    return this.rejectExecution(executionId, reason);
+    return this.rejectExecution(executionId, reason, options);
   }
 
   async approveExecutionTwiceForTest(executionId: string): Promise<unknown[]> {
@@ -5608,7 +7797,10 @@ export class ThinkToolsTestAgent extends Think {
     this._repairToolCalls = true;
   }
 
-  override beforeTurn(): TurnConfig | void {
+  override beforeTurn(ctx: TurnContext): TurnConfig | void {
+    if (ctx.continuation && this._failContinuationBeforeStream) {
+      throw new Error("continuation failed before streaming");
+    }
     this._preparationCount++;
     if (this._repairToolCalls) {
       return {
@@ -5835,6 +8027,38 @@ export class ThinkToolsTestAgent extends Think {
 // ── ThinkProgrammaticTestAgent ──────────────────────────────
 // Tests saveMessages, continueLastTurn, and body persistence.
 
+/**
+ * A `continueLastTurn` override that delegates to `super`, optionally after a
+ * delay or replacing the status it returns.
+ */
+export class ThinkContinueOverrideTestAgent extends ThinkTestAgent {
+  private _delayBeforeSuperMs = 0;
+  private _forcedStatus: SaveMessagesResult["status"] | null = null;
+
+  async configureContinueOverrideForTest(options: {
+    delayBeforeSuperMs?: number;
+    forcedStatus?: SaveMessagesResult["status"];
+  }): Promise<void> {
+    this._delayBeforeSuperMs = options.delayBeforeSuperMs ?? 0;
+    this._forcedStatus = options.forcedStatus ?? null;
+  }
+
+  protected override async continueLastTurn(
+    body?: Record<string, unknown>,
+    options?: SaveMessagesOptions
+  ): Promise<SaveMessagesResult> {
+    if (this._delayBeforeSuperMs > 0) {
+      await new Promise((resolve) =>
+        setTimeout(resolve, this._delayBeforeSuperMs)
+      );
+    }
+    const result = await super.continueLastTurn(body, options);
+    return this._forcedStatus
+      ? { ...result, status: this._forcedStatus }
+      : result;
+  }
+}
+
 export class ThinkProgrammaticTestAgent extends Think {
   protected static override submissionRecoveryStaleMs = 15 * 60 * 1000;
 
@@ -5853,7 +8077,10 @@ export class ThinkProgrammaticTestAgent extends Think {
   private _capturedTurnContexts: Array<{
     continuation?: boolean;
     body?: RpcJsonObject;
+    channel?: string;
   }> = [];
+  private _waitInSubmissionStatusHook = false;
+  private _submissionStatusHookWaits: string[] = [];
   private _delayedChunks: { chunks: string[]; delayMs: number } | null = null;
   private _throwBeforeTurnError: string | null = null;
   private _submissionStatusDelayMs = 0;
@@ -5866,6 +8093,7 @@ export class ThinkProgrammaticTestAgent extends Think {
     | "submit"
     | "addMessages"
     | "detachedNotify"
+    | "submitThenWait"
     | null = null;
   private _nestedAdmissionAttempted = false;
   private _nestedAdmissionSucceeded = false;
@@ -5877,6 +8105,11 @@ export class ThinkProgrammaticTestAgent extends Think {
   private _failNextContinueTransient: string | null = null;
   private _useRecoveryToolModel = false;
   private _recoveryToolExecutions = 0;
+  private _coldRpcOnStartCount = 0;
+
+  override onStart(): void {
+    this._coldRpcOnStartCount++;
+  }
 
   /**
    * Arm a ONE-SHOT platform-transient fault on the next `continueLastTurn`
@@ -5900,7 +8133,12 @@ export class ThinkProgrammaticTestAgent extends Think {
         cause: new Error(message)
       });
     }
-    return super.continueLastTurn(body, options);
+    const result = await super.continueLastTurn(body, options);
+    return {
+      requestId: result.requestId,
+      status: result.status,
+      ...(result.error !== undefined && { error: result.error })
+    };
   }
 
   override getModel(): LanguageModel {
@@ -5947,6 +8185,16 @@ export class ThinkProgrammaticTestAgent extends Think {
 
   async getMessagesForTest(): Promise<UIMessage[]> {
     return this.getMessages();
+  }
+
+  async getSessionMessagesForColdRpcTest(): Promise<{
+    messages: UIMessage[];
+    onStartCount: number;
+  }> {
+    return {
+      messages: (await this.session.getHistory()) as UIMessage[],
+      onStartCount: this._coldRpcOnStartCount
+    };
   }
 
   override onChatResponse(result: ChatResponseResult): void {
@@ -6012,15 +8260,41 @@ export class ThinkProgrammaticTestAgent extends Think {
       );
     }
     this._submissionLog.push(result);
+    if (
+      this._waitInSubmissionStatusHook &&
+      ["completed", "aborted", "skipped", "error"].includes(result.status)
+    ) {
+      try {
+        const waited = await this.waitForSubmission(result.submissionId, {
+          timeoutMs: 100
+        });
+        this._submissionStatusHookWaits.push(`resolved:${waited?.status}`);
+      } catch (error) {
+        this._submissionStatusHookWaits.push(
+          `error:${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+    }
+  }
+
+  /** Call `waitForSubmission` from `onSubmissionStatus` on terminal statuses. */
+  async waitInSubmissionStatusHookForTest(): Promise<void> {
+    this._waitInSubmissionStatusHook = true;
+  }
+
+  async getSubmissionStatusHookWaitsForTest(): Promise<string[]> {
+    return this._submissionStatusHookWaits;
   }
 
   override async beforeTurn(ctx: TurnContext): Promise<void> {
     if (this._throwBeforeTurnError) {
       throw new Error(this._throwBeforeTurnError);
     }
+    const channel = this.activeTurn?.channel;
     this._capturedTurnContexts.push({
       continuation: ctx.continuation,
-      body: ctx.body as RpcJsonObject | undefined
+      body: ctx.body as RpcJsonObject | undefined,
+      ...(channel !== undefined && { channel })
     });
     if (this._nestedAdmissionMode && !this._nestedAdmissionAttempted) {
       this._nestedAdmissionAttempted = true;
@@ -6068,6 +8342,13 @@ export class ThinkProgrammaticTestAgent extends Think {
           notifySource: "nested-detached-source"
         });
         return;
+      case "submitThenWait": {
+        const submitted = await this.runTurn({ mode: "submit", input: msg });
+        await this.waitForSubmission(submitted.submissionId, {
+          timeoutMs: 200
+        });
+        return;
+      }
     }
   }
 
@@ -6357,6 +8638,15 @@ export class ThinkProgrammaticTestAgent extends Think {
     return this.runTurn(options);
   }
 
+  async testRunTurnWaitError(options: RunTurnWait): Promise<string | null> {
+    try {
+      await this.runTurn(options);
+      return null;
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+  }
+
   async testRunTurnWaitString(text: string): Promise<TurnResult> {
     return this.runTurn({ mode: "wait", input: text });
   }
@@ -6570,6 +8860,7 @@ export class ThinkProgrammaticTestAgent extends Think {
     submissionId?: string;
     metadata?: Record<string, unknown>;
     messageTexts?: string[];
+    channel?: string;
   }): Promise<{
     submission: ThinkSubmissionInspection | null;
     messages: UIMessage[];
@@ -6619,7 +8910,8 @@ export class ThinkProgrammaticTestAgent extends Think {
         })),
         {
           submissionId,
-          metadata: options?.metadata
+          metadata: options?.metadata,
+          channel: options?.channel
         }
       );
 
@@ -6700,12 +8992,38 @@ export class ThinkProgrammaticTestAgent extends Think {
   async cancelSubmissionForTest(
     submissionId: string,
     reason?: string
-  ): Promise<void> {
-    await this.cancelSubmission(submissionId, reason);
+  ): Promise<CancelSubmissionResult> {
+    return this.cancelSubmission(submissionId, reason);
+  }
+
+  async waitForSubmissionForTest(
+    submissionId: string,
+    options?: { timeoutMs?: number }
+  ): Promise<ThinkSubmissionInspection | null> {
+    return this.waitForSubmission(submissionId, options);
   }
 
   async deleteSubmissionForTest(submissionId: string): Promise<boolean> {
     return this.deleteSubmission(submissionId);
+  }
+
+  async markSubmissionRunningHereForTest(submissionId: string): Promise<void> {
+    (
+      this as unknown as {
+        _submissionAbortControllers: Map<string, AbortController>;
+      }
+    )._submissionAbortControllers.set(submissionId, new AbortController());
+  }
+
+  async setSubmissionRowStatusForTest(
+    submissionId: string,
+    status: ThinkSubmissionStatus
+  ): Promise<void> {
+    this.sql`
+      UPDATE cf_think_submissions
+      SET status = ${status}, completed_at = ${Date.now()}
+      WHERE submission_id = ${submissionId}
+    `;
   }
 
   async deleteSubmissionsForTest(options?: {
@@ -6800,10 +9118,33 @@ export class ThinkProgrammaticTestAgent extends Think {
     });
   }
 
+  /** Leave stored chunks for `requestId`, then persist them as recovery does. */
+  async persistOrphanedStreamForTest(
+    requestId: string,
+    messageId: string
+  ): Promise<void> {
+    const internals = this as unknown as {
+      _resumableStream: {
+        start(requestId: string): string;
+        storeChunk(streamId: string, body: string): unknown;
+      };
+      _persistOrphanedStream(streamId: string): Promise<void>;
+    };
+    const streamId = internals._resumableStream.start(requestId);
+    for (const chunk of [
+      { type: "start", messageId },
+      { type: "text-start", id: "t1" },
+      { type: "text-delta", id: "t1", delta: "recovered" },
+      { type: "text-end", id: "t1" }
+    ]) {
+      internals._resumableStream.storeChunk(streamId, JSON.stringify(chunk));
+    }
+    await internals._persistOrphanedStream(streamId);
+  }
+
   async continueRecoveredChatForTest(requestId: string): Promise<void> {
-    await this._runScheduledChatRecovery({
-      kind: "continue",
-      data: { recoveredRequestId: requestId }
+    await this._chatRecoveryContinueDetached({
+      recoveredRequestId: requestId
     });
   }
 
@@ -6817,9 +9158,8 @@ export class ThinkProgrammaticTestAgent extends Think {
     requestId: string
   ): Promise<string | null> {
     try {
-      await this._runScheduledChatRecovery({
-        kind: "continue",
-        data: { recoveredRequestId: requestId }
+      await this._chatRecoveryContinueDetached({
+        recoveredRequestId: requestId
       });
       return null;
     } catch (error) {
@@ -6831,9 +9171,8 @@ export class ThinkProgrammaticTestAgent extends Think {
     requestId: string,
     delayMs: number
   ): Promise<void> {
-    const continuation = this._runScheduledChatRecovery({
-      kind: "continue",
-      data: { recoveredRequestId: requestId }
+    const continuation = this._chatRecoveryContinueDetached({
+      recoveredRequestId: requestId
     });
     await new Promise((resolve) => setTimeout(resolve, delayMs));
     await this.cancelSubmission(requestId, "stop during recovery");
@@ -6888,6 +9227,67 @@ export class ThinkProgrammaticTestAgent extends Think {
   /** Deliver the pending retry through the production recovery callback. */
   async runScheduledRecoveryRetryForTest(): Promise<void> {
     await runRecoveryWorkForTest(this, "_chatRecoveryRetry");
+  }
+
+  async runScheduledRecoveryContinueForTest(): Promise<void> {
+    await runRecoveryWorkForTest(this, "_chatRecoveryContinue");
+  }
+
+  async persistTestMessage(msg: UIMessage): Promise<void> {
+    await this.session.appendMessage(msg);
+  }
+
+  /**
+   * Leave the turn `requestId` as a crash does: its chat fiber row and an
+   * open stream holding `chunks`, then run startup fiber recovery.
+   */
+  async interruptChatTurnForTest(input: {
+    requestId: string;
+    latestMessageId: string;
+    latestMessageRole: "user" | "assistant";
+    latestUserMessageId: string;
+    chunks: Array<Record<string, unknown>>;
+  }): Promise<{ scheduledContinueCount: number; scheduledRetryCount: number }> {
+    const internals = this as unknown as {
+      _resumableStream: {
+        start(requestId: string): string;
+        storeChunk(streamId: string, body: string): unknown;
+        flushBuffer(): void;
+      };
+      _checkRunFibers(): Promise<void>;
+    };
+    const streamId = internals._resumableStream.start(input.requestId);
+    for (const chunk of input.chunks) {
+      internals._resumableStream.storeChunk(streamId, JSON.stringify(chunk));
+    }
+    internals._resumableStream.flushBuffer();
+    const snapshot = {
+      __cfThinkChatFiberSnapshot: {
+        kind: "think-chat-turn",
+        version: 1,
+        requestId: input.requestId,
+        continuation: false,
+        latestMessageId: input.latestMessageId,
+        latestMessageRole: input.latestMessageRole,
+        latestUserMessageId: input.latestUserMessageId,
+        startedAt: Date.now()
+      },
+      user: null
+    };
+    this.sql`
+      INSERT INTO cf_agents_runs (id, name, snapshot, created_at)
+      VALUES (${`fiber-${crypto.randomUUID()}`},
+              ${`${(this.constructor as typeof Think).CHAT_FIBER_NAME}:${input.requestId}`},
+              ${JSON.stringify(snapshot)}, ${Date.now()})
+    `;
+    await internals._checkRunFibers();
+    return {
+      scheduledContinueCount: recoveryWorkCountForTest(
+        this,
+        "_chatRecoveryContinue"
+      ),
+      scheduledRetryCount: recoveryWorkCountForTest(this, "_chatRecoveryRetry")
+    };
   }
 
   async insertSubmissionForTest(options: {
@@ -7057,6 +9457,20 @@ export class ThinkProgrammaticTestAgent extends Think {
 
   async testContinueLastTurn(): Promise<SaveMessagesResult> {
     return this.continueLastTurn();
+  }
+
+  private _streamStartContinuations: boolean[] = [];
+
+  protected override _startResumableStream(
+    requestId: string,
+    options?: { messageId?: string; continuation?: boolean }
+  ): string {
+    this._streamStartContinuations.push(options?.continuation ?? false);
+    return super._startResumableStream(requestId, options);
+  }
+
+  async getStreamStartContinuationsForTest(): Promise<boolean[]> {
+    return this._streamStartContinuations;
   }
 
   async testContinueLastTurnWithBody(
@@ -7243,7 +9657,7 @@ export class ThinkProgrammaticTestAgent extends Think {
   }
 
   async getCapturedOptions(): Promise<
-    Array<{ continuation?: boolean; body?: RpcJsonObject }>
+    Array<{ continuation?: boolean; body?: RpcJsonObject; channel?: string }>
   > {
     return this._capturedTurnContexts;
   }
@@ -7301,6 +9715,13 @@ type ScheduledTaskHandlerEventForTest = {
 export class ThinkScheduledTasksTestAgent extends ThinkProgrammaticTestAgent {
   override async getDefaultTimezone(): Promise<string | undefined> {
     return this.ctx.storage.get<string>("scheduledTasksDefaultTimezone");
+  }
+
+  override async getScheduledTasksScope(): Promise<"root" | "all"> {
+    return (
+      (await this.ctx.storage.get<"root" | "all">("scheduledTasksScope")) ??
+      "root"
+    );
   }
 
   override async getScheduledTasks(): Promise<ThinkScheduledTasks> {
@@ -7375,6 +9796,10 @@ export class ThinkScheduledTasksTestAgent extends ThinkProgrammaticTestAgent {
       return;
     }
     await this.ctx.storage.put("scheduledTasksDefaultTimezone", timezone);
+  }
+
+  async setScheduledTasksScopeForTest(scope: "root" | "all"): Promise<void> {
+    await this.ctx.storage.put("scheduledTasksScope", scope);
   }
 
   async reconcileScheduledTasksForTest(): Promise<void> {
@@ -7539,6 +9964,45 @@ export class ThinkScheduledTasksTestAgent extends ThinkProgrammaticTestAgent {
     await child.setDefaultTimezoneForTest(timezone);
   }
 
+  async setChildScheduledTasksScopeForTest(
+    name: string,
+    scope: "root" | "all"
+  ): Promise<void> {
+    const child = await this.subAgent(ThinkScheduledTasksTestAgent, name);
+    await child.setScheduledTasksScopeForTest(scope);
+  }
+
+  /**
+   * Force the child facet to restart, so the next `subAgent()` call replays
+   * its `onStart` — including the declared-task reconcile step. Storage is
+   * left intact, unlike `deleteSubAgent`.
+   */
+  async restartChildForTest(name: string): Promise<void> {
+    this.abortSubAgent(ThinkScheduledTasksTestAgent, name, "restart-for-test");
+  }
+
+  async runChildDeclaredPayloadForTest(
+    name: string,
+    payload: DeclaredScheduledTaskPayloadForTest
+  ): Promise<void> {
+    const child = await this.subAgent(ThinkScheduledTasksTestAgent, name);
+    await child.runDeclaredPayloadForTest(payload);
+  }
+
+  async getChildFirstDeclaredPayloadForTest(
+    name: string
+  ): Promise<DeclaredScheduledTaskPayloadForTest> {
+    const child = await this.subAgent(ThinkScheduledTasksTestAgent, name);
+    return child.getFirstDeclaredPayloadForTest();
+  }
+
+  async listChildScheduledTaskHandlerEventsForTest(
+    name: string
+  ): Promise<ScheduledTaskHandlerEventForTest[]> {
+    const child = await this.subAgent(ThinkScheduledTasksTestAgent, name);
+    return child.listScheduledTaskHandlerEventsForTest();
+  }
+
   async reconcileChildScheduledTasksForTest(name: string): Promise<void> {
     const child = await this.subAgent(ThinkScheduledTasksTestAgent, name);
     await child.reconcileScheduledTasksForTest();
@@ -7646,6 +10110,7 @@ export class ThinkRecoveryTestAgent extends Think {
   private _stashResult: { success: boolean; error?: string } | null = null;
   private _rejectPrefill = false;
   private _lastPromptRole: string | undefined;
+  private _modelPromptsForTest: string[][] = [];
   private _throwBeforeTurnMessage: string | null = null;
   // recovery × channels: capture the channel context + assembled system prompt
   // that each turn (including recovered ones) actually ran with, so a test can
@@ -7872,6 +10337,111 @@ export class ThinkRecoveryTestAgent extends Think {
     `[0]?.messages_json ?? null
     );
   }
+  private _chatResponses: Array<{
+    requestId: string;
+    status: string;
+    messageId: string;
+    recovered?: boolean;
+  }> = [];
+  private _turnAtReset: { requestId: string; userMessageId?: string } | null =
+    null;
+
+  override onChatResponse(result: ChatResponseResult): void {
+    this._chatResponses.push({
+      requestId: result.requestId,
+      status: result.status,
+      messageId: result.message.id,
+      ...(result.recovered !== undefined && { recovered: result.recovered })
+    });
+  }
+
+  async getChatResponsesForTest(): Promise<
+    Array<{
+      requestId: string;
+      status: string;
+      messageId: string;
+      recovered?: boolean;
+    }>
+  > {
+    return this._chatResponses;
+  }
+
+  /**
+   * Skip the next response hook, as a Durable Object reset right after the
+   * assistant message is persisted would.
+   */
+  async resetBeforeNextResponseHookForTest(): Promise<void> {
+    const self = this as unknown as {
+      _fireResponseHook(result: ChatResponseResult): Promise<void>;
+    };
+    const original = self._fireResponseHook;
+    self._fireResponseHook = async (result) => {
+      self._fireResponseHook = original;
+      this._turnAtReset = {
+        requestId: result.requestId,
+        userMessageId: this.messages
+          .filter((message) => message.role === "user")
+          .at(-1)?.id
+      };
+    };
+    const marker = this as unknown as {
+      _forgetPendingResponseHook(requestId: string): Promise<void>;
+      _responseHooksInFlight: Set<string>;
+    };
+    const forget = marker._forgetPendingResponseHook;
+    marker._forgetPendingResponseHook = async () => {
+      marker._forgetPendingResponseHook = forget;
+      marker._responseHooksInFlight.clear();
+    };
+  }
+
+  /** Re-create the chat fiber the reset left behind, then wake recovery. */
+  async recoverFromResetForTest(): Promise<void> {
+    await this.restoreFiberFromResetForTest();
+    await this.triggerFiberRecovery();
+  }
+
+  /** Re-create the chat fiber the reset left behind, without recovering it. */
+  async restoreFiberFromResetForTest(): Promise<void> {
+    const turn = this._turnAtReset;
+    if (!turn) throw new Error("no reset captured");
+    this._turnAtReset = null;
+    await this.insertInterruptedFiber(
+      `${(this.constructor as typeof Think).CHAT_FIBER_NAME}:${turn.requestId}`,
+      {
+        __cfThinkChatFiberSnapshot: {
+          kind: "think-chat-turn",
+          version: 1,
+          requestId: turn.requestId,
+          continuation: false,
+          latestMessageId: turn.userMessageId,
+          latestMessageRole: "user",
+          latestUserMessageId: turn.userMessageId,
+          startedAt: Date.now()
+        },
+        user: null
+      }
+    );
+  }
+
+  /** Fail the next final assistant-message persist, as a storage error would. */
+  async failNextAssistantPersistForTest(): Promise<void> {
+    const self = this as unknown as {
+      _persistAssistantMessageWithCutover(...args: unknown[]): Promise<void>;
+    };
+    const original = self._persistAssistantMessageWithCutover;
+    self._persistAssistantMessageWithCutover = async () => {
+      self._persistAssistantMessageWithCutover = original;
+      throw new Error("simulated persist failure");
+    };
+  }
+
+  /** Replay owed response hooks, as the startup durable-work step does. */
+  async replayPendingResponseHooksForTest(): Promise<void> {
+    await (
+      this as unknown as { _replayPendingResponseHooks(): Promise<void> }
+    )._replayPendingResponseHooks();
+  }
 
   // A single per-channel policy (voice) so recovery tests can assert that a
   // recovered turn re-resolves the channel from the persisted user message and
@@ -7958,7 +10528,15 @@ export class ThinkRecoveryTestAgent extends Think {
         }
       });
     }
-    return createMockModel("Continued response.");
+    return createMockModel((callOptions) => {
+      this._modelPromptsForTest.push(promptLinesForTest(callOptions));
+      return "Continued response.";
+    });
+  }
+
+  /** Each model call's prompt as `role: text` lines, oldest first. */
+  async getModelPromptsForTest(): Promise<string[][]> {
+    return this._modelPromptsForTest;
   }
 
   override beforeTurn(ctx: TurnContext): void {
@@ -8023,6 +10601,10 @@ export class ThinkRecoveryTestAgent extends Think {
 
   async getStoredMessages(): Promise<UIMessage[]> {
     return this.getMessages();
+  }
+
+  async getBranchesForTest(messageId: string): Promise<UIMessage[]> {
+    return (await this.session.getBranches(messageId)) as UIMessage[];
   }
 
   async getActiveFibers(): Promise<Array<{ id: string; name: string }>> {
@@ -8646,13 +11228,14 @@ export class ThinkRecoveryTestAgent extends Think {
             requestId: string;
             streamId: string;
             partialParts: unknown[];
-            targetAssistantId?: string;
+            persistPartial: () => Promise<string | undefined>;
           }): Promise<string>;
         }
       )._routeStallToBoundedRecovery({
         requestId,
         streamId: "stall-stream",
-        partialParts: []
+        partialParts: [],
+        persistPartial: async () => undefined
       });
     } finally {
       (
@@ -8703,6 +11286,7 @@ export class ThinkRecoveryTestAgent extends Think {
     seedRunningSubmission?: boolean;
     maxAttempts?: number;
     terminalMessage?: string;
+    seedMessengerDelivery?: boolean;
   }): Promise<{
     threw: boolean;
     exhaustedContexts: number;
@@ -8710,6 +11294,7 @@ export class ThinkRecoveryTestAgent extends Think {
     terminalBroadcast: string | undefined;
     incidentStatus: string | undefined;
     submissionStatus: string | null;
+    messengerOutcome?: string | null;
   }> {
     const maxAttempts = input.maxAttempts ?? 5;
     const terminalMessage =
@@ -8747,6 +11332,15 @@ export class ThinkRecoveryTestAgent extends Think {
           ${JSON.stringify([])}, NULL, NULL, ${now}, ${now}, ${now}, NULL
         )
       `;
+    }
+
+    const messengerKey = `cf_think_messenger_recovery:${begun.incidentId}`;
+    if (input.seedMessengerDelivery) {
+      await this.ctx.storage.put(messengerKey, {
+        messengerId: "fake",
+        threadId: "fake:thread",
+        partialText: ""
+      });
     }
 
     let terminalBroadcast: string | undefined;
@@ -8827,7 +11421,16 @@ export class ThinkRecoveryTestAgent extends Think {
       exhaustedReason: captured[0]?.reason,
       terminalBroadcast,
       incidentStatus: [...incidents.values()][0]?.status,
-      submissionStatus: submissionRows[0]?.status ?? null
+      submissionStatus: submissionRows[0]?.status ?? null,
+      ...(input.seedMessengerDelivery && {
+        messengerOutcome: await new Promise((resolve) =>
+          setTimeout(resolve, 50)
+        ).then(
+          async () =>
+            (await this.ctx.storage.get<{ outcome?: string }>(messengerKey))
+              ?.outcome ?? null
+        )
+      })
     };
   }
 
@@ -9034,11 +11637,38 @@ export class ThinkRecoveryTestAgent extends Think {
     targetUserId?: string;
     lastBody?: Record<string, unknown>;
   }): Promise<void> {
-    await this._runScheduledChatRecovery({ kind: "retry", data: options });
+    await this._chatRecoveryRetryDetached(options);
   }
 
   async runScheduledRecoveryRetryForTest(): Promise<void> {
     await runRecoveryWorkForTest(this, "_chatRecoveryRetry");
+  }
+
+  /**
+   * Look up origin ids for the recovery successor from inside an open recovery
+   * scope, and for an unrelated request concurrently from outside it (#2280).
+   */
+  async probeRecoveryOriginScopeForTest(ids: string[]): Promise<{
+    successor: string[] | undefined;
+    unrelated: string[] | undefined;
+  }> {
+    const self = this as unknown as {
+      _chatRecoveryOriginIdsScope: {
+        run<R>(store: string[], fn: () => R): R;
+      };
+      _originMessageIdsFor(requestId: string): string[] | undefined;
+    };
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const scoped = self._chatRecoveryOriginIdsScope.run(ids, async () => {
+      await gate;
+      return self._originMessageIdsFor("successor");
+    });
+    const unrelated = self._originMessageIdsFor("unrelated");
+    release();
+    return { successor: await scoped, unrelated };
   }
 
   async runScheduledRecoveryContinueForTest(): Promise<void> {
@@ -9089,15 +11719,22 @@ export class ThinkRecoveryTestAgent extends Think {
     streamId: string,
     requestId: string,
     chunks: Array<{ body: string; index: number }>,
-    status: "streaming" | "completed" | "error" = "streaming"
+    status: "streaming" | "completed" | "error" = "streaming",
+    options: { parentMessageId?: string; restore?: boolean } = {}
   ): Promise<void> {
     const now = Date.now();
     const state = status === "error" ? "errored" : status;
     const closedAt = state === "streaming" ? null : now;
+    const metadata = {
+      cfChat: 1,
+      ...(options.parentMessageId !== undefined && {
+        parentMessageId: options.parentMessageId
+      })
+    };
     this.sql`
       INSERT INTO cf_agents_streams
         (stream_id, state, tag, metadata, chunk_count, created_at, updated_at, closed_at)
-      VALUES (${streamId}, ${state}, ${requestId}, ${JSON.stringify({ cfChat: 1 })},
+      VALUES (${streamId}, ${state}, ${requestId}, ${JSON.stringify(metadata)},
               ${chunks.length}, ${now}, ${now}, ${closedAt})
     `;
     if (chunks.length > 0) {
@@ -9109,6 +11746,9 @@ export class ThinkRecoveryTestAgent extends Think {
                 ${body}, ${now}, ${now})
       `;
     }
+    // What startup does after a restart: pick the streaming row back up as
+    // the active stream, so recovery persists its partial.
+    if (options.restore) this["_resumableStream"].restore();
   }
 
   async getScheduledChatRecoveryCountForTest(
@@ -9319,6 +11959,94 @@ export class ThinkRecoveryTestAgent extends Think {
     )._rebindAgentToolChildRunRequestId(requestId);
   }
 
+  /**
+   * Seed a chat-turn fiber row for `requestId` (settled when `completed`) and
+   * report whether the recoverable-turn checks count it as recovery evidence.
+   */
+  async chatTurnFiberEvidenceForTest(
+    requestId: string,
+    completed: boolean
+  ): Promise<{ recoverable: boolean; freshEvidence: boolean }> {
+    const now = Date.now();
+    this.sql`
+      INSERT INTO cf_agents_runs (id, name, snapshot, created_at, completed_at)
+      VALUES (
+        ${`fiber-${crypto.randomUUID()}`},
+        ${`${(this.constructor as typeof Think).CHAT_FIBER_NAME}:${requestId}`},
+        ${null}, ${now}, ${completed ? now : null}
+      )
+    `;
+    const self = this as unknown as {
+      _hasRecoverableChatTurn(requestId: string): boolean;
+      _hasFreshRecoverableSubmissionEvidence(row: {
+        request_id: string;
+      }): boolean;
+    };
+    return {
+      recoverable: self._hasRecoverableChatTurn(requestId),
+      freshEvidence: self._hasFreshRecoverableSubmissionEvidence({
+        request_id: requestId
+      })
+    };
+  }
+
+  /**
+   * Seed an in-flight child-run row in a table created by an older release
+   * (no `event_delivery` column), with this isolate's ensure not yet run — a
+   * fresh isolate after upgrade whose first child-run access is recovery.
+   */
+  async seedLegacyAgentToolChildRunForTest(
+    runId: string,
+    requestId: string
+  ): Promise<void> {
+    this.sql`
+      CREATE TABLE cf_agent_tool_child_runs (
+        run_id TEXT PRIMARY KEY,
+        request_id TEXT,
+        stream_id TEXT,
+        status TEXT NOT NULL,
+        summary TEXT,
+        error_message TEXT,
+        started_at INTEGER NOT NULL,
+        completed_at INTEGER
+      )
+    `;
+    this.sql`
+      INSERT INTO cf_agent_tool_child_runs (run_id, request_id, status, started_at)
+      VALUES (${runId}, ${requestId}, 'running', ${Date.now()})
+    `;
+  }
+
+  /**
+   * Seed an in-flight `eventDelivery: "terminal"` child-run row, rebind it the
+   * way a recovered turn does, then finalize it the way a settled recovered
+   * turn does. Returns whether the run is still in the terminal-only set.
+   */
+  async terminalOnlyRunAfterRecoveredTurnForTest(
+    runId: string,
+    requestId: string
+  ): Promise<{ afterRebind: boolean; afterFinalize: boolean }> {
+    const self = this as unknown as {
+      _ensureAgentToolChildRunTable(): void;
+      _rebindAgentToolChildRunRequestId(requestId: string): void;
+      _finalizeAgentToolChildRunTailers(runId: string): void;
+      _agentToolTerminalOnlyRuns: Set<string>;
+    };
+    self._ensureAgentToolChildRunTable();
+    this.sql`
+      INSERT INTO cf_agent_tool_child_runs
+        (run_id, request_id, status, started_at, event_delivery)
+      VALUES (${runId}, 'old-req', 'running', ${Date.now()}, 'terminal')
+    `;
+    self._rebindAgentToolChildRunRequestId(requestId);
+    const afterRebind = self._agentToolTerminalOnlyRuns.has(runId);
+    self._finalizeAgentToolChildRunTailers(runId);
+    return {
+      afterRebind,
+      afterFinalize: self._agentToolTerminalOnlyRuns.has(runId)
+    };
+  }
+
   /** Whether this facet has a `cf_agent_tool_child_runs` table at all. */
   async hasAgentToolChildRunTableForTest(): Promise<boolean> {
     const rows = this.sql<{ n: number }>`
@@ -9510,16 +12238,8 @@ export class ThinkRecoveryTestAgent extends Think {
     const onSubmissionStatus = this.onSubmissionStatus.bind(this);
     const onChatResponse = this.onChatResponse.bind(this);
     const getModel = this.getModel.bind(this);
-    // Vendor divergence: one `_runScheduledChatRecovery` body backs both
-    // callbacks in this fork, so the handoff probe wraps it instead of
-    // upstream's two `*Detached` methods.
-    const host = this as unknown as {
-      _runScheduledChatRecovery(
-        recovery: { kind: "continue" | "retry"; data?: unknown },
-        onTurnStarted?: () => void
-      ): Promise<void>;
-    };
-    const runScheduledRecovery = host._runScheduledChatRecovery.bind(this);
+    const retryDetached = this._chatRecoveryRetryDetached.bind(this);
+    const continueDetached = this._chatRecoveryContinueDetached.bind(this);
     let handoffSignals = 0;
     let responseCount = 0;
     const terminalStatuses: string[] = [];
@@ -9581,9 +12301,19 @@ export class ThinkRecoveryTestAgent extends Think {
     if (streamOutcome === "error") {
       this.getModel = () => createInBandErrorMockModel("handoff stream error");
     }
-    host._runScheduledChatRecovery = async (recovery, onTurnStarted) => {
+    this._chatRecoveryRetryDetached = async (input, onTurnStarted) => {
       try {
-        await runScheduledRecovery(recovery, () => {
+        await retryDetached(input, () => {
+          handoffSignals++;
+          onTurnStarted?.();
+        });
+      } finally {
+        detachedFinished.resolve();
+      }
+    };
+    this._chatRecoveryContinueDetached = async (input, onTurnStarted) => {
+      try {
+        await continueDetached(input, () => {
           handoffSignals++;
           onTurnStarted?.();
         });
@@ -9714,7 +12444,8 @@ export class ThinkRecoveryTestAgent extends Think {
       this.onSubmissionStatus = onSubmissionStatus;
       this.onChatResponse = onChatResponse;
       this.getModel = getModel;
-      host._runScheduledChatRecovery = runScheduledRecovery;
+      this._chatRecoveryRetryDetached = retryDetached;
+      this._chatRecoveryContinueDetached = continueDetached;
     }
   }
 
@@ -9862,16 +12593,20 @@ export class ThinkRecoveryTestAgent extends Think {
       await this.preScheduleRecoveryRetryForTest(data);
     }
 
-    // Vendor divergence: one `_runScheduledChatRecovery` body backs both
-    // callbacks in this fork, so the handoff probe stubs that instead of
-    // upstream's two `*Detached` methods.
+    type ContinueData = Parameters<Think["_chatRecoveryContinue"]>[0];
+    type RetryData = Parameters<Think["_chatRecoveryRetry"]>[0];
     const host = this as unknown as {
-      _runScheduledChatRecovery(
-        recovery: { kind: "continue" | "retry"; data?: unknown },
+      _chatRecoveryContinueDetached(
+        data?: ContinueData,
+        onTurnStarted?: () => void
+      ): Promise<void>;
+      _chatRecoveryRetryDetached(
+        data?: RetryData,
         onTurnStarted?: () => void
       ): Promise<void>;
     };
-    const original = host._runScheduledChatRecovery.bind(this);
+    const originalContinue = host._chatRecoveryContinueDetached.bind(this);
+    const originalRetry = host._chatRecoveryRetryDetached.bind(this);
     const fail = async (onTurnStarted?: () => void): Promise<never> => {
       if (options.phase === "after") {
         onTurnStarted?.();
@@ -9879,7 +12614,9 @@ export class ThinkRecoveryTestAgent extends Think {
       }
       throw new Error("Network connection lost.");
     };
-    host._runScheduledChatRecovery = (_recovery, onTurnStarted) =>
+    host._chatRecoveryContinueDetached = (_data, onTurnStarted) =>
+      fail(onTurnStarted);
+    host._chatRecoveryRetryDetached = (_data, onTurnStarted) =>
       fail(onTurnStarted);
 
     let threw = false;
@@ -9894,7 +12631,8 @@ export class ThinkRecoveryTestAgent extends Think {
         error instanceof Error &&
         error.message.includes("Network connection lost");
     } finally {
-      host._runScheduledChatRecovery = original;
+      host._chatRecoveryContinueDetached = originalContinue;
+      host._chatRecoveryRetryDetached = originalRetry;
     }
 
     await new Promise((resolve) => setTimeout(resolve, 20));
@@ -10359,6 +13097,9 @@ export const POINTER_MEDIA_CHARS = 1_600_000;
  */
 export class ThinkMediaEvictionAgent extends Think {
   override mediaEviction: MediaEvictionConfig | boolean = false;
+  // A step of 1 moves the eviction cutoff with every message, so these
+  // six-message fixtures age `m0`/`m1` without growing to a full step.
+  override truncationStep = 1;
   override getModel(): LanguageModel {
     return createMockModel("media eviction agent response");
   }

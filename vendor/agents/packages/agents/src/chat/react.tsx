@@ -9,11 +9,13 @@ import type {
 } from "ai";
 import { nanoid } from "nanoid";
 import { use, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { isSocketAddressPending } from "../socket-address";
 import { chatThrottleOptions } from "./chat-throttle";
-import type { OutgoingMessage } from "./wire-types";
+import type { ChatTurnOutcome, OutgoingMessage } from "./wire-types";
 import { STREAM_RESUME_NONE_REASONS } from "./protocol";
 import { MessageType } from "./wire-types";
 import {
+  observedDivergesFrom,
   transition as broadcastTransition,
   type BroadcastStreamState
 } from "./broadcast-state";
@@ -365,6 +367,32 @@ type AddToolOutputOptions = {
 };
 
 /**
+ * Replays re-send only recent terminals, so duplicate suppression needs only
+ * a recent window of ended request ids.
+ */
+const MAX_REMEMBERED_ENDED_TURNS = 500;
+
+/**
+ * A chat request that ended, passed to `onTurnEnd`.
+ */
+export type ChatTurnEndEvent = {
+  /** The transport id of the request. */
+  requestId: string;
+  /**
+   * Ids of the user messages the request ended with. Absent when it did not
+   * end with a user message, or the server no longer has a record of it.
+   */
+  messageIds?: string[];
+  outcome: Exclude<ChatTurnOutcome, "recovering">;
+  /** The error message, when `outcome` is `"error"`. */
+  error?: string;
+  /** Whether this outcome was replayed on reconnect rather than seen live. */
+  replay: boolean;
+};
+
+export type { ChatTurnOutcome };
+
+/**
  * Callback for handling client-side tool execution.
  * Called when a tool without server-side execute is invoked.
  */
@@ -422,6 +450,9 @@ export type UseAgentChatOptions<
   /**
    * Callback for handling client-side tool execution.
    * Called when a tool without server-side `execute` is invoked by the LLM.
+   * It fires once the response stream ends, for each tool call still waiting
+   * for a result, so server tools that resolve in the same stream never
+   * reach it.
    *
    * Use this for:
    * - Tools that need browser APIs (geolocation, camera, etc.)
@@ -442,6 +473,21 @@ export type UseAgentChatOptions<
    * ```
    */
   onToolCall?: OnToolCallCallback;
+  /**
+   * Called once for each chat request that ends, with the ids of the user
+   * messages it carried. Use it to settle optimistic sends by the ids the
+   * client minted. It fires for this tab's requests, for requests from other
+   * connections, and for outcomes replayed on reconnect. It does not fire for
+   * a request that recovery continues under a new request; that request
+   * reports the same `messageIds` when it ends.
+   *
+   * A message id can appear in more than one event, for example when a send
+   * is skipped and a later turn answers it. The last event for an id wins.
+   *
+   * For a request this tab is streaming, it fires once `status` has
+   * settled, so it can call `sendMessage`.
+   */
+  onTurnEnd?: (event: ChatTurnEndEvent) => void;
   /**
    * @deprecated Use `onToolCall` callback instead for automatic tool execution.
    * @description Whether to automatically resolve tool calls that do not require human interaction.
@@ -607,6 +653,25 @@ function prependMissingHydratedMessages<ChatMessage extends UIMessage>(
   return [...missingHydratedMessages, ...currentMessages];
 }
 
+// Re-append the specific buffered sends a connect transcript omits, restoring
+// only the tracked ids (in local order).
+function restoreBufferedSends<ChatMessage extends UIMessage>(
+  snapshot: ChatMessage[],
+  local: readonly ChatMessage[],
+  bufferedIds: ReadonlySet<string>
+): ChatMessage[] {
+  if (bufferedIds.size === 0) {
+    return snapshot;
+  }
+
+  const snapshotIds = new Set(snapshot.map((message) => message.id));
+  const restored = local.filter(
+    (message) => bufferedIds.has(message.id) && !snapshotIds.has(message.id)
+  );
+
+  return restored.length === 0 ? snapshot : [...snapshot, ...restored];
+}
+
 /**
  * React hook for building AI chat interfaces using an Agent
  * @param options Chat options including the agent connection
@@ -698,6 +763,7 @@ export function useAgentChat<
     getInitialMessages,
     messages: optionsInitialMessages,
     onToolCall,
+    onTurnEnd,
     onData,
     experimental_automaticToolResolution,
     tools,
@@ -753,20 +819,69 @@ export function useAgentChat<
   // Keep refs to always point to the latest callbacks
   const onToolCallRef = useRef(onToolCall);
   onToolCallRef.current = onToolCall;
+  const onTurnEndRef = useRef(onTurnEnd);
+  onTurnEndRef.current = onTurnEnd;
+  const turnErrorsRef = useRef(new Map<string, string>());
+  const endedTurnIdsRef = useRef(new Set<string>());
+  const pendingTurnEndsRef = useRef<ChatTurnEndEvent[]>([]);
   const onDataRef = useRef(onData);
   onDataRef.current = onData;
 
-  const rawHttpUrl = agent.getHttpUrl();
-  const agentUrl = rawHttpUrl ? new URL(rawHttpUrl) : null;
-
-  if (agentUrl) {
-    agentUrl.searchParams.delete("_pk");
+  // `useAgent` addresses a new agent at least one render before its socket
+  // does. Until the socket catches up there is no URL for the new agent, and
+  // the previous socket's URL carries the previous agent's credentials. So
+  // while it is behind, key and load against the last address the socket
+  // did match, and switch once it catches up (#1864, #1874).
+  const socketAddressPending = isSocketAddressPending(agent);
+  const committedAddressRef = useRef<{
+    urlString: string | null;
+    addressKey: string;
+    agent: string;
+    name: string;
+  } | null>(null);
+  let address = committedAddressRef.current;
+  if (!socketAddressPending || address === null) {
+    const rawHttpUrl = agent.getHttpUrl();
+    const url = rawHttpUrl ? new URL(rawHttpUrl) : null;
+    url?.searchParams.delete("_pk");
+    // The socket's route (host, base path, extra path) is part of the address:
+    // the same agent name on another host or route has its own history. The
+    // socket options are set from the first render, and exclude the query.
+    const route = (
+      agent as {
+        partySocketOptions?: {
+          host?: string;
+          basePath?: string;
+          prefix?: string;
+          party?: string;
+          path?: string;
+        };
+      }
+    ).partySocketOptions;
+    address = {
+      urlString: url?.toString() ?? null,
+      addressKey: JSON.stringify([
+        Array.isArray(agent.path)
+          ? agent.path.map((step) => [step.agent, step.name])
+          : [[agent.agent ?? "", agent.name ?? ""]],
+        route
+          ? [
+              route.host ?? null,
+              route.basePath ?? null,
+              route.prefix ?? null,
+              route.party ?? null,
+              route.path ?? null
+            ]
+          : null
+      ]),
+      agent: agent.agent,
+      name: agent.name
+    };
+    if (!socketAddressPending) committedAddressRef.current = address;
   }
-  const agentUrlString = agentUrl?.toString() ?? null;
-
-  const agentAddressKey = Array.isArray(agent.path)
-    ? JSON.stringify(agent.path.map((step) => [step.agent, step.name]))
-    : JSON.stringify([[agent.agent ?? "", agent.name ?? ""]]);
+  const agentUrl = address.urlString ? new URL(address.urlString) : null;
+  const agentUrlString = address.urlString;
+  const agentAddressKey = address.addressKey;
 
   // Cache key for the request-dedup `requestCache` and the late-seed
   // effect. It uses the full root-first agent address when `useAgent`
@@ -914,7 +1029,7 @@ export function useAgentChat<
   }
 
   const shouldFetchInitialMessages =
-    getInitialMessages === null
+    getInitialMessages === null || committedAddressRef.current === null
       ? false
       : getInitialMessages
         ? true
@@ -923,8 +1038,8 @@ export function useAgentChat<
     ? null
     : doGetInitialMessages(
         {
-          agent: agent.agent,
-          name: agent.name,
+          agent: address.agent,
+          name: address.name,
           url: agentUrlString ?? undefined
         },
         initialMessagesCacheKey
@@ -963,6 +1078,10 @@ export function useAgentChat<
    * Used by onAgentMessage to skip messages already handled by the transport.
    */
   const localRequestIdsRef = useRef<Set<string>>(new Set());
+  // Ids of sends the transport buffered (socket not OPEN when `send()` ran, so
+  // the server hasn't seen them). Consumed by the next transcript snapshot to
+  // rescue the optimistic messages from the reconnect replay.
+  const pendingBufferedSendIdsRef = useRef<Set<string>>(new Set());
   const pendingReplayResumeRequestIdsRef = useRef<Set<string>>(new Set());
   const replayHydratedAssistantMessageIdsRef = useRef<Set<string>>(new Set());
   /**
@@ -995,6 +1114,11 @@ export function useAgentChat<
       agent: agentRef.current,
       activeRequestIds: localRequestIdsRef.current,
       cancelOnClientAbort,
+      onRequestBuffered: (messageId) => {
+        if (messageId) {
+          pendingBufferedSendIdsRef.current.add(messageId);
+        }
+      },
       prepareBody: async ({ messages: msgs, trigger, messageId }) => {
         // Start with the top-level body option (static or dynamic)
         let extraBody: Record<string, unknown> = {};
@@ -1269,6 +1393,8 @@ export function useAgentChat<
   const [clientToolResults, setClientToolResults] = useState<
     Map<string, unknown>
   >(new Map());
+  const clientToolResultsRef = useRef(clientToolResults);
+  clientToolResultsRef.current = clientToolResults;
 
   const initialMessagesRef = useRef(initialMessages);
   initialMessagesRef.current = initialMessages;
@@ -1363,7 +1489,15 @@ export function useAgentChat<
 
       return [
         ...messages.filter((message) => message.id !== protection.assistantId),
-        protectedAssistant
+        protectedIndex >= 0 && messages[protectedIndex].metadata
+          ? {
+              ...protectedAssistant,
+              metadata: {
+                ...(protectedAssistant.metadata ?? {}),
+                ...messages[protectedIndex].metadata
+              }
+            }
+          : protectedAssistant
       ];
     },
     []
@@ -1540,15 +1674,22 @@ export function useAgentChat<
     fallbackAckedResumeRequestIdsRef.current.clear();
     replayHydratedAssistantMessageIdsRef.current.clear();
     protectedStreamingAssistantRef.current = null;
+    pendingBufferedSendIdsRef.current.clear();
+    customTransport.appliedChunks.clear();
+    turnErrorsRef.current.clear();
+    pendingTurnEndsRef.current = [];
   }, [
-    customTransport,
     markInitialMessagesSeeded,
     setMessages,
-    resetToolContinuation
+    resetToolContinuation,
+    customTransport
   ]);
 
   const sendMessageWithStreamingProtection: typeof sendMessage = useCallback(
     async (message, options) => {
+      // Whether this send was buffered is detected at the real send site in the
+      // transport (via `onRequestBuffered`), not here — the socket can drop
+      // during the async request preparation between now and the actual send().
       const request = sendMessage(message, options);
 
       if (
@@ -1795,11 +1936,61 @@ export function useAgentChat<
     [autoContinueAfterToolResult, startToolContinuation]
   );
 
+  const [isServerStreaming, setIsServerStreaming] = useState(false);
+  // A server turn (this client's own or one observed from another tab) whose
+  // terminal frame was missed when the socket closed: its tool parts may still
+  // belong to a live server turn until that request's terminal frame or an
+  // idle probe settles it.
+  const [unresolvedObservedRequestId, setUnresolvedObservedRequestId] =
+    useState<string | null>(null);
+  const unresolvedObservedRequestIdRef = useRef(unresolvedObservedRequestId);
+  unresolvedObservedRequestIdRef.current = unresolvedObservedRequestId;
+  // A request closed with `recovering`: its tool parts still belong to the
+  // server until the recovery's successor streams or the turn really ends.
+  const [recoveringRequestId, setRecoveringRequestIdState] = useState<
+    string | null
+  >(null);
+  const recoveringRequestIdRef = useRef<string | null>(null);
+  const setRecoveringRequestId = useCallback((requestId: string | null) => {
+    recoveringRequestIdRef.current = requestId;
+    setRecoveringRequestIdState(requestId);
+  }, []);
+
+  // Server turns are serialized, so a request this client submits runs after
+  // the observed turn ends; its own lifecycle gates tool calls from here on.
+  useEffect(() => {
+    if (status === "submitted") {
+      setUnresolvedObservedRequestId(null);
+      setRecoveringRequestId(null);
+    }
+  }, [status, setRecoveringRequestId]);
+
+  useEffect(() => {
+    if (status === "submitted" || status === "streaming") return;
+    const events = pendingTurnEndsRef.current;
+    if (events.length === 0) return;
+    pendingTurnEndsRef.current = [];
+    for (const event of events) onTurnEndRef.current?.(event);
+  }, [status]);
+
   // Effect for new onToolCall callback pattern (v6 style)
   // This fires when there are tool calls that need client-side handling
   useEffect(() => {
     const currentOnToolCall = onToolCallRef.current;
     if (!currentOnToolCall) {
+      return;
+    }
+
+    // A server tool sits in `input-available` while the server executes it,
+    // and its result arrives in the same stream. Once the stream ends, every
+    // part still waiting is one the client has to answer (#2195).
+    if (
+      status === "streaming" ||
+      status === "submitted" ||
+      isServerStreaming ||
+      unresolvedObservedRequestId !== null ||
+      recoveringRequestId !== null
+    ) {
       return;
     }
 
@@ -1870,11 +2061,19 @@ export function useAgentChat<
         });
       }
     }
-  }, [chatMessages, sendToolOutputToServer, addToolResult, finishOnToolCall]);
+  }, [
+    chatMessages,
+    status,
+    isServerStreaming,
+    unresolvedObservedRequestId,
+    recoveringRequestId,
+    sendToolOutputToServer,
+    addToolResult,
+    finishOnToolCall
+  ]);
 
   const streamStateRef = useRef<BroadcastStreamState>({ status: "idle" });
 
-  const [isServerStreaming, setIsServerStreaming] = useState(false);
   // #1620: a durable chat turn is being recovered (interrupted by a
   // deploy/eviction or a stream-stall watchdog abort and now resuming). Driven
   // by the server's `CF_AGENT_CHAT_RECOVERING` frames; surfaced as a "working,
@@ -1883,6 +2082,64 @@ export function useAgentChat<
 
   useEffect(() => {
     const localResponseIds = localResponseMessageIdsRef.current;
+    const turnErrors = turnErrorsRef.current;
+    const endedTurnIds = endedTurnIdsRef.current;
+    // With resume:false a reconnect never replays, so a terminal frame lost
+    // while disconnected would hold onToolCall forever. An idle answer to
+    // this probe proves the held turn is over.
+    let idleProbeNeeded = false;
+    let idleProbeId: string | null = null;
+    // Whether this socket heard that a recovery is in progress. Hosts replay
+    // the status on connect, so after a reconnect its absence plus an idle
+    // probe answer means the recovery ended while we were away.
+    let serverReportsRecovery = false;
+
+    function reportTurnEnd(
+      frame: Extract<
+        OutgoingMessage<ChatMessage>,
+        { type: MessageType.CF_AGENT_USE_CHAT_RESPONSE }
+      >
+    ) {
+      if (frame.error && !frame.done) {
+        turnErrors.set(frame.id, frame.body);
+        if (turnErrors.size > MAX_REMEMBERED_ENDED_TURNS) {
+          const oldest = turnErrors.keys().next().value;
+          if (oldest !== undefined) turnErrors.delete(oldest);
+        }
+        return;
+      }
+      if (!frame.done) return;
+      const earlierError = turnErrors.get(frame.id);
+      turnErrors.delete(frame.id);
+      const outcome = frame.error
+        ? "error"
+        : (frame.outcome ??
+          (earlierError !== undefined ? "error" : "completed"));
+      if (outcome === "recovering" || endedTurnIds.has(frame.id)) return;
+      endedTurnIds.add(frame.id);
+      if (endedTurnIds.size > MAX_REMEMBERED_ENDED_TURNS) {
+        const oldest = endedTurnIds.values().next().value;
+        if (oldest !== undefined) endedTurnIds.delete(oldest);
+      }
+      const error = frame.error ? frame.body : earlierError;
+      const event: ChatTurnEndEvent = {
+        requestId: frame.id,
+        ...(frame.messageIds ? { messageIds: frame.messageIds } : {}),
+        outcome,
+        ...(outcome === "error" && error ? { error } : {}),
+        replay: frame.replay === true
+      };
+      // This listener runs before the transport's, so the Chat is still
+      // streaming the request: a send from the callback now would overlap it.
+      if (
+        localRequestIdsRef.current.has(frame.id) &&
+        (statusRef.current === "submitted" || statusRef.current === "streaming")
+      ) {
+        pendingTurnEndsRef.current.push(event);
+      } else {
+        onTurnEndRef.current?.(event);
+      }
+    }
 
     /**
      * Unified message handler that parses JSON once and dispatches based on type.
@@ -1905,6 +2162,8 @@ export function useAgentChat<
             type: "clear"
           }).state;
           setIsServerStreaming(false);
+          setUnresolvedObservedRequestId(null);
+          setRecoveringRequestId(null);
           setIsRecovering(false);
           // Shared local-state reset — see `resetLocalChatState`.
           resetLocalChatState();
@@ -1916,9 +2175,19 @@ export function useAgentChat<
           // frame on any terminal outcome (and locally on stream-resume /
           // terminal response / clear below, for a snappy handoff).
           setIsRecovering(Boolean(data.recovering));
+          serverReportsRecovery = Boolean(data.recovering);
+          if (!data.recovering) setRecoveringRequestId(null);
           break;
 
         case MessageType.CF_AGENT_CHAT_MESSAGES: {
+          // One-shot, consumed outside the updater so a re-invoked updater
+          // sees the same ids. Only a connect transcript predates the buffered
+          // sends; any other snapshot (e.g. a `drop` rollback after a
+          // mid-stream reconnect) has already seen them and wins.
+          const bufferedSendIds = data.connect
+            ? new Set(pendingBufferedSendIdsRef.current)
+            : new Set<string>();
+          pendingBufferedSendIdsRef.current.clear();
           setMessages((currentMessages: ChatMessage[]) => {
             let next = preserveProtectedStreamingAssistant(
               data.messages,
@@ -1944,17 +2213,29 @@ export function useAgentChat<
               // briefly trail a fully-persisted snapshot; merging then would drop
               // parts until replay catches up. In steady-state live observing the
               // accumulator is always at or ahead of the snapshot, so this still
-              // fixes the disappear/reappear flicker.
+              // fixes the disappear/reappear flicker. An accumulator whose text
+              // no longer extends the snapshot's is corrupt, not ahead (#2166).
               const snapshotIdx = next.findIndex(
                 (m) => m.id === observed.accumulator.messageId
               );
               const snapshotParts =
                 snapshotIdx >= 0 ? next[snapshotIdx].parts.length : 0;
-              if (observed.accumulator.parts.length >= snapshotParts) {
+              if (snapshotIdx >= 0 && next[snapshotIdx].metadata) {
+                observed.accumulator.metadata = {
+                  ...observed.accumulator.metadata,
+                  ...next[snapshotIdx].metadata
+                };
+              }
+              if (
+                observed.accumulator.parts.length >= snapshotParts &&
+                !observedDivergesFrom(observed.accumulator, next)
+              ) {
                 next = observed.accumulator.mergeInto(next) as ChatMessage[];
               }
             }
-            return next;
+            // Rescue sends the transport buffered while the socket was down
+            // that the reconnect replay would otherwise drop.
+            return restoreBufferedSends(next, currentMessages, bufferedSendIds);
           });
           break;
         }
@@ -2022,8 +2303,11 @@ export function useAgentChat<
           // frame type also means another connection owns a continuation; older or
           // delayed unreasoned frames are likewise non-authoritative (#1914).
           const handled = customTransport.handleStreamResumeNone(data);
+          const answersIdleProbe =
+            idleProbeId !== null && data.probeId === idleProbeId;
+          if (answersIdleProbe) idleProbeId = null;
           if (
-            handled &&
+            (handled || answersIdleProbe) &&
             data.reason === STREAM_RESUME_NONE_REASONS.IDLE &&
             typeof data.probeId === "string"
           ) {
@@ -2032,6 +2316,8 @@ export function useAgentChat<
             });
             streamStateRef.current = result.state;
             setIsServerStreaming(result.isStreaming);
+            setUnresolvedObservedRequestId(null);
+            if (!serverReportsRecovery) setRecoveringRequestId(null);
             if (observedToolContinuationRequestIdRef.current !== null) {
               resetToolContinuation();
             }
@@ -2049,11 +2335,34 @@ export function useAgentChat<
           break;
 
         case MessageType.CF_AGENT_STREAM_RESUMING: {
+          // Server turns are serialized: an offer for another request means
+          // the turn we still hold for a missed terminal frame is over.
+          setUnresolvedObservedRequestId((current) =>
+            current === data.id ? current : null
+          );
+          if (data.probeId !== undefined && data.probeId === idleProbeId) {
+            idleProbeId = null;
+          }
           const isEarlyToolContinuation =
             resumingToolContinuationRef.current &&
             !customTransport.isAwaitingResume();
           if (!resume && !customTransport.isAwaitingResume()) {
-            if (!isEarlyToolContinuation) return;
+            if (!isEarlyToolContinuation) {
+              // An offer without a probe id announces a live stream, which
+              // the server withholds from us until its terminal frame; hold
+              // its tool parts (and a recovery it succeeds) until then. A
+              // probe answer can instead replay a turn that already ended.
+              if (data.probeId === undefined) {
+                setUnresolvedObservedRequestId(data.id);
+              }
+              if (
+                recoveringRequestIdRef.current !== null &&
+                recoveringRequestIdRef.current !== data.id
+              ) {
+                setRecoveringRequestId(null);
+              }
+              return;
+            }
           }
           if (!resumingToolContinuationRef.current) {
             pendingReplayResumeRequestIdsRef.current.add(data.id);
@@ -2098,6 +2407,12 @@ export function useAgentChat<
           }).state;
           customTransport.observeServerTurn(data.id);
           setIsServerStreaming(true);
+          if (
+            recoveringRequestIdRef.current !== null &&
+            recoveringRequestIdRef.current !== data.id
+          ) {
+            setRecoveringRequestId(null);
+          }
           // The recovered turn is now streaming live to us — it's no longer
           // "recovering", it's producing the answer (#1620).
           setIsRecovering(false);
@@ -2114,6 +2429,26 @@ export function useAgentChat<
         }
 
         case MessageType.CF_AGENT_USE_CHAT_RESPONSE: {
+          if (data.done || data.error) {
+            setUnresolvedObservedRequestId((current) =>
+              current === data.id ? null : current
+            );
+          }
+          if (data.done && data.outcome === "recovering") {
+            setRecoveringRequestId(data.id);
+          } else if (
+            recoveringRequestIdRef.current !== null &&
+            recoveringRequestIdRef.current !== data.id &&
+            !data.replay &&
+            data.outcome !== "skipped"
+          ) {
+            // The successor is a new request, and turns are serialized: live
+            // frames for any later request mean recovery moved past the
+            // held one. Replays and the recovering request's own frames
+            // prove nothing.
+            setRecoveringRequestId(null);
+          }
+          reportTurnEnd(data);
           if (localRequestIdsRef.current.has(data.id)) {
             if (data.body?.trim()) {
               try {
@@ -2125,6 +2460,10 @@ export function useAgentChat<
                 if (
                   data.replay &&
                   data.continuation &&
+                  !customTransport.appliedChunks.isAppliedReplay(
+                    data.id,
+                    data
+                  ) &&
                   chunkData.type === "start"
                 ) {
                   // Restore the producer's prefix before AI SDK snapshots it.
@@ -2227,8 +2566,26 @@ export function useAgentChat<
           ) {
             return;
           }
+          // A request this tab is not observing ended (e.g. a stale send the
+          // server skipped): it must not replace the observed stream.
+          if (
+            data.done &&
+            !data.error &&
+            !(
+              streamStateRef.current.status === "observing" &&
+              streamStateRef.current.streamId === data.id
+            ) &&
+            !pendingReplayResumeRequestIdsRef.current.has(data.id) &&
+            observedToolContinuationRequestIdRef.current !== data.id
+          ) {
+            customTransport.appliedChunks.forget(data.id);
+            customTransport.handleServerTurnCompleted(data.id);
+            fallbackAckedResumeRequestIdsRef.current.delete(data.id);
+            break;
+          }
           if (data.error) {
             pendingReplayResumeRequestIdsRef.current.delete(data.id);
+            customTransport.appliedChunks.forget(data.id);
             customTransport.handleServerTurnCompleted(data.id);
             fallbackAckedResumeRequestIdsRef.current.delete(data.id);
             setIsRecovering(false);
@@ -2249,6 +2606,10 @@ export function useAgentChat<
             break;
           }
 
+          const appliedReplay = customTransport.appliedChunks.isAppliedReplay(
+            data.id,
+            data
+          );
           // Error bodies are human-readable diagnostics, not UI message
           // chunks. The transport-owned path short-circuits them before JSON
           // parsing; observers must do the same.
@@ -2282,6 +2643,7 @@ export function useAgentChat<
                 (
                   (chunkData as Record<string, unknown>).type as string
                 ).startsWith("data-") &&
+                !appliedReplay &&
                 onDataRef.current
               ) {
                 onDataRef.current(
@@ -2306,17 +2668,26 @@ export function useAgentChat<
             customTransport.handleServerTurnCompleted(data.id);
             fallbackAckedResumeRequestIdsRef.current.delete(data.id);
             // A terminal turn outcome resolves any in-progress recovery (#1620).
-            setIsRecovering(false);
+            if (data.outcome !== "recovering") setIsRecovering(false);
           }
           const completedObservedToolContinuation =
             data.done &&
             observedToolContinuationRequestIdRef.current === data.id;
 
+          // Already-applied starts must not restore the original prefix while
+          // the ledger skips its deltas: that would erase the live content.
+          const alreadyApplied = appliedReplay;
+          if (data.done) {
+            customTransport.appliedChunks.forget(data.id);
+          } else if (!alreadyApplied) {
+            customTransport.appliedChunks.record(data.id, data.seq);
+          }
+
           const result = broadcastTransition(streamStateRef.current, {
             type: "response",
             streamId: data.id,
             messageId: nanoid(),
-            chunkData,
+            chunkData: alreadyApplied ? undefined : chunkData,
             done: data.done,
             error: data.error,
             replay: data.replay,
@@ -2358,6 +2729,9 @@ export function useAgentChat<
     let disposed = false;
 
     const clearFallbackObserver = () => {
+      if (streamStateRef.current.status === "observing") {
+        setUnresolvedObservedRequestId(streamStateRef.current.streamId);
+      }
       const result = broadcastTransition(streamStateRef.current, {
         type: "clear"
       });
@@ -2378,6 +2752,16 @@ export function useAgentChat<
       }
       if (!resume) {
         reconnectProbePendingRef.current = false;
+        if (idleProbeNeeded) {
+          idleProbeNeeded = false;
+          idleProbeId = nanoid();
+          agentRef.current.send(
+            JSON.stringify({
+              type: MessageType.CF_AGENT_STREAM_RESUME_REQUEST,
+              probeId: idleProbeId
+            })
+          );
+        }
         return;
       }
       if (customTransport.retryPendingResume()) {
@@ -2407,13 +2791,24 @@ export function useAgentChat<
     function onAgentClose() {
       socketIsOpen = false;
       sawClose = true;
+      serverReportsRecovery = false;
       fallbackAckedResumeRequestIds.clear();
+
+      const unfinishedTurnId = customTransport.activeServerTurnId;
+      if (unfinishedTurnId !== null) {
+        setUnresolvedObservedRequestId(unfinishedTurnId);
+      }
 
       // resume:false opts out of recovering disconnected streams. There can be
       // no future authoritative probe, so stop claiming that a disconnected
       // fallback observer is live; pending client tool work remains folded into
       // the public flag independently.
       if (!resume) {
+        idleProbeNeeded ||=
+          unfinishedTurnId !== null ||
+          streamStateRef.current.status === "observing" ||
+          unresolvedObservedRequestIdRef.current !== null ||
+          recoveringRequestIdRef.current !== null;
         clearFallbackObserver();
       }
     }
@@ -2454,6 +2849,7 @@ export function useAgentChat<
       fallbackAckedResumeRequestIds.clear();
       streamStateRef.current = { status: "idle" };
       setIsServerStreaming(false);
+      setUnresolvedObservedRequestId(null);
       setIsRecovering(false);
       protectedStreamingAssistantRef.current = null;
       localResponseIds.clear();
@@ -2474,7 +2870,8 @@ export function useAgentChat<
     resetMatchingHydratedAssistantForReplay,
     restoreProtectedStreamingAssistant,
     resetLocalChatState,
-    invalidateResumeGeneration
+    invalidateResumeGeneration,
+    setRecoveringRequestId
   ]);
 
   // Own mount/chat-generation resumption so StrictMode, reconnects, tool
@@ -2635,14 +3032,18 @@ export function useAgentChat<
       }
     }
 
-    // Returning prev inside an unconditional dispatch still queues work while
-    // streaming. Only dispatch when this committed map actually needs pruning.
-    if (
-      [...clientToolResults.keys()].some((id) => !currentToolCallIds.has(id))
-    ) {
+    // Decide before dispatching: an updater that returns `prev` still
+    // re-renders while another update is pending, which during a stream is
+    // every chunk, and each such passive-effect update counts toward React's
+    // nested update limit ("Maximum update depth exceeded", #2217).
+    const isStale = (id: string) => !currentToolCallIds.has(id);
+    if ([...clientToolResultsRef.current.keys()].some(isStale)) {
       setClientToolResults((prev) => {
-        const retained = [...prev].filter(([id]) => currentToolCallIds.has(id));
-        return retained.length === prev.size ? prev : new Map(retained);
+        const next = new Map<string, unknown>();
+        for (const [id, output] of prev) {
+          if (!isStale(id)) next.set(id, output);
+        }
+        return next.size === prev.size ? prev : next;
       });
     }
 

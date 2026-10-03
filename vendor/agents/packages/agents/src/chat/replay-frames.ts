@@ -8,6 +8,7 @@
 import type { Connection } from "agents";
 import { CHAT_MESSAGE_TYPES } from "./protocol";
 import { sendIfOpen } from "./connection";
+import type { ChatTurnOutcome } from "./wire-types";
 
 /**
  * Send stored chunk bodies to a connection as replay frames.
@@ -19,8 +20,10 @@ export function sendReplayBodies(
   connection: Connection,
   requestId: string,
   bodies: Iterable<string>,
-  continuation: boolean
+  continuation: boolean,
+  firstSeq = 0
 ): boolean {
+  let seq = firstSeq;
   for (const body of bodies) {
     const sent = sendIfOpen(
       connection,
@@ -30,6 +33,7 @@ export function sendReplayBodies(
         id: requestId,
         type: CHAT_MESSAGE_TYPES.USE_CHAT_RESPONSE,
         replay: true,
+        seq: seq++,
         ...(continuation && { continuation: true })
       })
     );
@@ -47,7 +51,13 @@ export function sendReplayBodies(
 export function sendReplayControl(
   connection: Connection,
   requestId: string,
-  options: { done: boolean; replayComplete?: boolean; continuation: boolean }
+  options: {
+    done: boolean;
+    replayComplete?: boolean;
+    continuation: boolean;
+    messageIds?: string[];
+    outcome?: ChatTurnOutcome;
+  }
 ): boolean {
   return sendIfOpen(
     connection,
@@ -58,7 +68,10 @@ export function sendReplayControl(
       type: CHAT_MESSAGE_TYPES.USE_CHAT_RESPONSE,
       replay: true,
       ...(options.replayComplete && { replayComplete: true }),
-      ...(options.continuation && { continuation: true })
+      ...(options.continuation && { continuation: true }),
+      ...(options.done &&
+        options.messageIds && { messageIds: options.messageIds }),
+      ...(options.done && options.outcome && { outcome: options.outcome })
     })
   );
 }

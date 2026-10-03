@@ -2,17 +2,17 @@
 
 Upstream: <https://github.com/cloudflare/agents>
 
-Release pin: `agents@0.24.0`
-(`c076e4c9ff6cfb72931085226edfd3ee7965ac48`).
+Release pin: `agents@0.26.0`
+(`74570a19aafc676dd85831a31af047817e7bba12`).
 
-The package versions match the 0.24 release:
+The package versions match the 0.26 release:
 
-- `agents@0.24.0`
-- `@cloudflare/think@0.19.0`
-- `@cloudflare/ai-chat@0.12.0`
+- `agents@0.26.0`
+- `@cloudflare/think@0.20.0`
+- `@cloudflare/ai-chat@0.12.1`
 - `@cloudflare/voice@0.5.0`
 - `@cloudflare/shell@0.4.3`
-- `@cloudflare/codemode@0.5.2`
+- `@cloudflare/codemode@0.5.3`
 
 This fork contains only the package closure used by Rook. Compare future
 upstream releases against the commit above, reconcile

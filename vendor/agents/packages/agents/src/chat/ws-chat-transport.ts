@@ -12,6 +12,7 @@ import {
   failChatStream,
   ReplayChunkBatch
 } from "./replay-batch";
+import { AppliedChunkLedger, ContinuationReplayFilter } from "./replay-dedupe";
 import { MessageType, type OutgoingMessage } from "./wire-types";
 
 /**
@@ -30,6 +31,23 @@ const RESUME_PROBE_TIMEOUT_MS = 5000;
  * dropped follow-up degrades to a null resolve instead of hanging forever.
  */
 const RESUME_PENDING_TIMEOUT_MS = 60000;
+
+const SOCKET_CLOSED_MID_STREAM = "WebSocket closed mid-stream";
+
+/**
+ * Ends a stream whose socket closed before the terminal `done` frame, so the
+ * AI SDK reports an interrupted turn instead of a completed one (#2013).
+ * Uses an error chunk because `controller.error()` would discard chunks the
+ * consumer has not read yet.
+ */
+function interruptChatStream(
+  controller: ReadableStreamDefaultController<UIMessageChunk>,
+  batch?: ReplayChunkBatch
+): void {
+  batch?.flush();
+  controller.enqueue({ type: "error", errorText: SOCKET_CLOSED_MID_STREAM });
+  controller.close();
+}
 
 /**
  * A live-JavaScript-realm outbox keyed by AI SDK's stable chat id. Keeping the
@@ -79,7 +97,9 @@ function forgetPendingChatRequestById(requestId: string): void {
  * `useAgent` from `agents/react`.
  */
 export interface AgentConnection {
-  send: (data: string) => void;
+  // PartySocket returns `false` when the frame was buffered (socket not OPEN)
+  // rather than sent immediately; `void` keeps non-PartySocket providers valid.
+  send: (data: string) => boolean | void;
   addEventListener: (
     type: string,
     listener: (event: MessageEvent) => void,
@@ -117,6 +137,13 @@ export type WebSocketChatTransportOptions<
    * @default false
    */
   cancelOnClientAbort?: boolean;
+  /**
+   * Called when a `submit-message` request frame was buffered rather than sent
+   * immediately (the socket was not OPEN, so PartySocket queued it for the next
+   * reconnect). The hook uses this to preserve the optimistic message across the
+   * reconnect transcript replay. `messageId` is the submitted user message's id.
+   */
+  onRequestBuffered?: (messageId: string | undefined) => void;
 };
 
 /**
@@ -135,10 +162,16 @@ export class WebSocketChatTransport<
   private prepareBody?: WebSocketChatTransportOptions<ChatMessage>["prepareBody"];
   private activeRequestIds?: Set<string>;
   private cancelOnClientAbort: boolean;
+  private onRequestBuffered?: WebSocketChatTransportOptions<ChatMessage>["onRequestBuffered"];
 
   // Pending resume resolver — set by reconnectToStream, called by
   // handleStreamResuming when onAgentMessage sees CF_AGENT_STREAM_RESUMING.
   private _resumeResolver: ((data: { id: string }) => void) | null = null;
+  /**
+   * Continuation chunks this client applied, shared with the hook's fallback
+   * observer so a replay after reconnect skips them on either path (#1951).
+   */
+  readonly appliedChunks = new AppliedChunkLedger();
   // Pending "no stream" resolver — called by handleStreamResumeNone
   // when onAgentMessage sees CF_AGENT_STREAM_RESUME_NONE.
   private _resumeNoneResolver:
@@ -169,6 +202,7 @@ export class WebSocketChatTransport<
     this.prepareBody = options.prepareBody;
     this.activeRequestIds = options.activeRequestIds;
     this.cancelOnClientAbort = options.cancelOnClientAbort ?? false;
+    this.onRequestBuffered = options.onRequestBuffered;
   }
 
   /**
@@ -212,6 +246,15 @@ export class WebSocketChatTransport<
 
     const cancelledToolContinuation = this.abortActiveToolContinuation();
     return cancelledRequest || cancelledToolContinuation;
+  }
+
+  /**
+   * The server turn this transport last attached to that has not reported a
+   * terminal frame. A socket close ends the local stream but keeps this set,
+   * since the server keeps running the turn.
+   */
+  get activeServerTurnId(): string | null {
+    return this._activeServerTurnId;
   }
 
   private sendCancelFrame(requestId: string) {
@@ -514,7 +557,7 @@ export class WebSocketChatTransport<
             );
             return;
           }
-          finish(() => controller.close(), false, false);
+          finish(() => interruptChatStream(controller), false, false);
         };
 
         agent.addEventListener("message", onMessage, {
@@ -561,9 +604,19 @@ export class WebSocketChatTransport<
       throw error;
     }
 
-    // Send the request over WebSocket
+    // Send the request over WebSocket. `send()` returns false when the frame
+    // was buffered (socket not OPEN) rather than sent immediately; a buffered
+    // submit means the server hasn't seen the message yet, so tell the hook to
+    // preserve it across the reconnect transcript replay. Only an explicit
+    // false counts — non-PartySocket doubles return undefined (treated as sent).
     requestSent = true;
-    agent.send(requestFrame);
+    const sent = agent.send(requestFrame);
+    if (sent === false && options.trigger === "submit-message") {
+      const lastUserMessage = [...options.messages]
+        .reverse()
+        .find((message) => message.role === "user");
+      this.onRequestBuffered?.(lastUserMessage?.id);
+    }
 
     return stream;
   }
@@ -824,6 +877,11 @@ export class WebSocketChatTransport<
         readerController = controller;
         const batch = new ReplayChunkBatch(controller);
         replayBatch = batch;
+        let replayFilter: ContinuationReplayFilter<
+          OutgoingMessage<UIMessage> & {
+            type: MessageType.CF_AGENT_USE_CHAT_RESPONSE;
+          }
+        > | null = null;
         let timeout: ReturnType<typeof setTimeout> | undefined;
 
         const armTimeout = (delay: number) => {
@@ -897,13 +955,21 @@ export class WebSocketChatTransport<
             }
 
             if (data.error) {
+              transport.appliedChunks.forget(requestId);
               finish(() => failChatStream(batch, data.body || "Stream error"));
               return;
             }
 
-            applyChatResponseFrame(batch, data);
+            replayFilter ??= new ContinuationReplayFilter(
+              transport.appliedChunks,
+              requestId
+            );
+            for (const frame of replayFilter.frames(data)) {
+              applyChatResponseFrame(batch, frame);
+            }
 
             if (data.done) {
+              transport.appliedChunks.forget(requestId);
               finish(() => controller.close());
             }
           } catch {
@@ -911,11 +977,14 @@ export class WebSocketChatTransport<
           }
         };
 
+        // Before the resume handshake there is no server turn to interrupt;
+        // closing cleanly lets the hook re-probe on the next open.
         const onClose = () =>
-          finish(() => {
-            batch.flush();
-            controller.close();
-          });
+          finish(() =>
+            requestId === null
+              ? controller.close()
+              : interruptChatStream(controller, batch)
+          );
 
         agent.addEventListener("message", onMessage, {
           signal: streamController.signal
@@ -1017,6 +1086,11 @@ export class WebSocketChatTransport<
         streamController = controller;
         const batch = new ReplayChunkBatch(controller);
         replayBatch = batch;
+        const replayFilter = new ContinuationReplayFilter<
+          OutgoingMessage<UIMessage> & {
+            type: MessageType.CF_AGENT_USE_CHAT_RESPONSE;
+          }
+        >(transport.appliedChunks, requestId);
 
         const onMessage = (event: MessageEvent) => {
           try {
@@ -1045,14 +1119,18 @@ export class WebSocketChatTransport<
             forgetPendingChatRequestById(requestId);
 
             if (data.error) {
+              transport.appliedChunks.forget(requestId);
               finish(() => failChatStream(batch, data.body || "Stream error"));
               return;
             }
 
-            applyChatResponseFrame(batch, data);
+            for (const frame of replayFilter.frames(data)) {
+              applyChatResponseFrame(batch, frame);
+            }
             resolveReady(stream);
 
             if (data.done) {
+              transport.appliedChunks.forget(requestId);
               finish(() => controller.close());
             }
           } catch {
@@ -1061,14 +1139,7 @@ export class WebSocketChatTransport<
         };
 
         const onClose = () => {
-          finish(
-            () => {
-              batch.flush();
-              controller.close();
-            },
-            false,
-            false
-          );
+          finish(() => interruptChatStream(controller, batch), false, false);
         };
 
         agent.addEventListener("message", onMessage, {

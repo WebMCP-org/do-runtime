@@ -158,10 +158,11 @@ it("§1.4 public SQL values follow workerd's JSG conversion", async () => {
   });
 });
 
-it("§1.4 SQLite strings and blobs are limited to 4 MiB", async () => {
+it("§1.4 SQLite strings and blobs allow 8 MiB plus serialization padding", async () => {
   const probe = await host.spawn("sql-length-limit");
   expect(await probe.call("sqliteLengthLimit")).toEqual({
-    allowed: 4_000_000,
+    allowed: 8_000_000,
+    padded: 8 * 1024 * 1024 + 34,
     tooBig: "Error: string or blob too big: SQLITE_TOOBIG",
   });
 });

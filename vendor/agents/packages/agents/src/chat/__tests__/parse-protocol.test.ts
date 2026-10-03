@@ -125,7 +125,10 @@ describe("parseProtocolMessage", () => {
     });
     expect(
       parseProtocolMessage(JSON.stringify({ ...msg, probeId: "probe-1" }))
-    ).toEqual({ type: "stream-resume-request", probeId: "probe-1" });
+    ).toEqual({
+      type: "stream-resume-request",
+      probeId: "probe-1"
+    });
   });
 
   it("parses stream-resume-ack", () => {

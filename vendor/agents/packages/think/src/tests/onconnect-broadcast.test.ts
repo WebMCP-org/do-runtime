@@ -300,6 +300,11 @@ describe("Think — onConnect broadcast policy", () => {
 
     expect(types).toContain(MSG_CHAT_MESSAGES);
     expect(types).not.toContain(MSG_STREAM_RESUMING);
+    // Marks the transcript as predating any sends the client buffered while
+    // disconnected, so `useAgentChat` keeps them (#1983).
+    expect(messages).toContainEqual(
+      expect.objectContaining({ type: MSG_CHAT_MESSAGES, connect: true })
+    );
 
     await closeWS(ws);
   });
@@ -518,6 +523,111 @@ describe("Think — onConnect broadcast policy", () => {
   );
 });
 
+describe("Think — unacknowledged resume offers", () => {
+  it.each(["active", "closed"] as const)(
+    "keeps a %s resume offer pending when another request fails before streaming",
+    async (state) => {
+      const room = crypto.randomUUID();
+      const agent = await freshAgent(room);
+      const { ws } = await connectWS(room);
+      try {
+        await collectMessages(ws, 20);
+        const received = collectMessages(ws, 50);
+        expect(
+          await agent.testResumeTerminalOwnership({
+            requestId: "active-request",
+            unrelatedTerminal: state
+          })
+        ).toEqual({ stillPending: true });
+        const frames = await received;
+        expect(
+          frames.some(
+            (frame) =>
+              typeof frame.body === "string" &&
+              frame.body.includes("retained text")
+          )
+        ).toBe(true);
+      } finally {
+        await closeWS(ws);
+      }
+    }
+  );
+
+  it.each([true, false])(
+    "honors terminal exclusion=%s and replays the same chunks for a late ACK",
+    async (exclude) => {
+      const room = crypto.randomUUID();
+      const agent = await freshAgent(room);
+      const { ws } = await connectWS(room);
+      try {
+        await collectMessages(ws, 20);
+        const beforeAck = collectMessages(ws, 50);
+        await agent.testResumeTerminalOwnership({
+          requestId: "excluded-request",
+          exclude
+        });
+        const delivered = (await beforeAck).filter(
+          (frame) => frame.type === MSG_CHAT_RESPONSE
+        );
+        if (exclude) expect(delivered).toEqual([]);
+        else {
+          expect(delivered.filter((frame) => frame.body)).toHaveLength(3);
+          expect(delivered.at(-1)).toMatchObject({ done: true });
+        }
+        const afterAck = collectMessages(ws, 50);
+        ws.send(
+          JSON.stringify({
+            type: MSG_STREAM_RESUME_ACK,
+            id: "excluded-request"
+          })
+        );
+        const replay = (await afterAck).filter(
+          (frame) => frame.type === MSG_CHAT_RESPONSE
+        );
+        expect(
+          replay
+            .filter((frame) => frame.body)
+            .map((frame) => JSON.parse(frame.body as string).type)
+        ).toEqual(["text-start", "text-delta", "text-end"]);
+        expect(replay.at(-1)).toMatchObject({ done: true, replay: true });
+        if (!exclude)
+          expect(replay.filter((frame) => frame.body)).toEqual(
+            delivered.filter((frame) => frame.body)
+          );
+      } finally {
+        await closeWS(ws);
+      }
+    }
+  );
+
+  it.each(["finish", "complete", "error"] as const)(
+    "delivers the done frame once the offered stream ends (%s)",
+    async (close) => {
+      const room = crypto.randomUUID();
+      const agent = await freshAgent(room);
+      const { ws } = await connectWS(room);
+      try {
+        await collectMessages(ws);
+        const requestId = crypto.randomUUID();
+        const frames = waitForRequestFrameTypes(
+          ws,
+          requestId,
+          new Set([MSG_STREAM_RESUMING, MSG_CHAT_RESPONSE])
+        );
+
+        await agent.testEndStreamOfferedWithoutAck(requestId, close);
+
+        await expect(frames).resolves.toEqual([
+          MSG_STREAM_RESUMING,
+          MSG_CHAT_RESPONSE
+        ]);
+      } finally {
+        await closeWS(ws);
+      }
+    }
+  );
+});
+
 describe("Think — sub-agent stream frame ordering", () => {
   it("delivers STREAM_RESUMING before a later terminal broadcast", async () => {
     const parentRoom = crypto.randomUUID();
@@ -645,6 +755,16 @@ describe("Think — terminal replay on reconnect (#1645)", () => {
     // stale exhaustion would replay onto the now-empty chat on reconnect (#1645).
     await agent.clearMessages();
     expect(await agent.getPendingChatTerminalForTest()).toBeNull();
+  });
+
+  it("releases a claimed request when clearing its previous terminal fails", async () => {
+    const agent = await freshAgent();
+    const result = await agent.testRetryAfterTerminalClearFailure();
+    expect(result.error).toBe("terminal delete failed");
+    expect(result.claimedAfterFailure).toBe(false);
+    expect(result.originRetainedAfterFailure).toBe(false);
+    expect(result.rolesAfterRetry).toEqual(["user", "assistant"]);
+    expect(result.assistantText.length).toBeGreaterThan(0);
   });
 
   it("eagerly drops the terminal record when a new turn is submitted, before it streams (#1645)", async () => {

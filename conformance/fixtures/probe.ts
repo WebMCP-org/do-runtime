@@ -969,15 +969,16 @@ export class Probe extends DurableObject<ProbeEnv> {
     };
   }
 
-  /** Workerd caps every SQLite string or blob at 4 MiB. */
+  /** ← workerd 1b9b6ea02: 8 MiB rows plus 34 bytes of serialization padding. */
   sqliteLengthLimit(): Record<string, unknown> {
     const sql = this.ctx.storage.sql;
-    const allowed = sql.exec("SELECT length(?) AS length", "x".repeat(4_000_000)).one();
+    const allowed = sql.exec("SELECT length(?) AS length", "x".repeat(8_000_000)).one();
+    const padded = sql.exec("SELECT length(?) AS length", new Uint8Array(8 * 1024 * 1024 + 34)).one();
     try {
-      sql.exec("SELECT length(?)", new Uint8Array(4 * 1024 * 1024 + 1));
-      return { allowed: allowed.length, tooBig: "allowed" };
+      sql.exec("SELECT length(?)", new Uint8Array(8 * 1024 * 1024 + 35));
+      return { allowed: allowed.length, padded: padded.length, tooBig: "allowed" };
     } catch (error) {
-      return { allowed: allowed.length, tooBig: String(error) };
+      return { allowed: allowed.length, padded: padded.length, tooBig: String(error) };
     }
   }
 

@@ -46,6 +46,25 @@ function waitForJsonMessage<T>(
   });
 }
 
+function waitForClose(
+  ws: WebSocket,
+  timeoutMs = 5000
+): Promise<{ code: number; reason: string }> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      ws.removeEventListener("close", handler);
+      reject(new Error(`waitForClose timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    const handler = (event: CloseEvent) => {
+      clearTimeout(timer);
+      ws.removeEventListener("close", handler);
+      resolve({ code: event.code, reason: event.reason });
+    };
+    ws.addEventListener("close", handler);
+  });
+}
+
 async function expectRootKeepAliveRefCount(
   agent: { getRootKeepAliveRefCount(): Promise<number> },
   expected: number
@@ -1072,6 +1091,33 @@ describe("SubAgent", () => {
     await expectRootKeepAliveRefCount(agent, 0);
   });
 
+  it.each([
+    ["succeeded", false],
+    ["failed", true]
+  ])(
+    "keeps the root facet-run lease until a %s sub-agent fiber's leftover row is gone (#2305)",
+    async (_outcome, failBody) => {
+      const name = uniqueName();
+      const agent = await getAgentByName(env.TestSubAgentParent, name);
+
+      await expect(
+        agent.subAgentRunFiberWithFailingCleanup(
+          "cleanup-child",
+          "done",
+          failBody
+        )
+      ).resolves.toBe("done");
+      expect(await agent.subAgentRunningFiberCount("cleanup-child")).toBe(1);
+      expect(await agent.facetRunRows()).toHaveLength(1);
+
+      await runDurableObjectAlarm(agent);
+
+      expect(await agent.subAgentRunningFiberCount("cleanup-child")).toBe(0);
+      expect(await agent.facetRunRows()).toEqual([]);
+      expect(await agent.subAgentRecoveredFibers("cleanup-child")).toEqual([]);
+    }
+  );
+
   it("holds root keepAlive and facet-run leases for managed sub-agent fibers", async () => {
     const name = uniqueName();
     const agent = await getAgentByName(env.TestSubAgentParent, name);
@@ -1132,6 +1178,50 @@ describe("SubAgent", () => {
         snapshot: { value: "checkpoint" }
       })
     ]);
+  });
+
+  it("leaves host jobs to the root while a sub-agent's fiber recovery is pending (#2299)", async () => {
+    const name = uniqueName();
+    const agent = await getAgentByName(env.TestSubAgentParent, name);
+
+    await agent.insertSubAgentInterruptedFiber(
+      "orphan-wake-child",
+      "fiber-orphan-wake-1",
+      "recovery-throws"
+    );
+
+    // Startup recovery throws, so the orphaned row survives the wake. The
+    // root's facet-run lease owns the retry; the facet queues nothing.
+    await expect(
+      agent.subAgentLocalJobIdsAfterRestart("orphan-wake-child")
+    ).resolves.toEqual([]);
+    expect(await agent.subAgentRunningFiberCount("orphan-wake-child")).toBe(1);
+    expect((await agent.facetRunRows()).map((row) => row.runId)).toContain(
+      "fiber-orphan-wake-1"
+    );
+  });
+
+  it("drops host jobs an earlier release left in a sub-agent's queue (#2299)", async () => {
+    const name = uniqueName();
+    const agent = await getAgentByName(env.TestSubAgentParent, name);
+
+    await agent.subAgentInsertStaleHostJob(
+      "stale-jobs-child",
+      "cf:housekeeping",
+      "housekeeping"
+    );
+    await agent.subAgentInsertStaleHostJob(
+      "stale-jobs-child",
+      "cf:keep-alive",
+      "keepAlive"
+    );
+
+    await expect(
+      agent.subAgentLocalJobIdsAfterRestart("stale-jobs-child")
+    ).resolves.toEqual([]);
+    await expect(
+      agent.subAgentIncrement("stale-jobs-child", "c")
+    ).resolves.toBe(1);
   });
 
   it("applies managed sub-agent fiber recovery outcomes from the child", async () => {
@@ -1527,35 +1617,6 @@ describe("SubAgent", () => {
     }
   });
 
-  it("closes a frame arriving on a connection to a deleted sub-agent", async () => {
-    const parentName = uniqueName();
-    const childName = uniqueName();
-    const parent = await getAgentByName(env.TestSubAgentParent, parentName);
-    const ws = await connectWS(
-      `/agents/test-sub-agent-parent/${parentName}/sub/broadcast-sub-agent/${childName}`
-    );
-    await waitForJsonMessage<{ type: MessageType }>(
-      ws,
-      (data) => data.type === MessageType.CF_AGENT_STATE
-    );
-    expect(await parent.has("BroadcastSubAgent", childName)).toBe(true);
-
-    const closed = new Promise<{ code: number; reason: string }>((resolve) => {
-      ws.addEventListener(
-        "close",
-        (event) => resolve({ code: event.code, reason: event.reason }),
-        { once: true }
-      );
-    });
-    await parent.broadcastSubAgentDelete(childName);
-
-    // Resolving a route is what registers a child, so this frame must not
-    // lazily recreate the agent its connection targeted.
-    ws.send("still-here?");
-    expect(await closed).toEqual({ code: 1008, reason: "Sub-agent deleted" });
-    expect(await parent.has("BroadcastSubAgent", childName)).toBe(false);
-  });
-
   // ── Regression: cross-DO I/O on bootstrap broadcast paths ───────────
   // Sub-agents share their parent's process but have their own isolate.
   // On production, iterating the connection registry or sending through
@@ -1906,6 +1967,127 @@ describe("SubAgent", () => {
 
       await agent.subAgentDelete(childName);
       expect(await agent.has("CounterSubAgent", childName)).toBe(false);
+    });
+
+    // ── Regression: issue #2003 ──────────────────────────────────────
+    // A client WebSocket connected directly to a sub-agent survives
+    // `deleteSubAgent`. Its next message or close event used to be
+    // forwarded through the create-on-access resolver, silently
+    // recreating the facet the parent just deleted.
+
+    it("deleteSubAgent stays deleted even if the old socket attempts to send afterward", async () => {
+      const parentName = uniqueName();
+      const childName = uniqueName();
+      const ws = await connectWS(
+        `/agents/test-sub-agent-parent/${parentName}/sub/counter-sub-agent/${childName}`
+      );
+      const parent = await getAgentByName(env.TestSubAgentParent, parentName);
+      expect(await parent.has("CounterSubAgent", childName)).toBe(true);
+
+      await parent.subAgentDelete(childName);
+      expect(await parent.has("CounterSubAgent", childName)).toBe(false);
+
+      // deleteSubAgent also closes the socket (see the dedicated close
+      // test below), so a compliant WebSocket client may throw here
+      // rather than deliver the frame — that's fine and expected. What
+      // matters is the outcome: no interleaving of the close and a
+      // straggling send can bring the deleted sub-agent back.
+      try {
+        ws.send("straggler");
+      } catch {
+        // Expected once the socket is closed — the invariant below is
+        // what this test actually verifies.
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(await parent.has("CounterSubAgent", childName)).toBe(false);
+    });
+
+    it("deleteSubAgent closes a still-open sub-agent socket with an explicit code/reason", async () => {
+      const parentName = uniqueName();
+      const childName = uniqueName();
+      const ws = await connectWS(
+        `/agents/test-sub-agent-parent/${parentName}/sub/counter-sub-agent/${childName}`
+      );
+      const closePromise = waitForClose(ws);
+      const parent = await getAgentByName(env.TestSubAgentParent, parentName);
+
+      await parent.subAgentDelete(childName);
+
+      const { code, reason } = await closePromise;
+      expect(code).toBe(1001);
+      expect(reason).toBe("Sub-agent deleted");
+    });
+
+    it("a sub-agent's self-destruct() closes a still-open socket connected to it", async () => {
+      const parentName = uniqueName();
+      const childName = uniqueName();
+      const ws = await connectWS(
+        `/agents/test-sub-agent-parent/${parentName}/sub/counter-sub-agent/${childName}`
+      );
+      const closePromise = waitForClose(ws);
+      const parent = await getAgentByName(env.TestSubAgentParent, parentName);
+
+      await parent.subAgentSelfDestruct(childName);
+
+      const { code, reason } = await closePromise;
+      expect(code).toBe(1001);
+      expect(reason).toBe("Sub-agent deleted");
+    });
+
+    it("deleteSubAgent stays deleted after the client closes a still-open sub-agent socket", async () => {
+      const parentName = uniqueName();
+      const childName = uniqueName();
+      const ws = await connectWS(
+        `/agents/test-sub-agent-parent/${parentName}/sub/counter-sub-agent/${childName}`
+      );
+      const parent = await getAgentByName(env.TestSubAgentParent, parentName);
+      expect(await parent.has("CounterSubAgent", childName)).toBe(true);
+
+      await parent.subAgentDelete(childName);
+      expect(await parent.has("CounterSubAgent", childName)).toBe(false);
+
+      ws.close();
+
+      for (let attempt = 0; attempt < 20; attempt++) {
+        if (await parent.has("CounterSubAgent", childName)) break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(await parent.has("CounterSubAgent", childName)).toBe(false);
+    });
+
+    it("a nested facet's deleteSubAgent closes a socket routed to the deleted child", async () => {
+      const parentName = uniqueName();
+      const outerName = uniqueName();
+      const innerName = uniqueName();
+      const ws = await connectWS(
+        `/agents/test-sub-agent-parent/${parentName}/sub/outer-sub-agent/${outerName}/sub/inner-sub-agent/${innerName}`
+      );
+      const closePromise = waitForClose(ws);
+      const parent = await getAgentByName(env.TestSubAgentParent, parentName);
+      expect(await parent.nestedHasInner(outerName, innerName)).toBe(true);
+
+      await parent.nestedDeleteInner(outerName, innerName);
+
+      const { code, reason } = await closePromise;
+      expect(code).toBe(1001);
+      expect(reason).toBe("Sub-agent deleted");
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(await parent.nestedHasInner(outerName, innerName)).toBe(false);
+    });
+
+    it("a late frame from a deleted sub-agent's socket does not reach a same-name replacement", async () => {
+      const parentName = uniqueName();
+      const childName = uniqueName();
+      await connectWS(
+        `/agents/test-sub-agent-parent/${parentName}/sub/counter-sub-agent/${childName}`
+      );
+      const parent = await getAgentByName(env.TestSubAgentParent, parentName);
+      expect(await parent.has("CounterSubAgent", childName)).toBe(true);
+
+      expect(
+        await parent.subAgentForwardStaleFrameToReplacement(childName)
+      ).toBe(0);
     });
 
     it("listSubAgents enumerates every spawned child", async () => {

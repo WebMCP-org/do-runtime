@@ -76,7 +76,10 @@ const EXPECTED_SCHEMA_DDL = [
           id TEXT PRIMARY KEY NOT NULL,
           name TEXT NOT NULL,
           snapshot TEXT,
-          created_at INTEGER NOT NULL
+          created_at INTEGER NOT NULL,
+          completed_at INTEGER,
+          outcome TEXT,
+          error_message TEXT
         )`,
   `CREATE TABLE cf_agents_state (
         id TEXT PRIMARY KEY NOT NULL,
@@ -147,7 +150,7 @@ const EXPECTED_SCHEMA_DDL = [
         )`
 ];
 
-const EXPECTED_SCHEMA_VERSION = 11;
+const EXPECTED_SCHEMA_VERSION = 14;
 
 describe("schema DDL snapshot", () => {
   it("should match the expected DDL for the current schema version", async () => {
