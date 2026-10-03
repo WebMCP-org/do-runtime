@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { readFileSync } from "node:fs";
-import fg from "fast-glob";
+import { glob } from "node:fs/promises";
 
 /**
  * Recursively extract all file paths from an exports object
@@ -71,7 +71,7 @@ async function main() {
   // Find all package.json files in packages directory
   const packageJsonFiles: string[] = [];
 
-  for await (const file of await fg.glob("packages/*/package.json")) {
+  for await (const file of glob("packages/*/package.json")) {
     if (file.includes("node_modules")) continue;
     packageJsonFiles.push(file);
   }

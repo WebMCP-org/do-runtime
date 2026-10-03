@@ -9,7 +9,7 @@
     "durable objects"
   ],
   "type": "module",
-  "version": "0.24.0",
+  "version": "0.26.0",
   "license": "MIT",
   "repository": {
     "directory": "packages/agents",
@@ -34,9 +34,14 @@
     "yaml": "^2.9.1"
   },
   "devDependencies": {
+    "@ai-sdk/anthropic": "^4.0.0",
+    "@ai-sdk/openai": "^4.0.0",
+    "@ai-sdk/provider": "^4.0.0",
     "@ai-sdk/react": "^4.0.0",
     "@ai-sdk/valibot": "3.0.6",
     "@cloudflare/codemode": "workspace:*",
+    "@earendil-works/pi-ai": "^1.0.0",
+    "@earendil-works/pi-durable": "^1.0.0",
     "@modelcontextprotocol/client": "2.0.0",
     "@modelcontextprotocol/conformance-v2": "npm:@modelcontextprotocol/conformance@0.2.0-alpha.10",
     "@modelcontextprotocol/sdk": "1.30.0",
@@ -56,8 +61,11 @@
     "zod": "^4.6.4"
   },
   "peerDependencies": {
+    "@ai-sdk/provider": "^4.0.0",
     "@ai-sdk/react": "^3.0.0 || ^4.0.0",
     "@cloudflare/codemode": ">=0.5.0",
+    "@earendil-works/pi-ai": "^1.0.0",
+    "@earendil-works/pi-durable": "^1.0.0",
     "@modelcontextprotocol/client": "2.0.0",
     "@modelcontextprotocol/sdk": "1.30.0",
     "@modelcontextprotocol/server": "2.0.0",
@@ -72,10 +80,19 @@
     "zod": "^4.0.0"
   },
   "peerDependenciesMeta": {
+    "@ai-sdk/provider": {
+      "optional": true
+    },
     "@ai-sdk/react": {
       "optional": true
     },
     "@cloudflare/codemode": {
+      "optional": true
+    },
+    "@earendil-works/pi-ai": {
+      "optional": true
+    },
+    "@earendil-works/pi-durable": {
       "optional": true
     },
     "@tanstack/ai": {
@@ -150,6 +167,11 @@
       "import": "./dist/lifecycle/index.js",
       "require": "./dist/lifecycle/index.js"
     },
+    "./harness/pi": {
+      "types": "./dist/harness/pi/index.d.ts",
+      "import": "./dist/harness/pi/index.js",
+      "require": "./dist/harness/pi/index.js"
+    },
     "./agent-tools": {
       "types": "./dist/agent-tools.d.ts",
       "import": "./dist/agent-tools.js",
@@ -184,6 +206,16 @@
       "types": "./dist/observability/index.d.ts",
       "import": "./dist/observability/index.js",
       "require": "./dist/observability/index.js"
+    },
+    "./models/ai-sdk": {
+      "types": "./dist/models/ai-sdk/index.d.ts",
+      "import": "./dist/models/ai-sdk/index.js",
+      "require": "./dist/models/ai-sdk/index.js"
+    },
+    "./models/pi-ai": {
+      "types": "./dist/models/pi-ai/index.d.ts",
+      "import": "./dist/models/pi-ai/index.js",
+      "require": "./dist/models/pi-ai/index.js"
     },
     "./observability/ai": {
       "types": "./dist/observability/ai/index.d.ts",
@@ -294,6 +326,11 @@
       "types": "./dist/browser/ai.d.ts",
       "import": "./dist/browser/ai.js",
       "require": "./dist/browser/ai.js"
+    },
+    "./browser/ai-sdk": {
+      "types": "./dist/browser/ai-sdk.d.ts",
+      "import": "./dist/browser/ai-sdk.js",
+      "require": "./dist/browser/ai-sdk.js"
     },
     "./browser/tanstack-ai": {
       "types": "./dist/browser/tanstack-ai.d.ts",
@@ -423,7 +460,6 @@
   },
   "scripts": {
     "build": "tsx ./scripts/build.ts",
-    "evals": "(cd evals; evalite)",
     "test": "vitest --run",
     "test:node": "vitest --project node",
     "test:react": "vitest --project react",
@@ -434,6 +470,7 @@
     "test:browser": "vitest run --config src/browser-tests/vitest.config.ts",
     "test:workers": "vitest --project workers",
     "test:chat": "vitest --project chat",
+    "test:harness:pi": "vitest --project harness-pi",
     "test:webmcp": "vitest --project webmcp",
     "test:x402": "vitest --project x402",
     "test:e2e": "vitest --run -c src/e2e-tests/vitest.config.ts",

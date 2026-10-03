@@ -51,3 +51,26 @@ it("§1.12 untraced spans expose chainable attributes and nested active scopes",
     return value + 1;
   }, 41)).toBe(42);
 });
+
+it("§1.12 untraced spans support name and status updates, including after end", () => {
+  const span = tracing.startSpan("original");
+  for (const ended of [false, true]) {
+    if (ended) span.end();
+    expect(span.updateName("updated")).toBe(span);
+    for (const code of ["unset", "ok", "error"] as const) {
+      expect(span.setStatus({ code, message: "unrecorded" })).toBe(span);
+    }
+    let reads = 0;
+    expect(span.setStatus({
+      get code() {
+        reads++;
+        return "ok" as const;
+      },
+    })).toBe(span);
+    expect(reads).toBe(1);
+    expect(() => Reflect.apply(span.setStatus, span, [{ code: "invalid" }])).toThrow(
+      "Span status code must be 'unset', 'ok', or 'error'.",
+    );
+    expect(span.isTraced).toBe(false);
+  }
+});

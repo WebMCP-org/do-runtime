@@ -33,6 +33,7 @@ import type { ResumableStream } from "./resumable-stream";
 export interface PendingChatTerminal {
   requestId: string;
   body: string;
+  messageIds?: string[];
 }
 
 /**
@@ -49,10 +50,10 @@ export interface ResumeHandshakeHost {
   /** Accepted-but-not-yet-streamed turns and fresh request-id claims (#1784). */
   readonly preStream: PreStreamTurns<Connection>;
   /**
-   * Connections notified of a resumable stream, excluded from live broadcast
-   * until they ACK. Host-owned (shared with the streaming loop).
+   * Connection id to offered request id, excluded from live broadcast until
+   * that offer is acknowledged or terminalized. Shared with the streaming loop.
    */
-  readonly pendingResumeConnections: Set<string>;
+  readonly pendingResumeConnections: Map<string, string>;
   /** Read the pending terminal outcome (#1645), or `null` when none survives. */
   pendingChatTerminal(): Promise<PendingChatTerminal | null>;
   /** Materialize an orphaned stream's partial into a persisted assistant message. */
@@ -65,12 +66,20 @@ export interface ResumeHandshakeHost {
    * resumed by the replacement connection (#1784).
    */
   isConnectionPresent?(connectionId: string): boolean;
+  /**
+   * Whether the host still holds the request's terminal frames and will
+   * broadcast them once its message is persisted. Optional: hosts that send
+   * the terminal frame with the stream's end omit it. While true, a resume
+   * ACK gets the stored chunks without a terminal, so the connection learns
+   * the outcome from the live frame that follows the transcript.
+   */
+  holdsTerminalFrames?(requestId: string): boolean;
 }
 
 /**
  * Drives the server side of the stream-resume protocol over a
  * {@link ResumeHandshakeHost}. Construct once per agent (the host wires its
- * `ResumableStream` / `ContinuationState` / pending set in) and call the three
+ * `ResumableStream` / `ContinuationState` / pending offers in) and call the three
  * public methods from the host's existing onConnect / onMessage wiring, so
  * handler registration timing stays host-owned.
  */
@@ -149,9 +158,9 @@ export class ResumeHandshake {
       })
     );
     if (sent) {
-      // Add to pending set — excluded from live broadcasts until they ACK to
+      // Record the pending offer — excluded from live broadcasts until they ACK to
       // receive the full stream replay.
-      pendingResumeConnections.add(connection.id);
+      pendingResumeConnections.set(connection.id, requestId);
     }
   }
 
@@ -264,6 +273,10 @@ export class ResumeHandshake {
   ): Promise<void> {
     const { resumableStream, pendingResumeConnections, responseMessageType } =
       this.host;
+    const offeredRequestId = pendingResumeConnections.get(connection.id);
+    // A late ACK must not release or replay over a newer offer on this socket.
+    if (offeredRequestId !== undefined && offeredRequestId !== requestId)
+      return;
     pendingResumeConnections.delete(connection.id);
 
     if (
@@ -280,6 +293,11 @@ export class ResumeHandshake {
       if (orphanedStreamId) {
         await this.host.persistOrphanedStream(orphanedStreamId);
       }
+    } else if (this.host.holdsTerminalFrames?.(requestId)) {
+      // The stream closed (finished, recovering, or errored) but its message
+      // is still being persisted; the held terminal frames are broadcast
+      // after the transcript (#2334).
+      resumableStream.replayClosedStreamChunks(connection, requestId);
     } else if (await this._replayTerminalOnAck(connection, requestId)) {
       // Delivered the pending terminal error frame on the resumed stream the
       // client just ACKed (#1645).
@@ -304,6 +322,8 @@ export class ResumeHandshake {
         );
       }
     } else if (!resumableStream.hasActiveStream()) {
+      const messageIds = resumableStream.getOriginMessageIds(requestId);
+      const outcome = resumableStream.getOutcome(requestId);
       sendIfOpen(
         connection,
         JSON.stringify({
@@ -311,12 +331,24 @@ export class ResumeHandshake {
           done: true,
           id: requestId,
           type: responseMessageType,
-          replay: true
+          replay: true,
+          ...(messageIds && { messageIds }),
+          ...(outcome && { outcome })
         })
       );
     }
     // Otherwise this is a stale ACK for an unknown request while a different
     // stream is active; ignore it without disturbing that active stream.
+  }
+
+  /** Release only the offers belonging to the stream that just ended. */
+  releasePending(requestId: string | null): void {
+    for (const [connectionId, offeredRequestId] of this.host
+      .pendingResumeConnections) {
+      if (offeredRequestId === requestId) {
+        this.host.pendingResumeConnections.delete(connectionId);
+      }
+    }
   }
 
   /**
@@ -371,6 +403,9 @@ export class ResumeHandshake {
     ) {
       return true;
     }
+    const messageIds =
+      pending.messageIds ??
+      resumableStream.getOriginMessageIds(pending.requestId);
     sendIfOpen(
       connection,
       JSON.stringify({
@@ -378,7 +413,8 @@ export class ResumeHandshake {
         done: true,
         error: true,
         id: pending.requestId,
-        type: responseMessageType
+        type: responseMessageType,
+        ...(messageIds && { messageIds })
       })
     );
     return true;

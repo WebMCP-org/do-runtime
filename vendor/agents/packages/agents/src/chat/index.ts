@@ -1,7 +1,10 @@
 export {
   applyChunkToParts,
   createContinuationStart,
+  applyLateToolInput,
+  isLateToolInputChunk,
   isReplayChunk,
+  lateToolInputForwardChunks,
   normalizeToolInput,
   type MessageParts,
   type MessagePart,
@@ -24,6 +27,8 @@ export {
 } from "./stream-accumulator";
 
 export { TurnQueue, type TurnResult, type EnqueueOptions } from "./turn-queue";
+
+export { originMessageIds, withOriginMessageIds } from "./origin-message-ids";
 
 /**
  * @internal Shared text-segment separator for sibling streaming packages.
@@ -74,7 +79,7 @@ export { MAX_BOUND_PARAMS, buildInClauseStrings } from "./sql-batch";
  * @internal Platform-failure classifier shared with the chat hosts'
  * queue-dispatch deferral (#1730); sibling-package support, not a public API.
  */
-export { isPlatformFailure } from "../retries";
+export { isPlatformFailure, isDurableObjectResetError } from "../retries";
 
 export {
   createToolsFromClientSchemas,
@@ -89,12 +94,17 @@ export {
 } from "./protocol";
 
 export { MessageType } from "./wire-types";
-export type { OutgoingMessage, IncomingMessage } from "./wire-types";
+export type {
+  ChatTurnOutcome,
+  OutgoingMessage,
+  IncomingMessage
+} from "./wire-types";
 
 export {
   applyAgentToolEvent,
   createAgentToolEventState,
   interceptAgentToolBroadcast,
+  isPositionlessAgentToolChunk,
   AgentToolProgressEmitter,
   type AgentToolProgressEmitHooks,
   type AgentToolProgressEmitResult,
@@ -213,6 +223,7 @@ export {
  */
 export {
   aiSdkRecoveryCodec,
+  partialHasSettledToolResults,
   shouldCreditStreamProgress,
   type ChatRecoveryCodec,
   type ProgressCreditThrottle
@@ -266,6 +277,9 @@ export {
 export {
   ChatRecoveryEngine,
   runChatRecoveryExhaustion,
+  chatRecoveryBackoffSeconds,
+  retryAfterSeconds,
+  CHAT_RECOVERY_CANCELLED_REASON,
   type ChatRecoveryScheduleReason,
   type ChatRecoveryScheduleCallback,
   type ChatRecoveryAdapter,
@@ -301,5 +315,7 @@ export type {
 } from "./lifecycle";
 export {
   truncateOlderMessages,
-  type TruncateOptions
+  truncateOlderToolResults,
+  type TruncateOptions,
+  type TruncateToolResultsOptions
 } from "./truncate-older-messages";

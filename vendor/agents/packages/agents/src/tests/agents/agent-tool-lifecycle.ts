@@ -206,7 +206,7 @@ export class TestAgentToolLifecycleWindowParent extends TestAgentToolLifecyclePa
  */
 export class TestAgentToolLifecycleChild extends Agent {
   private tailers = new Set<ReadableStreamDefaultController<Uint8Array>>();
-  private releaseInspection: (() => void) | undefined;
+  private inspectionWaiters = new Set<() => void>();
   private releaseCancellation: (() => void) | undefined;
   private releaseReplayRead: (() => void) | undefined;
   private holdInspection = false;
@@ -297,7 +297,7 @@ export class TestAgentToolLifecycleChild extends Agent {
       (inspection.status === "completed" || inspection.status === "aborted")
     ) {
       await new Promise<void>((resolve) => {
-        this.releaseInspection = resolve;
+        this.inspectionWaiters.add(resolve);
       });
     }
     return inspection;
@@ -343,7 +343,7 @@ export class TestAgentToolLifecycleChild extends Agent {
         cancels: number;
         tails: number;
       }>`SELECT status, starts, cancels, tails FROM lifecycle_child`[0],
-      inspectionHeld: this.releaseInspection !== undefined,
+      inspectionHeld: this.inspectionWaiters.size > 0,
       cancellationHeld: this.releaseCancellation !== undefined,
       replayReadHeld: this.releaseReplayRead !== undefined
     };
@@ -358,8 +358,8 @@ export class TestAgentToolLifecycleChild extends Agent {
 
   releaseInspectionForTest(): void {
     this.holdInspection = false;
-    this.releaseInspection?.();
-    this.releaseInspection = undefined;
+    for (const resolve of this.inspectionWaiters) resolve();
+    this.inspectionWaiters.clear();
   }
 
   releaseCancellationForTest(): void {

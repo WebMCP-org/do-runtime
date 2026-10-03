@@ -432,6 +432,17 @@ class Span {
   setAttributes(_attributes: Record<string, boolean | number | string | undefined>): this {
     return this;
   }
+  // ← workerd 1f6faa79b: even untraced/ended spans validate status and return themselves.
+  updateName(_name: string): this {
+    return this;
+  }
+  setStatus(status: TracingSpanStatus): this {
+    const code = status.code;
+    if (code !== "unset" && code !== "ok" && code !== "error") {
+      throw new TypeError("Span status code must be 'unset', 'ok', or 'error'.");
+    }
+    return this;
+  }
   recordException(_exception: unknown): void {}
   end(): void {}
 }

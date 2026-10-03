@@ -1,9 +1,11 @@
 export {
+  CdpConnection,
   CdpSession,
   connectUrl,
   type CdpSendOptions,
-  type CdpAttachOptions
-} from "./cdp-session";
+  type CdpAttachOptions,
+  type CdpConnectionOptions
+} from "./cdp-connection";
 
 export {
   connectBrowser,
@@ -15,9 +17,13 @@ export {
   BrowserRenderingError,
   type BrowserBinding,
   type BrowserRecording,
+  type BrowserSessionGuardrails,
   type BrowserSessionInfo,
   type BrowserTargetInfo,
-  type ConnectBrowserOptions
+  type ConnectBrowserOptions,
+  type ConnectBrowserSessionOptions,
+  type ConnectChromiumBrowserOptions,
+  type ConnectKitesurfBrowserOptions
 } from "./browser-run";
 
 export {
@@ -26,7 +32,18 @@ export {
   type BrowserSessionLock,
   type BrowserSessionStore,
   type StoredBrowserSession
-} from "./session-manager";
+} from "./session-store";
+
+export {
+  Browser,
+  browserRun,
+  type BrowserConnection,
+  type BrowserOptions,
+  type BrowserProvider,
+  type BrowserRunOptions,
+  type BrowserRunProvider,
+  type ResolvedBrowser
+} from "./browser";
 
 export {
   browserContent,
@@ -53,6 +70,8 @@ export {
 
 export {
   loadCdpSpec,
+  type CdpField,
+  type CdpItems,
   type CdpSpecSource,
   type SearchableCdpSpec
 } from "./spec";

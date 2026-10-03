@@ -8,6 +8,13 @@ regression suites are present. Commands in this workspace's `package.json`
 are authoritative; upstream sections below that refer to Nx, sites, examples,
 guides, or experiments describe content intentionally left out of this fork.
 
+Upgrade support is forward-only: preserve migrations that carry existing actor
+data and queued work into the current release. Downgrade support is outside the
+maintained scope. Evalite, the credentialed `packages/agents/evals/` scheduling
+evaluation and its `evals` command are intentionally excluded. Do not restore
+them during upstream syncs; maintain runtime scheduling and deterministic tests.
+See [the local maintenance policy](docs/fork-diff.md#local-maintenance-policy).
+
 ## Project overview
 
 Cloudflare Agents SDK — a framework for building stateful AI agents on Cloudflare Workers. This is a monorepo containing the core SDK packages, examples, guides, sites, and documentation.

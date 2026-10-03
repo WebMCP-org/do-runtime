@@ -2,12 +2,17 @@ import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { browserHost, doRuntimeAwaitTransform } from "@mcp-b/do-runtime/vite";
 import agents from "agents/vite";
+import nodeStdlib from "node-stdlib-browser";
 import { defaultClientConditions, defineConfig } from "vite";
 
 const packageRoot = fileURLToPath(new URL("../../", import.meta.url));
 const resolvePackage = createRequire(import.meta.url).resolve;
 const cloudflareShellModule = `${packageRoot}vendor/agents/packages/shell/dist/index.js`;
 const unenvNode = (name: string): string => resolvePackage(`unenv/node/${name}`);
+const browserGlobals = {
+  process: nodeStdlib.process,
+  Buffer: [nodeStdlib.buffer, "Buffer"] as [string, string],
+};
 
 const actorAwaitTransformInclude = [
   "**/examples/extension/src/worker/**",
@@ -34,6 +39,7 @@ const facetEntries = new Map([
 ]);
 
 export default defineConfig(({ mode }) => ({
+  define: { global: "globalThis", "process.env": "{}" },
   plugins: [
     ...agents(),
     ...browserHost({
@@ -63,6 +69,7 @@ export default defineConfig(({ mode }) => ({
           minify: false,
           modulePreload: false,
           rollupOptions: {
+            transform: { inject: browserGlobals },
             input: facetEntries.get(mode),
             // The actor worker imports the facet's class exports at runtime, so
             // they are the extension's host ABI rather than dead entry code.
@@ -88,6 +95,7 @@ export default defineConfig(({ mode }) => ({
           // Extensions load from disk. Preload hints buy nothing and add a chunk.
           modulePreload: false,
           rollupOptions: {
+            transform: { inject: browserGlobals },
             // Relative to `root`, which is this directory. The two HTML entries sit at
             // the example root rather than under `src/`, so their built copies land at
             // `dist/offscreen.html` and `dist/popup.html` — the flat paths the manifest
@@ -109,6 +117,7 @@ export default defineConfig(({ mode }) => ({
   // await and module chunks need; they keep class names and run the transform.
   worker: {
     plugins: () => agents(),
+    rollupOptions: { transform: { inject: browserGlobals } },
   },
 
   resolve: {
@@ -119,14 +128,18 @@ export default defineConfig(({ mode }) => ({
       ...(mode === "think-probe"
         ? {
             "@cloudflare/shell": cloudflareShellModule,
-            crypto: unenvNode("crypto"),
-            "node:crypto": unenvNode("crypto"),
-            "node:events": unenvNode("events"),
             "node:stream/promises": unenvNode("stream/promises"),
-            "node:stream": unenvNode("stream"),
             "node:zlib": unenvNode("zlib"),
           }
         : {}),
+      // Sessions hashes persisted content synchronously. Reuse the same Node
+      // crypto implementation exercised by the SDK's browser suite.
+      ...Object.fromEntries(
+        (["crypto", "buffer", "stream", "events"] as const).flatMap((name) => [
+          [name, nodeStdlib[name]],
+          [`node:${name}`, nodeStdlib[name]],
+        ]),
+      ),
       "node:diagnostics_channel": unenvNode("diagnostics_channel"),
       "node:os": unenvNode("os"),
       path: unenvNode("path"),

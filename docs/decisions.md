@@ -8,9 +8,9 @@ the index the citations resolve to, not a second specification.
 Workerd line citations throughout the source use release `v1.20260713.1`, commit
 `03c396e9b14ea5644dfcfb696086d8df040a4efc` of
 [cloudflare/workerd](https://github.com/cloudflare/workerd). The conformance
-oracle is pinned separately to release `v1.20260911.1`, commit
-`925464ba9fe5751e4468626ce77f7a5810df274f`.
-The [September sync audit](workerd-sync.md) records the reviewed changes and
+oracle is pinned separately to release `v1.20261002.1`, commit
+`51a48a5bb7863fbeab791358bee8dff22c3ce83f`.
+The [workerd sync audit](workerd-sync.md) records the reviewed changes and
 remaining host-engine differences. New source comments name their upstream
 commit when the July line baseline no longer applies.
 
@@ -297,7 +297,7 @@ consumer peer dependencies retain one identity.
 | The pinned SQLite engines lack workerd's default-expression and internal-function patches | Native callbacks alone cannot enforce these new restrictions; the [sync audit](workerd-sync.md#sqlite-engine-work-still-required) records observed engine behavior and the required follow-up |
 | A native outbound WebSocket handshake cannot wait for storage confirmation | Actor-global `new WebSocket(url)` throws before opening the connection; pairs and host-owned transports remain supported |
 | No tracing observer or generic async span context | Spans are no-ops; active identity is scoped to the synchronous callback and is restored on return or throw |
-| `node:sqlite` exposes no `sqlite3_limit()` | Bound and returned strings and blobs enforce workerd's 4 MiB limit; SQL-computed values that are never returned may exceed it. The browser backend sets the native limit. |
+| `node:sqlite` exposes no `sqlite3_limit()` | Bound and returned strings and blobs enforce workerd's 8 MiB plus 34-byte limit; SQL-computed values that are never returned may exceed it. The browser backend sets the native limit. |
 | A response BYOB reader cannot be re-gated after `read(view)` | BYOB readers throw; callers use a default reader or `arrayBuffer()` |
 | A workerd facet alarm appears to schedule and then breaks asynchronously ([workerd#6810](https://github.com/cloudflare/workerd/issues/6810)) | This runtime refuses facet `setAlarm()` synchronously |
 | A host may lose a physical wake between durable and platform timer writes | The host timer journals an opaque one-shot token before arming; the scheduler remains authoritative |

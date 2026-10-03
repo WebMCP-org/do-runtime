@@ -10,11 +10,13 @@ import {
 export { CapabilityHarnessObject } from "./capabilities/harness.ts";
 import type { CapabilityHarnessObject } from "./capabilities/harness.ts";
 export {
+  ConcurrentStartObject,
   PlainLifecycleObject,
   RetryableStartObject,
   StatefulPlainObject
 } from "./capabilities/lifecycle.ts";
 import type {
+  ConcurrentStartObject,
   PlainLifecycleObject,
   RetryableStartObject,
   StatefulPlainObject
@@ -65,6 +67,12 @@ import type {
 } from "./capabilities/tasks.ts";
 export { PlainMcpClientObject } from "./capabilities/mcp-client.ts";
 import type { PlainMcpClientObject } from "./capabilities/mcp-client.ts";
+export { BrowserHarnessObject } from "./capabilities/browser.ts";
+import type { BrowserHarnessObject } from "./capabilities/browser.ts";
+export { TestBrowserAgent } from "./agents/browser.ts";
+// The browser tool's codemode runtime runs as a facet of the host agent.
+export { CodemodeRuntime } from "@cloudflare/codemode";
+import type { TestBrowserAgent } from "./agents/browser.ts";
 
 // Re-export all test agents so existing imports (e.g. `import { type Env } from "./worker"`)
 // and wrangler bindings continue to work.
@@ -112,6 +120,7 @@ export {
   TestMigrationAgent,
   TestSessionAgent,
   TestWaitConnectionsAgent,
+  TestNativeRpcAgent,
   RoutingOwnerAgent,
   RoutedChatAgent,
   TestSubAgentParent,
@@ -119,6 +128,7 @@ export {
   CounterSubAgent,
   OuterSubAgent,
   InnerSubAgent,
+  DenyingSubAgent,
   LeafSubAgent,
   CallbackSubAgent,
   BroadcastSubAgent,
@@ -206,6 +216,7 @@ import type {
   TestMigrationAgent,
   TestSessionAgent,
   TestWaitConnectionsAgent,
+  TestNativeRpcAgent,
   RoutingOwnerAgent,
   RoutedChatAgent,
   TestSubAgentParent,
@@ -224,6 +235,7 @@ export type Env = {
   CapabilityHarnessObject: DurableObjectNamespace<CapabilityHarnessObject>;
   PlainLifecycleObject: DurableObjectNamespace<PlainLifecycleObject>;
   RetryableStartObject: DurableObjectNamespace<RetryableStartObject>;
+  ConcurrentStartObject: DurableObjectNamespace<ConcurrentStartObject>;
   StatefulPlainObject: DurableObjectNamespace<StatefulPlainObject>;
   ScheduledLifecycleObject: DurableObjectNamespace<ScheduledLifecycleObject>;
   SchedulerHarnessObject: DurableObjectNamespace<SchedulerHarnessObject>;
@@ -241,6 +253,8 @@ export type Env = {
   SessionSearchHarnessObject: DurableObjectNamespace<SessionSearchHarnessObject>;
   SessionBenchObject: DurableObjectNamespace<SessionBenchObject>;
   PlainMcpClientObject: DurableObjectNamespace<PlainMcpClientObject>;
+  BrowserHarnessObject: DurableObjectNamespace<BrowserHarnessObject>;
+  TestBrowserAgent: DurableObjectNamespace<TestBrowserAgent>;
   MCP_OBJECT: DurableObjectNamespace<McpAgent>;
   TestCodemodeMcpAgent: DurableObjectNamespace<TestCodemodeMcpAgent>;
   EmailAgent: DurableObjectNamespace<TestEmailAgent>;
@@ -282,6 +296,7 @@ export type Env = {
   TestMigrationAgent: DurableObjectNamespace<TestMigrationAgent>;
   TestSessionAgent: DurableObjectNamespace<TestSessionAgent>;
   TestWaitConnectionsAgent: DurableObjectNamespace<TestWaitConnectionsAgent>;
+  TestNativeRpcAgent: DurableObjectNamespace<TestNativeRpcAgent>;
   RoutingOwnerAgent: DurableObjectNamespace<RoutingOwnerAgent>;
   RoutedChatAgent: DurableObjectNamespace<RoutedChatAgent>;
   TestSubAgentParent: DurableObjectNamespace<TestSubAgentParent>;

@@ -10,9 +10,11 @@ import { tool } from "ai";
 import { z } from "zod";
 import { Think } from "../../think";
 import type {
+  ChatErrorContext,
   ChatResponseResult,
   MessageConcurrency,
   StreamCallback,
+  TurnConfig,
   TurnContext
 } from "../../think";
 import { StreamAccumulator, type ClientToolSchema } from "agents/chat";
@@ -93,7 +95,9 @@ function createClientToolMockModel(): LanguageModel {
 // invocation it emits plain text.
 function createSlowClientToolMockModel(
   delayMs: number,
-  trailingGaps: number
+  trailingGaps: number,
+  finishReason: "tool-calls" | "stop" = "tool-calls",
+  onPrompt?: (prompt: unknown[]) => void
 ): LanguageModel {
   let callCount = 0;
   return {
@@ -107,6 +111,7 @@ function createSlowClientToolMockModel(
     doStream(options: Record<string, unknown>) {
       callCount++;
       const messages = (options as { prompt?: unknown[] }).prompt ?? [];
+      onPrompt?.(messages);
       const hasToolResult = messages.some(
         (m: unknown) =>
           typeof m === "object" &&
@@ -158,7 +163,7 @@ function createSlowClientToolMockModel(
             controller.enqueue({ type: "text-end", id: "t-trail" });
             controller.enqueue({
               type: "finish",
-              finishReason: "tool-calls",
+              finishReason,
               usage: { inputTokens: 10, outputTokens: 5 }
             });
           } else {
@@ -383,6 +388,93 @@ function createServerApprovalToolMockModel(): LanguageModel {
               }
             });
           }
+          controller.close();
+        }
+      });
+      return Promise.resolve({ stream });
+    }
+  } as LanguageModel;
+}
+
+/**
+ * #2185: one assistant turn that first calls a server tool that runs, then, in
+ * a later step of the same turn, calls the approval tool, so both parts land in
+ * one assistant message.
+ */
+function createSequentialApprovalMockModel(): LanguageModel {
+  const usage = {
+    inputTokens: { total: 10, noCache: 10, cacheRead: 0, cacheWrite: 0 },
+    outputTokens: { total: 5, text: 5, reasoning: 0 }
+  };
+  const toolResultNames = (prompt: unknown[]): string[] =>
+    prompt.flatMap((message) => {
+      const record = message as { role?: string; content?: unknown };
+      if (record.role !== "tool" || !Array.isArray(record.content)) return [];
+      return record.content.map(
+        (part) => (part as { toolName?: string }).toolName ?? ""
+      );
+    });
+  return {
+    specificationVersion: "v3",
+    provider: "test",
+    modelId: "mock-sequential-approval-model",
+    supportedUrls: {},
+    doGenerate() {
+      throw new Error("doGenerate not implemented");
+    },
+    doStream(options: Record<string, unknown>) {
+      const results = toolResultNames(
+        (options as { prompt?: unknown[] }).prompt ?? []
+      );
+      const call = (toolCallId: string, toolName: string, input: unknown) => [
+        { type: "tool-input-start", id: toolCallId, toolName },
+        {
+          type: "tool-input-delta",
+          id: toolCallId,
+          delta: JSON.stringify(input)
+        },
+        { type: "tool-input-end", id: toolCallId },
+        {
+          type: "tool-call",
+          toolCallId,
+          toolName,
+          input: JSON.stringify(input)
+        }
+      ];
+      const chunks: Array<Record<string, unknown>> = results.includes(
+        "updateTrigger"
+      )
+        ? [
+            { type: "text-start", id: "t-done" },
+            { type: "text-delta", id: "t-done", delta: "Trigger updated" },
+            { type: "text-end", id: "t-done" },
+            {
+              type: "finish",
+              finishReason: { unified: "stop", raw: undefined },
+              usage
+            }
+          ]
+        : results.includes("lookupTrigger")
+          ? [
+              ...call("tc-seq-approval", "updateTrigger", { enabled: true }),
+              {
+                type: "finish",
+                finishReason: { unified: "tool-calls", raw: undefined },
+                usage
+              }
+            ]
+          : [
+              ...call("tc-seq-lookup", "lookupTrigger", {}),
+              {
+                type: "finish",
+                finishReason: { unified: "tool-calls", raw: undefined },
+                usage
+              }
+            ];
+      const stream = new ReadableStream({
+        start(controller) {
+          controller.enqueue({ type: "stream-start", warnings: [] });
+          for (const chunk of chunks) controller.enqueue(chunk);
           controller.close();
         }
       });
@@ -632,7 +724,26 @@ function createMultiStepExecutableClientToolMockModel(): LanguageModel {
   } as LanguageModel;
 }
 
-function createTextOnlyMockModel(): LanguageModel {
+export type PromptMessageForTest = { role: string; text: string };
+
+function promptMessageForTest(message: unknown): PromptMessageForTest {
+  const { role, content } = message as { role: string; content: unknown };
+  const text =
+    typeof content === "string"
+      ? content
+      : Array.isArray(content)
+        ? content
+            .map((part: { type?: string; text?: string }) =>
+              part.type === "text" ? (part.text ?? "") : ""
+            )
+            .join("")
+        : "";
+  return { role, text };
+}
+
+function createTextOnlyMockModel(
+  onPrompt?: (prompt: unknown[]) => void
+): LanguageModel {
   return {
     specificationVersion: "v3",
     provider: "test",
@@ -641,7 +752,8 @@ function createTextOnlyMockModel(): LanguageModel {
     doGenerate() {
       throw new Error("doGenerate not implemented");
     },
-    doStream() {
+    doStream(options: Record<string, unknown>) {
+      onPrompt?.(options.prompt as unknown[]);
       const stream = new ReadableStream({
         start(controller) {
           controller.enqueue({ type: "stream-start", warnings: [] });
@@ -772,11 +884,15 @@ export class ThinkClientToolsAgent extends Think {
   private _useSlowClientToolStream = false;
   private _slowClientToolDelayMs = 30;
   private _slowClientToolGaps = 12;
+  private _slowClientToolFinishReason: "tool-calls" | "stop" = "tool-calls";
+  private _slowClientToolPromptTails: string[] = [];
+  private _textOnlyPrompts: unknown[][] = [];
   private _useMidStreamParallelToolStream = false;
   private _midStreamParallelGapMs = 40;
   private _midStreamParallelGapsBeforeSlow = 20;
   private _midStreamParallelGapsAfterSlow = 10;
   private _useServerApprovalTool = false;
+  private _useSequentialApprovalTool = false;
   private _serverApprovalToolExecutions = 0;
   private _serverApprovalToolFails = false;
   private _useExecutableClientTool = false;
@@ -787,10 +903,63 @@ export class ThinkClientToolsAgent extends Think {
   private _responseLog: ChatResponseResult[] = [];
   private _lastTurnToolNames: string[] = [];
   private _lastTurnMessagesJson = "[]";
+  private _stampMetadata = false;
+  private _failContinuationBeforeStream = false;
+  private _chatErrorLog: ChatErrorContext[] = [];
 
-  override beforeTurn(ctx: TurnContext): void {
+  override onChatError(error: unknown, ctx: ChatErrorContext): unknown {
+    this._chatErrorLog.push(ctx);
+    return error;
+  }
+
+  async setFailContinuationBeforeStream(value: boolean): Promise<void> {
+    this._failContinuationBeforeStream = value;
+  }
+
+  async getChatErrorLog(): Promise<ChatErrorContext[]> {
+    return this._chatErrorLog;
+  }
+
+  override beforeTurn(ctx: TurnContext): TurnConfig | void {
     this._lastTurnToolNames = Object.keys(ctx.tools);
     this._lastTurnMessagesJson = JSON.stringify(ctx.messages);
+    if (ctx.continuation && this._failContinuationBeforeStream) {
+      throw new Error("continuation failed before streaming");
+    }
+    if (this._stampMetadata) {
+      // Per-turn write path (`TurnConfig.messageMetadata`) for issue #1873.
+      // `createdAt` on `start` and `source` on `finish` prove the two are
+      // shallow-merged; `scope: "turn"` distinguishes this from the
+      // instance-level writer below. `continued` shows `beforeTurn` resolved the
+      // writer again for an auto-continuation turn.
+      return {
+        messageMetadata: ({ part }) => {
+          if (part.type === "start") {
+            return ctx.continuation
+              ? { continued: true }
+              : { createdAt: 1_700_000_000_000, scope: "turn" };
+          }
+          if (part.type === "finish") return { source: "server" };
+          return undefined;
+        }
+      };
+    }
+  }
+
+  async setMessageMetadataMode(value: boolean): Promise<void> {
+    this._stampMetadata = value;
+  }
+
+  // Instance-level default writer (`this.messageMetadata`), which applies to
+  // every turn without a `beforeTurn` override. `scope: "instance"` lets the
+  // precedence test confirm the per-turn config wins when both are set.
+  async setInstanceMessageMetadataMode(value: boolean): Promise<void> {
+    this.messageMetadata = value
+      ? ({ part }) =>
+          part.type === "start"
+            ? { createdAt: 1_600_000_000_000, scope: "instance" }
+            : undefined
+      : undefined;
   }
 
   async getLastTurnToolNames(): Promise<string[]> {
@@ -801,8 +970,24 @@ export class ThinkClientToolsAgent extends Think {
     return this._lastTurnMessagesJson;
   }
 
-  override onChatResponse(result: ChatResponseResult): void {
+  private _responseHookGate: Promise<void> | undefined;
+  private _releaseResponseHook: (() => void) | undefined;
+
+  /** While set, `onChatResponse` does not return until it is cleared. */
+  async setStallResponseHook(value: boolean): Promise<void> {
+    if (value) {
+      this._responseHookGate = new Promise((resolve) => {
+        this._releaseResponseHook = resolve;
+      });
+      return;
+    }
+    this._releaseResponseHook?.();
+    this._responseHookGate = undefined;
+  }
+
+  override async onChatResponse(result: ChatResponseResult): Promise<void> {
     this._responseLog.push(result);
+    await this._responseHookGate;
   }
 
   async getResponseLog(): Promise<ChatResponseResult[]> {
@@ -827,7 +1012,12 @@ export class ThinkClientToolsAgent extends Think {
     if (this._useSlowClientToolStream)
       return createSlowClientToolMockModel(
         this._slowClientToolDelayMs,
-        this._slowClientToolGaps
+        this._slowClientToolGaps,
+        this._slowClientToolFinishReason,
+        (prompt) => {
+          const last = prompt.at(-1) as { role?: string } | undefined;
+          this._slowClientToolPromptTails.push(last?.role ?? "");
+        }
       );
     if (this._useMidStreamParallelToolStream)
       return createMidStreamParallelToolModel(
@@ -835,13 +1025,32 @@ export class ThinkClientToolsAgent extends Think {
         this._midStreamParallelGapsBeforeSlow,
         this._midStreamParallelGapsAfterSlow
       );
-    if (this._useTextOnly) return createTextOnlyMockModel();
+    if (this._useTextOnly)
+      return createTextOnlyMockModel((prompt) => {
+        this._textOnlyPrompts.push(prompt);
+      });
+    if (this._useSequentialApprovalTool)
+      return createSequentialApprovalMockModel();
     if (this._useServerApprovalTool) return createServerApprovalToolMockModel();
     return createClientToolMockModel();
   }
 
   override getTools(): ToolSet {
+    if (this._useSequentialApprovalTool) {
+      return {
+        lookupTrigger: tool({
+          description: "Read the trigger",
+          inputSchema: z.object({}),
+          execute: async () => ({ enabled: false })
+        }),
+        ...this._serverApprovalTools()
+      };
+    }
     if (!this._useServerApprovalTool) return {};
+    return this._serverApprovalTools();
+  }
+
+  private _serverApprovalTools(): ToolSet {
     return {
       updateTrigger: tool({
         description: "Enable or disable a trigger",
@@ -866,8 +1075,42 @@ export class ThinkClientToolsAgent extends Think {
     this._useTextOnly = value;
   }
 
+  /** The prompt of each text-only model call. */
+  async getTextOnlyPromptsForTest(): Promise<unknown[][]> {
+    return this._textOnlyPrompts;
+  }
+
+  /** Each text-only model call's prompt as role/text pairs, oldest first. */
+  async getTextOnlyPromptTextsForTest(): Promise<PromptMessageForTest[][]> {
+    return this._textOnlyPrompts.map((prompt) =>
+      prompt.map(promptMessageForTest)
+    );
+  }
+
+  private _streamParents: Array<string | null> = [];
+
+  protected override _startResumableStream(
+    requestId: string,
+    options?: Parameters<Think["_startResumableStream"]>[1]
+  ): string {
+    const streamId = super._startResumableStream(requestId, options);
+    this._streamParents.push(
+      this["_resumableStream"].getStreamParentMessageId(streamId)
+    );
+    return streamId;
+  }
+
+  /** The parent message each chat stream recorded when it started. */
+  async getStreamParentsForTest(): Promise<Array<string | null>> {
+    return this._streamParents;
+  }
+
   async setServerApprovalToolMode(value: boolean): Promise<void> {
     this._useServerApprovalTool = value;
+  }
+
+  async setSequentialApprovalToolMode(value: boolean): Promise<void> {
+    this._useSequentialApprovalTool = value;
   }
 
   async getServerApprovalToolExecutions(): Promise<number> {
@@ -891,11 +1134,20 @@ export class ThinkClientToolsAgent extends Think {
   async setSlowClientToolStreamMode(
     enabled: boolean,
     delayMs?: number,
-    trailingGaps?: number
+    trailingGaps?: number,
+    finishReason?: "tool-calls" | "stop"
   ): Promise<void> {
     this._useSlowClientToolStream = enabled;
     if (delayMs !== undefined) this._slowClientToolDelayMs = delayMs;
     if (trailingGaps !== undefined) this._slowClientToolGaps = trailingGaps;
+    if (finishReason !== undefined) {
+      this._slowClientToolFinishReason = finishReason;
+    }
+  }
+
+  /** Role of the last prompt message of each slow client-tool model call. */
+  async getSlowClientToolPromptTailsForTest(): Promise<string[]> {
+    return this._slowClientToolPromptTails;
   }
 
   async setMidStreamParallelToolMode(
@@ -1402,6 +1654,38 @@ export class ThinkClientToolsAgent extends Think {
       internal._interactionApplyTail = Promise.resolve();
       internal._autoContinuation.reset();
     }
+  }
+
+  /**
+   * Drive the sub-agent RPC `chat()` entry point and return the streamed
+   * chunks plus the persisted assistant message's metadata (#1873).
+   */
+  async runChatForMetadata(message: string): Promise<{
+    startMetadataJson: string | undefined;
+    metadataJson: string | undefined;
+  }> {
+    const events: Array<Record<string, unknown>> = [];
+    let error: string | undefined;
+    await this.chat(message, {
+      onStart() {},
+      onEvent(json: string) {
+        events.push(JSON.parse(json) as Record<string, unknown>);
+      },
+      onDone() {},
+      onError(e: string) {
+        error = e;
+      }
+    });
+    if (error) throw new Error(error);
+    const messages = (await this.getMessages()) as UIMessage[];
+    const assistant = [...messages]
+      .reverse()
+      .find((m) => m.role === "assistant");
+    const start = events.find((e) => e.type === "start");
+    return {
+      startMetadataJson: JSON.stringify(start?.messageMetadata),
+      metadataJson: JSON.stringify(assistant?.metadata)
+    };
   }
 
   /**

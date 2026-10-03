@@ -562,6 +562,7 @@ it("OutputGate out-of-order", async () => {
 it("OutputGate exception", async () => {
   const gate = new OutputGate();
   let onBroken = gate.onBroken();
+  const secondOnBroken = gate.onBroken();
 
   expect(await poll(gate.wait())).toBe(true);
 
@@ -594,6 +595,7 @@ it("OutputGate exception", async () => {
   // We are marked broken at this point, though.
   expect(await poll(onBroken)).toBe(true);
   await expect(onBroken).rejects.toThrow("foo");
+  await expect(secondOnBroken).rejects.toThrow("foo");
 
   // Fulfill the first blocker (normally, not with an exception).
   expect(await poll(blocker1)).toBe(false);
@@ -1055,4 +1057,24 @@ it("a reentry callback releases its lock when the callback returns control", asy
 
   resume.resolve("done");
   expect(await running).toBe("done");
+});
+
+// ← workerd 275f7b2a4, io-gate-test.c++: sticky notifications retain the latest failure.
+it("OutputGate retains latest exception for future observers", async () => {
+  const gate = new OutputGate();
+  const currentObserver = gate.onBroken();
+  const first = Promise.withResolvers<void>();
+  const second = Promise.withResolvers<void>();
+  const firstBlocker = gate.lockWhile(first.promise);
+  const secondBlocker = gate.lockWhile(second.promise);
+
+  const firstFailure = new Error("first failure");
+  first.reject(firstFailure);
+  await expect(firstBlocker).rejects.toBe(firstFailure);
+  await expect(currentObserver).rejects.toBe(firstFailure);
+
+  const secondFailure = new Error("second failure");
+  second.reject(secondFailure);
+  await expect(secondBlocker).rejects.toBe(secondFailure);
+  await expect(gate.onBroken()).rejects.toBe(secondFailure);
 });

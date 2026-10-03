@@ -1,4 +1,4 @@
-import { env } from "cloudflare:workers";
+import { env, exports } from "cloudflare:workers";
 import {
   AGENT_TOOL_MILESTONE_PART,
   AGENT_TOOL_PROGRESS_PART,
@@ -25,6 +25,9 @@ type ThinkAgentToolTestStub = {
     afterCursor?: AgentToolReplayCursor
   ): Promise<AgentToolStoredChunk[]>;
   inspectAgentToolRun(runId: string): Promise<AgentToolInspection>;
+  broadcastRecoveredAgentToolChunkForTest(
+    eventDelivery: "full" | "terminal"
+  ): Promise<void>;
   seedAgentToolLastErrorForTest(runId: string, error: string): Promise<void>;
   setAgentToolOutputForTest(runId: string, output: unknown): Promise<void>;
   clearAgentToolOutputForTest(runId: string): Promise<void>;
@@ -39,7 +42,7 @@ type ThinkAgentToolTestStub = {
   resetTurnStateForTest(): Promise<void>;
   startAgentToolRun(
     input: unknown,
-    options: { runId: string }
+    options: { runId: string; eventDelivery?: "full" | "terminal" }
   ): ReturnType<ThinkTestAgent["startAgentToolRun"]>;
   cancelAgentToolRun(
     runId: string,
@@ -58,6 +61,27 @@ type ThinkAgentToolTestStub = {
     runId: string,
     requestId: string
   ): Promise<{ running: string | null; unknown: string | null }>;
+  inspectStaleRunReadOnlyForTest(): Promise<{
+    reported: string | undefined;
+    stored: string | undefined;
+  }>;
+  reconcileEvictedErroredRunForTest(): Promise<{
+    before: string | null;
+    assistantText: string;
+    inspection: AgentToolInspection;
+  }>;
+  coldCounterReattachForTest(afterSequence: number): Promise<{
+    liveSequenceAfterDrain: number | undefined;
+    postRestart: { sequence: number; body: string } | null;
+  }>;
+  progressDuringDrainForTest(): Promise<string[]>;
+  skippedChunkReattachForTest(): Promise<
+    Array<{ sequence: number; delta: string; unstored: boolean }>
+  >;
+  broadcastDuringDrainForTest(): Promise<{
+    drained: number[];
+    postRestart: { sequence: number; body: string } | null;
+  }>;
   getDefaultReattachBudgetsForTest(): Promise<{
     noProgressTimeoutMs: number;
     maxWindowIsFinite: boolean;
@@ -92,8 +116,17 @@ type ThinkAgentToolParentStub = DurableObjectStub & {
     progressBody: string,
     milestoneBody: string,
     chunkDelayMs: number,
-    runId?: string
+    runId?: string,
+    eventDelivery?: "full" | "terminal"
   ): Promise<{ result: RunAgentToolResult; events: AgentToolEventMessage[] }>;
+  replayAgentToolEventsForTest(): Promise<AgentToolEventMessage[]>;
+  persistChildMilestoneForTest(
+    runId: string,
+    name: string,
+    data: unknown
+  ): Promise<number>;
+  failNextChildChunkReadForTest(runId: string): Promise<void>;
+  runThinkChildDetachedTerminalForTest(): Promise<string | null>;
   startThinkChildWithoutTailForTest(
     input: string,
     errorText: string,
@@ -529,6 +562,237 @@ describe("Think agent tools", () => {
     expect(chunkBodies).toContain(milestoneBody);
   });
 
+  describe('eventDelivery: "terminal" (#2298)', () => {
+    const progressBody = JSON.stringify({
+      type: AGENT_TOOL_PROGRESS_PART,
+      transient: true,
+      data: { message: "halfway", fraction: 0.5 }
+    });
+    const milestoneBody = JSON.stringify({
+      type: AGENT_TOOL_MILESTONE_PART,
+      data: { name: "phase-1", sequence: 0, at: 1, data: { sources: 2 } }
+    });
+
+    it("forwards only lifecycle events to the parent's clients, live and on replay", async () => {
+      const parent = await freshParent();
+      const runId = crypto.randomUUID();
+
+      const { result, events } =
+        await parent.runThinkChildWithProgressInjectionForTest(
+          "headless parent",
+          progressBody,
+          milestoneBody,
+          10,
+          runId,
+          "terminal"
+        );
+
+      expect(result).toMatchObject({
+        status: "completed",
+        summary: "Hello from the assistant!"
+      });
+      const kinds = events.map((event) => event.event.kind);
+      expect(kinds[0]).toBe("snapshot");
+      expect(kinds.at(-1)).toBe("finished");
+      const chunkBodies = events
+        .filter((event) => event.event.kind === "chunk")
+        .map((event) => (event.event as { body: string }).body);
+      expect(chunkBodies.sort()).toEqual([milestoneBody, progressBody].sort());
+
+      const replayed = await parent.replayAgentToolEventsForTest();
+      const replayedBodies = replayed
+        .filter((event) => event.event.kind === "chunk")
+        .map((event) => (event.event as { body: string }).body);
+      expect(replayed[0]?.event.kind).toBe("collection");
+      expect(
+        replayedBodies.filter(
+          (body) => body !== progressBody && body !== milestoneBody
+        )
+      ).toEqual([]);
+      expect(replayed.at(-1)?.event).toMatchObject({
+        kind: "snapshot",
+        run: { status: "completed" },
+        snapshot: { replay: { chunks: [] } }
+      });
+    });
+
+    it("replays the child's persisted milestones to a fresh connection", async () => {
+      const parent = await freshParent();
+      const runId = crypto.randomUUID();
+      await parent.runThinkChildWithProgressInjectionForTest(
+        "headless parent",
+        progressBody,
+        milestoneBody,
+        10,
+        runId,
+        "terminal"
+      );
+      const sequence = await parent.persistChildMilestoneForTest(
+        runId,
+        "sources-gathered",
+        { sources: 3 }
+      );
+
+      const replayed = await parent.replayAgentToolEventsForTest();
+      const milestones = replayed.flatMap(({ event }) =>
+        event.kind === "snapshot" ? (event.snapshot?.milestones ?? []) : []
+      );
+      expect(milestones).toContainEqual(
+        expect.objectContaining({
+          name: "sources-gathered",
+          sequence,
+          data: { sources: 3 }
+        })
+      );
+      // Reconnect state is atomic: milestone identities remain their own durable
+      // sequences, independent of the parent's snapshot event sequence.
+      const milestoneSequences = milestones.map((m) => m.sequence);
+      expect(new Set(milestoneSequences).size).toBe(milestoneSequences.length);
+      expect(replayed.at(-1)?.event).toMatchObject({
+        kind: "snapshot",
+        run: { status: "completed" },
+        snapshot: { replay: { chunks: [] } }
+      });
+    });
+
+    it("replays persisted milestones when the child's chunk read fails", async () => {
+      const parent = await freshParent();
+      const runId = crypto.randomUUID();
+      await parent.runThinkChildWithProgressInjectionForTest(
+        "headless parent",
+        progressBody,
+        milestoneBody,
+        10,
+        runId,
+        "terminal"
+      );
+      await parent.persistChildMilestoneForTest(runId, "sources-gathered", {
+        sources: 3
+      });
+      await parent.failNextChildChunkReadForTest(runId);
+
+      const replayed = await parent.replayAgentToolEventsForTest();
+      expect(
+        replayed.some(
+          ({ event }) =>
+            event.kind === "snapshot" &&
+            event.snapshot?.milestones?.some(
+              (milestone) => milestone.name === "sources-gathered"
+            )
+        )
+      ).toBe(true);
+      expect(replayed.at(-1)?.event).toMatchObject({
+        kind: "snapshot",
+        run: { status: "completed" },
+        snapshot: { replay: { chunks: [] } }
+      });
+    });
+
+    it("still forwards every chunk by default", async () => {
+      const parent = await freshParent();
+      const { events } = await parent.runThinkChildWithProgressInjectionForTest(
+        "watched parent",
+        progressBody,
+        milestoneBody,
+        10
+      );
+      const chunkBodies = events.flatMap(({ event }) =>
+        event.kind === "chunk"
+          ? [event.body]
+          : event.kind === "snapshot"
+            ? (event.snapshot?.replay?.chunks.map((chunk) => chunk.body) ?? [])
+            : []
+      );
+      expect(
+        chunkBodies.some(
+          (body) => body !== progressBody && body !== milestoneBody
+        )
+      ).toBe(true);
+
+      const replayed = await parent.replayAgentToolEventsForTest();
+      expect(
+        replayed.some((event) => {
+          return (
+            event.event.kind === "snapshot" &&
+            (event.event.snapshot?.replay?.chunks.length ?? 0) > 0
+          );
+        })
+      ).toBe(true);
+    });
+
+    it("rejects terminal delivery for a detached run", async () => {
+      const parent = await freshParent();
+      await expect(
+        parent.runThinkChildDetachedTerminalForTest()
+      ).resolves.toMatch(/not supported for detached runs/);
+    });
+
+    it("stops the child broadcasting its own chunks", async () => {
+      async function chatChunksBroadcast(
+        eventDelivery: "full" | "terminal"
+      ): Promise<number> {
+        const room = crypto.randomUUID();
+        const res = await exports.default.fetch(
+          `http://example.com/agents/think-test-agent/${room}`,
+          { headers: { Upgrade: "websocket" } }
+        );
+        const ws = res.webSocket as WebSocket;
+        ws.accept();
+        let chunks = 0;
+        ws.addEventListener("message", (e: MessageEvent) => {
+          try {
+            const frame = JSON.parse(e.data as string) as {
+              type?: string;
+              body?: string;
+            };
+            if (frame.type === "cf_agent_use_chat_response" && frame.body) {
+              chunks++;
+            }
+          } catch {
+            // Non-JSON frames are not chat chunks.
+          }
+        });
+        const agent = await freshAgent(room);
+        const runId = crypto.randomUUID();
+        await agent.startAgentToolRun("child probe", { runId, eventDelivery });
+        await waitForAgentToolRun(agent, runId);
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        ws.close();
+        return chunks;
+      }
+
+      expect(await chatChunksBroadcast("full")).toBeGreaterThan(0);
+      expect(await chatChunksBroadcast("terminal")).toBe(0);
+    });
+
+    it("keeps suppressing a recovered child's chunks after a restart", async () => {
+      async function recoveredChunksBroadcast(
+        eventDelivery: "full" | "terminal"
+      ): Promise<number> {
+        const room = crypto.randomUUID();
+        const res = await exports.default.fetch(
+          `http://example.com/agents/think-test-agent/${room}`,
+          { headers: { Upgrade: "websocket" } }
+        );
+        const ws = res.webSocket as WebSocket;
+        ws.accept();
+        let chunks = 0;
+        ws.addEventListener("message", (e: MessageEvent) => {
+          const frame = JSON.parse(e.data as string) as { id?: string };
+          if (frame.id === "recovered-request") chunks++;
+        });
+        const agent = await freshAgent(room);
+        await agent.broadcastRecoveredAgentToolChunkForTest(eventDelivery);
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        ws.close();
+        return chunks;
+      }
+
+      expect(await recoveredChunksBroadcast("full")).toBe(1);
+      expect(await recoveredChunksBroadcast("terminal")).toBe(0);
+    });
+  });
+
   it("does not contaminate a run's terminal status with an unrelated turn's error frame (#1575)", async () => {
     const parent = await freshParent();
     const runId = crypto.randomUUID();
@@ -597,6 +861,82 @@ describe("Think agent tools", () => {
 
     expect(resolved.running).toBe(runId);
     expect(resolved.unknown).toBeNull();
+  });
+
+  it("inspects a stale run read-only when asked not to reconcile", async () => {
+    const agent = await freshAgent();
+    expect(await agent.inspectStaleRunReadOnlyForTest()).toEqual({
+      reported: "running",
+      stored: "running"
+    });
+  });
+
+  it("reconciles a child evicted after a stream error as error, not completed", async () => {
+    // The turn broadcast an error chunk and persisted an assistant reply, but
+    // the child was evicted before the finalizer sealed the row `error`.
+    const agent = await freshAgent();
+    const { before, assistantText, inspection } =
+      await agent.reconcileEvictedErroredRunForTest();
+
+    expect(before).toBe("running");
+    expect(assistantText).toContain("Sorry, something went wrong.");
+    expect(inspection).toMatchObject({
+      status: "error",
+      error: "model exploded"
+    });
+  });
+
+  it("realigns a cold live counter when re-attaching after the last stored chunk", async () => {
+    // Parent recovery re-attaches with `afterSequence` = the last stored index,
+    // so nothing drains; a new chunk must still forward past the backlog.
+    const agent = await freshAgent();
+    const { liveSequenceAfterDrain, postRestart } =
+      await agent.coldCounterReattachForTest(2);
+
+    expect(liveSequenceAfterDrain).toBe(3);
+    expect(postRestart).toMatchObject({ sequence: 3 });
+  });
+
+  it("forwards progress and stored chunks exactly once across a tail's drain", async () => {
+    // Progress frames aren't stored, so they must not shift the live numbering
+    // of later stored chunks or be deduped against a stored position.
+    const agent = await freshAgent();
+    const parsed = (await agent.progressDuringDrainForTest()).map(
+      (body) =>
+        JSON.parse(body) as {
+          type: string;
+          delta?: string;
+          data?: { message?: string };
+        }
+    );
+
+    expect(
+      parsed.filter((chunk) => chunk.type === "text-delta").map((c) => c.delta)
+    ).toEqual(["a", "b", "c"]);
+    expect(
+      parsed
+        .filter((chunk) => chunk.type === "data-agent-progress")
+        .map((chunk) => chunk.data?.message)
+    ).toEqual(["during-drain"]);
+  });
+
+  it("keeps stored replay and live numbering separate across an unstored chunk", async () => {
+    const agent = await freshAgent();
+    expect(await agent.skippedChunkReattachForTest()).toEqual([
+      { sequence: 0, delta: "a", unstored: false },
+      { sequence: 1, delta: "b", unstored: false },
+      { sequence: 2, delta: "c", unstored: false },
+      { sequence: 4, delta: "<oversized>", unstored: true },
+      { sequence: 5, delta: "d", unstored: false }
+    ]);
+  });
+
+  it("forwards a chunk broadcast while a cold re-attach drains", async () => {
+    const agent = await freshAgent();
+    const { drained, postRestart } = await agent.broadcastDuringDrainForTest();
+
+    expect(drained).toEqual([0, 1, 2]);
+    expect(postRestart).toMatchObject({ sequence: 3 });
   });
 
   it("keeps a completed Think child's stored chunks for a parent attaching afterwards", async () => {
