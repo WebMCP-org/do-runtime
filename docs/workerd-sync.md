@@ -1,8 +1,11 @@
 # workerd sync: October 2, 2026
 
-The oracle is now pinned to `v1.20261002.1`
-([`51a48a5bb786`](https://github.com/cloudflare/workerd/tree/51a48a5bb7863fbeab791358bee8dff22c3ce83f)),
-with Workers types `5.20261002.1`. The September audit below records the prior
+The oracle is now pinned to `v1.20261009.1`
+([`a3985499a5f7`](https://github.com/cloudflare/workerd/tree/a3985499a5f7820cf72f39aba486120383e6580c)),
+with Workers types `5.20261009.1`; the audit of that range is pending. The
+previous pin was `v1.20261002.1`
+([`51a48a5bb786`](https://github.com/cloudflare/workerd/tree/51a48a5bb7863fbeab791358bee8dff22c3ce83f)).
+The September audit below records the prior
 behavioral baseline; the October audit covers the previously unaudited
 [`v1.20260907.1...v1.20261002.1`](https://github.com/cloudflare/workerd/compare/v1.20260907.1...v1.20261002.1)
 range.
