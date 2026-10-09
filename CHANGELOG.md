@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.11.0
+
+### Minor Changes
+
+- 33c5f26: Align the runtime with workerd 1.20261009.1: untraced tracing spans now support
+  `spanContext()`, returning workerd's all-zero span identity. Pin the conformance
+  oracle and Workers types to the October 9 release.
+
 ## 0.10.0
 
 ### Minor Changes
