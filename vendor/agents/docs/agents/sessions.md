@@ -242,7 +242,23 @@ await session.addCompaction(summary, fromMessageId, toMessageId);
 
 Sessions stamps each message with a token estimate when the row is written. `compactAfter()` gates on that O(1) aggregate and never reads the transcript to decide whether to compact. Auto-compaction failures are non-fatal: they log, emit `session:error`, and leave the transcript alone.
 
-To trim a transcript before handing it to a model, `truncateOlderMessages` is exported from [`agents/chat`](./chat-agents.md), not from `agents/sessions`.
+To trim a transcript before handing it to a model, `truncateOlderMessages` is exported from [`agents/chat`](./chat-agents.md), not from `agents/sessions`. If your tools define `toModelOutput`, a truncated tool output may no longer match the tool's output schema. In that case, pass `toolOutputs: false` to `truncateOlderMessages` and call `truncateOlderToolResults` on the result of `convertToModelMessages`, which truncates what the model reads after `toModelOutput` has run. Provider-executed tool outputs are never truncated.
+
+With the default `keepRecent`, the truncation cutoff moves forward by one message whenever a message is added, so every turn rewrites a message near the end of the prompt and invalidates the provider's prompt cache from that point. To keep the prefix stable, move the cutoff in steps and pass the same `keepRecent` to both functions:
+
+```ts
+const step = 8;
+const keepRecent = history.length <= 4 ? 4 : 4 + ((history.length - 4) % step);
+const truncated = truncateOlderMessages(history, {
+  keepRecent,
+  toolOutputs: false
+});
+const modelMessages = truncateOlderToolResults(
+  await convertToModelMessages(truncated, { tools }),
+  truncated,
+  { keepRecent }
+);
+```
 
 ## Large messages
 
@@ -344,6 +360,25 @@ const unsubscribe = sessions.subscribe(async (event) => {
 ```
 
 `import` fires once per `importMessage()` and carries the row; it is deliberately not an `append`, so a projection does not patch itself per imported row during a migration — it marks itself stale and re-derives once. `compaction` fires when an overlay is stored directly through `addCompaction()`; `compact()` reports its own overlay as `compact`.
+
+A host that keeps an in-memory transcript does not need to write that reduction itself. `session.mirror()` subscribes for one session and patches an array in place: an append or update replaces the entry with the same id (or pushes a new row), a delete filters, and a clear empties it:
+
+```ts
+const stop = sessions.session("").mirror<UIMessage>({
+  get: () => this.messages,
+  set: (messages) => {
+    this.messages = messages;
+  },
+  transform: (message) => toCachedMessage(message),
+  intercept: async (event) => {
+    if (event.type !== "compact") return false;
+    this.messages = await reloadFromStorage();
+    return true;
+  }
+});
+```
+
+`get()` is read on every event, so reassigning the array is safe. `intercept` handles an event instead of the default reduction. Use it for changes an in-place patch cannot express, such as a branch append or a compaction. `onApplied` runs after an append or update was written, with the entry it replaced.
 
 This is a local cache-coherence feed, not a cross-object event log. Capability diagnostics are also emitted through Lifecycle observability.
 

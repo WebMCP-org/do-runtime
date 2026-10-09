@@ -7,8 +7,11 @@
     "src/voice/tests/**/*.ts",
     "src/voice/react-tests/**/*.ts",
     "src/voice/react-tests/**/*.tsx",
+    "src/harness/opencode/tests/**/*.ts",
     "src/harness/pi/tests/**/*.ts",
-    "src/channels/__tests__/**/*.ts",
-    "src/channels/live-tests/**/*.ts"
+    "src/harness/think/tests/**/*.ts",
+    "src/harness/container/tests/**/*.ts",
+    "src/harness/container/runtime/tests/**/*.ts",
+    "src/experimental/channels/__tests__/**/*.ts"
   ]
 }

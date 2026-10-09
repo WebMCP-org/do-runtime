@@ -350,6 +350,10 @@ export class Streams extends LifecycleCapability {
         continue;
       }
 
+      // The yield above was a suspension point: appends made while the
+      // consumer held the batch woke no waiter, so re-poll before sleeping.
+      if (rows.length > 0) continue;
+
       // Live tail: wait for the next append or settlement, then re-poll.
       // Wakeups carry no data, so there is nothing to buffer or dedupe.
       await this.#waitForWakeup(streamId, signal);
@@ -657,7 +661,7 @@ export class Streams extends LifecycleCapability {
         for (const hook of this.#deleteHooks) hook(row, cursor);
       }
     }
-    if (this.#legacyChunkTable) {
+    if (this.#legacyTableLive()) {
       // Unfolded v1 rows die with the stream; no point folding them first.
       this.#sql`DELETE FROM cf_agents_stream_chunks WHERE stream_id = ${streamId}`;
       this.#dropLegacyChunkTableIfEmpty();
@@ -910,7 +914,7 @@ export class Streams extends LifecycleCapability {
    * per chunk. The table is dropped once the last stream's rows are gone.
    */
   #foldLegacyChunks(streamId: string): void {
-    if (!this.#legacyChunkTable) return;
+    if (!this.#legacyTableLive()) return;
     this.lifecycle.storage.transactionSync(() => {
       const tail = this.#sql<{ block: number; seq_to: number }>`
         SELECT block, seq_to FROM cf_agents_stream_blocks
@@ -969,6 +973,19 @@ export class Streams extends LifecycleCapability {
       }
       this.#dropLegacyChunkTableIfEmpty();
     });
+  }
+
+  /**
+   * Whether the v1 chunk table is still there. The flag is per instance,
+   * but the table is per object: another Streams instance on the same
+   * storage (a host's own, beside a harness's) may have folded the last v1
+   * rows and dropped it. Recheck before use while the flag says it exists.
+   */
+  #legacyTableLive(): boolean {
+    if (!this.#legacyChunkTable) return false;
+    if (this.#hasLegacyChunkTable()) return true;
+    this.#legacyChunkTable = false;
+    return false;
   }
 
   #hasLegacyChunkTable(): boolean {

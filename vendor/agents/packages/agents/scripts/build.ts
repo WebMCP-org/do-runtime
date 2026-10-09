@@ -3,6 +3,7 @@ import { globSync } from "glob";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { copyPackageDocs } from "../../../scripts/copy-package-docs";
 import { formatDeclarationFiles } from "../../../scripts/format-declarations";
+import { buildDaemon } from "./build-daemon";
 
 const entries = [
   "src/*.ts",
@@ -10,7 +11,14 @@ const entries = [
   "src/skills/index.ts",
   "src/skills/compile.ts",
   "src/lifecycle/index.ts",
+  "src/harness/ai-sdk/index.ts",
+  "src/harness/opencode/index.ts",
   "src/harness/pi/index.ts",
+  "src/harness/think/index.ts",
+  "src/harness/container/index.ts",
+  "src/harness/container/daemon/index.ts",
+  "src/harness/container/runtime/index.ts",
+  "src/harness/store/index.ts",
   "src/routing/index.ts",
   "src/chat/index.ts",
   "src/chat/transport.ts",
@@ -23,6 +31,7 @@ const entries = [
   "src/mcp/client/x402.ts",
   "src/observability/index.ts",
   "src/models/ai-sdk/index.ts",
+  "src/models/opencode/index.ts",
   "src/models/pi-ai/index.ts",
   "src/observability/ai/index.ts",
   "src/queue/index.ts",
@@ -39,6 +48,10 @@ const entries = [
   "src/browser/ai.ts",
   "src/browser/ai-sdk.ts",
   "src/browser/tanstack-ai.ts",
+  "src/websearch/index.ts",
+  "src/websearch/tools/pi.ts",
+  "src/websearch/tools/ai-sdk.ts",
+  "src/websearch/tools/tanstack-ai.ts",
   "src/experimental/webmcp.ts",
   "src/voice/index.ts",
   "src/voice/types.ts",
@@ -48,13 +61,13 @@ const entries = [
   "src/voice/workers-ai.ts",
   "src/voice/sfu.ts",
   "src/voice/text.ts",
-  "src/channels/index.ts",
-  "src/channels/email.ts",
-  "src/channels/slack.ts",
-  "src/channels/telegram.ts",
-  "src/channels/voice.ts",
-  "src/channels/ai-sdk.ts",
-  "src/channels/tanstack-ai.ts"
+  "src/experimental/channels/index.ts",
+  "src/experimental/channels/email/index.ts",
+  "src/experimental/channels/slack/index.ts",
+  "src/experimental/channels/telegram/index.ts",
+  "src/experimental/channels/web/index.ts",
+  "src/experimental/channels/web/client.ts",
+  "src/experimental/channels/web/ai-sdk.ts"
 ];
 
 for (const entry of entries) {
@@ -87,6 +100,9 @@ function injectSkillsTypeReference(): void {
 }
 
 async function main() {
+  // Embedded in agents/harness/container, so it must exist first.
+  await buildDaemon();
+
   await build({
     clean: true,
     dts: true,
@@ -97,6 +113,28 @@ async function main() {
     format: "esm",
     outputOptions: { keepNames: true },
     sourcemap: true,
+    fixedExtension: false
+  });
+
+  // The CLI is self-contained: its dependencies are devDependencies bundled
+  // here, so installing `agents` pulls in none of them.
+  await build({
+    clean: false,
+    dts: false,
+    platform: "node",
+    target: "node22",
+    entry: { cli: "src/cli/index.ts" },
+    deps: {
+      onlyBundle: [
+        "@earendil-works/pi-tui",
+        "highlight.js",
+        "marked",
+        "get-east-asian-width"
+      ]
+    },
+    format: "esm",
+    minify: true,
+    banner: "#!/usr/bin/env node",
     fixedExtension: false
   });
 

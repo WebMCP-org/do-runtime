@@ -1,0 +1,93 @@
+import type {
+  ChannelMessage,
+  DeliveryResult,
+  ParticipantResult
+} from "./channel";
+import type { ChannelIngressResult } from "./ingress";
+import type { Participant } from "./protocol";
+
+const textEncoder = new TextEncoder();
+
+export function encodeUtf8(value: string): Uint8Array<ArrayBuffer> {
+  return textEncoder.encode(value);
+}
+
+export function utf8ByteLength(value: string): number {
+  return encodeUtf8(value).byteLength;
+}
+
+export function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+export function defaultText(message: ChannelMessage): string {
+  return message.title
+    ? `${message.title}\n\n${message.markdown}`
+    : message.markdown;
+}
+
+export function renderInput(input: unknown): string {
+  if (typeof input === "string") return input;
+  try {
+    return JSON.stringify(input, null, 2) ?? String(input);
+  } catch {
+    return String(input);
+  }
+}
+
+export function uncertain(
+  code: string,
+  message: string,
+  reference?: string
+): Extract<DeliveryResult, { status: "uncertain" }> {
+  return {
+    status: "uncertain",
+    ...(reference !== undefined && { reference }),
+    error: { code, message }
+  };
+}
+
+export function emptyIngressResponse<TRaw>(
+  status = 200
+): ChannelIngressResult<TRaw> {
+  return { events: [], response: new Response(null, { status }) };
+}
+
+export function unsupported(
+  code: string,
+  message: string
+): Extract<DeliveryResult, { status: "failed" }> {
+  return {
+    status: "failed",
+    retryable: false,
+    error: { code, message }
+  };
+}
+
+/** The agent object of a participant's own, namespaced so app routes cannot collide. */
+export function participantRoute(participant: Participant): string {
+  return `participant:${participant.id}`;
+}
+
+/** Check what an application's `participant` callback returned. */
+export function toParticipant(
+  result: ParticipantResult,
+  source: string
+): Participant | null {
+  if (result === null) return null;
+  if (typeof result === "string") {
+    if (result.length > 0) return { id: result };
+  } else if (
+    isRecord(result) &&
+    typeof result.id === "string" &&
+    result.id.length > 0 &&
+    (result.name === undefined || typeof result.name === "string")
+  ) {
+    return result.name === undefined
+      ? { id: result.id }
+      : { id: result.id, name: result.name };
+  }
+  throw new Error(
+    `${source} participant must return a non-empty id, a participant, or null`
+  );
+}
