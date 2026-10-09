@@ -2,13 +2,13 @@
 
 Upstream: <https://github.com/cloudflare/agents>
 
-Release pin: `agents@0.26.0`
-(`74570a19aafc676dd85831a31af047817e7bba12`).
+Release pin: `agents@0.27.0`
+(`e335186331f99be12609a5eb0c64c7863c3ccafd`).
 
-The package versions match the 0.26 release:
+The package versions match the 0.27 release:
 
-- `agents@0.26.0`
-- `@cloudflare/think@0.20.0`
+- `agents@0.27.0`
+- `@cloudflare/think@0.20.1`
 - `@cloudflare/ai-chat@0.12.1`
 - `@cloudflare/voice@0.5.0`
 - `@cloudflare/shell@0.4.3`

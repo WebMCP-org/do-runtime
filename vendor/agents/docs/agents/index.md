@@ -58,7 +58,6 @@ The differentiator is not "we have durable state" — it is what happens when a 
 - [Push Notifications](./push-notifications.md) - Browser push notifications via Web Push API and scheduled delivery
 - TODO: [SMS](./sms.md) - Text message integration (Twilio, etc.)
 - [Voice Agents](./voice.md) - Build voice agents with real-time speech-to-text, text-to-speech, and conversation persistence
-- [Channels](./channels.md) - Send and receive messages through Slack, Telegram, email, browser voice, or custom adapters
 - [Chat SDK State](./chat-sdk.md) - Store Chat SDK subscriptions, locks, queues, and history in Agents sub-agents
 
 ## Background Processing
@@ -79,6 +78,10 @@ The differentiator is not "we have durable state" — it is what happens when a 
 - [Agent Tools](./agent-tools.md) - Run chat-capable sub-agents as tools with streaming child timelines
 - [Server-Driven Messages](./server-driven-messages.md) - Autonomous agent workflows: scheduled follow-ups, queue processing, webhooks, chained reasoning
 - TODO: [Using AI Models](./using-ai-models.md) - OpenAI, Anthropic, Workers AI, and other providers
+- [Models (Experimental)](./models.md) - `createAI` — one AI SDK provider for Workers AI and third-party catalog models, same string space
+- [Models for pi-ai (Beta)](./models-pi-ai.md) - `createAI` for pi-ai: Workers AI ids and third-party models through AI Gateway, as a pi-ai provider
+- [Pi harness (Beta)](./harnesses/pi.md) - Host pi-durable sessions in a Durable Object with durable storage and lifecycle wakeups
+- [Think harness (Experimental)](./harnesses/think.md) - Run Think's agent loop as a Lifecycle capability, with transcripts in Sessions, output in Streams, and turns that survive eviction
 - TODO: [RAG (Retrieval Augmented Generation)](./rag.md) - Vector search with Vectorize
 - [Sessions (Experimental)](./sessions.md) - Durable message trees, streamed history, compaction, search, and lossless attachment offload
 - [Context (Experimental)](./context.md) - System-prompt blocks, frozen prompts, writable/searchable/loadable providers, and their tools
@@ -125,6 +128,7 @@ The differentiator is not "we have durable state" — it is what happens when a 
 ## Compute Environments
 
 - [Browse the Web (Experimental)](./browse-the-web.md) - Full CDP access for web inspection, scraping, and debugging
+- [Search the Web (Beta)](./search-the-web.md) - A `websearch` tool over Cloudflare's Web Search API for the pi harness, the AI SDK, and TanStack AI
 - TODO: [Cloudflare Sandboxes](./sandboxes.md) - Isolated environments for coding agents, ffmpeg, and heavy compute
 
 ## Advanced Topics

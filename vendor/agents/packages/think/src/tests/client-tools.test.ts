@@ -15,6 +15,7 @@ const MSG_MESSAGE_UPDATED = "cf_agent_message_updated";
 const MSG_STREAM_RESUME_REQUEST = "cf_agent_stream_resume_request";
 const MSG_STREAM_RESUME_NONE = "cf_agent_stream_resume_none";
 const MSG_STREAM_RESUMING = "cf_agent_stream_resuming";
+const MSG_STREAM_PENDING = "cf_agent_stream_pending";
 
 // ── Helpers ──────────────────────────────────────────────────────
 
@@ -3071,6 +3072,80 @@ describe("resume coordination during pending continuation", () => {
     await closeWS(ws);
   });
 
+  it("releases a held STREAM_RESUME_REQUEST when the continuation fails before streaming", async () => {
+    const room = crypto.randomUUID();
+    const agent = await freshAgent(room);
+    const { ws } = await connectWS(room);
+    await delay(100);
+
+    const userMsg: UIMessage = {
+      id: "msg-resume-fail-user",
+      role: "user",
+      parts: [{ type: "text", text: "hi" }]
+    } as UIMessage;
+
+    const initialDone = waitForDone(ws, 10000);
+    ws.send(
+      JSON.stringify({
+        type: MSG_CHAT_REQUEST,
+        id: "req-resume-fail",
+        init: {
+          method: "POST",
+          body: JSON.stringify({ messages: [userMsg] })
+        }
+      })
+    );
+    await initialDone;
+
+    await agent.persistToolCallMessage([
+      userMsg,
+      {
+        id: "assistant-resume-fail",
+        role: "assistant",
+        parts: [
+          {
+            type: "tool-client_action",
+            toolCallId: "tc-resume-fail",
+            state: "input-available",
+            input: { action: "test" }
+          }
+        ]
+      } as unknown as UIMessage
+    ]);
+
+    // Park the continuation before its stream starts, so the resume request
+    // is held against it rather than racing the failure.
+    await agent.setFailContinuationBeforeStream(true);
+    await agent.holdContinuationStartForTest();
+    ws.send(
+      JSON.stringify({
+        type: MSG_TOOL_RESULT,
+        toolCallId: "tc-resume-fail",
+        toolName: "client_action",
+        output: "done",
+        autoContinue: true
+      })
+    );
+    await waitUntil(() => agent.isContinuationStartHeldForTest(), 8000);
+
+    const pendingPromise = waitForMessageOfType(ws, MSG_STREAM_PENDING, 3000);
+    ws.send(
+      JSON.stringify({
+        type: MSG_STREAM_RESUME_REQUEST,
+        probeId: "probe-failed-continuation"
+      })
+    );
+    await pendingPromise;
+
+    // Without STREAM_RESUME_NONE the client keeps waiting for a stream that
+    // never starts.
+    const nonePromise = waitForMessageOfType(ws, MSG_STREAM_RESUME_NONE, 3000);
+    await agent.releaseContinuationStartForTest();
+    expect(await nonePromise).toMatchObject({ type: MSG_STREAM_RESUME_NONE });
+
+    await closeWS(ws);
+  });
+
   it("correlates idle STREAM_RESUME_NONE after a continuation completes", async () => {
     const room = crypto.randomUUID();
     const agent = await freshAgent(room);
@@ -3240,6 +3315,104 @@ describe("deferred continuation", () => {
 
     await closeWS(ws);
   });
+});
+
+// ── Chained client tools (#2443) ─────────────────────────────────
+
+describe("Think — chained client tools across continuations (#2443)", () => {
+  type ChainAgent = Awaited<ReturnType<typeof freshAgent>>;
+
+  function sendToolResult(ws: WebSocket, toolCallId: string, output: string) {
+    ws.send(
+      JSON.stringify({
+        type: MSG_TOOL_RESULT,
+        toolCallId,
+        toolName: "client_action",
+        output,
+        autoContinue: true
+      })
+    );
+  }
+
+  async function waitForIdle(agent: ChainAgent) {
+    await waitUntil(async () => !(await agent.isChatTurnActiveForTest()), 8000);
+  }
+
+  // The user turn ends on `tc-chain-1`, waiting for the client.
+  async function startChain(agent: ChainAgent, room: string) {
+    await agent.setChainedClientToolMode(true);
+    const { ws } = await connectWS(room);
+    await collectMessages(ws, 3);
+    sendChatRequest(ws, [makeUserMessage("do two steps")], {
+      clientTools: [{ name: "client_action", description: "A client tool" }]
+    });
+    await waitUntil(
+      async () => (await agent.getChainedModelCallsForTest()).length === 1
+    );
+    await waitForIdle(agent);
+    return ws;
+  }
+
+  // A fast client tool answers `tc-chain-2` while the continuation that
+  // called it still streams, and the coalesce timer fires only after that
+  // turn has settled: the ordering that stalled the chat.
+  async function answerMidStreamThenSettle(agent: ChainAgent, ws: WebSocket) {
+    await waitUntil(() => agent.isChainedStreamHeldForTest(), 8000);
+    await agent.holdCoalesceTimerForTest();
+    sendToolResult(ws, "tc-chain-2", "step two");
+    await waitUntil(
+      async () => (await agent.getContinuationSlotsForTest()).pending
+    );
+    await agent.releaseChainedStreamForTest();
+    await waitForIdle(agent);
+    await agent.releaseCoalesceTimerForTest();
+  }
+
+  async function expectOneContinuationPerStep(agent: ChainAgent) {
+    await waitUntil(
+      async () => (await agent.getChainedModelCallsForTest()).length >= 3,
+      4000
+    );
+    await waitForIdle(agent);
+    await delay(200);
+    expect(await agent.getChainedModelCallsForTest()).toEqual([0, 1, 2]);
+  }
+
+  it("runs the next continuation when a client tool result lands while a continuation streams", async () => {
+    const room = crypto.randomUUID();
+    const agent = await freshAgent(room);
+    const ws = await startChain(agent, room);
+    sendToolResult(ws, "tc-chain-1", "step one");
+
+    await answerMidStreamThenSettle(agent, ws);
+
+    await expectOneContinuationPerStep(agent);
+    await closeWS(ws);
+  }, 30000);
+
+  it("runs one continuation, not two, when a result was also deferred before the stream", async () => {
+    const room = crypto.randomUUID();
+    const agent = await freshAgent(room);
+    const ws = await startChain(agent, room);
+
+    // A second result for `tc-chain-1` lands after the first continuation
+    // took its pending but before its stream starts, so it is deferred.
+    await agent.holdContinuationStartForTest();
+    sendToolResult(ws, "tc-chain-1", "step one");
+    await waitUntil(() => agent.isContinuationStartHeldForTest(), 8000);
+    sendToolResult(ws, "tc-chain-1", "step one (retried)");
+    await waitUntil(
+      async () => (await agent.getContinuationSlotsForTest()).deferred
+    );
+    await agent.releaseContinuationStartForTest();
+
+    await answerMidStreamThenSettle(agent, ws);
+
+    // The next continuation covers the deferred result; running it too
+    // would call the model again with a transcript ending in text.
+    await expectOneContinuationPerStep(agent);
+    await closeWS(ws);
+  }, 30000);
 });
 
 // ── onChatResponse from WebSocket path ───────────────────────────

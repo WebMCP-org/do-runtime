@@ -426,6 +426,12 @@ class Span {
     if (token !== SPAN_CONSTRUCTION) throw new TypeError("Illegal constructor");
   }
 
+  // ← workerd ec93d7032: a no-op span has no identity, so it answers the all-zero
+  // (invalid, never propagated) context, as a fresh object that survives end().
+  spanContext(): TracingSpanContext {
+    return { traceId: "0".repeat(32), spanId: "0".repeat(16), traceFlags: 0 };
+  }
+
   setAttribute(_name: string, _value: unknown): this {
     return this;
   }
