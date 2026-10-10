@@ -187,24 +187,49 @@ export function buildTar(entries: Array<TarInputEntry>): Uint8Array {
   return concatBytes(chunks);
 }
 
-export function listTar(bytes: Uint8Array): StateArchiveEntry[] {
-  return parseTar(bytes)
-    .map((entry) => ({
-      path: entry.path,
-      type: entry.type,
-      size: entry.size
-    }))
-    .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+export type ArchiveEntry = {
+  path: string;
+  type: "file" | "directory";
+  bytes: Uint8Array;
+};
+
+/**
+ * Reads every entry of a tar, gzip-compressed tar or ZIP archive, chosen by
+ * its leading bytes. Anything else, and any entry that fails its integrity
+ * check, rejects before a caller writes a single entry.
+ */
+export async function readArchive(
+  path: string,
+  bytes: Uint8Array
+): Promise<ArchiveEntry[]> {
+  if (startsWithBytes(bytes, GZIP_MAGIC)) {
+    const tar = await gunzipBytes(bytes);
+    if (!isTar(tar)) {
+      throw new Error(
+        `${path} is gzip-compressed but does not contain a tar archive`
+      );
+    }
+    return parseTar(path, tar);
+  }
+  if (
+    startsWithBytes(bytes, ZIP_LOCAL_MAGIC) ||
+    startsWithBytes(bytes, ZIP_EMPTY_MAGIC)
+  ) {
+    return parseZip(path, bytes);
+  }
+  if (isTar(bytes)) {
+    return parseTar(path, bytes);
+  }
+  const known = KNOWN_NON_ARCHIVES.find(([magic]) =>
+    startsWithBytes(bytes, magic)
+  );
+  throw new Error(
+    `${path} is ${known ? `${known[1]}, not` : "not"} a tar, gzip-compressed tar or ZIP archive`
+  );
 }
 
-export function extractTar(
-  bytes: Uint8Array
-): Array<{ path: string; type: "file" | "directory"; bytes?: Uint8Array }> {
-  return parseTar(bytes).map((entry) =>
-    entry.type === "file"
-      ? { path: entry.path, type: entry.type, bytes: entry.bytes }
-      : { path: entry.path, type: entry.type }
-  );
+export function describeArchiveEntry(entry: ArchiveEntry): StateArchiveEntry {
+  return { path: entry.path, type: entry.type, size: entry.bytes.byteLength };
 }
 
 export type TarInputEntry =
@@ -506,37 +531,217 @@ function createTarHeader(entry: TarInputEntry): Uint8Array {
   return header;
 }
 
-function parseTar(bytes: Uint8Array): Array<{
-  path: string;
-  type: "file" | "directory";
-  size: number;
-  bytes: Uint8Array;
-}> {
-  const entries: Array<{
-    path: string;
-    type: "file" | "directory";
-    size: number;
-    bytes: Uint8Array;
-  }> = [];
+const GZIP_MAGIC = [0x1f, 0x8b];
+const ZIP_LOCAL_MAGIC = [0x50, 0x4b, 0x03, 0x04];
+const ZIP_EMPTY_MAGIC = [0x50, 0x4b, 0x05, 0x06];
+const KNOWN_NON_ARCHIVES: Array<[number[], string]> = [
+  [[0x25, 0x50, 0x44, 0x46], "a PDF document"],
+  [
+    [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1],
+    "a legacy Office (OLE) document"
+  ],
+  [[0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c], "a 7z archive"],
+  [[0x52, 0x61, 0x72, 0x21], "a RAR archive"],
+  [[0x42, 0x5a, 0x68], "a bzip2 file"],
+  [[0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00], "an xz file"],
+  [[0x28, 0xb5, 0x2f, 0xfd], "a Zstandard file"]
+];
+
+function startsWithBytes(bytes: Uint8Array, magic: number[]): boolean {
+  return (
+    bytes.byteLength >= magic.length &&
+    magic.every((byte, index) => bytes[index] === byte)
+  );
+}
+
+/** A tar stream opens with a checksummed header, or with the zero end block. */
+function isTar(bytes: Uint8Array): boolean {
+  if (bytes.byteLength < 512) return false;
+  const header = bytes.subarray(0, 512);
+  return header.every((byte) => byte === 0) || tarChecksumMatches(header);
+}
+
+/** POSIX sums unsigned bytes; some historic writers summed signed ones. */
+function tarChecksumMatches(header: Uint8Array): boolean {
+  const stored = readOctal(header, 148, 8);
+  let unsigned = 0;
+  let signed = 0;
+  for (let index = 0; index < 512; index++) {
+    const byte = index >= 148 && index < 156 ? 32 : header[index];
+    unsigned += byte;
+    signed += byte > 127 ? byte - 256 : byte;
+  }
+  return stored === unsigned || stored === signed;
+}
+
+function parseTar(archivePath: string, bytes: Uint8Array): ArchiveEntry[] {
+  const entries: ArchiveEntry[] = [];
   let offset = 0;
   while (offset + 512 <= bytes.byteLength) {
     const header = bytes.subarray(offset, offset + 512);
     if (header.every((byte) => byte === 0)) break;
+    if (!tarChecksumMatches(header)) {
+      throw new Error(
+        `${archivePath}: tar header at byte ${offset} fails its checksum`
+      );
+    }
     const path = readAscii(header, 0, 100);
     const size = readOctal(header, 124, 12);
     const typeFlag = String.fromCharCode(header[156] || 48);
     const type = typeFlag === "5" ? "directory" : "file";
     offset += 512;
-    const body = bytes.subarray(offset, offset + size);
+    if (offset + size > bytes.byteLength) {
+      throw new Error(`${archivePath}: tar entry ${path} is truncated`);
+    }
     entries.push({
       path,
       type,
-      size,
-      bytes: new Uint8Array(body)
+      bytes: new Uint8Array(bytes.subarray(offset, offset + size))
     });
     offset += Math.ceil(size / 512) * 512;
   }
   return entries;
+}
+
+const ZIP_LOCAL_SIGNATURE = 0x04034b50;
+const ZIP_CENTRAL_SIGNATURE = 0x02014b50;
+const ZIP_END_SIGNATURE = 0x06054b50;
+const ZIP64_END_LOCATOR_SIGNATURE = 0x07064b50;
+const ZIP_END_LENGTH = 22;
+
+/**
+ * Reads entries through the central directory, which carries final sizes and
+ * CRCs even when an archiver streamed them into trailing data descriptors.
+ */
+async function parseZip(
+  archivePath: string,
+  bytes: Uint8Array
+): Promise<ArchiveEntry[]> {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const u16 = (offset: number) => view.getUint16(offset, true);
+  const u32 = (offset: number) => view.getUint32(offset, true);
+  const end = findZipEnd(view);
+  if (end === -1) {
+    throw new Error(
+      `${archivePath}: ZIP end of central directory not found; the archive is truncated`
+    );
+  }
+  const count = u16(end + 10);
+  const centralOffset = u32(end + 16);
+  if (
+    count === 0xffff ||
+    centralOffset === 0xffffffff ||
+    (end >= 20 && u32(end - 20) === ZIP64_END_LOCATOR_SIGNATURE)
+  ) {
+    throw new Error(`${archivePath}: ZIP64 archives are not supported`);
+  }
+  if (u16(end + 4) !== 0 || u16(end + 6) !== 0) {
+    throw new Error(
+      `${archivePath}: multi-disk ZIP archives are not supported`
+    );
+  }
+
+  const entries: ArchiveEntry[] = [];
+  let cursor = centralOffset;
+  for (let index = 0; index < count; index++) {
+    if (cursor + 46 > end || u32(cursor) !== ZIP_CENTRAL_SIGNATURE) {
+      throw new Error(`${archivePath}: ZIP central directory is corrupt`);
+    }
+    const flags = u16(cursor + 8);
+    const method = u16(cursor + 10);
+    const crc = u32(cursor + 16);
+    const compressedSize = u32(cursor + 20);
+    const size = u32(cursor + 24);
+    const nameLength = u16(cursor + 28);
+    const localOffset = u32(cursor + 42);
+    const name = decodeText(
+      bytes.subarray(cursor + 46, cursor + 46 + nameLength)
+    );
+    cursor += 46 + nameLength + u16(cursor + 30) + u16(cursor + 32);
+
+    if (name.endsWith("/")) {
+      entries.push({
+        path: name.slice(0, -1),
+        type: "directory",
+        bytes: new Uint8Array()
+      });
+      continue;
+    }
+    const entryError = (problem: string) =>
+      new Error(`${archivePath}: ZIP entry ${name} ${problem}`);
+    if (flags & 0x1) throw entryError("is encrypted");
+    if (method !== 0 && method !== 8) {
+      throw entryError(
+        `uses compression method ${method}; only stored (0) and deflate (8) are supported`
+      );
+    }
+    if (
+      localOffset + 30 > bytes.byteLength ||
+      u32(localOffset) !== ZIP_LOCAL_SIGNATURE
+    ) {
+      throw entryError("has no local header");
+    }
+    const dataStart =
+      localOffset + 30 + u16(localOffset + 26) + u16(localOffset + 28);
+    if (dataStart + compressedSize > bytes.byteLength) {
+      throw entryError("is truncated");
+    }
+    const data = bytes.subarray(dataStart, dataStart + compressedSize);
+    let content: Uint8Array;
+    try {
+      content =
+        method === 8
+          ? await transformBytes(data, new DecompressionStream("deflate-raw"))
+          : new Uint8Array(data);
+    } catch (error) {
+      throw entryError(
+        `could not be inflated: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+    if (content.byteLength !== size) {
+      throw entryError(
+        `holds ${content.byteLength} bytes; its directory record says ${size}`
+      );
+    }
+    if (crc32(content) !== crc) throw entryError("failed its CRC-32 check");
+    entries.push({ path: name, type: "file", bytes: content });
+  }
+  return entries;
+}
+
+/** The end record sits last, followed only by an archive comment of up to 64 KiB. */
+function findZipEnd(view: DataView): number {
+  const last = view.byteLength - ZIP_END_LENGTH;
+  for (let offset = last; offset >= Math.max(0, last - 0xffff); offset--) {
+    if (
+      view.getUint32(offset, true) === ZIP_END_SIGNATURE &&
+      offset + ZIP_END_LENGTH + view.getUint16(offset + 20, true) <=
+        view.byteLength
+    ) {
+      return offset;
+    }
+  }
+  return -1;
+}
+
+let crc32Table: Uint32Array | undefined;
+
+function crc32(bytes: Uint8Array): number {
+  if (!crc32Table) {
+    crc32Table = new Uint32Array(256);
+    for (let index = 0; index < 256; index++) {
+      let value = index;
+      for (let bit = 0; bit < 8; bit++) {
+        value = value & 1 ? (value >>> 1) ^ 0xedb88320 : value >>> 1;
+      }
+      crc32Table[index] = value >>> 0;
+    }
+  }
+  let crc = 0xffffffff;
+  for (const byte of bytes) {
+    crc = crc32Table[(crc ^ byte) & 0xff] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xffffffff) >>> 0;
 }
 
 function writeAscii(

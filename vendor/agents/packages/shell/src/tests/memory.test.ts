@@ -1,5 +1,6 @@
 import { InMemoryFs } from "../fs/in-memory-fs";
 import { describe, expect, it } from "vitest";
+import { buildTar } from "../extras";
 import { createMemoryStateBackend } from "../memory";
 import { StateBatchOperationError } from "../index";
 
@@ -664,6 +665,302 @@ describe("MemoryStateBackend", () => {
     });
   });
 });
+
+describe("MemoryStateBackend archive formats", () => {
+  const documentXml = `<?xml version="1.0"?><w:document>${"<w:p>quarterly revenue</w:p>".repeat(40)}</w:document>`;
+  const rawBytes = Uint8Array.from({ length: 256 }, (_, index) => index);
+
+  it("lists and extracts stored and deflated ZIP entries", async () => {
+    const backend = createMemoryStateBackend();
+    await backend.writeFileBytes(
+      "/report.docx",
+      await buildZip([
+        { name: "[Content_Types].xml", content: "<Types/>", method: 8 },
+        { name: "word/" },
+        { name: "word/document.xml", content: documentXml, method: 8 },
+        { name: "media/raw.bin", content: rawBytes, method: 0 }
+      ])
+    );
+
+    await expect(backend.listArchive("/report.docx")).resolves.toEqual([
+      { path: "[Content_Types].xml", type: "file", size: 8 },
+      { path: "media/raw.bin", type: "file", size: 256 },
+      { path: "word", type: "directory", size: 0 },
+      { path: "word/document.xml", type: "file", size: documentXml.length }
+    ]);
+
+    await expect(
+      backend.extractArchive("/report.docx", "/unpacked")
+    ).resolves.toEqual({
+      destination: "/unpacked",
+      entries: [
+        { path: "[Content_Types].xml", type: "file", size: 8 },
+        { path: "word", type: "directory", size: 0 },
+        { path: "word/document.xml", type: "file", size: documentXml.length },
+        { path: "media/raw.bin", type: "file", size: 256 }
+      ]
+    });
+    await expect(backend.readFile("/unpacked/word/document.xml")).resolves.toBe(
+      documentXml
+    );
+    await expect(
+      backend.readFile("/unpacked/[Content_Types].xml")
+    ).resolves.toBe("<Types/>");
+    await expect(
+      backend.readFileBytes("/unpacked/media/raw.bin")
+    ).resolves.toEqual(rawBytes);
+    expect((await backend.stat("/unpacked/word"))?.type).toBe("directory");
+  });
+
+  it("reads ZIP sizes from the central directory when a data descriptor follows the entry", async () => {
+    const backend = createMemoryStateBackend();
+    await backend.writeFileBytes(
+      "/streamed.xlsx",
+      await buildZip(
+        [
+          { name: "xl/workbook.xml", content: documentXml, method: 8 },
+          { name: "notes.txt", content: "plain", method: 0 }
+        ],
+        { dataDescriptor: true }
+      )
+    );
+
+    await backend.extractArchive("/streamed.xlsx", "/sheet");
+
+    await expect(backend.readFile("/sheet/xl/workbook.xml")).resolves.toBe(
+      documentXml
+    );
+    await expect(backend.readFile("/sheet/notes.txt")).resolves.toBe("plain");
+  });
+
+  it("rejects a file that is not a tar, gzip-compressed tar or ZIP archive", async () => {
+    const backend = createMemoryStateBackend({
+      files: {
+        "/notes.txt": "just some notes, not an archive",
+        "/paper.pdf": "%PDF-1.7\n%binary"
+      }
+    });
+
+    await expect(backend.extractArchive("/notes.txt", "/out")).rejects.toThrow(
+      "/notes.txt is not a tar, gzip-compressed tar or ZIP archive"
+    );
+    await expect(backend.listArchive("/notes.txt")).rejects.toThrow(
+      "/notes.txt is not a tar, gzip-compressed tar or ZIP archive"
+    );
+    await expect(backend.extractArchive("/paper.pdf", "/out")).rejects.toThrow(
+      "/paper.pdf is a PDF document, not a tar, gzip-compressed tar or ZIP archive"
+    );
+    await expect(backend.exists("/out")).resolves.toBe(false);
+  });
+
+  it("rejects a gzip file that does not contain a tar archive", async () => {
+    const backend = createMemoryStateBackend({
+      files: { "/notes.txt": "just some notes" }
+    });
+    await backend.compressFile("/notes.txt");
+
+    await expect(
+      backend.extractArchive("/notes.txt.gz", "/out")
+    ).rejects.toThrow(
+      "/notes.txt.gz is gzip-compressed but does not contain a tar archive"
+    );
+  });
+
+  it("rejects a ZIP entry whose content does not match its checksum without writing any entry", async () => {
+    const backend = createMemoryStateBackend();
+    await backend.writeFileBytes(
+      "/corrupt.zip",
+      await buildZip([
+        { name: "first.txt", content: "intact", method: 0 },
+        { name: "second.txt", content: "damaged", method: 0, badCrc: true }
+      ])
+    );
+
+    await expect(
+      backend.extractArchive("/corrupt.zip", "/out")
+    ).rejects.toThrow(
+      "/corrupt.zip: ZIP entry second.txt failed its CRC-32 check"
+    );
+    await expect(backend.exists("/out")).resolves.toBe(false);
+  });
+
+  it("rejects encrypted ZIP entries and compression methods other than stored and deflate", async () => {
+    const backend = createMemoryStateBackend();
+    await backend.writeFileBytes(
+      "/locked.zip",
+      await buildZip([
+        { name: "secret.txt", content: "x", method: 0, encrypted: true }
+      ])
+    );
+    await backend.writeFileBytes(
+      "/bzip2.zip",
+      await buildZip([{ name: "data.txt", content: "x", method: 12 }])
+    );
+
+    await expect(backend.extractArchive("/locked.zip", "/out")).rejects.toThrow(
+      "/locked.zip: ZIP entry secret.txt is encrypted"
+    );
+    await expect(backend.extractArchive("/bzip2.zip", "/out")).rejects.toThrow(
+      "/bzip2.zip: ZIP entry data.txt uses compression method 12; only stored (0) and deflate (8) are supported"
+    );
+  });
+
+  it("extracts a gzip-compressed tar archive", async () => {
+    const backend = createMemoryStateBackend({
+      files: { "/src/a.txt": "hello", "/src/nested/b.txt": "world" }
+    });
+    await backend.createArchive("/bundle.tar", ["/src"]);
+    await backend.compressFile("/bundle.tar", "/bundle.tgz");
+
+    await expect(backend.listArchive("/bundle.tgz")).resolves.toEqual(
+      await backend.listArchive("/bundle.tar")
+    );
+    await backend.extractArchive("/bundle.tgz", "/restored");
+
+    await expect(backend.readFile("/restored/src/nested/b.txt")).resolves.toBe(
+      "world"
+    );
+  });
+
+  it("joins ZIP entry names onto the destination the same way as tar entry names", async () => {
+    const backend = createMemoryStateBackend();
+    await backend.writeFileBytes(
+      "/entries.tar",
+      buildTar([
+        { path: "../tar-parent.txt", type: "file", bytes: encode("tar") },
+        { path: "/tar-rooted.txt", type: "file", bytes: encode("tar") }
+      ])
+    );
+    await backend.writeFileBytes(
+      "/entries.zip",
+      await buildZip([
+        { name: "../zip-parent.txt", content: "zip" },
+        { name: "/zip-rooted.txt", content: "zip" }
+      ])
+    );
+
+    await backend.extractArchive("/entries.tar", "/restored/inner");
+    await backend.extractArchive("/entries.zip", "/restored/inner");
+
+    await expect(backend.readFile("/restored/tar-parent.txt")).resolves.toBe(
+      "tar"
+    );
+    await expect(backend.readFile("/restored/zip-parent.txt")).resolves.toBe(
+      "zip"
+    );
+    await expect(
+      backend.readFile("/restored/inner/tar-rooted.txt")
+    ).resolves.toBe("tar");
+    await expect(
+      backend.readFile("/restored/inner/zip-rooted.txt")
+    ).resolves.toBe("zip");
+  });
+});
+
+type ZipFixtureEntry = {
+  name: string;
+  content?: string | Uint8Array;
+  method?: 0 | 8 | 12;
+  encrypted?: boolean;
+  badCrc?: boolean;
+};
+
+function encode(text: string): Uint8Array {
+  return new TextEncoder().encode(text);
+}
+
+/** Writes a ZIP the way common archivers do: local headers, central directory, end record. */
+async function buildZip(
+  entries: ZipFixtureEntry[],
+  options: { dataDescriptor?: boolean } = {}
+): Promise<Uint8Array> {
+  const local: number[] = [];
+  const central: number[] = [];
+  for (const entry of entries) {
+    const name = encode(entry.name);
+    const content =
+      typeof entry.content === "string"
+        ? encode(entry.content)
+        : (entry.content ?? new Uint8Array());
+    const method = entry.method ?? 0;
+    const data = method === 8 ? await deflateRaw(content) : content;
+    const crc = crc32(content) ^ (entry.badCrc ? 1 : 0);
+    const flags =
+      (entry.encrypted ? 0x1 : 0) | (options.dataDescriptor ? 0x8 : 0) | 0x800;
+    const offset = local.length;
+    const headerSizes = options.dataDescriptor
+      ? [0, 0, 0]
+      : [crc, data.byteLength, content.byteLength];
+    pushLe(local, 0x04034b50, 4);
+    pushLe(local, 20, 2);
+    pushLe(local, flags, 2);
+    pushLe(local, method, 2);
+    pushLe(local, 0, 4);
+    pushLe(local, headerSizes[0], 4);
+    pushLe(local, headerSizes[1], 4);
+    pushLe(local, headerSizes[2], 4);
+    pushLe(local, name.byteLength, 2);
+    pushLe(local, 0, 2);
+    local.push(...name, ...data);
+    if (options.dataDescriptor) {
+      pushLe(local, 0x08074b50, 4);
+      pushLe(local, crc, 4);
+      pushLe(local, data.byteLength, 4);
+      pushLe(local, content.byteLength, 4);
+    }
+    pushLe(central, 0x02014b50, 4);
+    pushLe(central, 0x031e, 2);
+    pushLe(central, 20, 2);
+    pushLe(central, flags, 2);
+    pushLe(central, method, 2);
+    pushLe(central, 0, 4);
+    pushLe(central, crc, 4);
+    pushLe(central, data.byteLength, 4);
+    pushLe(central, content.byteLength, 4);
+    pushLe(central, name.byteLength, 2);
+    pushLe(central, 0, 2);
+    pushLe(central, 0, 2);
+    pushLe(central, 0, 2);
+    pushLe(central, 0, 2);
+    pushLe(central, 0, 4);
+    pushLe(central, offset, 4);
+    central.push(...name);
+  }
+  const end: number[] = [];
+  pushLe(end, 0x06054b50, 4);
+  pushLe(end, 0, 2);
+  pushLe(end, 0, 2);
+  pushLe(end, entries.length, 2);
+  pushLe(end, entries.length, 2);
+  pushLe(end, central.length, 4);
+  pushLe(end, local.length, 4);
+  pushLe(end, 0, 2);
+  return Uint8Array.from([...local, ...central, ...end]);
+}
+
+function pushLe(target: number[], value: number, byteLength: 2 | 4): void {
+  for (let index = 0; index < byteLength; index++) {
+    target.push((value >>> (index * 8)) & 0xff);
+  }
+}
+
+async function deflateRaw(bytes: Uint8Array): Promise<Uint8Array> {
+  const stream = new Blob([new Uint8Array(bytes)])
+    .stream()
+    .pipeThrough(new CompressionStream("deflate-raw"));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+function crc32(bytes: Uint8Array): number {
+  let crc = 0xffffffff;
+  for (const byte of bytes) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit++) {
+      crc = crc & 1 ? (crc >>> 1) ^ 0xedb88320 : crc >>> 1;
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
 
 describe("InMemoryFs — symlinks", () => {
   it("stat follows symlinks, lstat does not", async () => {

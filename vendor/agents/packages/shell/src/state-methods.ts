@@ -197,12 +197,13 @@ export const STATE_METHODS: Record<StateMethodName, StateMethodSpec> = {
   listArchive: {
     params: ["path"],
     kind: "read",
-    description: "List entries in a tar archive."
+    description: "List entries in a tar, gzip-compressed tar or ZIP archive."
   },
   extractArchive: {
     params: ["path", "destination"],
     kind: "write",
-    description: "Extract a tar archive to a destination directory."
+    description:
+      "Extract a tar, gzip-compressed tar or ZIP archive (including .docx, .xlsx and .pptx) to a destination directory."
   },
   compressFile: {
     params: ["path", "destination?"],
