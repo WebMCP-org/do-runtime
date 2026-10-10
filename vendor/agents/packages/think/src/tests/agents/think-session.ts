@@ -471,6 +471,39 @@ function createInBandErrorMockModel(
   } as LanguageModel;
 }
 
+/**
+ * A model stream cut inside a tool call: the model starts streaming `write`'s
+ * input, then the connection drops. `"close"` ends the stream cleanly with no
+ * finish chunk (a relay closing the response early); `"error"` fails it (a
+ * network error mid-body).
+ */
+function createCutToolInputMockModel(ending: "close" | "error"): LanguageModel {
+  return new MockLanguageModelV3({
+    doStream: async () => ({
+      stream: new ReadableStream({
+        start(controller) {
+          controller.enqueue({ type: "stream-start", warnings: [] });
+          controller.enqueue({
+            type: "tool-input-start",
+            id: "tc-cut",
+            toolName: "write"
+          });
+          controller.enqueue({
+            type: "tool-input-delta",
+            id: "tc-cut",
+            delta: '{"path":"ou'
+          });
+          if (ending === "error") {
+            controller.error(new Error("connection reset mid tool input"));
+          } else {
+            controller.close();
+          }
+        }
+      })
+    })
+  });
+}
+
 function createInBandErrorStreamResult(
   errorText: string,
   textChunks: string[] = [],
@@ -3889,6 +3922,51 @@ export class ThinkTestAgent extends Think {
     this._inBandErrorResponse = { errorText, textChunks };
   }
 
+  private _cutToolInput: "close" | "error" | null = null;
+
+  async setCutToolInputResponseForTest(
+    ending: "close" | "error" | null
+  ): Promise<void> {
+    this._cutToolInput = ending;
+  }
+
+  /**
+   * The cut-stream error reaches `classifyChatError` as an `Error`, so an app
+   * that classifies it `transient` gets the existing bounded recovery.
+   */
+  async testCutToolInputRecoveryForTest(): Promise<{
+    first: TestChatResult;
+    scheduledContinues: number;
+    cutToolState: string | undefined;
+    finalAssistantText: string;
+  }> {
+    this._cutToolInput = "close";
+    this.classifyChatError = (error) =>
+      error instanceof Error && error.message.includes("tool call write")
+        ? "transient"
+        : undefined;
+    const first = await this.testChat("write it");
+    this._cutToolInput = null;
+    const { scheduledContinues } = await this.runScheduledRecoveryForTest();
+    const messages = await this.getMessages();
+    const cutTool = messages
+      .flatMap((message) => message.parts)
+      .find(
+        (part) => (part as { toolCallId?: string }).toolCallId === "tc-cut"
+      ) as { state?: string } | undefined;
+    const finalAssistantText = (
+      messages.filter((m) => m.role === "assistant").at(-1)?.parts ?? []
+    )
+      .map((part) => (part.type === "text" ? part.text : ""))
+      .join("");
+    return {
+      first,
+      scheduledContinues,
+      cutToolState: cutTool?.state,
+      finalAssistantText
+    };
+  }
+
   async clearInBandErrorResponse(): Promise<void> {
     this._inBandErrorResponse = null;
   }
@@ -4246,6 +4324,9 @@ export class ThinkTestAgent extends Think {
 
   override getModel(): ThinkModel {
     if (this._stringModelForTest) return this._stringModelForTest;
+    if (this._cutToolInput) {
+      return createCutToolInputMockModel(this._cutToolInput);
+    }
     const midStream = this._midStreamGate;
     if (midStream) {
       return new MockLanguageModelV3({
