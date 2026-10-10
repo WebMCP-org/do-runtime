@@ -1,13 +1,81 @@
-# workerd sync: October 2, 2026
+# workerd sync: October 9, 2026
 
-The oracle is now pinned to `v1.20261002.1`
+The oracle is now pinned to `v1.20261009.1`
+([`a3985499a5f7`](https://github.com/cloudflare/workerd/tree/a3985499a5f7820cf72f39aba486120383e6580c)),
+with Workers types `5.20261009.1`. The October 9 audit covers
+[`v1.20261002.1...v1.20261009.1`](https://github.com/cloudflare/workerd/compare/v1.20261002.1...v1.20261009.1);
+the October 2 and September audits below record the earlier baselines.
+
+## October 9 audit
+
+The [official release](https://github.com/cloudflare/workerd/releases/tag/v1.20261009.1)
+and [npm latest metadata](https://registry.npmjs.org/workerd/latest) agreed on
+`1.20261009.1`, commit `a3985499a5f7820cf72f39aba486120383e6580c`, when checked
+on October 9 (UTC). The range contains **124 commits: 97 non-merge commits and
+27 merges**. The endpoint diff changes 354 files, with 14,017 insertions and
+6,526 deletions. Most of it is the experimental TypeScript streams
+implementation, the V8 startup-snapshot pipeline, and Rust test relocation.
+`compatibility-date.capnp` is unchanged; only the maximum compatibility date
+advances, to October 16.
+
+The [commit ledger](workerd-sync-2026-10-09.csv) records every SHA, its parents,
+subject, changed paths, and disposition, using the same method as the October 2
+audit: every subject and path list screened, applicable patches and regression
+tests inspected, and endpoint diffs checked so intermediate states do not
+become port work.
+
+### Behavioral ports
+
+| Upstream change | Local result and evidence |
+| --- | --- |
+| [Span context, `ec93d7032`](https://github.com/cloudflare/workerd/commit/ec93d7032be4a00e7a2e557a4deb2374d82e1136) | The no-op `Span` now has `spanContext()`. It returns a fresh plain object with workerd's all-zero, invalid identity: a 32-digit `traceId`, a 16-digit `spanId`, and `traceFlags: 0`. Mutating one result does not affect the next, and the value survives `end()`. The oracle returns exactly this for `startSpan()` and `enterSpan()` spans, and `getActiveSpan()` is `undefined` outside a span, as it is locally. The shared conformance row failed in Node with `span.spanContext is not a function` before the port and passes in all lanes. Real trace and span IDs need a tracing observer, which remains outside the local no-op contract. |
+
+The compatibility date is unchanged. Updating the oracle and ambient Workers
+types does not opt local hosts into newer compatibility-date policy.
+
+### Reviewed host and protocol changes
+
+| Surface | Disposition |
+| --- | --- |
+| Durable Object snapshots | [`b6e4e7700`](https://github.com/cloudflare/workerd/commit/b6e4e770086682c02a482fbee8808b8302455acf) adds `storage.snapshot()` and `storage.onNextSessionRestore()` only under the `experimental` flag. [`b68e96c29`](https://github.com/cloudflare/workerd/commit/b68e96c29) adds the opaque capability transport. The oracle lane enables `experimental`, so both methods exist there. A probe measured `snapshot()` rejecting with "This Durable Object's storage back-end does not implement snapshots." `onNextSessionRestore("…")` rejects with the existing point-in-time-recovery error. Locally both are absent. No local backend can capture or restore a snapshot, so this is recorded rather than shimmed. |
+| WebSockets | [`713da3aed`](https://github.com/cloudflare/workerd/commit/713da3aede32b71bc2826b5cabc8b34b50356193) and [`dfaadb370`](https://github.com/cloudflare/workerd/commit/dfaadb37038446712956294bec6a8e99e346858c) fix a use-after-free when a client `new WebSocket(url)` `open` listener throws. The read loop stops once another path closes the incoming side, and the native socket is released without waiting for the peer. The only application-facing path is `initConnection()`, which is client-only. Local actors refuse outbound `new WebSocket(url)` before native construction, and other client sockets are host WebSockets. Accepted, paired, and hibernatable socket semantics are unchanged. |
+| Tracing and observability | [`fetch_setup` spans, `64de5d4aa`](https://github.com/cloudflare/workerd/commit/64de5d4aa), Python spans, tail-stream session sizing, and isolate metrics (script sizes, generated code sizes, V8 histograms, isolate UUID) feed native observers. The port has no span or isolate observer. |
+| Distributed Durable Object retries | `c920a4500`, `8c3e9ec27`, and `c39bb251f` add temporary diagnostics for candidate retry changes, exhaustion time, and stop reasons. `1c9a606e7`, `50dcd4b65`, and `5d14d6cb3` extend retry tests. Local calls have no claim or replay protocol, as recorded on October 2. |
+| `ctx.cache.invalidate()` | [`421e81dc8`](https://github.com/cloudflare/workerd/commit/421e81dc877c74cdd1e015352900878a96169fc9) adds a method beside `purge()`. Its default implementation throws. The local `cache` export is already a boundary that throws on any member access, so `invalidate` fails at the same point. The type arrives through Workers types. |
+| Streams | 24 commits refine the TypeScript streams implementation behind the experimental `typescript_implemented_streams` flag: tee, `from()`, async iteration, queue totals, transform enqueue, and detached writable sinks. Local streams are host WHATWG streams, and the flag is not enabled locally. |
+| Native runtime, products and types | The V8 startup-snapshot pipeline (`STARTUP_SNAPSHOT` autogate), JSG NonCoercible wrapping, cppgc allocation reporting, GC exception containment, own-util removal, Rust/KJ/capnp updates, Bazel 9.3, D1 JSRPC normalization, Flagship types, `ReadonlyMap`/`ReadonlySet` RPC types, and Node global declaration fixes are native substrate, separate products, or ambient types supplied by the pin. |
+
+### Security review
+
+[`713da3aed`](https://github.com/cloudflare/workerd/commit/713da3aede32b71bc2826b5cabc8b34b50356193)
+is a native use-after-free in a C++ read loop. It has no JavaScript analogue
+because local socket references are GC-owned.
+[`2df1f8514`](https://github.com/cloudflare/workerd/commit/2df1f8514) contains
+exceptions thrown by IoOwn release during V8 GC, which has no local
+counterpart.
+
+### Toolchain
+
+`wrangler` was refreshed in range to 4.148.0. The 4.149.0 release was inside
+the repository's release-age gate when checked. `@cloudflare/vitest-pool-workers`
+0.23.0 has the same dependencies as 0.22.0 and adds a deprecation notice: the
+package was renamed to `@cloudflare/vitest-plugin`. All conformance lanes pass on
+0.23.0. Migrating to the renamed plugin is separate follow-up work.
+
+### Focused validation
+
+The `spanContext` row failed in the Node lane before the port and passed on the
+`1.20261009.1` oracle. Integrated runtime validation then passed: 1,022 unit
+tests; 83 workerd, 83 Node, and 96 browser conformance/smoke tests; and 83 tests
+in each transformed Node/browser lane.
+
+## October 2 audit
+
+The oracle was pinned to `v1.20261002.1`
 ([`51a48a5bb786`](https://github.com/cloudflare/workerd/tree/51a48a5bb7863fbeab791358bee8dff22c3ce83f)),
-with Workers types `5.20261002.1`. The September audit below records the prior
-behavioral baseline; the October audit covers the previously unaudited
+with Workers types `5.20261002.1`, and the audit covered the previously unaudited
 [`v1.20260907.1...v1.20261002.1`](https://github.com/cloudflare/workerd/compare/v1.20260907.1...v1.20261002.1)
 range.
-
-## October audit
 
 The [official release](https://github.com/cloudflare/workerd/releases/tag/v1.20261002.1)
 and [npm latest metadata](https://registry.npmjs.org/workerd/latest) agreed on
@@ -89,7 +157,7 @@ runtime audit.
 with Workers types `5.20260911.1` and `@sqlite.org/sqlite-wasm` `3.53.4-build1`
 (SQLite 3.53.4), since 0.8.2. Conformance was re-validated on those pins, but the
 [`v1.20260907.1...v1.20260911.1`](https://github.com/cloudflare/workerd/compare/v1.20260907.1...v1.20260911.1)
-upstream range had not yet been source-audited. The October audit above now includes it.
+upstream range had not yet been source-audited. The October 2 audit above now includes it.
 A direct probe on SQLite 3.53.4 reproduced the default-expression findings below,
 so the [engine work](#sqlite-engine-work-still-required) is unchanged.
 

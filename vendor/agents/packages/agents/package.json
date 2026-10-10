@@ -9,7 +9,10 @@
     "durable objects"
   ],
   "type": "module",
-  "version": "0.26.0",
+  "bin": {
+    "agents": "./dist/cli.js"
+  },
+  "version": "0.27.0",
   "license": "MIT",
   "repository": {
     "directory": "packages/agents",
@@ -42,10 +45,13 @@
     "@cloudflare/codemode": "workspace:*",
     "@earendil-works/pi-ai": "^1.0.0",
     "@earendil-works/pi-durable": "^1.0.0",
+    "@earendil-works/pi-tui": "1.0.0",
     "@modelcontextprotocol/client": "2.0.0",
     "@modelcontextprotocol/conformance-v2": "npm:@modelcontextprotocol/conformance@0.2.0-alpha.10",
     "@modelcontextprotocol/sdk": "1.30.0",
     "@modelcontextprotocol/server": "2.0.0",
+    "@opencode/plugin": "2.0.24",
+    "@opencode/sdk": "2.0.24",
     "@tanstack/ai": "0.54.0",
     "@types/react": "^19.3.0",
     "@valibot/to-json-schema": "1.8.0",
@@ -54,6 +60,7 @@
     "ai": "^7.0.0",
     "chat": "4.38.0",
     "glob": "^13.0.6",
+    "highlight.js": "11.12.0",
     "just-bash": "^3.4.2",
     "react": "^19.3.0",
     "teleproto": "^1.229.0",
@@ -69,6 +76,8 @@
     "@modelcontextprotocol/client": "2.0.0",
     "@modelcontextprotocol/sdk": "1.30.0",
     "@modelcontextprotocol/server": "2.0.0",
+    "@opencode/plugin": "^2.0.24",
+    "@opencode/sdk": "^2.0.24",
     "@tanstack/ai": ">=0.10.2 <1.0.0",
     "@x402/core": "^2.0.0",
     "@x402/evm": "^2.0.0",
@@ -93,6 +102,12 @@
       "optional": true
     },
     "@earendil-works/pi-durable": {
+      "optional": true
+    },
+    "@opencode/plugin": {
+      "optional": true
+    },
+    "@opencode/sdk": {
       "optional": true
     },
     "@tanstack/ai": {
@@ -167,10 +182,45 @@
       "import": "./dist/lifecycle/index.js",
       "require": "./dist/lifecycle/index.js"
     },
+    "./harness/ai-sdk": {
+      "types": "./dist/harness/ai-sdk/index.d.ts",
+      "import": "./dist/harness/ai-sdk/index.js",
+      "require": "./dist/harness/ai-sdk/index.js"
+    },
+    "./harness/opencode": {
+      "types": "./dist/harness/opencode/index.d.ts",
+      "import": "./dist/harness/opencode/index.js",
+      "require": "./dist/harness/opencode/index.js"
+    },
     "./harness/pi": {
       "types": "./dist/harness/pi/index.d.ts",
       "import": "./dist/harness/pi/index.js",
       "require": "./dist/harness/pi/index.js"
+    },
+    "./harness/think": {
+      "types": "./dist/harness/think/index.d.ts",
+      "import": "./dist/harness/think/index.js",
+      "require": "./dist/harness/think/index.js"
+    },
+    "./harness/container": {
+      "types": "./dist/harness/container/index.d.ts",
+      "import": "./dist/harness/container/index.js",
+      "require": "./dist/harness/container/index.js"
+    },
+    "./harness/container/daemon": {
+      "types": "./dist/harness/container/daemon/index.d.ts",
+      "import": "./dist/harness/container/daemon/index.js",
+      "require": "./dist/harness/container/daemon/index.js"
+    },
+    "./harness/container/runtime": {
+      "types": "./dist/harness/container/runtime/index.d.ts",
+      "import": "./dist/harness/container/runtime/index.js",
+      "require": "./dist/harness/container/runtime/index.js"
+    },
+    "./harness/store": {
+      "types": "./dist/harness/store/index.d.ts",
+      "import": "./dist/harness/store/index.js",
+      "require": "./dist/harness/store/index.js"
     },
     "./agent-tools": {
       "types": "./dist/agent-tools.d.ts",
@@ -211,6 +261,11 @@
       "types": "./dist/models/ai-sdk/index.d.ts",
       "import": "./dist/models/ai-sdk/index.js",
       "require": "./dist/models/ai-sdk/index.js"
+    },
+    "./models/opencode": {
+      "types": "./dist/models/opencode/index.d.ts",
+      "import": "./dist/models/opencode/index.js",
+      "require": "./dist/models/opencode/index.js"
     },
     "./models/pi-ai": {
       "types": "./dist/models/pi-ai/index.d.ts",
@@ -337,6 +392,26 @@
       "import": "./dist/browser/tanstack-ai.js",
       "require": "./dist/browser/tanstack-ai.js"
     },
+    "./websearch": {
+      "types": "./dist/websearch/index.d.ts",
+      "import": "./dist/websearch/index.js",
+      "require": "./dist/websearch/index.js"
+    },
+    "./websearch/pi": {
+      "types": "./dist/websearch/tools/pi.d.ts",
+      "import": "./dist/websearch/tools/pi.js",
+      "require": "./dist/websearch/tools/pi.js"
+    },
+    "./websearch/ai-sdk": {
+      "types": "./dist/websearch/tools/ai-sdk.d.ts",
+      "import": "./dist/websearch/tools/ai-sdk.js",
+      "require": "./dist/websearch/tools/ai-sdk.js"
+    },
+    "./websearch/tanstack-ai": {
+      "types": "./dist/websearch/tools/tanstack-ai.d.ts",
+      "import": "./dist/websearch/tools/tanstack-ai.js",
+      "require": "./dist/websearch/tools/tanstack-ai.js"
+    },
     "./voice": {
       "types": "./dist/voice/index.d.ts",
       "import": "./dist/voice/index.js",
@@ -377,40 +452,40 @@
       "import": "./dist/voice/text.js",
       "require": "./dist/voice/text.js"
     },
-    "./channels": {
-      "types": "./dist/channels/index.d.ts",
-      "import": "./dist/channels/index.js",
-      "require": "./dist/channels/index.js"
+    "./experimental/channels": {
+      "types": "./dist/experimental/channels/index.d.ts",
+      "import": "./dist/experimental/channels/index.js",
+      "require": "./dist/experimental/channels/index.js"
     },
-    "./channels/email": {
-      "types": "./dist/channels/email.d.ts",
-      "import": "./dist/channels/email.js",
-      "require": "./dist/channels/email.js"
+    "./experimental/channels/email": {
+      "types": "./dist/experimental/channels/email/index.d.ts",
+      "import": "./dist/experimental/channels/email/index.js",
+      "require": "./dist/experimental/channels/email/index.js"
     },
-    "./channels/slack": {
-      "types": "./dist/channels/slack.d.ts",
-      "import": "./dist/channels/slack.js",
-      "require": "./dist/channels/slack.js"
+    "./experimental/channels/slack": {
+      "types": "./dist/experimental/channels/slack/index.d.ts",
+      "import": "./dist/experimental/channels/slack/index.js",
+      "require": "./dist/experimental/channels/slack/index.js"
     },
-    "./channels/telegram": {
-      "types": "./dist/channels/telegram.d.ts",
-      "import": "./dist/channels/telegram.js",
-      "require": "./dist/channels/telegram.js"
+    "./experimental/channels/telegram": {
+      "types": "./dist/experimental/channels/telegram/index.d.ts",
+      "import": "./dist/experimental/channels/telegram/index.js",
+      "require": "./dist/experimental/channels/telegram/index.js"
     },
-    "./channels/voice": {
-      "types": "./dist/channels/voice.d.ts",
-      "import": "./dist/channels/voice.js",
-      "require": "./dist/channels/voice.js"
+    "./experimental/channels/web": {
+      "types": "./dist/experimental/channels/web/index.d.ts",
+      "import": "./dist/experimental/channels/web/index.js",
+      "require": "./dist/experimental/channels/web/index.js"
     },
-    "./channels/ai-sdk": {
-      "types": "./dist/channels/ai-sdk.d.ts",
-      "import": "./dist/channels/ai-sdk.js",
-      "require": "./dist/channels/ai-sdk.js"
+    "./experimental/channels/web/client": {
+      "types": "./dist/experimental/channels/web/client.d.ts",
+      "import": "./dist/experimental/channels/web/client.js",
+      "require": "./dist/experimental/channels/web/client.js"
     },
-    "./channels/tanstack-ai": {
-      "types": "./dist/channels/tanstack-ai.d.ts",
-      "import": "./dist/channels/tanstack-ai.js",
-      "require": "./dist/channels/tanstack-ai.js"
+    "./experimental/channels/web/ai-sdk": {
+      "types": "./dist/experimental/channels/web/ai-sdk.d.ts",
+      "import": "./dist/experimental/channels/web/ai-sdk.js",
+      "require": "./dist/experimental/channels/web/ai-sdk.js"
     },
     "./tsconfig": "./agents.tsconfig.json",
     "./vite": {
@@ -453,7 +528,8 @@
         ],
         "outputs": [
           "{projectRoot}/dist",
-          "{projectRoot}/docs"
+          "{projectRoot}/docs",
+          "{projectRoot}/src/harness/container/daemon-source.generated.ts"
         ]
       }
     }
@@ -466,11 +542,12 @@
     "test:voice:workers": "vitest --project voice-workers",
     "test:voice:react": "vitest --project voice-react",
     "test:channels": "vitest --project channels",
-    "test:channels:live": "vitest --run -c src/channels/vitest.live.config.ts",
     "test:browser": "vitest run --config src/browser-tests/vitest.config.ts",
     "test:workers": "vitest --project workers",
     "test:chat": "vitest --project chat",
+    "test:harness:opencode": "vitest --project harness-opencode",
     "test:harness:pi": "vitest --project harness-pi",
+    "test:harness:container": "vitest --project harness-container --project harness-container-runtime",
     "test:webmcp": "vitest --project webmcp",
     "test:x402": "vitest --project x402",
     "test:e2e": "vitest --run -c src/e2e-tests/vitest.config.ts",
@@ -484,6 +561,8 @@
     "test:conformance:server:mcp-agent": "bash conformance/run.sh server-mcp-agent",
     "test:conformance:server:handler": "bash conformance/run.sh server-handler",
     "test:conformance:server:handler:legacy-compat": "bash conformance/run.sh server-handler-legacy-compat",
-    "test:conformance:server:handler:legacy": "bash conformance/run.sh server-handler-legacy"
+    "test:conformance:server:handler:legacy": "bash conformance/run.sh server-handler-legacy",
+    "test:harness:think": "vitest --project harness-think",
+    "build:daemon": "tsx ./scripts/build-daemon.ts"
   }
 }

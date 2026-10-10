@@ -43,6 +43,10 @@ export {
   TaskStreamComposeObject
 } from "./capabilities/streams.ts";
 export { StreamBenchObject } from "./capabilities/streams-bench.ts";
+export { ChannelsHarnessObject } from "./capabilities/channels.ts";
+import type { ChannelsHarnessObject } from "./capabilities/channels.ts";
+export { AiSdkHarnessObject } from "./capabilities/ai-sdk-harness.ts";
+import type { AiSdkHarnessObject } from "./capabilities/ai-sdk-harness.ts";
 export { SqliteStrategiesBench } from "./capabilities/sqlite-strategies-bench.ts";
 export {
   SessionBenchObject,
@@ -244,6 +248,8 @@ export type Env = {
   TaskHarnessObject: DurableObjectNamespace<TaskHarnessObject>;
   TaskSchedulerCoexistObject: DurableObjectNamespace<TaskSchedulerCoexistObject>;
   StreamHarnessObject: DurableObjectNamespace<StreamHarnessObject>;
+  ChannelsHarnessObject: DurableObjectNamespace<ChannelsHarnessObject>;
+  AiSdkHarnessObject: DurableObjectNamespace<AiSdkHarnessObject>;
   CutoverHarnessObject: DurableObjectNamespace<CutoverHarnessObject>;
   SqliteStrategiesBench: DurableObjectNamespace<SqliteStrategiesBench>;
   STREAMS_R2: R2Bucket;

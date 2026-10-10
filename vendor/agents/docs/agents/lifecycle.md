@@ -156,6 +156,46 @@ Host-specific bindings, authentication, and protocol adapters remain explicit
 constructor dependencies. Lifecycle never grants a capability the complete
 host implicitly.
 
+A capability's public operations can run before startup, because
+[native RPC](#native-rpc) bypasses the automatic startup on fetch, alarm and
+WebSocket events. If an operation starts work that `onStart` also awaits, such
+as lazily opening a store, it must call `await this.lifecycle.ready()` first:
+
+```ts
+class Store extends LifecycleCapability {
+  #opening: Promise<Database> | undefined;
+
+  constructor() {
+    super("store");
+  }
+
+  async onStart(): Promise<void> {
+    await this.#open();
+  }
+
+  async get(key: string): Promise<string | undefined> {
+    const db = await this.#open();
+    return db.get(key);
+  }
+
+  async #open(): Promise<Database> {
+    // Without this, an RPC that calls get() before startup begins the open
+    // outside startup, and onStart then waits on it behind a closed gate.
+    await this.lifecycle.ready();
+    this.#opening ??= openDatabase(this.lifecycle.storage);
+    return this.#opening;
+  }
+}
+```
+
+Startup holds the input gate (`blockConcurrencyWhile`) while `onStart` runs, so
+work begun outside startup has its timers and I/O held back and never finishes.
+`onStart` waits on it until startup times out after 30 seconds and the object
+is reset. Whether it happens depends on whether the RPC arrives first, so it
+shows up as an intermittent timeout. `ready()` resolves immediately inside
+startup, so `onStart` can call the same guarded method. `Tasks`, `Streams`,
+`Scheduler`, `Queue` and `PiHarness` guard their operations this way.
+
 Capability hooks run outside host context, but user callbacks run through
 `this.lifecycle.runInHostContext(fn)` inside the host invocation context.
 Scheduler and Queue dispatch their registered callbacks through this
@@ -341,13 +381,17 @@ The capability speaks the Agent protocol on every connection, so a plain
 Durable Object is reachable from `useAgent` and `AgentClient` exactly like an
 `Agent`:
 
-- On connect it sends the identity frame, which resolves the client's
-  `ready` and `identified`, then the current state when `state` is set.
+- On connect it sends the identity frame, then the current state when
+  `state` is set. The identity frame says when a state frame follows it,
+  so the client's `ready` and `identified` wait for that state, and a
+  caller awaiting `ready` never reads the default value.
   `protocol` controls this: `true` (default) for every connection, a
   function to decide per connection — `false` marks it no-protocol, so it
   gets no protocol text frames on connect or by broadcast but still sends
   and receives ordinary messages and callables — or `false` to have the
-  host drive the sequence itself with `sendIdentity()` and `sendState()`.
+  host drive the sequence itself with `sendConnectFrames()`, or
+  `sendIdentity()` and `sendState()` separately (the client then resolves
+  `ready` on the identity alone).
   `Agent` passes `false`, because it must decide whether a connection
   belongs to a facet before any frame is sent.
 - `readonly` decides per connection whether state writes over the wire are
@@ -429,7 +473,19 @@ async runTask(): Promise<void> {
 }
 ```
 
-Agent's internal RPC entry points already enforce this boundary.
+An `Agent` enforces this boundary for you. Its internal RPC entry points and
+the public `async` methods your subclass exposes over RPC start the lifecycle
+before they run, so a cold instance does not serve those calls against
+uninitialized state. Synchronous methods are never deferred; if one reads state
+that `onStart` sets up, make it `async` or call `await this.lifecycle.start()`
+in it. Concurrent calls to `start()` share the same startup operation, and
+`lifecycle.isStarted()` returns `true` only after capabilities and `onStart()`
+have finished.
+
+Startup resolves the Durable Object name. An async RPC to an Agent addressed
+with `newUniqueId()` or `idFromString()` fails instead of running before
+initialization. Address the Agent by name with `getAgentByName()`, `getByName()`,
+or `idFromName()`.
 
 ## Object names
 

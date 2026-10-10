@@ -10,7 +10,7 @@
  * every arm is pinned.
  */
 
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import type { Actor, Timer } from "../io/io-context";
 import { IoContext, setUserErrorDetail } from "../io/io-context";
 import { InputGate, OutputGate } from "../io/io-gate";
@@ -50,8 +50,8 @@ test("readable stream callbacks re-enter their creator when consumed outside its
   const stream = await ctx.run(() =>
     store.run("creator", () => new target.ReadableStream(Object.freeze(source), { highWaterMark: 0 })),
   );
-  await new Promise((resolve) => setTimeout(resolve, 0));
-  expect(ctx.hasCurrent()).toBe(false);
+  // The creator's lock can release a task later on a loaded runner; consume only once it has.
+  await vi.waitFor(() => expect(ctx.hasCurrent()).toBe(false));
   const reader = stream.getReader();
   expect(await store.run("unrelated", () => reader.read())).toEqual({ value: "chunk", done: false });
   await reader.cancel();

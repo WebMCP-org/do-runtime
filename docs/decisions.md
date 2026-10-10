@@ -8,8 +8,8 @@ the index the citations resolve to, not a second specification.
 Workerd line citations throughout the source use release `v1.20260713.1`, commit
 `03c396e9b14ea5644dfcfb696086d8df040a4efc` of
 [cloudflare/workerd](https://github.com/cloudflare/workerd). The conformance
-oracle is pinned separately to release `v1.20261002.1`, commit
-`51a48a5bb7863fbeab791358bee8dff22c3ce83f`.
+oracle is pinned separately to release `v1.20261009.1`, commit
+`a3985499a5f7820cf72f39aba486120383e6580c`.
 The [workerd sync audit](workerd-sync.md) records the reviewed changes and
 remaining host-engine differences. New source comments name their upstream
 commit when the July line baseline no longer applies.

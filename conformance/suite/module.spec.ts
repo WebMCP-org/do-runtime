@@ -74,3 +74,25 @@ it("§1.12 untraced spans support name and status updates, including after end",
     expect(span.isTraced).toBe(false);
   }
 });
+
+it("§1.12 untraced spans expose a fresh all-zero span context, including after end", () => {
+  const invalid = {
+    traceId: "0".repeat(32),
+    spanId: "0".repeat(16),
+    traceFlags: 0,
+  };
+  tracing.enterSpan("outer", (outer) => {
+    const manual = tracing.startSpan("manual");
+    for (const span of [outer, manual]) {
+      const context = span.spanContext();
+      expect(Object.getPrototypeOf(context)).toBe(Object.prototype);
+      expect(Object.keys(context)).toEqual(["traceId", "spanId", "traceFlags"]);
+      expect(context).toEqual(invalid);
+      context.traceId = "mutated";
+      expect(span.spanContext()).not.toBe(context);
+      expect(span.spanContext()).toEqual(invalid);
+    }
+    manual.end();
+    expect(manual.spanContext()).toEqual(invalid);
+  });
+});

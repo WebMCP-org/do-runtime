@@ -103,7 +103,8 @@ import type {
   TextStreamPart,
   ToolSet,
   TypedToolCall,
-  UIMessage
+  UIMessage,
+  UIMessageChunk
 } from "ai";
 import {
   convertToModelMessages,
@@ -877,6 +878,67 @@ function normalizeToolFinishEvent(event: unknown): {
     output: success ? e.output : undefined,
     error: success ? undefined : e.error
   };
+}
+
+/**
+ * Vendor divergence: a model response that ends while a tool call's input is
+ * still streaming was cut off. When the provider's body ends without a finish
+ * event, the AI SDK keeps the partial step and finishes it with reason
+ * `other`, so the turn would otherwise complete with no error and a tool call
+ * that never ran. Emit an error chunk before that finish (or at the end of a
+ * stream with no finish) so stream consumers fail the turn as they do any
+ * in-stream error. Any other finish reason is the provider's own account of the
+ * step and passes, as does a stopped turn (`abort`) or one that already
+ * errored.
+ */
+function failOnUnfinishedToolInput(
+  onError: (error: unknown) => string
+): TransformStream<UIMessageChunk, UIMessageChunk> {
+  const open = new Map<string, string>();
+  let settled = false;
+  const reportOpenInput = (
+    controller: TransformStreamDefaultController<UIMessageChunk>
+  ) => {
+    if (settled || open.size === 0) return;
+    settled = true;
+    const tools = [...open.values()].join(", ");
+    controller.enqueue({
+      type: "error",
+      errorText: onError(
+        new Error(
+          `The model response ended before the input of tool call ${tools} was complete.`
+        )
+      )
+    });
+  };
+  return new TransformStream({
+    transform(chunk, controller) {
+      switch (chunk.type) {
+        case "tool-input-start":
+          open.set(chunk.toolCallId, chunk.toolName);
+          break;
+        case "tool-input-available":
+        case "tool-input-error":
+        case "tool-output-available":
+        case "tool-output-error":
+        case "tool-output-denied":
+          open.delete(chunk.toolCallId);
+          break;
+        case "abort":
+        case "error":
+          settled = true;
+          break;
+        case "finish":
+          if (chunk.finishReason === "other") reportOpenInput(controller);
+          settled = true;
+          break;
+      }
+      controller.enqueue(chunk);
+    },
+    flush(controller) {
+      reportOpenInput(controller);
+    }
+  });
 }
 
 async function* readableStreamToAsyncIterable<T>(
@@ -8157,7 +8219,9 @@ export class Think<
               return timing || custom ? { ...timing, ...custom } : undefined;
             }
           });
-          return readableStreamToAsyncIterable(uiStream);
+          return readableStreamToAsyncIterable(
+            uiStream.pipeThrough(failOnUnfinishedToolInput(onError))
+          );
         },
         output: outputPromise
       } satisfies StreamableResult;
@@ -19557,11 +19621,7 @@ export class Think<
       const ownsPending = this._continuation.pending?.requestId === requestId;
       const ownsActive = this._continuation.activeRequestId === requestId;
       if (!ownsPending && !ownsActive) return;
-      if (ownsPending) {
-        if (!streamed) this._continuation.sendResumeNone();
-        this._continuation.clearPending();
-      }
-      this._activateDeferredContinuation();
+      this._settleContinuationTurn(requestId, streamed);
     };
 
     let reported = false;
@@ -19686,6 +19746,36 @@ export class Think<
       });
     }
     return true;
+  }
+
+  /**
+   * Settle the continuation state when an auto-continuation turn ends (#2443).
+   *
+   * A turn only owns `pending` until its stream starts: `_streamResult` moves
+   * that pending to the active slot, freeing `pending` for the NEXT
+   * continuation. A client tool result that lands while this turn is still
+   * streaming (a fast client tool chained across steps) creates that next
+   * pending, and the stream-finalize re-arm fires it. So `pending` is cleared
+   * here only while it still holds this turn's request — a turn that never
+   * streamed (failed, aborted, or produced nothing before its stream started).
+   * Clearing unconditionally would drop the newer pending and stall the chat.
+   *
+   * A newer pending that has not started also covers any `deferred` follow-up:
+   * that result arrived before this turn's stream and the newer continuation
+   * runs after it, so firing the deferred too would run a redundant turn that
+   * replays a transcript ending in assistant text.
+   */
+  private _settleContinuationTurn(requestId: string, streamed: boolean): void {
+    const pending = this._continuation.pending;
+    if (pending?.requestId === requestId) {
+      if (!streamed) {
+        this._continuation.sendResumeNone();
+      }
+      this._continuation.clearPending();
+    } else if (pending && !pending.pastCoalesce) {
+      this._continuation.clearDeferred();
+    }
+    this._activateDeferredContinuation();
   }
 
   private _activateDeferredContinuation(): void {

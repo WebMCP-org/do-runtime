@@ -9,7 +9,7 @@
     "tools"
   ],
   "type": "module",
-  "version": "0.20.0",
+  "version": "0.20.1",
   "license": "MIT",
   "repository": {
     "directory": "packages/think",
@@ -165,7 +165,9 @@
     "test:react": "vitest --run -c src/react-tests/vitest.config.ts",
     "test:workers": "vitest --run -c src/tests/vitest.config.ts",
     "test:e2e": "vitest --run -c src/e2e-tests/vitest.config.ts",
-    "test:browser": "vitest run -c src/browser-tests/vitest.config.ts --retry=0"
+    "test:browser": "vitest run -c src/browser-tests/vitest.config.ts --retry=0",
+    "test:harness": "tsx scripts/harness-compat.ts",
+    "test:harness:check": "tsx scripts/harness-compat.ts --check"
   },
   "nx": {
     "targets": {
