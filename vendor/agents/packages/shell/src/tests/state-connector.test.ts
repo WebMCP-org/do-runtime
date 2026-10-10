@@ -39,11 +39,22 @@ describe("drift guards", () => {
       if (spec.params.length === 0) {
         expect(STATE_TYPES).toContain(`${method}()`);
       } else {
-        expect(STATE_TYPES, `${method} signature`).toContain(
-          `${method}(args: {`
+        expect(STATE_TYPES, `${method} signature`).toMatch(
+          new RegExp(`\\b${method}(<[^>]*>)?\\(args: \\{`)
         );
       }
     }
+  });
+
+  it("types JSON reads as any by default so model code can index them", () => {
+    // `const data = await state.readJson({ path }); data.items` must pass
+    // TypeScript preflight without a cast.
+    expect(STATE_TYPES).toContain(
+      "readJson<T = any>(args: { path: string }): Promise<T>;"
+    );
+    expect(STATE_TYPES).toContain(
+      "queryJson<T = any>(args: { path: string; query: string }): Promise<T>;"
+    );
   });
 });
 
