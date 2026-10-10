@@ -290,9 +290,9 @@ declare const state: {
   // Archives & compression
   /** Pack sources into a tar archive. */
   createArchive(args: { path: string; sources: string[] }): Promise<StateArchiveCreateResult>;
-  /** List entries in a tar archive. */
+  /** List entries in a tar, gzip-compressed tar or ZIP archive. */
   listArchive(args: { path: string }): Promise<StateArchiveEntry[]>;
-  /** Extract a tar archive to a destination directory. */
+  /** Extract a tar, gzip-compressed tar or ZIP archive (including .docx, .xlsx and .pptx) to a destination directory. */
   extractArchive(args: { path: string; destination: string }): Promise<StateArchiveExtractResult>;
   /** Gzip-compress a file. Default destination is \`path + ".gz"\`. */
   compressFile(args: { path: string; destination?: string }): Promise<StateCompressionResult>;
