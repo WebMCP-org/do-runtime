@@ -219,11 +219,11 @@ declare const state: {
 
   // JSON
   /** Parse a JSON file and return the value. */
-  readJson(args: { path: string }): Promise<unknown>;
+  readJson<T = any>(args: { path: string }): Promise<T>;
   /** Write a value as JSON to a file. */
   writeJson(args: { path: string; value: unknown; options?: StateJsonWriteOptions }): Promise<void>;
   /** Query a JSON file using dot-path syntax like ".key[0].nested". */
-  queryJson(args: { path: string; query: string }): Promise<unknown>;
+  queryJson<T = any>(args: { path: string; query: string }): Promise<T>;
   /** Apply set/delete operations to a JSON file in place. */
   updateJson(args: { path: string; operations: StateJsonUpdateOperation[] }): Promise<StateJsonUpdateResult>;
 
