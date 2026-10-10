@@ -44,14 +44,14 @@ import type {
 import {
   buildTar,
   buildTree,
+  describeArchiveEntry,
   detectFile as detectFileFromBytes,
-  extractTar,
   findInTree,
   gzipBytes,
   gunzipBytes,
   hashBytes,
-  listTar,
   queryJsonValue,
+  readArchive,
   summarizeTree,
   updateJsonValue,
   type TarInputEntry
@@ -326,31 +326,26 @@ export class FileSystemStateBackend implements StateBackend {
   }
 
   async listArchive(path: string): Promise<StateArchiveEntry[]> {
-    return listTar(await this.readFileBytes(path));
+    return (await readArchive(path, await this.readFileBytes(path)))
+      .map(describeArchiveEntry)
+      .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
   }
 
   async extractArchive(
     path: string,
     destination: string
   ): Promise<StateArchiveExtractResult> {
-    const entries = extractTar(await this.readFileBytes(path));
+    const entries = await readArchive(path, await this.readFileBytes(path));
     for (const entry of entries) {
       const destPath =
         destination === "/" ? `/${entry.path}` : `${destination}/${entry.path}`;
       if (entry.type === "directory") {
         await this.mkdir(destPath, { recursive: true });
-      } else if (entry.bytes) {
+      } else {
         await this.writeFileBytes(destPath, entry.bytes);
       }
     }
-    return {
-      destination,
-      entries: entries.map((entry) => ({
-        path: entry.path,
-        type: entry.type,
-        size: entry.bytes?.byteLength ?? 0
-      }))
-    };
+    return { destination, entries: entries.map(describeArchiveEntry) };
   }
 
   async compressFile(
