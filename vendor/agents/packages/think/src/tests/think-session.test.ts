@@ -307,6 +307,28 @@ describe("Think — core", () => {
     expect(messages).toHaveLength(0);
   });
 
+  it("calls onHistoryCleared for a programmatic and a client clear", async () => {
+    const room = "chat-clear-hook";
+    const agent = await freshAgent(room);
+    await agent.testChat("Hello!");
+
+    await agent.clearMessages();
+    expect(await agent.getHistoryClearedCount()).toBe(1);
+
+    await agent.testChat("Hello again!");
+    const ws = await connectThinkTestAgentWS(room);
+    try {
+      ws.send(JSON.stringify({ type: MSG_CHAT_CLEAR }));
+      // The clear frame and the RPC read travel separate transports.
+      await vi.waitFor(
+        async () => expect(await agent.getHistoryClearedCount()).toBe(2),
+        { timeout: 5000, interval: 50 }
+      );
+    } finally {
+      await closeWS(ws);
+    }
+  });
+
   it("should broadcast programmatic clearMessages to connected clients", async () => {
     const room = "chat-rpc-clear-broadcast";
     const agent = await freshAgent(room);

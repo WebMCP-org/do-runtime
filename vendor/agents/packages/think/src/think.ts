@@ -1629,6 +1629,27 @@ function ensureValidContinueCheckpoint(
 }
 
 /**
+ * The stored id behind each model message that one stored message converts
+ * to (see {@link TurnContext.messageIds}). `convertToModelMessages` turns each
+ * user and system message into exactly one model message, in order, and the
+ * messages Think appends to a request come after all of them.
+ */
+function storedMessageIds(
+  messages: readonly ModelMessage[],
+  history: readonly UIMessage[]
+): (string | undefined)[] {
+  const anchors = history.filter(
+    (message) => message.role === "user" || message.role === "system"
+  );
+  let next = 0;
+  return messages.map((message) =>
+    message.role === "user" || message.role === "system"
+      ? anchors[next++]?.id
+      : undefined
+  );
+}
+
+/**
  * Carry a context reminder (`ContextBlocks.reminder()`) after the cached
  * prefix without persisting it. It joins the final user message when there is
  * one, since not every provider accepts two user messages in a row. A request
@@ -2904,6 +2925,13 @@ export interface TurnContext {
    * value rides at the end, inside the last user message when there is one.
    */
   messages: ModelMessage[];
+  /**
+   * The stored message behind each entry of `messages`, by index. Every user
+   * and system message converts from exactly one stored message and carries
+   * its id. Assistant and tool messages, which one stored message can split
+   * into several, and messages Think adds to the request are `undefined`.
+   */
+  messageIds: readonly (string | undefined)[];
   /** Merged tool set (workspace + getTools + session + MCP + client + caller). */
   tools: ToolSet;
   /**
@@ -4940,7 +4968,14 @@ export class Think<
     // replay onto a freshly-cleared (empty) conversation on reconnect. Covers
     // both the WS `chat-clear` path and the programmatic `clearMessages()` API.
     await this._clearChatTerminal();
+    await this.onHistoryCleared();
   }
+
+  /**
+   * Called after the stored conversation is cleared, by {@link clearMessages}
+   * or a client's chat-clear. Drop state kept per stored message here.
+   */
+  protected onHistoryCleared(): void | Promise<void> {}
 
   /** Append a message while keeping Think's live message cache coherent. */
   protected appendMessageToHistory(
@@ -7395,9 +7430,10 @@ export class Think<
    * and the proactive context guard so a mid-turn recompaction rebuilds the
    * head through the exact same pipeline.
    */
-  private async _assembleModelMessages(
-    tools: ToolSet
-  ): Promise<Awaited<ReturnType<typeof convertToModelMessages>>> {
+  private async _assembleModelMessages(tools: ToolSet): Promise<{
+    messages: Awaited<ReturnType<typeof convertToModelMessages>>;
+    history: UIMessage[];
+  }> {
     const history = await this._turnHistory();
     const providerSafeHistory = history.map(
       toProviderSafeExecutionOutcomeMessage
@@ -7434,7 +7470,12 @@ export class Think<
       tools,
       ignoreIncompleteToolCalls: true
     });
-    return truncateOlderToolResults(modelMessages, truncated, { keepRecent });
+    return {
+      messages: truncateOlderToolResults(modelMessages, truncated, {
+        keepRecent
+      }),
+      history: truncated
+    };
   }
 
   /**
@@ -7492,7 +7533,7 @@ export class Think<
       // The compaction refreshed the stored prompt, but this request keeps
       // the system prompt it started with, so it still needs the reminder.
       const head = withContextReminder(
-        await this._assembleModelMessages(this._activeTurnTools),
+        (await this._assembleModelMessages(this._activeTurnTools)).messages,
         this._turnContextReminder
       );
       const tail = event.messages.slice(this._turnModelMessageBaseline);
@@ -7794,8 +7835,9 @@ export class Think<
     const system = this._systemPromptForTurn(baseSystem, tools);
 
     this._turnContextReminder = await this.context.reminder();
+    const assembled = await this._assembleModelMessages(tools);
     const messages = withContextReminder(
-      await this._assembleModelMessages(tools),
+      assembled.messages,
       this._turnContextReminder
     );
 
@@ -7820,6 +7862,7 @@ export class Think<
     const ctx: TurnContext = {
       system,
       messages,
+      messageIds: storedMessageIds(messages, assembled.history),
       tools,
       get model() {
         return resolveDefaultModel();
@@ -7864,6 +7907,10 @@ export class Think<
       ...turnContextWithoutModel(ctx),
       system: finalSystem,
       messages: finalMessages,
+      // Messages a hook supplied have no known stored source.
+      messageIds: config.messages
+        ? finalMessages.map(() => undefined)
+        : storedMessageIds(finalMessages, assembled.history),
       tools: mergedTools,
       model: finalModel
     };
