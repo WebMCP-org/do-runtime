@@ -5,8 +5,11 @@
  * `Timer` and `fetch` ports have to reach the platform's own, because
  * `installActorScope` replaces the globals with gated ones built on those
  * ports; a port that read the installed global would arm a timeout to
- * implement a timeout. Beside `global-scope.ts` because that is what replaces
- * them, and not in `util/`, which corresponds to workerd's `util/`.
+ * implement a timeout. The same replacement makes `WebSocket` refuse
+ * construction, so a host that opens its own transport, to hand an actor
+ * through `acceptWebSocket`, needs the platform's constructor too. Beside
+ * `global-scope.ts` because that is what replaces them, and not in `util/`,
+ * which corresponds to workerd's `util/`.
  */
 
 import type { Timer } from "../io/io-context";
@@ -35,3 +38,10 @@ export const platformTimer: Timer = {
 
 /** The platform's `fetch`. */
 export const platformFetch: FetchPort = globalThis.fetch.bind(globalThis);
+
+/**
+ * The platform's `WebSocket` constructor, for a host-owned transport. The installed actor scope's
+ * `WebSocket` refuses construction because a native handshake cannot wait for the output gate; a
+ * host that opens a socket with this one and hands it to `acceptWebSocket` owns that ordering.
+ */
+export const platformWebSocket: typeof WebSocket = globalThis.WebSocket;

@@ -212,11 +212,12 @@ export {
 } from "./api/global-scope";
 /**
  * `ports.timer` and `ports.fetch` over the platform's own `setTimeout`,
- * `clearTimeout` and `fetch`, captured when the package loads. That is before
- * any `installActorScope` can replace the globals, so hosts stop depending on
+ * `clearTimeout` and `fetch`, and the platform's `WebSocket` for host-owned
+ * transports, captured when the package loads. That is before any
+ * `installActorScope` can replace the globals, so hosts stop depending on
  * module order.
  */
-export { platformFetch, platformTimer } from "./api/platform";
+export { platformFetch, platformTimer, platformWebSocket } from "./api/platform";
 export type { AcceptedWebSocket, RawWebSocket, RehydratedWebSocket } from "./api/web-socket";
 export { ALREADY_ACCEPTED_MESSAGE, WebSocketRequestResponsePair } from "./api/web-socket";
 export { BYOB_READER_UNGATABLE_MESSAGE, gateRequestBody } from "./api/http";
