@@ -520,6 +520,24 @@ describe("Think — beforeTurn hook", () => {
     expect(await agent.getHeldMessengerThreadIdForTest()).toBe("thread-a");
   });
 
+  it("names the stored message behind each user message", async () => {
+    const agent = await freshAgent("hook-bt-message-ids");
+    await agent.testChat("First");
+    await agent.testChat("Second");
+
+    const stored = (await agent.getStoredMessages()) as UIMessage[];
+    const [first, second] = stored.filter((m) => m.role === "user");
+    const sources = await agent.getBeforeTurnMessageSources();
+    expect(sources).toEqual([
+      [{ role: "user", id: first.id }],
+      [
+        { role: "user", id: first.id },
+        { role: "assistant", id: null },
+        { role: "user", id: second.id }
+      ]
+    ]);
+  });
+
   it("captures continuation flag from programmatic path", async () => {
     const agent = await freshProgrammaticAgent("hook-bt-save");
     await agent.testChat("First message");

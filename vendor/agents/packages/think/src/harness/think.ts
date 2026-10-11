@@ -406,7 +406,11 @@ export class Think<
   async clearMessages(): Promise<void> {
     await this.harness.session().reset();
     await this.#sync();
+    await this.onHistoryCleared();
   }
+
+  /** Called after {@link clearMessages} clears the stored conversation. */
+  protected onHistoryCleared(): void | Promise<void> {}
 
   async continueLastTurn(): Promise<SaveMessagesResult> {
     const session = this.harness.session();
@@ -681,12 +685,23 @@ export class Think<
       trigger: "submission",
       continuation: turn.continuation
     };
+    const messages = await convertToModelMessages([...turn.messages], {
+      tools,
+      ignoreIncompleteToolCalls: true
+    });
+    // Each user and system message converts from exactly one stored message.
+    const anchors = turn.messages.filter(
+      (message) => message.role === "user" || message.role === "system"
+    );
+    let anchor = 0;
     const config = await this.beforeTurn({
       system: turn.system ?? this.getSystemPrompt(),
-      messages: await convertToModelMessages([...turn.messages], {
-        tools,
-        ignoreIncompleteToolCalls: true
-      }),
+      messages,
+      messageIds: messages.map((message) =>
+        message.role === "user" || message.role === "system"
+          ? anchors[anchor++]?.id
+          : undefined
+      ),
       tools,
       model,
       continuation: turn.continuation,

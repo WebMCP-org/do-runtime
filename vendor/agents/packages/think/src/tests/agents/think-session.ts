@@ -1610,6 +1610,10 @@ export class ThinkTestAgent extends Think {
     body?: RpcJsonObject;
   }> = [];
   private _beforeTurnMessagesJson: string[] = [];
+  private _beforeTurnMessageSources: Array<
+    Array<{ role: string; id: string | null }>
+  > = [];
+  private _historyClearedCount = 0;
   private _capturedTurnChannels: string[] = [];
   private _capturedTurnMetadata: (Record<string, unknown> | undefined)[] = [];
   private _beforeTurnThrowChannel: string | null = null;
@@ -1678,6 +1682,12 @@ export class ThinkTestAgent extends Think {
       body: ctx.body as RpcJsonObject | undefined
     });
     this._beforeTurnMessagesJson.push(JSON.stringify(ctx.messages));
+    this._beforeTurnMessageSources.push(
+      ctx.messages.map((message, index) => ({
+        role: message.role,
+        id: ctx.messageIds[index] ?? null
+      }))
+    );
     const lastUser = [...ctx.messages].reverse().find((m) => m.role === "user");
     this._turnIdentityLog.push({
       input: JSON.stringify(lastUser?.content ?? null),
@@ -2247,6 +2257,20 @@ export class ThinkTestAgent extends Think {
     }>
   > {
     return this._beforeTurnLog;
+  }
+
+  async getBeforeTurnMessageSources(): Promise<
+    Array<Array<{ role: string; id: string | null }>>
+  > {
+    return this._beforeTurnMessageSources;
+  }
+
+  protected override onHistoryCleared(): void {
+    this._historyClearedCount++;
+  }
+
+  async getHistoryClearedCount(): Promise<number> {
+    return this._historyClearedCount;
   }
 
   async getLastBeforeTurnMessagesJson(): Promise<string | null> {
