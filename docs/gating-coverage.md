@@ -114,7 +114,7 @@ promise continuations that do not pass through syntax the transform can rewrite.
 | Surface | Why |
 | --- | --- |
 | `getReader({ mode: "byob" })` | `read(view)` returns the caller's own buffer; there is no seam to gate, and a working-but-ungated reader is the silent failure this layer exists to prevent |
-| Actor-global `new WebSocket(url)` | The native constructor starts its handshake immediately, before output confirmation. Refused before construction; hosts supply transports and actor code can use `WebSocketPair`. |
+| Actor-global `new WebSocket(url)` | The native constructor starts its handshake immediately, before output confirmation. Refused before construction; hosts open transports with `platformWebSocket` and hand them to `acceptWebSocket`, and actor code can use `WebSocketPair`. |
 
 ## Foreign by design
 
