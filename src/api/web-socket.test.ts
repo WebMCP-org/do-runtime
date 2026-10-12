@@ -177,8 +177,54 @@ describe("outgoing messages", () => {
     write.resolve();
     await quiesce();
     expect(socket.sent).toEqual([]);
-    expect(socket.closed).toEqual([]);
+    // The queued close(1000) never reaches the transport; only the abort's drop does.
+    expect(socket.closed).toEqual([undefined]);
     expect(ctx.waitUntilStatus()).toBeUndefined();
+  });
+
+  test("an aborted actor drops its accepted socket instead of leaving it OPEN", async () => {
+    // ← a classic socket is owned by its IoContext; destroying the context drops the
+    // connection. A caller that kept the socket must see it closed, not write into it forever.
+    const { ctx, socket } = newFixture();
+    const accepted = await ctx.run(() => acceptWebSocket(ctx, socket));
+    expect(accepted.readyState).toBe(AcceptedWebSocket.OPEN);
+
+    ctx.abort(new Error("actor stopped"));
+    await quiesce();
+    expect(accepted.readyState).toBe(AcceptedWebSocket.CLOSED);
+    expect(socket.closed).toEqual([undefined]);
+
+    accepted.send("after");
+    accepted.close(1000);
+    socket.dispatchEvent(new CloseEvent("close", { code: 1005, wasClean: true }));
+    await quiesce();
+    expect(socket.sent).toEqual([]);
+    expect(socket.closed).toEqual([undefined]);
+    expect(ctx.waitUntilStatus()).toBeUndefined();
+  });
+
+  test("an aborted actor's pair half drops the connection the host holds", async () => {
+    const { ctx } = newFixture();
+    const registry = new HibernatableWebSocketRegistry(ctx, {
+      message: () => {},
+      close: () => {},
+      error: () => {},
+    });
+    const { 0: client, 1: server } = new registry.WebSocketPair();
+    // What returning the client half in a 101 response does: the host takes it out of the actor.
+    const host = (client as AcceptedWebSocket).coupleToHost();
+    host.accept();
+    const closes: string[] = [];
+    host.addEventListener("close", (event) => {
+      const close = event as CloseEvent;
+      closes.push(`${close.code}:${close.wasClean}`);
+    });
+    await ctx.run(() => server.accept());
+
+    ctx.abort(new Error("actor stopped"));
+    await quiesce();
+    expect(server.readyState).toBe(AcceptedWebSocket.CLOSED);
+    expect(closes).toEqual(["1006:false"]);
   });
 
   test("auto-responses bypass output locks but remain behind earlier sends", async () => {
