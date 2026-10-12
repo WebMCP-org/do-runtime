@@ -458,17 +458,38 @@ export class AcceptedWebSocket extends EventTarget implements RawWebSocket, WebS
   }
 
   #enableClassic(): void {
+    const ctx = this.#ctx;
     const delivery: SocketDelivery = {
       mode: "classic",
-      criticalSection: this.#ctx?.getCriticalSection(),
+      criticalSection: ctx?.getCriticalSection(),
     };
     this.#delivery = delivery;
     socketMetadata(this).accepted = { mode: "classic" };
+    ctx?.onAbort().catch(() => {
+      this.#dropWith(ctx, delivery);
+    });
     const pending = this.#pending;
     this.#pending = [];
     for (const item of pending) {
       this.#deliverClassic(item.type, item.event, delivery.criticalSection);
     }
+  }
+
+  /**
+   * ← a classic socket is owned by its `IoContext`, and tearing the context down
+   * drops the connection. Without this an aborted actor's socket stays OPEN while
+   * `#enqueue` discards every write, and a caller that kept it waits forever.
+   * A socket that moved on (to a host, to hibernation, to another context) is
+   * no longer this context's to drop.
+   */
+  #dropWith(ctx: IoContext, delivery: SocketDelivery): void {
+    if (this.#released || this.#ctx !== ctx || this.#delivery !== delivery) return;
+    if (this.#readyState === AcceptedWebSocket.CLOSED) return;
+    this.#readyState = AcceptedWebSocket.CLOSED;
+    this.#ownClose = true;
+    const socket = this.#socket;
+    if (socket instanceof MemoryWebSocketEndpoint) socket.abort(1006, "");
+    else socket.close();
   }
 
   #receive(type: SocketEvent, event: Event): void {
@@ -520,7 +541,8 @@ export class AcceptedWebSocket extends EventTarget implements RawWebSocket, WebS
     };
     const ctx = this.#ctx;
     if (ctx === undefined) queueMicrotask(deliver);
-    else ctx.addWaitUntil(ctx.run(deliver, { input: criticalSection }));
+    // An aborted context refuses `run()`; the frame has nobody left to deliver to.
+    else if (!ctx.isAborted()) ctx.addWaitUntil(ctx.run(deliver, { input: criticalSection }));
   }
 
   #enqueue(write: () => void, outputLock?: Promise<void>): void {
