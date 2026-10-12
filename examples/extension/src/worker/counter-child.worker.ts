@@ -7,10 +7,12 @@
  * ordinary Agents SDK code, with no blob, eval, or shared ambient.
  */
 
+import { platformFetch, platformTimer, platformWebSocket } from "@mcp-b/do-runtime";
 import { Agent } from "agents";
 import type {
   CounterValueState,
   NestedSubAgentSnapshot,
+  SubAgentPlatformSnapshot,
   SubAgentSnapshot,
 } from "../protocol";
 
@@ -53,6 +55,29 @@ export class CounterChild extends Agent<CounterEnv, CounterValueState> {
 
   async scheduledBump(): Promise<void> {
     this.setState({ value: this.state.value + 1 });
+  }
+
+  /**
+   * The platform primitives this bundle's own copy of the runtime exports. It is evaluated after
+   * the root installed its actor scope, so a copy that captured the globals for itself would
+   * hold the refusing `WebSocket` and the root's gated timer and `fetch`.
+   */
+  async platformPrimitives(): Promise<SubAgentPlatformSnapshot> {
+    return {
+      // Nothing listens on port 1; constructing the socket is the proof, so close it at once.
+      webSocket: await outcome(() => new platformWebSocket("ws://127.0.0.1:1/").close()),
+      timer: await outcome(() => platformTimer.afterDelay(0)),
+      fetch: await outcome(async () => await (await platformFetch("data:,ok")).text()),
+    };
+  }
+}
+
+async function outcome(run: () => unknown): Promise<string> {
+  try {
+    await run();
+    return "ok";
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
   }
 }
 

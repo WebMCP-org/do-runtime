@@ -65,6 +65,7 @@ import type {
   HostRpc,
   HostStatus,
   NestedSubAgentSnapshot,
+  SubAgentPlatformSnapshot,
   SubAgentSnapshot,
   SupervisorRpc,
   ThinkProbeStatus,
@@ -758,6 +759,10 @@ class HostTarget extends RpcTarget implements HostRpc {
 
   async nestedSubAgent(): Promise<NestedSubAgentSnapshot> {
     return await (await placed()).entry.nestedSubAgent();
+  }
+
+  async subAgentPlatform(): Promise<SubAgentPlatformSnapshot> {
+    return await (await placed()).entry.subAgentPlatform();
   }
 
   async armSubAgentWake(delayMs: number): Promise<number> {

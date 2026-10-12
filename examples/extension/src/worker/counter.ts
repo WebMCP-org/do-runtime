@@ -25,6 +25,7 @@ import {
   type CounterState,
   type CounterValueState,
   type NestedSubAgentSnapshot,
+  type SubAgentPlatformSnapshot,
   type SubAgentSnapshot,
   type ThinkProbeStatus,
   type ThinkProbeSubmission,
@@ -196,6 +197,10 @@ export class Counter extends Agent<CounterEnv, CounterState> {
     return await child.bumpLeaf();
   }
 
+  async subAgentPlatform(): Promise<SubAgentPlatformSnapshot> {
+    return await (await this.subAgent(CounterChild, "platform")).platformPrimitives();
+  }
+
   async armSubAgentWake(delayMs: number): Promise<number> {
     return await (await this.subAgent(CounterChild, "scheduled")).armWake(delayMs);
   }
@@ -284,6 +289,7 @@ export class CounterChild extends Agent<CounterEnv, CounterValueState> {
   declare bumpLeaf: () => Promise<NestedSubAgentSnapshot>;
   declare armWake: (delayMs: number) => Promise<number>;
   declare currentValue: () => Promise<number>;
+  declare platformPrimitives: () => Promise<SubAgentPlatformSnapshot>;
 }
 
 /** A type-only token for the separately bundled Think facet. */
