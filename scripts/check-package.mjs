@@ -75,8 +75,12 @@ if (typeof runtime.createActorContainer !== "function") {
 if (typeof runtime.BrokenActorError !== "function" || typeof runtime.CanceledError !== "function") {
   throw new Error("packed root entry does not export its actor lifecycle errors");
 }
-if (typeof runtime.platformTimer?.afterDelay !== "function" || typeof runtime.platformFetch !== "function") {
-  throw new Error("packed root entry does not export platformTimer and platformFetch");
+if (
+  typeof runtime.platformTimer?.afterDelay !== "function" ||
+  typeof runtime.platformFetch !== "function" ||
+  typeof runtime.platformWebSocket !== "function"
+) {
+  throw new Error("packed root entry does not export platformTimer, platformFetch and platformWebSocket");
 }
 if (
   typeof alarmCoordinator.BrowserAlarmCoordinator !== "function" ||

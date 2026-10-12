@@ -23,8 +23,10 @@ import {
   installActorScope,
   isAlarmFailureUserError,
   NO_GLOBAL_OUTBOUND_MESSAGE,
+  OUTBOUND_WEBSOCKET_UNGATABLE_MESSAGE,
 } from "./global-scope";
 import { ACTOR_SCOPE_GLOBALS } from "./actor-scope-globals";
+import { platformWebSocket } from "./platform";
 import { HibernatableWebSocketRegistry } from "./web-socket";
 import { AsyncLocalStorage } from "../browser/async-hooks";
 import { facetScopeBanner } from "../vite";
@@ -514,6 +516,34 @@ describe("installActorScope", () => {
       write.resolve();
       globalThis.WebSocket = NativeWebSocket;
     }
+  });
+
+  test("platformWebSocket still opens a host-owned transport once the realm's WebSocket refuses", async () => {
+    // A host opens its own socket and hands it to `acceptWebSocket`, so it needs
+    // the constructor the package captured before any scope replaced the global.
+    const { ctx, scope } = newScope();
+    const realm = ACTOR_SCOPE_GLOBALS.map(
+      (name) => [name, Object.getOwnPropertyDescriptor(globalThis, name)] as const,
+    );
+    installActorScope(globalThis, () => scope);
+    const closed = Promise.withResolvers<WebSocket>();
+    try {
+      await ctx.run(() => {
+        expect(() => new WebSocket("ws://127.0.0.1:1/")).toThrow(OUTBOUND_WEBSOCKET_UNGATABLE_MESSAGE);
+        const socket = new platformWebSocket("ws://127.0.0.1:1/");
+        socket.addEventListener("close", () => closed.resolve(socket), { once: true });
+      });
+    } finally {
+      for (const [name, descriptor] of realm) {
+        if (descriptor === undefined) Reflect.deleteProperty(globalThis, name);
+        else Object.defineProperty(globalThis, name, descriptor);
+      }
+    }
+    expect(platformWebSocket).toBe(globalThis.WebSocket);
+    // Nothing listens on port 1, so the platform's handshake reaches the network, fails and closes.
+    const socket = await closed.promise;
+    expect(socket).toBeInstanceOf(platformWebSocket);
+    expect(socket.readyState).toBe(platformWebSocket.CLOSED);
   });
 
   test("the bound scope reads the current external entry without installing it", () => {
