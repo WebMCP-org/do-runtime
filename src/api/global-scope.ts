@@ -54,6 +54,7 @@ import {
 import { onAbort } from "../io/io-gate";
 import { ACTOR_SCOPE_GLOBALS } from "./actor-scope-globals";
 import { gateResponseBody } from "./http";
+import { platform } from "./platform";
 import {
   installWebSocketGlobals,
   WebSocketRequestResponsePair,
@@ -616,14 +617,13 @@ function scopeCrypto(resolve: () => ActorGlobalScope): Crypto {
   } as unknown as Crypto;
 }
 
-/** Captured at import, before any host installs a scope over it. */
-const platformCrypto = globalThis.crypto;
+/** The platform's, which `platform.ts` captured before any host installed a scope over it. */
+const platformCrypto = platform.crypto;
 
 // Native stream callbacks bypass transformed awaits. Capture their creator,
 // including async stores, before later input or demand arrives from another actor.
-// These constructors are captured before a host installs its actor scope.
-const ActorReadableStream = withActorStreamCallbacks(globalThis.ReadableStream);
-const ActorTransformStream = withActorStreamCallbacks(globalThis.TransformStream);
+const ActorReadableStream = withActorStreamCallbacks(platform.ReadableStream);
+const ActorTransformStream = withActorStreamCallbacks(platform.TransformStream);
 
 function withActorStreamCallbacks<T extends typeof ReadableStream | typeof TransformStream>(
   Stream: T,

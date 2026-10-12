@@ -76,8 +76,9 @@ popup.html ──sendMessage──▶ service worker ──chrome.offscreen.crea
 - **Real Agents SDK sub-agents.** The root uses the public `subAgent()`,
   `parentAgent()`, `abortSubAgent()`, and `deleteSubAgent()` APIs. The e2e proves
   sibling isolation, overlapping awaits, nested children, restart persistence,
-  abort-versus-delete storage semantics, and a child schedule delivered after
-  Chrome recreates an evicted host.
+  abort-versus-delete storage semantics, a child schedule delivered after
+  Chrome recreates an evicted host, and that the child bundle's own copy of the
+  runtime exports the platform's `WebSocket`, timer and `fetch`.
 - **A hibernatable `AgentClient` connection across container eviction.** The
   offscreen page opens the SDK client over a `MessagePort`-backed WebSocket,
   while the actor receives the server half through `ctx.acceptWebSocket()`. The

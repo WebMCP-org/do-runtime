@@ -436,6 +436,12 @@ async function main() {
       JSON.stringify({ childValue: 1, leafValue: 1 }),
     );
 
+    check(
+      "a separately bundled sub-agent's runtime copy exports the platform's primitives",
+      JSON.stringify(await op(popup, "subAgentPlatform")),
+      JSON.stringify({ webSocket: "ok", timer: "ok", fetch: "ok" }),
+    );
+
     // ---------------------------------------------------------------------
     // 2. Root-container eviction keeps the existing hibernatable socket. The
     //    offscreen document, Worker, MessagePort and AgentClient all stay put;

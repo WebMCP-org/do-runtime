@@ -40,6 +40,7 @@ import {
   type HostStatus,
   type NestedSubAgentSnapshot,
   type RelayRoundTrip,
+  type SubAgentPlatformSnapshot,
   type SubAgentSnapshot,
   type SupervisorRpc,
   type ThinkProbeStatus,
@@ -337,6 +338,7 @@ const ops = {
   overlapSubAgents: async (): Promise<readonly SubAgentSnapshot[]> => await host.overlapSubAgents(),
   subAgentLifecycle: async (): Promise<readonly number[]> => await host.subAgentLifecycle(),
   nestedSubAgent: async (): Promise<NestedSubAgentSnapshot> => await host.nestedSubAgent(),
+  subAgentPlatform: async (): Promise<SubAgentPlatformSnapshot> => await host.subAgentPlatform(),
   armSubAgentWake: async (delayMs: number): Promise<number> => await host.armSubAgentWake(delayMs),
   scheduledSubAgentValue: async (): Promise<number> => await host.scheduledSubAgentValue(),
   startMcpProbe: async (origin: string) => await host.startMcpProbe(origin),
@@ -430,6 +432,8 @@ async function runOp(op: HostOp, args: readonly unknown[]): Promise<unknown> {
       return await ops.subAgentLifecycle();
     case "nestedSubAgent":
       return await ops.nestedSubAgent();
+    case "subAgentPlatform":
+      return await ops.subAgentPlatform();
     case "armSubAgentWake":
       return await ops.armSubAgentWake(integerArg(args, 0));
     case "scheduledSubAgentValue":

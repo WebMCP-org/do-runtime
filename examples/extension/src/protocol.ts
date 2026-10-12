@@ -62,6 +62,13 @@ export type NestedSubAgentSnapshot = {
   readonly leafValue: number;
 };
 
+/** `"ok"` or the error each platform primitive threw inside a separately bundled facet. */
+export type SubAgentPlatformSnapshot = {
+  readonly webSocket: string;
+  readonly timer: string;
+  readonly fetch: string;
+};
+
 export type ThinkProbeSubmission = {
   readonly accepted: boolean;
   readonly error: string | null;
@@ -136,6 +143,7 @@ export interface HostRpc {
   overlapSubAgents(): Promise<readonly SubAgentSnapshot[]>;
   subAgentLifecycle(): Promise<readonly number[]>;
   nestedSubAgent(): Promise<NestedSubAgentSnapshot>;
+  subAgentPlatform(): Promise<SubAgentPlatformSnapshot>;
   armSubAgentWake(delayMs: number): Promise<number>;
   scheduledSubAgentValue(): Promise<number>;
   startMcpProbe(origin: string): Promise<{ publicReady: boolean; authUrls: string[] }>;
