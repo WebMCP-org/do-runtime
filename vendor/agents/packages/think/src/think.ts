@@ -3945,6 +3945,15 @@ export class Think<
   >["acceptsPdfs"] = true;
 
   /**
+   * Extracts a PDF's text, one string per page. Unset by default. When set,
+   * a workspace `read` of a PDF renders as that text for a model without PDF
+   * input (see {@link workspaceAcceptsPdfs}) instead of a note naming the file.
+   */
+  workspacePdfText: NonNullable<
+    Parameters<typeof createWorkspaceTools>[1]
+  >["pdfText"] = undefined;
+
+  /**
    * Opt-in HTTP fetch tools. Disabled by default — set to a config object to
    * register a generic `fetch_url` tool (when `allowlist` is provided) and one
    * `fetch_<name>` tool per `bindings` target. Read-only (GET), allowlisted,
@@ -7769,7 +7778,8 @@ export class Think<
     const workspaceTools = createWorkspaceTools(this.workspace, {
       bash: this.workspaceBash,
       acceptsImages: this.workspaceAcceptsImages,
-      acceptsPdfs: this.workspaceAcceptsPdfs
+      acceptsPdfs: this.workspaceAcceptsPdfs,
+      pdfText: this.workspacePdfText
     });
     const fetchToolSet: ToolSet = this.fetchTools
       ? createFetchTools({

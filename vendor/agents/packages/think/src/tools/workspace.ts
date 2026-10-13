@@ -181,6 +181,11 @@ export interface WorkspaceToolsOptions {
    * {@link ReadToolOptions}.
    */
   acceptsPdfs?: ReadToolOptions["acceptsPdfs"];
+  /**
+   * Extracts a PDF's text for a model without PDF input. See
+   * {@link ReadToolOptions}.
+   */
+  pdfText?: ReadToolOptions["pdfText"];
 }
 
 export type WorkspaceTools = {
@@ -224,7 +229,8 @@ export function createWorkspaceTools(
     read: createReadTool({
       ops: workspaceReadOps(workspace),
       acceptsImages: options.acceptsImages,
-      acceptsPdfs: options.acceptsPdfs
+      acceptsPdfs: options.acceptsPdfs,
+      pdfText: options.pdfText
     }),
     write: createWriteTool({ ops: workspaceWriteOps(workspace) }),
     edit: createEditTool({ ops: workspaceEditOps(workspace) }),
@@ -321,10 +327,18 @@ export interface ReadToolOptions {
    * Same render-time contract as {@link acceptsImages}.
    */
   acceptsPdfs?: boolean | (() => boolean | Promise<boolean>);
+  /**
+   * Returns a PDF's text, one string per page. When the model has no PDF
+   * input, a PDF read renders as this text, line-numbered and windowed by the
+   * read's `offset` and `limit` like a text file, instead of a note naming the
+   * file. Results are cached by content, because every later request renders
+   * the read again.
+   */
+  pdfText?: (bytes: Uint8Array) => Promise<readonly string[]>;
 }
 
 export function createReadTool(options: ReadToolOptions): Tool {
-  const { ops, acceptsImages = true, acceptsPdfs = true } = options;
+  const { ops, acceptsImages = true, acceptsPdfs = true, pdfText } = options;
 
   return tool({
     description:
@@ -504,9 +518,43 @@ export function createReadTool(options: ReadToolOptions): Tool {
         const modelReadsPdfs =
           typeof acceptsPdfs === "function" ? await acceptsPdfs() : acceptsPdfs;
         if (!modelReadsPdfs) {
+          if (!pdfText) {
+            return {
+              type: "error-text",
+              value: `${note} This model has no PDF input, so the document was not sent.`
+            };
+          }
+          let pages: readonly string[];
+          try {
+            pages = await cachedPdfText(pdfText, bytes);
+          } catch (error) {
+            return {
+              type: "error-text",
+              value: `${note} This model has no PDF input, and the document's text could not be extracted: ${errorMessage(error)}`
+            };
+          }
+          const pageCount = `${pages.length} ${pages.length === 1 ? "page" : "pages"}`;
+          if (pages.every((page) => page.trim() === "")) {
+            return {
+              type: "error-text",
+              value: `${note} This model has no PDF input, and none of the document's ${pageCount} has a text layer.`
+            };
+          }
+          const text = pages
+            .map(
+              (page, index) => `--- Page ${index + 1} ---\n${page.trimEnd()}`
+            )
+            .join("\n");
+          const { content } = numberLines(
+            text,
+            typeof input.offset === "number" ? input.offset : undefined,
+            typeof input.limit === "number" ? input.limit : undefined
+          );
           return {
-            type: "error-text",
-            value: `${note} This model has no PDF input, so the document was not sent.`
+            type: "text",
+            value:
+              `${note} This model has no PDF input, so this is the text of its ${pageCount}, without layout or images.\n` +
+              content
           };
         }
       }
@@ -603,33 +651,12 @@ function readTextWithLineNumbers({
       return { error: `Could not read file: ${path}` };
     }
 
-    const allLines = content.split("\n");
-    const totalLines = allLines.length;
-
-    // Apply offset/limit
-    const startLine = offset ? offset - 1 : 0;
-    const endLine = limit ? startLine + limit : allLines.length;
-    const lines = allLines.slice(startLine, endLine);
-
-    // Format with line numbers, truncate long lines
-    const numbered = lines.map((line, i) => {
-      const lineNum = startLine + i + 1;
-      const truncated =
-        line.length > MAX_LINE_LENGTH
-          ? line.slice(0, MAX_LINE_LENGTH) + "... (truncated)"
-          : line;
-      return `${lineNum}\t${truncated}`;
-    });
-
-    // Truncate if too many lines
-    let output: string;
-    if (numbered.length > MAX_LINES) {
-      output =
-        numbered.slice(0, MAX_LINES).join("\n") +
-        `\n... (${numbered.length - MAX_LINES} more lines truncated)`;
-    } else {
-      output = numbered.join("\n");
-    }
+    const {
+      content: output,
+      totalLines,
+      startLine,
+      endLine
+    } = numberLines(content, offset, limit);
 
     const result: TextReadToolOutput = {
       path,
@@ -644,6 +671,71 @@ function readTextWithLineNumbers({
 
     return result;
   });
+}
+
+function numberLines(content: string, offset?: number, limit?: number) {
+  const allLines = content.split("\n");
+  const totalLines = allLines.length;
+
+  // Apply offset/limit
+  const startLine = offset ? offset - 1 : 0;
+  const endLine = limit ? startLine + limit : allLines.length;
+  const lines = allLines.slice(startLine, endLine);
+
+  // Format with line numbers, truncate long lines
+  const numbered = lines.map((line, i) => {
+    const lineNum = startLine + i + 1;
+    const truncated =
+      line.length > MAX_LINE_LENGTH
+        ? line.slice(0, MAX_LINE_LENGTH) + "... (truncated)"
+        : line;
+    return `${lineNum}\t${truncated}`;
+  });
+
+  // Truncate if too many lines
+  const output =
+    numbered.length > MAX_LINES
+      ? numbered.slice(0, MAX_LINES).join("\n") +
+        `\n... (${numbered.length - MAX_LINES} more lines truncated)`
+      : numbered.join("\n");
+
+  return { content: output, totalLines, startLine, endLine };
+}
+
+// A read renders again on every later request, and extraction parses the
+// whole document, so recent results are kept by content digest per extractor.
+const PDF_TEXT_CACHE_SIZE = 8;
+const pdfTextCache = new WeakMap<
+  NonNullable<ReadToolOptions["pdfText"]>,
+  Map<string, Promise<readonly string[]>>
+>();
+
+async function cachedPdfText(
+  pdfText: NonNullable<ReadToolOptions["pdfText"]>,
+  bytes: Uint8Array
+): Promise<readonly string[]> {
+  // The extractor may take ownership of the buffer it is given.
+  const copy = bytes.slice();
+  const digest = uint8ArrayToBase64(
+    new Uint8Array(await crypto.subtle.digest("SHA-256", copy))
+  );
+  let cache = pdfTextCache.get(pdfText);
+  if (!cache) {
+    cache = new Map();
+    pdfTextCache.set(pdfText, cache);
+  }
+  let pages = cache.get(digest);
+  if (pages) {
+    cache.delete(digest);
+  } else {
+    pages = pdfText(copy);
+    pages.catch(() => cache.delete(digest));
+  }
+  cache.set(digest, pages);
+  while (cache.size > PDF_TEXT_CACHE_SIZE) {
+    cache.delete(cache.keys().next().value!);
+  }
+  return pages;
 }
 
 async function detectWorkspaceMediaType({
