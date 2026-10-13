@@ -2,12 +2,13 @@
  * A model stream cut inside a tool call must end the turn with a visible
  * error, not a silent `completed`.
  *
- * The provider's response can stop mid tool input two ways: the body errors
- * (a network failure), or it ends cleanly with no finish chunk (a relay or
- * proxy closing the response early). In the second case the AI SDK keeps the
- * partial step and reports `finish` with reason `other`, so the turn looked
- * complete: no error frame, no `onChatError`, and a tool call left
- * `input-streaming` until the next turn's transcript repair.
+ * The provider's response can stop mid tool input three ways: the body errors
+ * (a network failure), it ends cleanly with no finish chunk (a relay or proxy
+ * closing the response early), or the provider finishes the step on its own
+ * terms, such as its output token limit. In the last two cases the AI SDK
+ * keeps the partial step and reports `finish` (`other`, or the provider's
+ * reason), so the turn looked complete: no error frame, no `onChatError`, and
+ * a tool call left `input-streaming` until the next turn's transcript repair.
  */
 
 import { env, exports } from "cloudflare:workers";
@@ -96,8 +97,8 @@ function cutToolPart(messages: UIMessage[]) {
 }
 
 describe("Think — model stream cut inside a tool call", () => {
-  it.each(["close", "error"] as const)(
-    "reports an error to WebSocket clients when the stream %ss mid tool input",
+  it.each(["close", "error", "length"] as const)(
+    "reports an error to WebSocket clients when the stream ends (%s) mid tool input",
     async (ending) => {
       const { agent, ws } = await freshAgent();
       await agent.setCutToolInputResponseForTest(ending);
@@ -135,8 +136,8 @@ describe("Think — model stream cut inside a tool call", () => {
     }
   });
 
-  it.each(["close", "error"] as const)(
-    "reports an error to chat() callbacks when the stream %ss mid tool input",
+  it.each(["close", "error", "length"] as const)(
+    "reports an error to chat() callbacks when the stream ends (%s) mid tool input",
     async (ending) => {
       const room = crypto.randomUUID();
       const agent = await getAgentByName(
@@ -149,6 +150,23 @@ describe("Think — model stream cut inside a tool call", () => {
 
       expect(result.done).toBe(false);
       expect(result.error).toBeTruthy();
+    }
+  );
+
+  it.each([
+    ["close", "other"],
+    ["length", "length"]
+  ] as const)(
+    "hands classifyChatError the unfinished call and its finish reason (%s)",
+    async (ending, finishReason) => {
+      const agent = await getAgentByName(
+        env.ThinkTestAgent as unknown as DurableObjectNamespace<ThinkTestAgent>,
+        crypto.randomUUID()
+      );
+
+      await expect(
+        agent.cutToolInputClassificationForTest(ending)
+      ).resolves.toEqual({ toolNames: ["write"], finishReason });
     }
   );
 
