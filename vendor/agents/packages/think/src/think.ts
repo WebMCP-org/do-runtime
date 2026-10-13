@@ -881,15 +881,41 @@ function normalizeToolFinishEvent(event: unknown): {
 }
 
 /**
+ * Vendor divergence: the error a turn fails with when the model response ended
+ * while a tool call's input was still streaming, so that call never ran.
+ * `finishReason` is the reason the AI SDK reported for the final step: `other`
+ * when the body stopped without the provider's own finish (a dropped or
+ * relayed connection), or the provider's account of why it stopped, such as
+ * `length` when the output token limit cut the input off. It reaches
+ * `classifyChatError` as this instance, so an app can route a cut connection
+ * into bounded recovery and leave a deterministic stop as a visible error.
+ */
+export class UnfinishedToolInputError extends Error {
+  constructor(
+    readonly toolNames: readonly string[],
+    readonly finishReason: string
+  ) {
+    const tools = toolNames.join(", ");
+    super(
+      finishReason === "other"
+        ? `The model response ended before the input of tool call ${tools} was complete.`
+        : `The model response finished with reason "${finishReason}" before the input of tool call ${tools} was complete.`
+    );
+    this.name = "UnfinishedToolInputError";
+  }
+}
+
+/**
  * Vendor divergence: a model response that ends while a tool call's input is
  * still streaming was cut off. When the provider's body ends without a finish
  * event, the AI SDK keeps the partial step and finishes it with reason
- * `other`, so the turn would otherwise complete with no error and a tool call
- * that never ran. Emit an error chunk before that finish (or at the end of a
- * stream with no finish) so stream consumers fail the turn as they do any
- * in-stream error. Any other finish reason is the provider's own account of the
- * step and passes, as does a stopped turn (`abort`) or one that already
- * errored.
+ * `other`; when the provider stops on its own terms (`length`,
+ * `content-filter`) it reports that reason. Either way the turn would
+ * otherwise complete with no error and a tool call that never ran. Emit an
+ * error chunk before that finish (or at the end of a stream with no finish) so
+ * stream consumers fail the turn as they do any in-stream error. A finish
+ * with reason `tool-calls` or none, a stopped turn (`abort`), or one that
+ * already errored passes.
  */
 function failOnUnfinishedToolInput(
   onError: (error: unknown) => string
@@ -897,17 +923,15 @@ function failOnUnfinishedToolInput(
   const open = new Map<string, string>();
   let settled = false;
   const reportOpenInput = (
-    controller: TransformStreamDefaultController<UIMessageChunk>
+    controller: TransformStreamDefaultController<UIMessageChunk>,
+    finishReason: string
   ) => {
     if (settled || open.size === 0) return;
     settled = true;
-    const tools = [...open.values()].join(", ");
     controller.enqueue({
       type: "error",
       errorText: onError(
-        new Error(
-          `The model response ended before the input of tool call ${tools} was complete.`
-        )
+        new UnfinishedToolInputError([...open.values()], finishReason)
       )
     });
   };
@@ -929,14 +953,22 @@ function failOnUnfinishedToolInput(
           settled = true;
           break;
         case "finish":
-          if (chunk.finishReason === "other") reportOpenInput(controller);
+          // `tool-calls` is the provider's own claim that the step's calls
+          // are complete, and a finish without a reason makes no claim;
+          // every other reason left this input unfinished.
+          if (
+            chunk.finishReason !== undefined &&
+            chunk.finishReason !== "tool-calls"
+          ) {
+            reportOpenInput(controller, chunk.finishReason);
+          }
           settled = true;
           break;
       }
       controller.enqueue(chunk);
     },
     flush(controller) {
-      reportOpenInput(controller);
+      reportOpenInput(controller, "other");
     }
   });
 }
