@@ -42,7 +42,6 @@ export {
 } from "./think-session";
 export { ThinkFetchToolsTestAgent } from "./fetch-tools";
 export { ThinkExecuteToolAgent } from "./execute-tool";
-export { ThinkExecuteHitlAgent } from "./execute-hitl";
 export { ThinkFiberTestAgent } from "./fiber";
 export { ThinkClientToolsAgent } from "./client-tools";
 export {

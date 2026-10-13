@@ -176,10 +176,6 @@
         "name": "ThinkExecuteToolAgent"
       },
       {
-        "class_name": "ThinkExecuteHitlAgent",
-        "name": "ThinkExecuteHitlAgent"
-      },
-      {
         "class_name": "ThinkFetchToolsTestAgent",
         "name": "ThinkFetchToolsTestAgent"
       },
@@ -278,7 +274,6 @@
         "ThinkMessengerRouteTestAgent",
         "ThinkMcpToolMaterializationAgent",
         "ThinkExecuteToolAgent",
-        "ThinkExecuteHitlAgent",
         "ThinkFetchToolsTestAgent",
         "ThinkOnStartReconcileFailureAgent",
         "ThinkOnStartHydrationFailureAgent",

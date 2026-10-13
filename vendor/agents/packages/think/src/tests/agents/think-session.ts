@@ -5093,26 +5093,31 @@ export class ThinkAgentToolParent extends Agent {
   }
 
   /**
-   * Seed a PARENT-side `cf_agent_tool_runs` row with an explicit status, to
-   * assert how the concurrency cap counts (or ignores) a given lifecycle state.
-   * Soft-terminal `interrupted` rows must NOT occupy a slot (only
-   * `starting`/`running` do), so a re-issue after recovery is never cap-blocked.
+   * Seed a PARENT-side `cf_agent_tool_runs` row with an explicit status and
+   * child liveness observation, to assert how the concurrency cap counts (or
+   * ignores) a given lifecycle state. An awaited `interrupted` row occupies a
+   * slot unless its child was observed stopped; omitting `childStillRunning`
+   * leaves liveness unobserved, which the cap treats as possibly running.
    */
   async seedParentAgentToolRunForTest(
     runId: string,
-    status: string
+    status: string,
+    childStillRunning?: boolean
   ): Promise<void> {
     const now = Date.now();
     const completedAt =
       status === "starting" || status === "running" ? null : now;
+    const childStillRunningColumn =
+      childStillRunning === undefined ? null : childStillRunning ? 1 : 0;
     this.sql`
       INSERT INTO cf_agent_tool_runs (
         run_id, parent_tool_call_id, agent_type, input_preview,
         input_redacted, status, display_metadata, display_order,
-        started_at, completed_at
+        started_at, completed_at, child_still_running
       ) VALUES (
         ${runId}, 'seed-tool-call', 'ThinkTestAgent', ${JSON.stringify("seed")},
-        1, ${status}, ${JSON.stringify({ name: "seed" })}, 0, ${now}, ${completedAt}
+        1, ${status}, ${JSON.stringify({ name: "seed" })}, 0, ${now}, ${completedAt},
+        ${childStillRunningColumn}
       )
     `;
   }
