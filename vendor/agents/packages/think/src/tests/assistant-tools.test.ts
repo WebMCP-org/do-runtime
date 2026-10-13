@@ -358,6 +358,126 @@ describe("assistant tools — read", () => {
     });
   });
 
+  describe("PDF reads for a model without PDF input", () => {
+    const path = "/documents/filing.pdf";
+    const bytes = new Uint8Array(asciiBytes("%PDF-1.4\n"));
+    const ops = {
+      stat: () => ({
+        path,
+        name: "filing.pdf",
+        type: "file" as const,
+        mimeType: "application/pdf",
+        size: bytes.length,
+        createdAt: 0,
+        updatedAt: 0
+      }),
+      readFile: async () => null,
+      readFileBytes: async () => bytes
+    };
+    const render = async (
+      read: ReturnType<typeof createReadTool>,
+      input: { path: string; offset?: number; limit?: number }
+    ) => {
+      const output = await read.execute!(input, {
+        toolCallId: "pdf-read",
+        messages: [],
+        context: {}
+      });
+      return read.toModelOutput!({ toolCallId: "pdf-read", input, output });
+    };
+
+    it("renders the extracted text by page, windowed like a text file", async () => {
+      const calls: Uint8Array[] = [];
+      const pdfText = async (data: Uint8Array) => {
+        calls.push(data);
+        return ["Filed April 18, 2025\nClaim 7", "Appendix"];
+      };
+      const read = createReadTool({ ops, acceptsPdfs: false, pdfText });
+
+      await expect(render(read, { path })).resolves.toEqual({
+        type: "text",
+        value:
+          `Read ${path} (application/pdf, 9 B). This model has no PDF input, ` +
+          "so this is the text of its 2 pages, without layout or images.\n" +
+          "1\t--- Page 1 ---\n2\tFiled April 18, 2025\n3\tClaim 7\n" +
+          "4\t--- Page 2 ---\n5\tAppendix"
+      });
+      await expect(
+        render(read, { path, offset: 4, limit: 2 })
+      ).resolves.toMatchObject({
+        value: expect.stringMatching(
+          /images\.\n4\t--- Page 2 ---\n5\tAppendix$/
+        )
+      });
+      // Every later request renders the read again; the text is parsed once.
+      expect(calls).toHaveLength(1);
+      expect(calls[0]).toEqual(bytes);
+      expect(calls[0]).not.toBe(bytes);
+    });
+
+    it("says so when no page has a text layer", async () => {
+      const read = createReadTool({
+        ops,
+        acceptsPdfs: false,
+        pdfText: async () => ["", " \n"]
+      });
+      await expect(render(read, { path })).resolves.toEqual({
+        type: "error-text",
+        value:
+          `Read ${path} (application/pdf, 9 B). This model has no PDF input, ` +
+          "and none of the document's 2 pages has a text layer."
+      });
+    });
+
+    it("names the extraction failure and retries it on the next render", async () => {
+      let attempts = 0;
+      const read = createReadTool({
+        ops,
+        acceptsPdfs: false,
+        pdfText: async () => {
+          attempts++;
+          if (attempts === 1) throw new Error("Invalid PDF structure.");
+          return ["Recovered"];
+        }
+      });
+      await expect(render(read, { path })).resolves.toEqual({
+        type: "error-text",
+        value:
+          `Read ${path} (application/pdf, 9 B). This model has no PDF input, ` +
+          "and the document's text could not be extracted: Invalid PDF structure."
+      });
+      await expect(render(read, { path })).resolves.toMatchObject({
+        type: "text",
+        value: expect.stringContaining("1\t--- Page 1 ---\n2\tRecovered")
+      });
+    });
+
+    it("keeps the note without an extractor and sends the file to a PDF model", async () => {
+      await expect(
+        render(createReadTool({ ops, acceptsPdfs: false }), { path })
+      ).resolves.toEqual({
+        type: "error-text",
+        value: `Read ${path} (application/pdf, 9 B). This model has no PDF input, so the document was not sent.`
+      });
+
+      let extracted = false;
+      const output = await render(
+        createReadTool({
+          ops,
+          acceptsPdfs: () => true,
+          pdfText: async () => {
+            extracted = true;
+            return ["unused"];
+          }
+        }),
+        { path }
+      );
+      expect(output).toMatchObject({ type: "content" });
+      expect(JSON.stringify(output)).toContain('"type":"file-data"');
+      expect(extracted).toBe(false);
+    });
+  });
+
   it("does not line-number unknown binary files", async () => {
     const agent = await freshAgent("read-unknown-binary");
     await agent.seedBytes(
