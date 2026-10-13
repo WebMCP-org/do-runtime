@@ -8,7 +8,11 @@ type ConcurrencyStub = {
   runConcurrentThinkChildrenForTest(
     count: number
   ): Promise<Array<{ runId: string; status: string; error?: string }>>;
-  seedParentAgentToolRunForTest(runId: string, status: string): Promise<void>;
+  seedParentAgentToolRunForTest(
+    runId: string,
+    status: string,
+    childStillRunning?: boolean
+  ): Promise<void>;
   runSingleThinkChildForTest(): Promise<{ status: string; error?: string }>;
 };
 
@@ -59,15 +63,33 @@ describe("maxConcurrentAgentTools", () => {
     await parent.setMaxConcurrentAgentToolsForTest(1);
 
     // A prior run that recovery gave up on is sealed `interrupted` (a soft,
-    // repairable terminal). It must NOT hold the single slot — otherwise a
-    // re-issue after parent recovery could never run.
+    // repairable terminal) after its child was observed stopped. It must NOT
+    // hold the single slot — otherwise a re-issue after parent recovery could
+    // never run.
     await parent.seedParentAgentToolRunForTest(
       "prior-interrupted",
-      "interrupted"
+      "interrupted",
+      false
     );
 
     const result = await parent.runSingleThinkChildForTest();
     expect(result.status).toBe("completed");
+  });
+
+  it("counts an `interrupted` run whose child may still be running", async () => {
+    const parent = await freshParent();
+    await parent.setMaxConcurrentAgentToolsForTest(1);
+
+    // Liveness was never observed, so the child may still be executing and
+    // keeps its slot until a later inspection repairs the row.
+    await parent.seedParentAgentToolRunForTest(
+      "unobserved-interrupted",
+      "interrupted"
+    );
+
+    const result = await parent.runSingleThinkChildForTest();
+    expect(result.status).toBe("error");
+    expect(result.error).toContain("maxConcurrentAgentTools (1) exceeded");
   });
 
   it("DOES count an in-flight `running` run toward the cap", async () => {

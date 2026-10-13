@@ -1,7 +1,13 @@
 import type { LanguageModel, ToolSet, UIMessage } from "ai";
 import { hasToolCall, Output, tool } from "ai";
 import { MockLanguageModelV3 } from "ai/test";
-import { action, skills, Think, type ThinkSession } from "../../think";
+import {
+  action,
+  skills,
+  Think,
+  type ThinkSession,
+  UnfinishedToolInputError
+} from "../../think";
 import { Agent } from "agents";
 import type {
   AgentPathStep,
@@ -471,13 +477,19 @@ function createInBandErrorMockModel(
   } as LanguageModel;
 }
 
+type CutToolInputEnding = "close" | "error" | "length";
+
 /**
  * A model stream cut inside a tool call: the model starts streaming `write`'s
  * input, then the connection drops. `"close"` ends the stream cleanly with no
  * finish chunk (a relay closing the response early); `"error"` fails it (a
- * network error mid-body).
+ * network error mid-body); `"length"` is the provider finishing the step on its
+ * output token limit (a Responses `response.incomplete` with
+ * `max_output_tokens`).
  */
-function createCutToolInputMockModel(ending: "close" | "error"): LanguageModel {
+function createCutToolInputMockModel(
+  ending: CutToolInputEnding
+): LanguageModel {
   return new MockLanguageModelV3({
     doStream: async () => ({
       stream: new ReadableStream({
@@ -495,9 +507,16 @@ function createCutToolInputMockModel(ending: "close" | "error"): LanguageModel {
           });
           if (ending === "error") {
             controller.error(new Error("connection reset mid tool input"));
-          } else {
-            controller.close();
+            return;
           }
+          if (ending === "length") {
+            controller.enqueue({
+              type: "finish",
+              finishReason: { unified: "length", raw: "max_output_tokens" },
+              usage: v3Usage(10, 5)
+            });
+          }
+          controller.close();
         }
       })
     })
@@ -3946,12 +3965,35 @@ export class ThinkTestAgent extends Think {
     this._inBandErrorResponse = { errorText, textChunks };
   }
 
-  private _cutToolInput: "close" | "error" | null = null;
+  private _cutToolInput: CutToolInputEnding | null = null;
 
   async setCutToolInputResponseForTest(
-    ending: "close" | "error" | null
+    ending: CutToolInputEnding | null
   ): Promise<void> {
     this._cutToolInput = ending;
+  }
+
+  /** What `classifyChatError` is handed when a stream ends mid tool input. */
+  async cutToolInputClassificationForTest(
+    ending: Exclude<CutToolInputEnding, "error">
+  ): Promise<{ toolNames: string[]; finishReason: string } | null> {
+    let classified: { toolNames: string[]; finishReason: string } | null = null;
+    this._cutToolInput = ending;
+    this.classifyChatError = (error) => {
+      if (error instanceof UnfinishedToolInputError) {
+        classified = {
+          toolNames: [...error.toolNames],
+          finishReason: error.finishReason
+        };
+      }
+      return undefined;
+    };
+    try {
+      await this.testChat("write it");
+    } finally {
+      this._cutToolInput = null;
+    }
+    return classified;
   }
 
   /**
@@ -3966,7 +4008,8 @@ export class ThinkTestAgent extends Think {
   }> {
     this._cutToolInput = "close";
     this.classifyChatError = (error) =>
-      error instanceof Error && error.message.includes("tool call write")
+      error instanceof UnfinishedToolInputError &&
+      error.finishReason === "other"
         ? "transient"
         : undefined;
     const first = await this.testChat("write it");
@@ -5093,26 +5136,31 @@ export class ThinkAgentToolParent extends Agent {
   }
 
   /**
-   * Seed a PARENT-side `cf_agent_tool_runs` row with an explicit status, to
-   * assert how the concurrency cap counts (or ignores) a given lifecycle state.
-   * Soft-terminal `interrupted` rows must NOT occupy a slot (only
-   * `starting`/`running` do), so a re-issue after recovery is never cap-blocked.
+   * Seed a PARENT-side `cf_agent_tool_runs` row with an explicit status and
+   * child liveness observation, to assert how the concurrency cap counts (or
+   * ignores) a given lifecycle state. An awaited `interrupted` row occupies a
+   * slot unless its child was observed stopped; omitting `childStillRunning`
+   * leaves liveness unobserved, which the cap treats as possibly running.
    */
   async seedParentAgentToolRunForTest(
     runId: string,
-    status: string
+    status: string,
+    childStillRunning?: boolean
   ): Promise<void> {
     const now = Date.now();
     const completedAt =
       status === "starting" || status === "running" ? null : now;
+    const childStillRunningColumn =
+      childStillRunning === undefined ? null : childStillRunning ? 1 : 0;
     this.sql`
       INSERT INTO cf_agent_tool_runs (
         run_id, parent_tool_call_id, agent_type, input_preview,
         input_redacted, status, display_metadata, display_order,
-        started_at, completed_at
+        started_at, completed_at, child_still_running
       ) VALUES (
         ${runId}, 'seed-tool-call', 'ThinkTestAgent', ${JSON.stringify("seed")},
-        1, ${status}, ${JSON.stringify({ name: "seed" })}, 0, ${now}, ${completedAt}
+        1, ${status}, ${JSON.stringify({ name: "seed" })}, 0, ${now}, ${completedAt},
+        ${childStillRunningColumn}
       )
     `;
   }
