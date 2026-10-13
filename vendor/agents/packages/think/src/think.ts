@@ -10045,8 +10045,8 @@ export class Think<
 
   private _ensureAgentToolChildRunTable(): void {
     // Runs ahead of every milestone, progress snapshot and child-run read, so
-    // the DDL (two CREATE IF NOT EXISTS plus three ALTER attempts that throw
-    // and are swallowed) is paid once per isolate, not per call.
+    // the DDL (two CREATE IF NOT EXISTS plus ALTER attempts that throw and
+    // are swallowed) is paid once per isolate, not per call.
     if (this.#agentToolChildRunTableReady) return;
     this.sql`
       CREATE TABLE IF NOT EXISTS cf_agent_tool_child_runs (
@@ -10063,6 +10063,11 @@ export class Think<
       )
     `;
 
+    // Structured child output is a fork column; tables created by upstream
+    // releases lack it, and recovery reads it before any other child-run write.
+    this._addAgentToolChildRunColumnIfMissing(
+      "ALTER TABLE cf_agent_tool_child_runs ADD COLUMN output_schema_json TEXT"
+    );
     this._addAgentToolChildRunColumnIfMissing(
       "ALTER TABLE cf_agent_tool_child_runs ADD COLUMN output_json TEXT"
     );
