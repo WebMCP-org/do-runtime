@@ -258,3 +258,21 @@ harnesses, the `agents` CLI, and Web Search tools. These are imported with the
 release and are opt-in; no fork divergence was added for them. The daemon
 bundle `src/harness/container/daemon-source.generated.ts` is generated at build
 time, gitignored, and excluded from format and lint, as upstream does.
+
+## Native recovery inspection
+
+`Think.listRecoverableChatRequests()` exposes the framework's current request
+and stable recovery-root identities before post-startup Task alarms run. It
+inspects the canonical chat Task step journal, stash snapshots, pending recovery
+callbacks and owed response hooks. Completed model steps, canceled Tasks, Stop
+epochs, terminal streams without an owed hook and superseded callback targets
+do not create live work. A successor replaces its predecessor within the same
+root. The existing startup response-hook replay uses the same unfinished-step
+inspection, so stale Task cleanup cannot suppress an owed terminal hook.
+
+`ActiveTurn.recoveryRootRequestId` exposes the existing admitted-turn identity;
+pending response hooks retain it across eviction. Hosts can retain one latest
+input projection without treating a retry as a new input or reading private
+Task SQL. Native Workers regressions exercise live model work, journal cutovers,
+pending hooks, cancellation and successor correlation. Retire these additions
+when upstream exposes equivalent semantic recovery inspection and stable roots.

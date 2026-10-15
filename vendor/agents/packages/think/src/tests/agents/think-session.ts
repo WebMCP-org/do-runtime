@@ -61,13 +61,19 @@ import type {
 import type { MessengerContext } from "../../messengers";
 import {
   CHAT_MESSAGE_TYPES,
+  CHAT_RECOVERY_INCIDENT_KEY_PREFIX,
   CHAT_RECOVERY_TASK_NAME,
   chatRecoveryTaskRunOptions,
   sanitizeMessage,
   enforceRowSizeLimit,
   StreamAccumulator
 } from "agents/chat";
-import type { ClientToolSchema, ResumableStream, TurnQueue } from "agents/chat";
+import type {
+  ChatRecoveryTaskInput,
+  ClientToolSchema,
+  ResumableStream,
+  TurnQueue
+} from "agents/chat";
 import type { Schedule } from "agents";
 import type { Session } from "../../think";
 import type { ContextConfig } from "agents/context";
@@ -12038,6 +12044,99 @@ export class ThinkRecoveryTestAgent extends Think {
     this
       .sql`UPDATE cf_agents_jobs SET time = ${later} WHERE id = ${`task:${runId}`}`;
     return runId;
+  }
+
+  /** The model step settled, but a crash left its containing Task unclosed. */
+  async insertChatTaskJournalForTest(
+    runId: string,
+    state: "running" | "completed" | "failed",
+    stepName: "model-turn" | "continuation" = "model-turn"
+  ): Promise<void> {
+    const now = Date.now();
+    this.sql`
+      INSERT INTO cf_agents_task_steps
+        (run_id, step_name, kind, state, attempt, created_at, started_at,
+         updated_at, completed_at)
+      VALUES (${runId}, ${stepName}, 'do', ${state}, 1, ${now}, ${now},
+              ${now}, ${state === "running" ? null : now})
+    `;
+  }
+
+  async cancelChatTaskForTest(runId: string): Promise<boolean> {
+    return this.tasks.cancel(runId, "Cancelled by test");
+  }
+
+  /** Persist the exact marker a reset between message cutover and its hook leaves. */
+  async insertPendingResponseHookForTest(input: {
+    requestId: string;
+    messageId: string;
+    status: "completed" | "error" | "aborted";
+    recoveryRootRequestId?: string;
+  }): Promise<void> {
+    await this.ctx.storage.put(
+      `cf_think_pending_response_hook:${input.requestId}`,
+      { ...input, continuation: false }
+    );
+  }
+
+  /** Seed a real queued recovery Task and its incident, held before alarm dispatch. */
+  async insertQueuedChatRecoveryForTest(input: {
+    requestId: string;
+    recoveryRootRequestId: string;
+    recoveryKind: "retry" | "continue";
+    targetMessageId: string;
+    recoveredRequestId?: string;
+  }): Promise<string> {
+    const incidentId = crypto.randomUUID();
+    const now = Date.now();
+    await this.ctx.storage.put(
+      CHAT_RECOVERY_INCIDENT_KEY_PREFIX + encodeURIComponent(incidentId),
+      {
+        incidentId,
+        requestId: input.requestId,
+        recoveryRootRequestId: input.recoveryRootRequestId,
+        recoveryKind: input.recoveryKind,
+        attempt: 1,
+        maxAttempts: 3,
+        status: "scheduled",
+        firstSeenAt: now,
+        lastAttemptAt: now
+      }
+    );
+    const callback =
+      input.recoveryKind === "retry"
+        ? "_chatRecoveryRetry"
+        : "_chatRecoveryContinue";
+    const taskInput = {
+      callback,
+      data: {
+        originalRequestId: input.recoveryRootRequestId,
+        incidentId,
+        stopEpoch: 0,
+        ...(input.recoveredRequestId !== undefined
+          ? { recoveredRequestId: input.recoveredRequestId }
+          : {}),
+        ...(input.recoveryKind === "retry"
+          ? { targetUserId: input.targetMessageId }
+          : { targetAssistantId: input.targetMessageId })
+      },
+      delaySeconds: 0
+    } satisfies ChatRecoveryTaskInput;
+    const receipt = await this.tasks.__DO_NOT_USE_WILL_BREAK__enqueue(
+      CHAT_RECOVERY_TASK_NAME,
+      taskInput,
+      chatRecoveryTaskRunOptions(taskInput, "initial")
+    );
+    const later = now + 60 * 60 * 1000;
+    this.sql`
+      UPDATE cf_agents_task_runs SET next_at = ${later}
+      WHERE run_id = ${receipt.runId}
+    `;
+    this.sql`
+      UPDATE cf_agents_jobs SET time = ${later}
+      WHERE id = ${`task:${receipt.runId}`}
+    `;
+    return receipt.runId;
   }
 
   /** Drive every due Task run and Lifecycle job, as an alarm wake does. */
