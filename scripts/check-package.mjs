@@ -105,6 +105,7 @@ if (typeof nodeBackend.createNodeSqlProvider !== "function") {
   throw new Error("packed Node backend does not export createNodeSqlProvider");
 }
 if (
+  typeof gate.__bindOptionalSuperMethod !== "function" ||
   typeof gate.__gateAwait !== "function" ||
   typeof gate.__resumeAwait !== "function" ||
   typeof gate.__gateAsyncIterable !== "function"

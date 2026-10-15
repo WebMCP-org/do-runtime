@@ -282,6 +282,13 @@ consumer peer dependencies retain one identity.
     clients, so a new frame type breaks them. `connectMessagePortWebSocket`
     therefore sends no `open` frame; only `serveMessagePortWebSockets` sends
     one, to its own clients.
+21. Lower only async functions and generators for browser async context with
+    Babel's targeted plugins. Preserve optional calls on callable capabilities:
+    a compiler-generated `.call()` would traverse a remote property. Delegate
+    optional `super` callees to the injected gate module's bound-callable helper
+    before async lowering so their receiver survives capture and the whole
+    optional chain stays native. Preserve the SDK's native
+    async-method identity and compose source maps for its method shells.
 
 ## Deliberate divergences
 

@@ -44,6 +44,10 @@ await build({
         id === "capnweb" ||
         id === "@ungap/structured-clone" ||
         id === "magic-string" ||
+        id === "@babel/core" ||
+        id === "@babel/plugin-transform-async-generator-functions" ||
+        id === "@babel/plugin-transform-async-to-generator" ||
+        id === "@jridgewell/remapping" ||
         id === "vite" ||
         id.startsWith("node:"),
       output: {

@@ -28,17 +28,32 @@ AI SDK's streamed tool execution, whose callbacks bypass transformed awaits.
 
 This requires compilation. Native `await` bypasses `Promise.prototype.then`, as
 the [TC39 async-context proposal](https://github.com/tc39/proposal-async-context)
-explains. The opt-in Vite transform first gates awaits, then uses Vite's installed
-Oxc transformer to lower async functions and generators to Promise callbacks.
+explains. The opt-in Vite transform first gates awaits, then uses Babel's
+[async function](https://babeljs.io/docs/babel-plugin-transform-async-to-generator)
+and [async generator](https://babeljs.io/docs/babel-plugin-transform-async-generator-functions)
+plugins to lower only asynchronous syntax to Promise callbacks. Other syntax,
+including optional calls on callable RPC capabilities, stays native. Lowering
+all syntax to ES2016 would introduce `.call()` property access on those
+capabilities and dispatch a remote `method.call` instead of invoking `method`.
 Importing the shim installs context binding on `Promise.prototype.then` once per
 realm. Importing the runtime alone does not patch Promise.
 
-The opt-in transform also corrects the generator helper from Vite's bundled Oxc (≥ 0.144.0):
-an early return must resume awaited `finally` cleanup with `next`, while a
-delegated `yield*` may still require `return`. This follows the
-[upstream Babel helper](https://github.com/babel/babel/blob/main/packages/babel-helpers/src/helpers/wrapAsyncGenerator.ts).
-The correction checks the helper's exact code shape and fails with a review
-message if it changes, so a compiler upgrade cannot silently retain a stale fix.
+Babel's async transform captures `super` properties in getter arrows. Before
+lowering, a small selector binds only an optional `super` callee through
+`__bindOptionalSuperMethod` in the injected gate module. The helper reads the
+method once and returns either undefined or a callable using its captured
+`Reflect.apply`. The entire optional chain stays native, including short-circuit
+behavior, computed keys, awaited/yielded arguments, delete, grouped method
+receivers and later remote calls. A non-nullish non-callable still throws only
+when invoked after argument evaluation. Ordinary optional calls are unaffected.
+The canonical Babel generator helper also resumes awaited `finally`
+cleanup correctly on early return, including delegated `yield*`; no generated
+helper patch is required.
+
+Async method shells retain native `AsyncFunction` identity for SDK lifecycle
+dispatch, while their bodies contain no native await. Their restoration map is
+composed with Babel's map and the preceding gate-insertion map, so stack traces
+still refer to the original source.
 
 Untransformed native async functions and top-level module awaits do not propagate
 this context. Bind callbacks registered with external event APIs explicitly;
