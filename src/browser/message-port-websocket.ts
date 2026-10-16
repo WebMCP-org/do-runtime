@@ -9,7 +9,7 @@ export type MessagePortWebSocketWireMessage =
 
 type MessagePortWebSocketReadyMessage = { readonly type: "open" };
 
-/** The socket uses only this part of a MessagePort; JSON transports can bind it directly. */
+/** The part of a MessagePort the socket uses, so another transport can stand in for one. */
 export interface MessagePortWebSocketPort {
   postMessage(message: MessagePortWebSocketWireMessage): void;
   addEventListener(type: "message", listener: (event: MessageEvent<unknown>) => void): void;
@@ -93,6 +93,12 @@ export class MessagePortWebSocket extends EventTarget implements RawWebSocket {
   /** End a socket whose physical host disappeared without notifying that host. */
   protected disconnect(code = 1006, reason = ""): void {
     this.#finishClose(code, reason, false);
+  }
+
+  /** Fail the connection as a native socket does: an error event, then an unclean close. */
+  protected fail(code: number, reason: string): void {
+    this.#emit(new Event("error"), this.onerror);
+    this.disconnect(code, reason);
   }
 
   #handleWireMessage(value: unknown): void {

@@ -693,28 +693,27 @@ class TimeoutManager {
 class TaskSet {
   readonly #tasks = new Set<Promise<void>>();
   readonly #taskFailed: (exception: unknown) => void;
+  readonly #sizeChanged: () => void;
 
-  constructor(
-    taskFailed: (exception: unknown) => void,
-    private readonly changed = () => {},
-  ) {
+  constructor(taskFailed: (exception: unknown) => void, sizeChanged = () => {}) {
     this.#taskFailed = taskFailed;
+    this.#sizeChanged = sizeChanged;
   }
 
   add(promise: Promise<void>): void {
     const task = promise.then(
       () => {
         this.#tasks.delete(task);
-        this.changed();
+        this.#sizeChanged();
       },
       (exception: unknown) => {
         this.#tasks.delete(task);
         this.#taskFailed(exception);
-        this.changed();
+        this.#sizeChanged();
       },
     );
     this.#tasks.add(task);
-    this.changed();
+    this.#sizeChanged();
   }
 
   size(): number {
@@ -735,6 +734,14 @@ class TaskSet {
 export class IoContext {
   readonly #actor: Actor;
   readonly #timer: Timer;
+
+  /**
+   * ← the `RequestTracker` (`io/request-tracker.h`) whose `inactive()` hook starts
+   * eviction in server.c++'s `ActorContainer` once no request holds the actor. The
+   * host owns eviction here, so the context counts what upstream's `ActiveRequest`s
+   * stand for — events inside `run()` and host leases — and notifies listeners as
+   * those, waitUntil work and the input lock change, and on abort.
+   */
   readonly #activityListeners = new Set<() => void>();
   #pendingEvents = 0;
   #activityLeases = 0;

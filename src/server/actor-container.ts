@@ -1466,16 +1466,15 @@ class ActorContainerImpl implements ActorContainer {
           // The dispatch is the one moment that knows both the method name and
           // the caller's frames — the provenance `describeLostLock` reports.
           this.#ctx.noteGateUse(`entry ${String(property)}()`, captureGateStack());
-          return await this.#ctx
+          return this.#ctx
             .run(
               () =>
                 this.#withExternalEntry(async () => {
-                  const result = await (value as (...rest: unknown[]) => unknown).apply(
-                    subject,
-                    args,
-                  );
-                  // Reply drain belongs to this event's lifetime, including after
-                  // the method returned and released its input-gate slice.
+                  const result: unknown = await Reflect.apply(value, subject, args);
+                  // ← the reply being piped through `waitForOutputLocks()`. This is §1.1's
+                  // whole point: a method that returns without awaiting its own write still
+                  // must not answer before that write is durable. Draining inside `run()`
+                  // keeps the event pending until the reply can leave.
                   await this.#ctx.waitForOutputLocks();
                   return result;
                 }),
@@ -1578,6 +1577,7 @@ class ActorContainerImpl implements ActorContainer {
    * `_cf_executingScheduleRowId` upstream depends on.
    */
   deliverAlarm(scheduledTime: number, retryCount: number): Promise<AlarmResult> {
+    // A delivery queued behind the previous one is not an event yet; the lease covers the wait.
     const release = this.acquireActivity();
     const delivery = this.#alarmTail.then(
       () => this.#deliverAlarmImpl(scheduledTime, retryCount),
