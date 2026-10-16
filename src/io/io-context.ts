@@ -105,12 +105,7 @@
  */
 
 import { bindAsyncContext } from "../util/async-context";
-import {
-  CriticalSection,
-  type InputGate,
-  Lock,
-  type OutputGate,
-} from "./io-gate";
+import { CriticalSection, type InputGate, Lock, type OutputGate } from "./io-gate";
 
 /**
  * ← `kj::Timer`, threaded into IoContext upstream.
@@ -569,7 +564,10 @@ class TimeoutManager {
   setTimeout(ctx: IoContext, params: TimeoutParameters): number {
     const id = this.#nextId++;
     const state: TimeoutState = {
-      params: { ...params, callback: params.callback === undefined ? undefined : bindAsyncContext(params.callback) },
+      params: {
+        ...params,
+        callback: params.callback === undefined ? undefined : bindAsyncContext(params.callback),
+      },
       isCanceled: false,
       armed: undefined,
     };
@@ -658,29 +656,32 @@ class TimeoutManager {
     state: TimeoutState,
     criticalSection: CriticalSection | undefined,
   ): Promise<void> {
-    await ctx.run(() => {
-      // "We've been canceled before running. Nothing more to do."
-      if (state.isCanceled) return;
-      const callback = state.params.callback;
-      if (callback === undefined) return;
+    await ctx.run(
+      () => {
+        // "We've been canceled before running. Nothing more to do."
+        if (state.isCanceled) return;
+        const callback = state.params.callback;
+        if (callback === undefined) return;
 
-      // ← "First, move our timeout promise to the task set so it's safe to call clearInterval()
-      // inside the user's callback." A non-repeating timeout is done with its entry either way; a
-      // repeating one keeps it so `clearInterval` inside the callback still finds it.
-      if (!state.params.repeat) {
-        state.params.callback = undefined;
-        this.#timeouts.delete(id);
-      }
+        // ← "First, move our timeout promise to the task set so it's safe to call clearInterval()
+        // inside the user's callback." A non-repeating timeout is done with its entry either way; a
+        // repeating one keeps it so `clearInterval` inside the callback still finds it.
+        if (!state.params.repeat) {
+          state.params.callback = undefined;
+          this.#timeouts.delete(id);
+        }
 
-      // ← the `KJ_DEFER(unwindDetector.catchExceptionsIfUnwinding(...))`: "The user's callback
-      // might throw, but we need to at least attempt to reschedule interval callbacks even if
-      // they throw."
-      try {
-        callback();
-      } finally {
-        if (state.params.repeat && !state.isCanceled) this.#arm(ctx, id, state);
-      }
-    }, { input: criticalSection });
+        // ← the `KJ_DEFER(unwindDetector.catchExceptionsIfUnwinding(...))`: "The user's callback
+        // might throw, but we need to at least attempt to reschedule interval callbacks even if
+        // they throw."
+        try {
+          callback();
+        } finally {
+          if (state.params.repeat && !state.isCanceled) this.#arm(ctx, id, state);
+        }
+      },
+      { input: criticalSection },
+    );
   }
 }
 
@@ -692,22 +693,27 @@ class TimeoutManager {
 class TaskSet {
   readonly #tasks = new Set<Promise<void>>();
   readonly #taskFailed: (exception: unknown) => void;
+  readonly #sizeChanged: () => void;
 
-  constructor(taskFailed: (exception: unknown) => void) {
+  constructor(taskFailed: (exception: unknown) => void, sizeChanged = () => {}) {
     this.#taskFailed = taskFailed;
+    this.#sizeChanged = sizeChanged;
   }
 
   add(promise: Promise<void>): void {
     const task = promise.then(
       () => {
         this.#tasks.delete(task);
+        this.#sizeChanged();
       },
       (exception: unknown) => {
         this.#tasks.delete(task);
         this.#taskFailed(exception);
+        this.#sizeChanged();
       },
     );
     this.#tasks.add(task);
+    this.#sizeChanged();
   }
 
   size(): number {
@@ -730,6 +736,17 @@ export class IoContext {
   readonly #timer: Timer;
 
   /**
+   * ← the `RequestTracker` (`io/request-tracker.h`) whose `inactive()` hook starts
+   * eviction in server.c++'s `ActorContainer` once no request holds the actor. The
+   * host owns eviction here, so the context counts what upstream's `ActiveRequest`s
+   * stand for — events inside `run()` and host leases — and notifies listeners as
+   * those, waitUntil work and the input lock change, and on abort.
+   */
+  readonly #activityListeners = new Set<() => void>();
+  #pendingEvents = 0;
+  #activityLeases = 0;
+
+  /**
    * ← `kj::Maybe<InputGate::Lock> currentInputLock`, made a stack.
    *
    * The top entry is the lock of the slice that is running right now. Entries are
@@ -744,7 +761,9 @@ export class IoContext {
    * serialises slices, so the latest note is the best available ancestor of
    * whatever continuation is running lockless now.
    */
-  #lastGateUse: { readonly what: string; readonly stack: string | undefined; readonly at: number } | undefined;
+  #lastGateUse:
+    | { readonly what: string; readonly stack: string | undefined; readonly at: number }
+    | undefined;
   #transformGateUses = 0;
   #transformGateStack: string | undefined;
 
@@ -777,7 +796,10 @@ export class IoContext {
     void promise.catch(() => {});
 
     this.#tasks = new TaskSet((exception) => this.#taskFailed(exception));
-    this.#waitUntilTasks = new TaskSet((exception) => this.#taskFailed(exception));
+    this.#waitUntilTasks = new TaskSet(
+      (exception) => this.#taskFailed(exception),
+      () => this.#activityChanged(),
+    );
 
     // Arrange to complain if the input gate is broken, which indicates a critical section
     // failed and the actor can no longer be used.
@@ -810,6 +832,46 @@ export class IoContext {
   /** Is a gated slice running? The question `IoContext::hasCurrent()` answers upstream. */
   hasCurrent(): boolean {
     return this.#currentInputLocks.length > 0;
+  }
+
+  /** Full event lifetimes, including time queued for admission and awaiting I/O. */
+  pendingEventCount(): number {
+    return this.#pendingEvents;
+  }
+
+  activityLeaseCount(): number {
+    return this.#activityLeases;
+  }
+
+  /** A host lease retains liveness without taking either actor gate. */
+  acquireActivity(): () => void {
+    this.#activityLeases++;
+    this.#activityChanged();
+    let held = true;
+    return () => {
+      if (!held) return;
+      held = false;
+      this.#activityLeases--;
+      this.#activityChanged();
+    };
+  }
+
+  onActivityChange(listener: () => void): () => void {
+    this.#activityListeners.add(listener);
+    return () => this.#activityListeners.delete(listener);
+  }
+
+  #activityChanged(): void {
+    for (const listener of this.#activityListeners) {
+      try {
+        listener();
+      } catch (error) {
+        // An observer must not abandon admission or its event's finalizer.
+        queueMicrotask(() => {
+          throw error;
+        });
+      }
+    }
   }
 
   /**
@@ -985,6 +1047,7 @@ export class IoContext {
     this.#timeouts.cancelAll();
 
     this.#rejectAbort(exception);
+    this.#activityChanged();
   }
 
   /**
@@ -1087,18 +1150,25 @@ export class IoContext {
       throw aborted.exception;
     }
 
-    const callback = bindAsyncContext(func);
-    const input = options?.input;
-    let lock: Lock;
-    if (input === undefined) {
-      lock = await this.#actor.getInputGate().wait(options?.signal);
-    } else if (input instanceof CriticalSection) {
-      lock = await input.wait(options?.signal);
-    } else {
-      lock = input;
-    }
+    this.#pendingEvents++;
+    this.#activityChanged();
+    try {
+      const callback = bindAsyncContext(func);
+      const input = options?.input;
+      let lock: Lock;
+      if (input === undefined) {
+        lock = await this.#actor.getInputGate().wait(options?.signal);
+      } else if (input instanceof CriticalSection) {
+        lock = await input.wait(options?.signal);
+      } else {
+        lock = input;
+      }
 
-    return await this.#runImpl(callback, lock);
+      return await this.#runImpl(callback, lock);
+    } finally {
+      this.#pendingEvents--;
+      this.#activityChanged();
+    }
   }
 
   /**
@@ -1188,7 +1258,8 @@ export class IoContext {
     this.#requireCurrent();
     func = bindAsyncContext(func);
     const criticalSection = this.getCriticalSection();
-    const shouldSample = this.#transformGateUses++ % 64 === 0 || this.#transformGateStack === undefined;
+    const shouldSample =
+      this.#transformGateUses++ % 64 === 0 || this.#transformGateStack === undefined;
     if (shouldSample) this.#transformGateStack = captureGateStack();
     this.#lastGateUse = {
       what: shouldSample
@@ -1354,6 +1425,7 @@ export class IoContext {
     }
     this.#currentInputLocks.splice(at, 1);
     lock.release();
+    this.#activityChanged();
   }
 
   /**
@@ -1377,18 +1449,21 @@ export class IoContext {
       promiseForExceptionOrT(promise).then(async (outcome) => {
         // `run()` releases the supplied lock if the context aborted. The result stays
         // unsettled in that case: the actor is being torn down and onAbort() reports it.
-        await this.run((): void => {
-          if (outcome.ok) {
-            // `func` runs under the lock, which is the guarantee that makes it a parameter.
-            try {
-              resolve(func(outcome.value));
-            } catch (exception) {
-              reject(exception);
+        await this.run(
+          (): void => {
+            if (outcome.ok) {
+              // `func` runs under the lock, which is the guarantee that makes it a parameter.
+              try {
+                resolve(func(outcome.value));
+              } catch (exception) {
+                reject(exception);
+              }
+            } else {
+              reject(outcome.exception);
             }
-          } else {
-            reject(outcome.exception);
-          }
-        }, { input: ilOrCs });
+          },
+          { input: ilOrCs },
+        );
       }),
     );
 

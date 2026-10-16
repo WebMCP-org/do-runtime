@@ -7,7 +7,21 @@ export type MessagePortWebSocketWireMessage =
   | { readonly type: "message"; readonly data: MessagePortWebSocketData }
   | { readonly type: "close"; readonly code: number; readonly reason: string };
 
+/** The far end of a socket the host owns; it absorbs an already-disconnected transport, so callers never retry sends. */
+export interface MessagePortWebSocketPeer {
+  send(message: MessagePortWebSocketWireMessage): void;
+  close(): void;
+}
+
 type MessagePortWebSocketReadyMessage = { readonly type: "open" };
+
+/** The part of a MessagePort the socket uses, so another transport can stand in for one. */
+export interface MessagePortWebSocketPort {
+  postMessage(message: MessagePortWebSocketWireMessage): void;
+  addEventListener(type: "message", listener: (event: MessageEvent<unknown>) => void): void;
+  start(): void;
+  close(): void;
+}
 
 /** One WebSocket-shaped endpoint backed by one dedicated MessagePort. */
 export class MessagePortWebSocket extends EventTarget implements RawWebSocket {
@@ -36,7 +50,7 @@ export class MessagePortWebSocket extends EventTarget implements RawWebSocket {
 
   constructor(
     readonly url: string,
-    private readonly port: MessagePort,
+    private readonly port: MessagePortWebSocketPort,
     autoOpen = true,
   ) {
     super();
@@ -85,6 +99,12 @@ export class MessagePortWebSocket extends EventTarget implements RawWebSocket {
   /** End a socket whose physical host disappeared without notifying that host. */
   protected disconnect(code = 1006, reason = ""): void {
     this.#finishClose(code, reason, false);
+  }
+
+  /** Fail the connection as a native socket does: an error event, then an unclean close. */
+  protected fail(code: number, reason: string): void {
+    this.#emit(new Event("error"), this.onerror);
+    this.disconnect(code, reason);
   }
 
   #handleWireMessage(value: unknown): void {

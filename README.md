@@ -65,13 +65,13 @@ lane.
 The repository contains the runtime and the proofs needed to use it as an
 execution target:
 
-| Area | What it contains |
-| --- | --- |
-| [`@mcp-b/do-runtime`](src/) | Input and output gates, implicit transactions, Durable Object storage APIs, facets, alarms, hibernatable WebSockets, Worker Loader, and `cloudflare:workers`. |
-| [`vendor/agents/`](vendor/agents/README.md) | Rook's Agents SDK fork. It consumes the runtime; the runtime package does not import the SDK. |
-| [`conformance/`](conformance/) | One behavioral suite run against real workerd, the Node host, and the browser host in Chromium. |
-| [`examples/extension/`](examples/extension/README.md) | A Chrome MV3 host with an offscreen supervisor, local Agents SDK actors and sub-agents, OPFS persistence, durable alarms, hibernatable sockets, and restart recovery. |
-| [`examples/vibe-platform/`](examples/vibe-platform/README.md) | An in-tab editor that runs a user-authored Agent locally and exports the unchanged source as a Wrangler project. |
+| Area                                                          | What it contains                                                                                                                                                      |
+| ------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`@mcp-b/do-runtime`](src/)                                   | Input and output gates, implicit transactions, Durable Object storage APIs, facets, alarms, hibernatable WebSockets, Worker Loader, and `cloudflare:workers`.         |
+| [`vendor/agents/`](vendor/agents/README.md)                   | Rook's Agents SDK fork. It consumes the runtime; the runtime package does not import the SDK.                                                                         |
+| [`conformance/`](conformance/)                                | One behavioral suite run against real workerd, the Node host, and the browser host in Chromium.                                                                       |
+| [`examples/extension/`](examples/extension/README.md)         | A Chrome MV3 host with an offscreen supervisor, local Agents SDK actors and sub-agents, OPFS persistence, durable alarms, hibernatable sockets, and restart recovery. |
+| [`examples/vibe-platform/`](examples/vibe-platform/README.md) | An in-tab editor that runs a user-authored Agent locally and exports the unchanged source as a Wrangler project.                                                      |
 
 This work was extracted from Rook, SigVelo's AI agent for Chrome. Cloudflare,
 Workers, Durable Objects, and workerd are Cloudflare's; this is an independent
@@ -166,10 +166,10 @@ pnpm exec playwright install chromium
 pnpm --filter do-runtime-example-extension e2e
 ```
 
-| Example | Browser shape | What the test proves |
-| --- | --- | --- |
-| [Chrome MV3 extension](examples/extension/README.md) | Service worker -> offscreen document -> actor Worker -> sqlite-wasm/OPFS | An Agents SDK root and its sub-agents retain state across host teardown; alarms wake an evicted host; hibernatable sockets, state sync, callable RPC, queues, MCP, and email routing use the real SDK paths. |
-| [In-tab coding platform](examples/vibe-platform/README.md) | Page -> workspace Worker and authored-Agent Worker -> sqlite-wasm/OPFS | A user-authored Agent runs against durable local state, survives code replacement, and exports from the browser as the same source in a Wrangler project. |
+| Example                                                    | Browser shape                                                            | What the test proves                                                                                                                                                                                         |
+| ---------------------------------------------------------- | ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| [Chrome MV3 extension](examples/extension/README.md)       | Service worker -> offscreen document -> actor Worker -> sqlite-wasm/OPFS | An Agents SDK root and its sub-agents retain state across host teardown; alarms wake an evicted host; hibernatable sockets, state sync, callable RPC, queues, MCP, and email routing use the real SDK paths. |
+| [In-tab coding platform](examples/vibe-platform/README.md) | Page -> workspace Worker and authored-Agent Worker -> sqlite-wasm/OPFS   | A user-authored Agent runs against durable local state, survives code replacement, and exports from the browser as the same source in a Wrangler project.                                                    |
 
 Run both browser end-to-end suites with `pnpm test:examples`.
 
@@ -187,12 +187,15 @@ Start it at `http://localhost:5173` with
 The [Chrome MV3 example](examples/extension/README.md) splits its host across
 three runtime contexts and a build. Each one imports only the subpaths it needs:
 
-| Context | Example file | Imports from `@mcp-b/do-runtime` |
-| --- | --- | --- |
-| Service worker | `src/background.ts` | `/browser/offscreen-document` (`OffscreenDocumentCoordinator`) and `/browser/alarm-coordinator` (`BrowserAlarmCoordinator`, `parseBrowserAlarmProjection`, `parseBrowserAlarmTransportJournal`). |
-| Offscreen document | `src/offscreen/offscreen.ts` | `/browser/message-port-websocket` (`createMessagePortWebSocketConstructor`, the client end of each socket). It spawns the actor Worker and opens its RPC session with `capnweb` directly. |
-| Actor Worker | `src/worker/actor.worker.ts` | The root (`createActorContainer`, `installActorScope`, `AlarmScheduler`, `newRpcSession`, `platformTimer`, `platformFetch`, `platformWebSocket` and more), `/backends/sqlite-wasm` (`installSqliteWasmHost`, `SqliteWasmActorStorage`, `createSqliteWasmProvider`), `/browser` (`connectMessagePortWebSocket`, `installWebSocketUpgradeGlobals`, `withWebSocketUpgrade`), `/browser/message-port-websocket` (`serveMessagePortWebSockets`) and `/browser/alarm-coordinator` (`createBrowserAlarmProjector`). `browserHost()` resolves its `cloudflare:workers` import to `/cloudflare-workers`. |
-| Build | `vite.config.ts` | `/vite`: `...browserHost({ include, facets })` in `plugins`. Each facet builds in a pass of its own (`vite build --mode <facet>`), which adds `doRuntimeAwaitTransform` and `output.keepNames: true` itself. |
+| Context            | Example file                 | Imports from `@mcp-b/do-runtime`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| ------------------ | ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Service worker     | `src/background.ts`          | `/browser/offscreen-document` (`OffscreenDocumentCoordinator`) and `/browser/alarm-coordinator` (`BrowserAlarmCoordinator`, `parseBrowserAlarmProjection`, `parseBrowserAlarmTransportJournal`).                                                                                                                                                                                                                                                                                                                                                                                                |
+| Offscreen document | `src/offscreen/offscreen.ts` | `/browser/worker-supervisor` (`BrowserWorkerSupervisor`) owns worker placement, Cap'n Web sessions, readiness and retained client transports; `/browser/message-port-websocket` supplies client sockets.                                                                                                                                                                                                                                                                                                                                                                                        |
+| Actor Worker       | `src/worker/actor.worker.ts` | The root (`createActorContainer`, `installActorScope`, `AlarmScheduler`, `newRpcSession`, `platformTimer`, `platformFetch`, `platformWebSocket` and more), `/backends/sqlite-wasm` (`installSqliteWasmHost`, `SqliteWasmActorStorage`, `createSqliteWasmProvider`), `/browser` (`connectMessagePortWebSocket`, `installWebSocketUpgradeGlobals`, `withWebSocketUpgrade`), `/browser/message-port-websocket` (`serveMessagePortWebSockets`) and `/browser/alarm-coordinator` (`createBrowserAlarmProjector`). `browserHost()` resolves its `cloudflare:workers` import to `/cloudflare-workers`. |
+| Build              | `vite.config.ts`             | `/vite`: `...browserHost({ include, facets })` in `plugins`. Each facet builds in a pass of its own (`vite build --mode <facet>`), which adds `doRuntimeAwaitTransform` and `output.keepNames: true` itself.                                                                                                                                                                                                                                                                                                                                                                                    |
+
+The [browser hosting guide](docs/browser-hosting.md) covers typed worker bootstrap,
+facet placement, deletion-fenced references and activity-driven eviction.
 
 The popup imports nothing from the package. It only sends `chrome.runtime`
 messages.
@@ -215,12 +218,12 @@ An actor has an identity and private state. A Durable Object adds gates that
 serialize event slices and storage access, plus storage and lifecycle behavior
 that survives process loss:
 
-| | What it means | Where it lives here |
-| --- | --- | --- |
-| **Named identity** | `idFromName("alice")` always means the same actor, and the id names its storage. | `ActorContainerOptions.id` + `uniqueKey`, `src/server/actor-id-impl.ts` |
-| **Private transactional storage** | A SQLite database only this actor can open. KV and SQL share the file; writes coalesce into implicit transactions that commit at gate-release boundaries. | `src/io/actor-sqlite.ts`, `src/api/sql.ts`, `src/util/` |
-| **Input and output gates** | The input gate serializes event slices across `await`. The output gate holds a reply until the write it could reveal is durable. | `src/io/io-gate.ts`, `src/io/io-context.ts` |
-| **Alarms and facets** | `setAlarm()` wakes the actor later with retries and backoff. Facets are child actors with their own gates and database under a root. | `src/server/alarm-scheduler.ts`, `src/server/facet-*.ts` |
+|                                   | What it means                                                                                                                                             | Where it lives here                                                     |
+| --------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| **Named identity**                | `idFromName("alice")` always means the same actor, and the id names its storage.                                                                          | `ActorContainerOptions.id` + `uniqueKey`, `src/server/actor-id-impl.ts` |
+| **Private transactional storage** | A SQLite database only this actor can open. KV and SQL share the file; writes coalesce into implicit transactions that commit at gate-release boundaries. | `src/io/actor-sqlite.ts`, `src/api/sql.ts`, `src/util/`                 |
+| **Input and output gates**        | The input gate serializes event slices across `await`. The output gate holds a reply until the write it could reveal is durable.                          | `src/io/io-gate.ts`, `src/io/io-context.ts`                             |
+| **Alarms and facets**             | `setAlarm()` wakes the actor later with retries and backoff. Facets are child actors with their own gates and database under a root.                      | `src/server/alarm-scheduler.ts`, `src/server/facet-*.ts`                |
 
 With the default storage options, a method awaiting storage holds other calls
 back, so a read-modify-write that only awaits storage needs no extra lock.
@@ -266,7 +269,12 @@ Save this as `host.mts` and run `pnpm exec tsc && node host.mts`:
 ```ts
 import { mkdir } from "node:fs/promises";
 import { DurableObject } from "@mcp-b/do-runtime/cloudflare-workers";
-import { createActorContainer, DEFAULT_ALARM_OUTLET, noFacets, platformTimer } from "@mcp-b/do-runtime";
+import {
+  createActorContainer,
+  DEFAULT_ALARM_OUTLET,
+  noFacets,
+  platformTimer
+} from "@mcp-b/do-runtime";
 import { createNodeSqlProvider } from "@mcp-b/do-runtime/backends/node-sqlite";
 
 class Counter extends DurableObject {
@@ -280,7 +288,8 @@ class Counter extends DurableObject {
   async history(): Promise<number> {
     this.ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS hits (at INTEGER)");
     this.ctx.storage.sql.exec("INSERT INTO hits VALUES (?)", Date.now());
-    return this.ctx.storage.sql.exec("SELECT count(*) AS c FROM hits").one().c as number;
+    return this.ctx.storage.sql.exec("SELECT count(*) AS c FROM hits").one()
+      .c as number;
   }
 }
 
@@ -295,11 +304,13 @@ const container = await createActorContainer({
     sql: createNodeSqlProvider({ directory: "./data" }),
     alarms: DEFAULT_ALARM_OUTLET, // refuses — a real host passes AlarmScheduler.hooks("counter-1")
     facets: noFacets, // refuses — a real host constructs a child container per request
-    timer: platformTimer,
-  },
+    timer: platformTimer
+  }
 });
 
-const counter = container.entry(await container.start((ctx, env) => new Counter(ctx, env)));
+const counter = container.entry(
+  await container.start((ctx, env) => new Counter(ctx, env))
+);
 await counter.increment(); // 1
 await counter.increment(); // 2
 ```
@@ -315,21 +326,21 @@ pool, and worker bootstrapping are shown in the browser examples above.
 
 The runtime owns semantics; the host owns placement and substrate. `createActorContainer()` is asynchronous because the database opens asynchronously, and a returned container is fully initialised — there is no half-started state.
 
-| Option | What the host supplies |
-| --- | --- |
-| `id` | The actor's stable name (`idFromName` input). |
-| `uniqueKey` | The namespace key every id is derived from. Change it and every actor loses its data. |
-| `exports` | The `ctx.exports` class registry, built from `LoopbackDurableObjectClass`. |
-| `env` | The bindings the constructor receives. Assign `container.workerLoader(...)` onto it if the actor needs a Worker Loader. |
-| `ports.sql` | A `SqlDatabaseProvider`: `backends/node-sqlite` or `backends/sqlite-wasm`. |
-| `ports.alarms` | `AlarmScheduler.hooks(id)` for a root actor. Facets have no alarm slot. |
-| `ports.facets` | A `FacetHost`: place a child container, abort it, copy or delete its storage. |
-| `ports.timer` | `platformTimer`, or your own `now()` and `afterDelay()` below any installed actor scope. |
-| `ports.fetch` | Optional global outbound, such as `platformFetch`. Absent means `fetch` refuses by name, as a Worker with `globalOutbound: null` does. |
+| Option              | What the host supplies                                                                                                                                              |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `id`                | The actor's stable name (`idFromName` input).                                                                                                                       |
+| `uniqueKey`         | The namespace key every id is derived from. Change it and every actor loses its data.                                                                               |
+| `exports`           | The `ctx.exports` class registry, built from `LoopbackDurableObjectClass`.                                                                                          |
+| `env`               | The bindings the constructor receives. Assign `container.workerLoader(...)` onto it if the actor needs a Worker Loader.                                             |
+| `ports.sql`         | A `SqlDatabaseProvider`: `backends/node-sqlite` or `backends/sqlite-wasm`.                                                                                          |
+| `ports.alarms`      | `AlarmScheduler.hooks(id)` for a root actor. Facets have no alarm slot.                                                                                             |
+| `ports.facets`      | A `FacetHost`: place a child container, abort it, copy or delete its storage.                                                                                       |
+| `ports.timer`       | `platformTimer`, or your own `now()` and `afterDelay()` below any installed actor scope.                                                                            |
+| `ports.fetch`       | Optional global outbound, such as `platformFetch`. Absent means `fetch` refuses by name, as a Worker with `globalOutbound: null` does.                              |
 | `ports.hibernation` | Optional mirror callbacks for accepted sockets, attachment bytes, auto-response changes, and closure. Omit it when the host never rebuilds a live socket placement. |
-| `webSockets` | Socket references and mirrored tags/attachments to register before the new instance constructor runs. |
-| `gateHooks` | Optional input/output gate instrumentation for an embedding host. |
-| `facet` | Present when constructing a local child: its id, depth, and the root-owned `FacetTree`. |
+| `webSockets`        | Socket references and mirrored tags/attachments to register before the new instance constructor runs.                                                               |
+| `gateHooks`         | Optional input/output gate instrumentation for an embedding host.                                                                                                   |
+| `facet`             | Present when constructing a local child: its id, depth, and the root-owned `FacetTree`.                                                                             |
 
 The lifecycle:
 
@@ -463,38 +474,72 @@ with its own port protocol opens its end itself. Embedders relay
 type is a breaking change for them. That is why the "open" frame stayed out of
 `connectMessagePortWebSocket`.
 
-`container.quiescence()` reports armed timers, pending `waitUntil` work, input
-lock state, and output-gate breakage without waiting. `drainWaitUntil()` is for
+Chrome extensions using JSON-only `chrome.runtime.Port` can use
+`createChromePortWebSocketConstructor({ connect, beforeConnect, readLastError })`
+from `@mcp-b/do-runtime/browser/chrome-port-websocket`. `connect(url)` names and
+opens the extension port; optional `beforeConnect()` ensures the accepting host
+exists, or returns a retry deadline shared by replacement sockets. The adapter
+reuses `MessagePortWebSocket`, encodes binary frames as canonical base64, and
+detects ports left connected after their accepting document disappears.
+Set `probeLiveness: false` for service-worker clients so heartbeat traffic does
+not prevent suspension. The accepting document uses `bindChromePortWebSocket`
+to exchange `MessagePortWebSocketWireMessage` frames; it answers liveness pings
+without forwarding them to an actor. Both adapters read `runtime.lastError`
+through the supplied callback inside the disconnect event.
+
+`container.quiescence()` reports full pending events, activity leases, armed timers,
+pending `waitUntil` work, input lock state, and output-gate breakage without waiting.
+`onActivityChange()` observes these facts independently of input-gate ownership;
+`acquireActivity()` retains a real host operation which starts outside actor entry. `drainWaitUntil()` is for
 shutdown and intentionally never settles while a live interval remains armed.
 
 Actor bundles can also install `doRuntimeAwaitTransform()` from `@mcp-b/do-runtime/vite`. Transformed awaits follow workerd's rule, with the exceptions in [gating coverage](docs/gating-coverage.md#transform). An await that settles while the actor still holds its input lock continues in the same checkpoint and keeps the lock and the implicit transaction: storage calls, plain values, and resumptions the runtime already admitted. An await on foreign I/O re-enters through a fresh input lock. A production build checks the final module graph and fails with transformed/total counts for any included module with an uncovered await; the development transform warns once per module if a transformed await reaches its fail-open path without an actor lock.
 
 The plugin resolves the imports it injects (`@mcp-b/do-runtime/gate`, `@mcp-b/do-runtime/browser/async-hooks`) to this package's own files, ahead of any host alias for them. `asyncContext: true` lowers async functions for the browser `AsyncLocalStorage`. Browser build: register `...browserHost({ include: actorModules })` from `@mcp-b/do-runtime/vite` in the `plugins` of a browser-only config; its aliases apply to every environment and win over the application's own. It aliases `cloudflare:workers`, `cloudflare:email` and `async_hooks` to this package's files, pre-bundled dependencies included, builds Workers as ES modules that keep class names, and runs this transform in Workers and, while serving, in the application. Without it, any dependency importing `cloudflare:workers`, `cloudflare:email` (a data-only `EmailMessage`) or `node:async_hooks`, including one Vite pre-bundles, needs host aliases to `@mcp-b/do-runtime/cloudflare-workers`, `/cloudflare-email` and `/browser/async-hooks`; `workersModuleAliases()` returns the first two. A host that loads facet bundles by URL into its root's realm prefixes each with `facetScopeBanner({ registry })`, which binds every name `installActorScope` writes (`ACTOR_SCOPE_GLOBALS`) to `globalThis[registry][scope]`, where `scope` is the bundle URL's `?scope=` parameter. Each facet bundle carries its own copy of the runtime, and its `platformTimer`, `platformFetch` and `platformWebSocket` are the platform's: the captures are realm-shared, and the host's copy, which loads before `installActorScope` can run, makes them. With `facets: { registry, match }`, Worker bundles build without code splitting, each matched chunk gets `facetScopeBanner({ registry })`, and the build fails if a matched chunk imports anything. Match on `chunk.facadeModuleId`.
 
+An idle host backing several root/facet prefixes in one pool can use
+`exportSqliteWasmPoolSnapshot(sqlite3, pool)` and
+`importSqliteWasmPoolSnapshot(sqlite3, pool, snapshot)` from the same backend
+entry. The snapshot contains every absolute filename and its image; the host
+owns its archive envelope, checksums, actor selection and maintenance window.
+`validateSqliteWasmPoolSnapshot(sqlite3, snapshot)` preflights restoration
+without opening a destination, so hosts restoring several pools can validate
+all of them before modifying the first. It checks native UTF-8 filename limits,
+SQLite image sizes, database integrity and the runtime storage version.
+Replacement reserves headroom, removes orphan files and shares the scoped
+provider's rollback mechanism. A failed rollback throws
+`SqliteWasmPoolRestoreError` carrying the original images. Stop all pool users
+first; rollback survives operation failures, while recovery across process
+termination requires the host's external backup. Both first open each
+database a terminated worker left with a hot rollback journal, so SQLite rolls
+back its uncommitted transaction, and refuse any sidecar that remains. Export
+does not run storage migrations and remains available for a database stamped by
+a newer runtime.
+
 ## What is not supported
 
 The browser cannot reproduce every workerd facility. Unsupported runtime APIs throw named errors. Native engine behavior and partial implementations have the explicit limits below; see the [September workerd audit](docs/workerd-sync.md) for the upstream changes behind them.
 
-| Area | Contract here |
-| --- | --- |
-| Cloudflare point-in-time recovery and read replication | Unsupported by local SQLite; named methods throw. Bookmarks are development counters, not recovery points. |
-| Actor-class stub serialization | Throws; needs workerd's serializer and channel tokens. |
-| Module-scope `waitUntil`, `cache`, `abortIsolate`, Workers RPC stub constructors | Named `cloudflare:workers` boundaries throw. |
-| `DurableObjectState.abort()` | Breaks later storage and re-entry; cannot synchronously terminate the calling JavaScript slice. Alarms observe the abort even if the handler returns; `{ retryAlarm: false }` abandons that alarm. |
-| Outbound `new WebSocket(url)` inside actor globals | Refused before opening a connection because the native handshake cannot wait for the output gate. `WebSocketPair` and host-owned transports remain supported; a host opens its own with `platformWebSocket` and hands it to `acceptWebSocket`. |
-| `cloudflare:workers` tracing | No-op spans expose the current API. Active span identity follows synchronous callbacks only; there is no observer or propagation across awaits. |
-| Stored value wire bytes | Browser-safe versioned structured-clone encoding rather than V8's private format; public value types align and legacy JSON rows remain readable. |
-| SQL row counters | Local `rowsRead`/`rowsWritten`, including `sql.ingest()`, use returned rows and SQLite's `changes()`, so schema, index, trigger and FK-action writes are not counted; workerd's libsql counters include them. |
-| Reserved SQL names | `_cf_` detected from tokenized SQL text, which can reject more than workerd's authorizer. `ANALYZE` on a reserved table is refused where workerd allows it. |
-| Authorizer-only SQL forms | `ATTACH`, `DETACH`, the temp-schema creations (both `CREATE TEMP …` and the `temp.` qualifier), `VACUUM`, and virtual-table modules outside upstream's four (`fts5`, `fts5vocab`, `rtree`, `rtree_i32`) are refused from the leading keyword, with workerd's own messages. These reach the authorizer's own decisions — action codes and its temp-schema rule — rather than `SqlStorageRegulator` callbacks, so porting the regulator did not carry them. The refused and allowed forms are matched through SQLite's identifier quoting, whitespace or none. `EXPLAIN` in front of a refused form still compiles here, where workerd's authorizer refuses it. |
-| SQL function allowlist | Not enforced. Workerd's authorizer denies any function outside its 138-name `ALLOWED_SQLITE_FUNCTIONS` list; this runtime allows every function the backend compiled, including build-detail readers such as `sqlite_version()` and `sqlite_source_id()`. |
-| SQLite internal functions and default expressions | The current engines lack workerd's internal-function and default-expression authorizer patches. Native authorizer callbacks exist in both engines, but the runtime does not wire them into its SQL policy. See the [engine findings](docs/workerd-sync.md#sqlite-engine-work-still-required). |
-| PRAGMA allowlist | Workerd's allowlist enforced from tokenized SQL text. A `pragma_*` table-valued function with a string or bound argument is authorized by pragma name only, where workerd's authorizer also sees the resolved argument; the pinned conformance row is the contract. |
-| Node SQLite length limit | Bound and returned strings and blobs are capped at 8 MiB plus 34 bytes of serialization padding; `node:sqlite` cannot cap an unreturned SQL-computed value. The browser backend uses SQLite's native limit. |
-| Response BYOB readers | Refused; their continuation cannot be re-gated. Use a default reader or `arrayBuffer()`. |
-| Facet `setAlarm()` | Refused synchronously, where workerd breaks the actor asynchronously ([workerd#6810](https://github.com/cloudflare/workerd/issues/6810)). |
-| Alarm exception provenance | Unclassified handler failures stay retryable; browser errors lack jsg provenance. |
-| Alarm bookkeeping failure | Start and completion bookkeeping retry with bounded backoff; workerd leaves these alarms retained without a timer. Completed handlers are not redelivered for cleanup failures. Covered by the scheduler's SQLite fault-injection tests. |
+| Area                                                                             | Contract here                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Cloudflare point-in-time recovery and read replication                           | Unsupported by local SQLite; named methods throw. Bookmarks are development counters, not recovery points.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| Actor-class stub serialization                                                   | Throws; needs workerd's serializer and channel tokens.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| Module-scope `waitUntil`, `cache`, `abortIsolate`, Workers RPC stub constructors | Named `cloudflare:workers` boundaries throw.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `DurableObjectState.abort()`                                                     | Breaks later storage and re-entry; cannot synchronously terminate the calling JavaScript slice. Alarms observe the abort even if the handler returns; `{ retryAlarm: false }` abandons that alarm.                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| Outbound `new WebSocket(url)` inside actor globals                               | Refused before opening a connection because the native handshake cannot wait for the output gate. `WebSocketPair` and host-owned transports remain supported; a host opens its own with `platformWebSocket` and hands it to `acceptWebSocket`.                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `cloudflare:workers` tracing                                                     | No-op spans expose the current API. Active span identity follows synchronous callbacks only; there is no observer or propagation across awaits.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| Stored value wire bytes                                                          | Browser-safe versioned structured-clone encoding rather than V8's private format; public value types align and legacy JSON rows remain readable.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| SQL row counters                                                                 | Local `rowsRead`/`rowsWritten`, including `sql.ingest()`, use returned rows and SQLite's `changes()`, so schema, index, trigger and FK-action writes are not counted; workerd's libsql counters include them.                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| Reserved SQL names                                                               | `_cf_` detected from tokenized SQL text, which can reject more than workerd's authorizer. `ANALYZE` on a reserved table is refused where workerd allows it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| Authorizer-only SQL forms                                                        | `ATTACH`, `DETACH`, the temp-schema creations (both `CREATE TEMP …` and the `temp.` qualifier), `VACUUM`, and virtual-table modules outside upstream's four (`fts5`, `fts5vocab`, `rtree`, `rtree_i32`) are refused from the leading keyword, with workerd's own messages. These reach the authorizer's own decisions — action codes and its temp-schema rule — rather than `SqlStorageRegulator` callbacks, so porting the regulator did not carry them. The refused and allowed forms are matched through SQLite's identifier quoting, whitespace or none. `EXPLAIN` in front of a refused form still compiles here, where workerd's authorizer refuses it. |
+| SQL function allowlist                                                           | Not enforced. Workerd's authorizer denies any function outside its 138-name `ALLOWED_SQLITE_FUNCTIONS` list; this runtime allows every function the backend compiled, including build-detail readers such as `sqlite_version()` and `sqlite_source_id()`.                                                                                                                                                                                                                                                                                                                                                                                                     |
+| SQLite internal functions and default expressions                                | The current engines lack workerd's internal-function and default-expression authorizer patches. Native authorizer callbacks exist in both engines, but the runtime does not wire them into its SQL policy. See the [engine findings](docs/workerd-sync.md#sqlite-engine-work-still-required).                                                                                                                                                                                                                                                                                                                                                                 |
+| PRAGMA allowlist                                                                 | Workerd's allowlist enforced from tokenized SQL text. A `pragma_*` table-valued function with a string or bound argument is authorized by pragma name only, where workerd's authorizer also sees the resolved argument; the pinned conformance row is the contract.                                                                                                                                                                                                                                                                                                                                                                                           |
+| Node SQLite length limit                                                         | Bound and returned strings and blobs are capped at 8 MiB plus 34 bytes of serialization padding; `node:sqlite` cannot cap an unreturned SQL-computed value. The browser backend uses SQLite's native limit.                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| Response BYOB readers                                                            | Refused; their continuation cannot be re-gated. Use a default reader or `arrayBuffer()`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| Facet `setAlarm()`                                                               | Refused synchronously, where workerd breaks the actor asynchronously ([workerd#6810](https://github.com/cloudflare/workerd/issues/6810)).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| Alarm exception provenance                                                       | Unclassified handler failures stay retryable; browser errors lack jsg provenance.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| Alarm bookkeeping failure                                                        | Start and completion bookkeeping retry with bounded backoff; workerd leaves these alarms retained without a timer. Completed handlers are not redelivered for cleanup failures. Covered by the scheduler's SQLite fault-injection tests.                                                                                                                                                                                                                                                                                                                                                                                                                      |
 
 ### Stability
 
@@ -502,19 +547,19 @@ This is `0.x`. The public surface is what [`src/index.ts`](src/index.ts) and the
 
 ## Package layout
 
-| Path | Responsibility |
-| --- | --- |
-| `src/util/` | SQLite seam, KV tables, metadata helpers |
-| `src/io/` | Gates, invocation context, actor storage engine, ids, Worker channels |
-| `src/api/` | Workers-facing APIs: `DurableObjectState`, SQL, WebSocket, Worker Loader, `cloudflare:workers` |
-| `src/server/` | Actor containers, facet lifecycle, deletion recovery, alarm scheduling |
-| `src/browser/` | Physical alarm projection, offscreen-document recovery, MessagePort-backed WebSockets, and the opt-in `async_hooks` shim ([browser async context](docs/browser-async-context.md)) for browser hosts |
-| `src/transport/` | The one `MessagePort` Cap'n Web session adapter |
-| `backends/` | `node:sqlite` and sqlite-wasm/OPFS `SqlDatabaseProvider`s |
-| `conformance/` | One suite, three hosts: workerd, Node, browser; plus the probe fixture and benchmarks |
-| `examples/` | Runnable browser hosts: an MV3 extension and an in-page vibe-coding platform |
-| `docs/migrations.md` | How Rook evolves Wrangler declarations, application SQL, and persisted Agent state without duplicating Cloudflare's migration machinery |
-| `docs/decisions.md` | The numbered invariants and decisions that source comments cite (`§1.2`, `decision 8`) |
+| Path                 | Responsibility                                                                                                                                                                                                                                                  |
+| -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `src/util/`          | SQLite seam, KV tables, metadata helpers                                                                                                                                                                                                                        |
+| `src/io/`            | Gates, invocation context, actor storage engine, ids, Worker channels                                                                                                                                                                                           |
+| `src/api/`           | Workers-facing APIs: `DurableObjectState`, SQL, WebSocket, Worker Loader, `cloudflare:workers`                                                                                                                                                                  |
+| `src/server/`        | Actor containers, facet lifecycle, deletion recovery, alarm scheduling                                                                                                                                                                                          |
+| `src/browser/`       | Actor-tree placement, worker supervision and recovery, physical alarm projection, offscreen-document recovery, MessagePort/Chrome Port WebSockets, and the opt-in `async_hooks` shim ([browser async context](docs/browser-async-context.md)) for browser hosts |
+| `src/transport/`     | The one `MessagePort` Cap'n Web session adapter                                                                                                                                                                                                                 |
+| `backends/`          | `node:sqlite` and sqlite-wasm/OPFS `SqlDatabaseProvider`s                                                                                                                                                                                                       |
+| `conformance/`       | One suite, three hosts: workerd, Node, browser; plus the probe fixture and benchmarks                                                                                                                                                                           |
+| `examples/`          | Runnable browser hosts: an MV3 extension and an in-page vibe-coding platform                                                                                                                                                                                    |
+| `docs/migrations.md` | How Rook evolves Wrangler declarations, application SQL, and persisted Agent state without duplicating Cloudflare's migration machinery                                                                                                                         |
+| `docs/decisions.md`  | The numbered invariants and decisions that source comments cite (`§1.2`, `decision 8`)                                                                                                                                                                          |
 
 The `util → io → api → server` direction follows workerd's own layering, enforced with TypeScript project references. Source comments cite the workerd file and line they port (`← io-gate.c++:142`), and every deliberate divergence is recorded beside its implementation and in a conformance row.
 

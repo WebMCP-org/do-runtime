@@ -36,6 +36,7 @@ describe("jsonSchemaToType", () => {
         "type UserInput = {",
         "    name: string;",
         "    age?: number;",
+        "    [key: string]: unknown;",
         "}"
       ].join("\n")
     );
@@ -56,6 +57,7 @@ describe("jsonSchemaToType", () => {
       [
         "type StatusInput = {",
         '    status?: "active" | "inactive" | "pending";',
+        "    [key: string]: unknown;",
         "}"
       ].join("\n")
     );
@@ -85,7 +87,9 @@ describe("jsonSchemaToType", () => {
         "    address?: {",
         "        street: string;",
         "        zip?: string;",
+        "        [key: string]: unknown;",
         "    };",
+        "    [key: string]: unknown;",
         "}"
       ].join("\n")
     );
@@ -106,8 +110,9 @@ describe("jsonSchemaToType", () => {
     expect(result).toBe(
       [
         "type DataInput = {",
-        "    tags?: string[];",
-        "    scores?: number[];",
+        "    tags?: Array<string>;",
+        "    scores?: Array<number>;",
+        "    [key: string]: unknown;",
         "}"
       ].join("\n")
     );
@@ -155,6 +160,7 @@ describe("generateTypesFromJsonSchema", () => {
         "    /** City name */",
         "    city: string;",
         '    units?: "celsius" | "fahrenheit";',
+        "    [key: string]: unknown;",
         "}",
         "type GetWeatherOutput = unknown",
         "",
@@ -199,10 +205,12 @@ describe("generateTypesFromJsonSchema", () => {
         "type SearchInput = {",
         "    query: string;",
         "    limit?: number;",
+        "    [key: string]: unknown;",
         "}",
         "type SearchOutput = unknown",
         "type GetItemInput = {",
         "    id: string;",
+        "    [key: string]: unknown;",
         "}",
         "type GetItemOutput = unknown",
         "",
@@ -245,10 +253,12 @@ describe("generateTypesFromJsonSchema", () => {
       [
         "type GetUserInput = {",
         "    id: string;",
+        "    [key: string]: unknown;",
         "}",
         "type GetUserOutput = {",
         "    name: string;",
         "    email: string;",
+        "    [key: string]: unknown;",
         "}",
         "",
         "declare const codemode: {",
@@ -327,7 +337,8 @@ describe("generateTypesFromJsonSchema", () => {
         "    /** Issue body */",
         "    body?: string;",
         "    /** Labels to add */",
-        "    labels?: string[];",
+        "    labels?: Array<string>;",
+        "    [key: string]: unknown;",
         "}",
         "type CreateIssueOutput = unknown",
         "type ListIssuesInput = {",
@@ -335,6 +346,7 @@ describe("generateTypesFromJsonSchema", () => {
         "    repo: string;",
         '    state?: "open" | "closed" | "all";',
         "    per_page?: number;",
+        "    [key: string]: unknown;",
         "}",
         "type ListIssuesOutput = unknown",
         "",

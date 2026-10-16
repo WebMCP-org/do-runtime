@@ -31,6 +31,7 @@ async function main() {
     target: "es2021",
     entry: [
       "src/index.ts",
+      "src/json-schema-types.ts",
       "src/ai.ts",
       "src/mcp.ts",
       "src/tanstack-ai.ts",

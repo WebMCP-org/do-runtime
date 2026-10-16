@@ -21,9 +21,7 @@
 
 import {
   AlarmScheduler,
-  DEFAULT_ALARM_OUTLET,
   LoopbackDurableObjectClass,
-  actorScopeBindings,
   asLoopbackDurableObjectClass,
   createActorContainer,
   createDurableObjectNamespace,
@@ -38,11 +36,6 @@ import {
   type ActorGlobalScope,
   type ActorScopeBindings,
   type AlarmResult,
-  type FacetHandle,
-  type FacetHost,
-  type FacetId,
-  type FacetStartRequest,
-  type FacetTree,
 } from "@mcp-b/do-runtime";
 import {
   createSqliteWasmProvider,
@@ -58,8 +51,14 @@ import {
   installWebSocketUpgradeGlobals,
   withWebSocketUpgrade,
 } from "@mcp-b/do-runtime/browser";
+import {
+  BrowserActorTree,
+  isActorQuiescent,
+  type BrowserFacetSnapshot,
+} from "@mcp-b/do-runtime/browser/actor-tree";
 import { createBrowserAlarmProjector } from "@mcp-b/do-runtime/browser/alarm-coordinator";
-import { serveMessagePortWebSockets } from "@mcp-b/do-runtime/browser/message-port-websocket";
+import { MessagePortWebSocket } from "@mcp-b/do-runtime/browser/message-port-websocket";
+import { serveBrowserWorker } from "@mcp-b/do-runtime/browser/worker-supervisor";
 import type {
   CounterSnapshot,
   HostRpc,
@@ -71,7 +70,6 @@ import type {
   ThinkProbeStatus,
   ThinkProbeSubmission,
   WakeProjection,
-  WorkerBoot,
 } from "../protocol";
 import { Counter, type CounterEnv } from "./counter";
 
@@ -126,10 +124,6 @@ const EVICTION_TIMEOUT_MS = 5_000;
 // Facet placement: bundled Agent classes, one database and gate set per child
 
 type FacetConstructor = new (ctx: DurableObjectState, env: CounterEnv) => object;
-type FacetModule = {
-  readonly gate: { container: ActorContainer | undefined };
-  readonly loaded: Promise<Record<string, unknown>>;
-};
 
 function isFacetConstructor(value: unknown): value is FacetConstructor {
   return typeof value === "function" && value.prototype !== undefined;
@@ -153,158 +147,33 @@ const THINK_PROBE_MODULE_URL = "../think-probe.js";
 const facetScopes: Record<string, ActorScopeBindings> = {};
 Object.defineProperty(globalThis, FACET_SCOPES_GLOBAL, { value: facetScopes });
 
-type FacetPlacement = {
-  readonly container: ActorContainer;
-  readonly storage: SqliteWasmActorStorage;
-  readonly stub: object;
-};
-
-/**
- * The extension equivalent of workerd's in-process facet placement. Classes
- * are bundled and trusted, so MV3 needs neither eval nor a Worker Loader: the
- * `DurableObjectClass` token names an export in that module.
- */
-class ExtensionFacetHost implements FacetHost {
-  readonly #placements = new Map<FacetId, FacetPlacement>();
-  readonly #modules = new Map<FacetId, FacetModule>();
-  #host: SqliteWasmHost | undefined;
-  #tree: FacetTree | undefined;
-  #exports: Record<string, unknown> | undefined;
-
-  attach(
-    host: SqliteWasmHost,
-    tree: FacetTree,
-    workerExports: Record<string, unknown>,
-  ): void {
-    this.#host = host;
-    this.#tree = tree;
-    this.#exports = workerExports;
-  }
-
-  start(request: FacetStartRequest): FacetHandle {
-    const existing = this.#placements.get(request.id);
-    if (existing !== undefined) {
-      return { stub: Promise.resolve(existing.stub), broken: existing.container.onBroken };
-    }
-
-    const tree = this.#tree;
-    const workerExports = this.#exports;
-    if (tree === undefined || workerExports === undefined) {
-      throw new Error("do-runtime example: facet host was reached before the root was attached");
-    }
-
-    const started = (async (): Promise<FacetPlacement> => {
-      const facetModule = this.#moduleFor(request.id, request.className);
-      const exported = (await facetModule.loaded)[request.className];
-      if (!isFacetConstructor(exported)) {
-        throw new Error(`do-runtime example: no bundled facet class named ${request.className}`);
-      }
-      const storage = new SqliteWasmActorStorage(this.#requireHost(), `/facet-${request.id}`);
-      const env: CounterEnv = { Counter: counterNamespace(facetModule.gate) };
-      const exports = { ...workerExports, Counter: env.Counter };
-      const container = await createActorContainer({
-        id: request.routedId ?? ACTOR_ID,
-        uniqueKey: UNIQUE_KEY,
-        exports,
-        env,
-        ports: {
-          sql: storage,
-          alarms: DEFAULT_ALARM_OUTLET,
-          facets: this,
-          timer: platformTimer,
-          fetch: platformFetch,
-        },
-        facet: { depth: request.depth, id: request.id, tree },
-      });
-      facetModule.gate.container = container;
-      let instance: object;
-      try {
-        instance = await container.start((ctx) => new exported(ctx, env));
-      } catch (error) {
-        facetModule.gate.container = undefined;
-        container.abort(error);
-        storage.close();
-        throw error;
-      }
-      const placement = { container, storage, stub: container.entry(instance) };
-      this.#placements.set(request.id, placement);
-      return placement;
-    })();
-
-    const { promise: broken, reject } = Promise.withResolvers<never>();
-    void broken.catch(() => {});
-    void started.then(
-      ({ container }) => {
-        void container.onBroken.catch(reject);
-      },
-      () => {},
-    );
-    return { stub: started.then(({ stub }) => stub), broken };
-  }
-
-  abort(id: FacetId, reason?: string): void {
-    const placement = this.#placements.get(id);
-    if (placement === undefined) return;
-    this.#placements.delete(id);
-    const module = this.#modules.get(id);
-    if (module !== undefined) module.gate.container = undefined;
-    placement.container.abort(new Error(reason ?? "Facet placement closed."));
-    placement.storage.close();
-  }
-
-  async deleteStorage(id: FacetId, subtree: readonly FacetId[]): Promise<void> {
-    for (const target of [...subtree, id]) {
-      const storage = this.#storageFor(target);
-      this.abort(target);
-      storage.deleteAll();
-    }
-  }
-
-  async copyStorage(src: FacetId, dst: FacetId): Promise<void> {
-    await this.#storageFor(dst).copyFrom(this.#storageFor(src));
-  }
-
-  #storageFor(id: FacetId): SqliteWasmActorStorage {
-    return (
-      this.#placements.get(id)?.storage ??
-      new SqliteWasmActorStorage(this.#requireHost(), `/facet-${id}`)
-    );
-  }
-
-  #moduleFor(id: FacetId, className: string): FacetModule {
-    const existing = this.#modules.get(id);
-    if (existing !== undefined) return existing;
-
-    const gate: FacetModule["gate"] = { container: undefined };
-    const key = `facet-${id}`;
-    facetScopes[key] = actorScopeBindings(() => {
-      if (gate.container === undefined) {
-        throw new Error(
-          `do-runtime example: ${key} reached an async primitive outside its live placement`,
-        );
-      }
-      return gate.container.globals;
-    });
+let restoringFacets: readonly BrowserFacetSnapshot[] = [];
+let facetPool: SqliteWasmHost | undefined;
+let facetExports: Record<string, unknown> | undefined;
+const facets = new BrowserActorTree({
+  storage(id) {
+    if (!facetPool) throw new Error("Facet storage reached before root placement");
+    return new SqliteWasmActorStorage(facetPool, `/facet-${id}`);
+  },
+  async load(request, scope) {
+    facetScopes[scope.key] = scope.globals;
     const url = new URL(
-      className === "ThinkProbe" ? THINK_PROBE_MODULE_URL : COUNTER_CHILD_MODULE_URL,
+      request.className === "ThinkProbe" ? THINK_PROBE_MODULE_URL : COUNTER_CHILD_MODULE_URL,
       globalThis.location.href,
     );
-    url.searchParams.set("scope", key);
-    const module = {
-      gate,
-      loaded: loadFacetModule(url),
+    url.searchParams.set("scope", scope.key);
+    const exported = (await loadFacetModule(url))[request.className];
+    if (!isFacetConstructor(exported))
+      throw new Error(`No bundled facet class named ${request.className}`);
+    if (!facetExports) throw new Error("Facet exports reached before root placement");
+    const env: CounterEnv = { Counter: counterNamespace(scope) };
+    return {
+      construct: (ctx: DurableObjectState) => new exported(ctx, env),
+      env,
+      exports: { ...facetExports, Counter: env.Counter },
     };
-    this.#modules.set(id, module);
-    return module;
-  }
-
-  #requireHost(): SqliteWasmHost {
-    if (this.#host === undefined) throw new Error("do-runtime example: facet host has no pool");
-    return this.#host;
-  }
-}
-
-const facets = new ExtensionFacetHost();
+  },
+});
 // Worker-owned, not placement-owned: accepted raw sockets survive a root replacement.
 const hibernation = new HibernationMirror();
 
@@ -329,7 +198,8 @@ let placing: Promise<Live> | undefined;
 /** The last `onBroken` rejection, surfaced through `status()`. */
 let brokenReason: string | null = null;
 
-function counterNamespace(gate?: FacetModule["gate"]) {
+/** `gate` names the calling actor's container; without one, calls come from the host. */
+function counterNamespace(gate?: { readonly container: ActorContainer | undefined }) {
   return createDurableObjectNamespace<Counter>(UNIQUE_KEY, {
     getGlobalActor: ({ id }) => {
       const name = id.getName();
@@ -497,7 +367,8 @@ async function installSubstrate(): Promise<Substrate> {
         ).rawRows[0]?.[0],
       ),
     project: async (projection) => {
-      if (peer === undefined) throw new Error("cannot project an alarm before the supervisor connects");
+      if (peer === undefined)
+        throw new Error("cannot project an alarm before the supervisor connects");
       await peer.projectWake(projection);
     },
   });
@@ -522,7 +393,7 @@ async function installSubstrate(): Promise<Substrate> {
 async function place(): Promise<Live> {
   const { host, scheduler } = await installedSubstrate();
   const storage = new SqliteWasmActorStorage(host, ACTOR_PREFIX);
-  const rootGate: FacetModule["gate"] = { container: undefined };
+  const rootGate: { container: ActorContainer | undefined } = { container: undefined };
   const actorNamespace = counterNamespace(rootGate);
 
   const facetClass = (className: string): unknown =>
@@ -565,7 +436,18 @@ async function place(): Promise<Live> {
   });
   rootGate.container = container;
 
-  facets.attach(host, container.facetTree, workerExports);
+  facetPool = host;
+  facetExports = workerExports;
+  facets.attach(
+    {
+      id: ACTOR_ID,
+      uniqueKey: UNIQUE_KEY,
+      tree: container.facetTree,
+      ports: { timer: platformTimer, fetch: platformFetch },
+    },
+    restoringFacets,
+  );
+  restoringFacets = [];
 
   // **Consume `onBroken` at the moment the container exists.** It rejects when a
   // gate breaks, and a host that ignores it gets an actor that answers nothing
@@ -595,6 +477,7 @@ async function place(): Promise<Live> {
     throw error;
   }
   live = { container, entry: container.entry(instance), instance, storage };
+  await facets.restore();
   return live;
 }
 
@@ -622,11 +505,7 @@ async function waitUntilEvictable(container: ActorContainer): Promise<void> {
     if (state.outputGateBroken) {
       throw new Error(`The actor output gate is broken: ${JSON.stringify(state)}`);
     }
-    if (
-      state.armedTimers === 0 &&
-      state.pendingWaitUntil === 0 &&
-      !state.inputLockHeld
-    ) {
+    if (isActorQuiescent(container) && facets.isQuiescent()) {
       return;
     }
     if (Date.now() >= deadline) {
@@ -662,6 +541,10 @@ async function waitUntilEvictable(container: ActorContainer): Promise<void> {
  * is not.
  */
 class HostTarget extends RpcTarget implements HostRpc {
+  /** This example's worker stays resident. */
+  async prepareHibernation(): Promise<null> {
+    return null;
+  }
   async directStubIncrement(): Promise<number> {
     await placed();
     const stub = await getAgentByName<CounterEnv, Counter>(rootNamespace, ACTOR_ID);
@@ -692,14 +575,20 @@ class HostTarget extends RpcTarget implements HostRpc {
         throw new Error("Outbound email is not available in this browser host");
       },
     };
-    await routeAgentEmail(message, { Counter: rootNamespace }, {
-      resolver: async () => ({ agentName: "Counter", agentId: ACTOR_ID }),
-    });
+    await routeAgentEmail(
+      message,
+      { Counter: rootNamespace },
+      {
+        resolver: async () => ({ agentName: "Counter", agentId: ACTOR_ID }),
+      },
+    );
   }
 
   async evict(): Promise<void> {
     const current = await placed();
     await waitUntilEvictable(current.container);
+    restoringFacets = facets.snapshot();
+    facets.closeAll();
     live = undefined;
     current.storage.close();
     await placed();
@@ -737,7 +626,8 @@ class HostTarget extends RpcTarget implements HostRpc {
           ?.slice(6)
       : body;
     const result: unknown = JSON.parse(data ?? "null");
-    if (!response.ok) throw new Error(`MCP request failed with ${response.status}: ${JSON.stringify(result)}`);
+    if (!response.ok)
+      throw new Error(`MCP request failed with ${response.status}: ${JSON.stringify(result)}`);
     return result;
   }
 
@@ -850,41 +740,30 @@ class HostTarget extends RpcTarget implements HostRpc {
 /** Held so the session is not collected while the worker lives. */
 let peer: ReturnType<typeof newRpcSession<SupervisorRpc>> | undefined;
 
-function isWorkerBoot(value: unknown): value is WorkerBoot {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    "port" in value &&
-    value.port instanceof MessagePort &&
-    "sockets" in value &&
-    value.sockets instanceof MessagePort
-  );
-}
-
-self.addEventListener("message", (event: MessageEvent<unknown>) => {
-  if (peer !== undefined) {
-    throw new Error("do-runtime example: this actor worker was booted twice.");
-  }
-  if (!isWorkerBoot(event.data)) throw new TypeError("invalid actor worker boot message");
-  // `newRpcSession` from the package, never capnweb's `newMessagePortRpcSession`
-  // directly: it applies the `RpcTarget` prototype graft that makes the class
-  // above recognisable to capnweb, immediately before opening the session.
-  peer = newRpcSession<SupervisorRpc>(event.data.port, new HostTarget());
-  // The runtime turns a missing route or a refused upgrade into the close the
-  // client reads; the Agent's own refusal text becomes a 1008 reason.
-  serveMessagePortWebSockets(event.data.sockets, (bridge, url) =>
-    connectMessagePortWebSocket(bridge, url, async (request) => {
-      await placed();
-      return await routeAgentRequest(
-        request,
-        { Counter: rootNamespace },
-        { onBeforeConnect: withWebSocketUpgrade },
-      );
-    }),
-  );
-  // Start the scheduler now, not at the first operation: a worker recreated by
-  // a Chrome wake has no client, and its due alarm must still be delivered.
-  void installedSubstrate().catch((error: unknown) => {
-    console.error("[do-runtime example] the alarm scheduler could not start:", error);
-  });
+serveBrowserWorker<string, SupervisorRpc>({
+  scope: self,
+  parseConfiguration(value) {
+    if (value !== "counter") throw new TypeError("Unknown example actor configuration");
+    return value;
+  },
+  async initialize(_configuration, host) {
+    peer = host;
+    // A Chrome wake must start the durable scheduler even without a client.
+    await installedSubstrate();
+    return new HostTarget();
+  },
+  async connect({ port, url }) {
+    await connectMessagePortWebSocket(
+      new MessagePortWebSocket(url, port, false),
+      url,
+      async (request) => {
+        await placed();
+        return routeAgentRequest(
+          request,
+          { Counter: rootNamespace },
+          { onBeforeConnect: withWebSocketUpgrade },
+        );
+      },
+    );
+  },
 });

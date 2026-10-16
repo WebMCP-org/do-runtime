@@ -564,7 +564,15 @@ export interface ActorContainer {
   /** For the host's idle check — today's `drainWaitUntil`. */
   drainWaitUntil(): Promise<void>;
 
+  /** Retain this placement for host/SDK work that outlives its initiating event. */
+  acquireActivity(): () => void;
+
+  /** Observe event, lease and background-work changes without entering the actor. */
+  onActivityChange(listener: () => void): () => void;
+
   quiescence(): {
+    pendingEvents: number;
+    activityLeases: number;
     armedTimers: number;
     pendingWaitUntil: number;
     inputLockHeld: boolean;
@@ -851,10 +859,7 @@ class ActorImpl implements Actor {
 
   classInstance: ClassInstance = { kind: "before-ctor" };
 
-  constructor(
-    isFacet: boolean,
-    hooks: ActorContainerOptions["gateHooks"] = {},
-  ) {
+  constructor(isFacet: boolean, hooks: ActorContainerOptions["gateHooks"] = {}) {
     this.#isFacet = isFacet;
     this.#inputGate = new InputGate(hooks.input);
     this.#outputGate = new OutputGate(hooks.output);
@@ -1329,7 +1334,8 @@ class ActorContainerImpl implements ActorContainer {
     this.#webSockets = new HibernatableWebSocketRegistry(
       this.#ctx,
       {
-        message: (socket, message) => this.#runWebSocketHandler("webSocketMessage", socket, message),
+        message: (socket, message) =>
+          this.#runWebSocketHandler("webSocketMessage", socket, message),
         close: (socket, code, reason, wasClean) =>
           this.#runWebSocketHandler("webSocketClose", socket, code, reason, wasClean),
         error: (socket, error) => this.#runWebSocketHandler("webSocketError", socket, error),
@@ -1460,18 +1466,21 @@ class ActorContainerImpl implements ActorContainer {
           // The dispatch is the one moment that knows both the method name and
           // the caller's frames — the provenance `describeLostLock` reports.
           this.#ctx.noteGateUse(`entry ${String(property)}()`, captureGateStack());
-          const result = await this.#ctx.run(
-            () =>
-              this.#withExternalEntry(() =>
-                (value as (...rest: unknown[]) => unknown).apply(subject, args),
-              ),
-            { signal },
-          ).catch(this.#throwRpcException);
-          // ← the reply being piped through `waitForOutputLocks()`. This is §1.1's whole point:
-          // a method that returns without awaiting its own write still must not answer before
-          // that write is durable.
-          await this.#ctx.waitForOutputLocks().catch(this.#throwRpcException);
-          return result;
+          return this.#ctx
+            .run(
+              () =>
+                this.#withExternalEntry(async () => {
+                  const result: unknown = await Reflect.apply(value, subject, args);
+                  // ← the reply being piped through `waitForOutputLocks()`. This is §1.1's
+                  // whole point: a method that returns without awaiting its own write still
+                  // must not answer before that write is durable. Draining inside `run()`
+                  // keeps the event pending until the reply can leave.
+                  await this.#ctx.waitForOutputLocks();
+                  return result;
+                }),
+              { signal },
+            )
+            .catch(this.#throwRpcException);
         };
         bound.set(property, gated);
         return gated;
@@ -1534,10 +1543,7 @@ class ActorContainerImpl implements ActorContainer {
   };
 
   run<T>(event: () => T | PromiseLike<T>, signal?: AbortSignal): Promise<T> {
-    return this.#ctx.run(
-      () => this.#withExternalEntry(event),
-      { signal },
-    );
+    return this.#ctx.run(() => this.#withExternalEntry(event), { signal });
   }
 
   #withExternalEntry<T>(body: () => T): T {
@@ -1571,16 +1577,19 @@ class ActorContainerImpl implements ActorContainer {
    * `_cf_executingScheduleRowId` upstream depends on.
    */
   deliverAlarm(scheduledTime: number, retryCount: number): Promise<AlarmResult> {
+    // A delivery queued behind the previous one is not an event yet; the lease covers the wait.
+    const release = this.acquireActivity();
     const delivery = this.#alarmTail.then(
       () => this.#deliverAlarmImpl(scheduledTime, retryCount),
       () => this.#deliverAlarmImpl(scheduledTime, retryCount),
     );
     this.#alarmTail = delivery.catch(() => undefined);
-    return delivery;
+    return delivery.finally(release);
   }
 
   abandonAlarm(scheduledTime: number): Promise<number | null> {
-    return this.#cache.abandonAlarm(scheduledTime);
+    const release = this.acquireActivity();
+    return this.#cache.abandonAlarm(scheduledTime).finally(release);
   }
 
   waitOutputLocks(): Promise<void> {
@@ -1591,8 +1600,18 @@ class ActorContainerImpl implements ActorContainer {
     return this.#ctx.drainWaitUntil();
   }
 
+  acquireActivity(): () => void {
+    return this.#ctx.acquireActivity();
+  }
+
+  onActivityChange(listener: () => void): () => void {
+    return this.#ctx.onActivityChange(listener);
+  }
+
   quiescence() {
     return {
+      pendingEvents: this.#ctx.pendingEventCount(),
+      activityLeases: this.#ctx.activityLeaseCount(),
       armedTimers: this.#ctx.getTimeoutCount(),
       pendingWaitUntil: this.#ctx.waitUntilTaskCount(),
       inputLockHeld: this.#ctx.hasCurrent(),

@@ -1,7 +1,7 @@
 /**
  * Tests for codemode JSON Schema to TypeScript conversion.
  * Dual tests verify both JSON Schema and Zod paths produce identical output
- * through jsonSchemaToTypeString().
+ * through jsonSchemaToType().
  */
 import { z } from "zod";
 import { jsonSchema } from "ai";
@@ -131,7 +131,7 @@ describe("basic types", () => {
       })
     },
     (result) => {
-      expect(result).toContain("tags?: string[];");
+      expect(result).toContain("tags?: Array<string>;");
     },
     { description: "Search" }
   );
@@ -815,7 +815,7 @@ describe("edge cases", () => {
 
     const result = genTypes(tools);
 
-    expect(result).toContain("list?: unknown[];");
+    expect(result).toContain("list?: Array<unknown>;");
   });
 
   it("handles empty enum as never", () => {
@@ -981,7 +981,7 @@ describe("enum/const values", () => {
     expect(result).toContain('line \\"one\\"');
   });
 
-  it("serializes object enum values with JSON.stringify", () => {
+  it("prints object enum values as literal types", () => {
     const tools = {
       test: {
         description: "Test",
@@ -1000,7 +1000,7 @@ describe("enum/const values", () => {
     expect(result).not.toContain("[object Object]");
   });
 
-  it("serializes array enum values with JSON.stringify", () => {
+  it("prints array enum values as tuples", () => {
     const tools = {
       test: {
         description: "Test",
@@ -1019,7 +1019,7 @@ describe("enum/const values", () => {
     expect(result).not.toContain("[object Object]");
   });
 
-  it("serializes object const values with JSON.stringify", () => {
+  it("prints object const values as literal types", () => {
     const tools = {
       test: {
         description: "Test",
@@ -1076,10 +1076,10 @@ describe("additionalProperties", () => {
 
     const result = genTypes(tools);
 
-    expect(result).toContain("[key: string]: string;");
+    expect(result).toContain("Record<string, string>");
   });
 
-  it("returns empty object type when no properties and additionalProperties is false", () => {
+  it("rejects additional fields when no properties and additionalProperties is false", () => {
     const tools = {
       test: {
         description: "Test",
@@ -1092,7 +1092,7 @@ describe("additionalProperties", () => {
 
     const result = genTypes(tools);
 
-    expect(result).toContain("type TestInput = {}");
+    expect(result).toContain("type TestInput = Record<string, never>");
     expect(result).not.toContain("Record<string, unknown>");
   });
 

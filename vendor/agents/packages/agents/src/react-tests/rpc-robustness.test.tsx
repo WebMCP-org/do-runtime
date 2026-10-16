@@ -817,6 +817,152 @@ describe("useAgent RPC robustness", () => {
     });
   });
 
+  describe("a transport that closes inside send()", () => {
+    /**
+     * Replaces only the browser WebSocket. Once its pipe is gone, send()
+     * reports the close before returning, as a transport that discovers a
+     * dead peer while writing may.
+     */
+    function deadPipeSockets() {
+      const sockets: DeadPipeSocket[] = [];
+      class DeadPipeSocket extends EventTarget {
+        readyState: number = WebSocket.CONNECTING;
+        binaryType: BinaryType = "blob";
+        bufferedAmount = 0;
+        readonly protocol = "";
+        readonly extensions = "";
+        readonly sent: string[] = [];
+        pipeGone = false;
+
+        constructor(readonly url: string) {
+          super();
+          sockets.push(this);
+        }
+
+        open() {
+          this.readyState = WebSocket.OPEN;
+          this.dispatchEvent(new Event("open"));
+        }
+
+        respond(frame: string, result: unknown) {
+          const { id, type } = JSON.parse(frame) as {
+            id: string;
+            type: string;
+          };
+          this.dispatchEvent(
+            new MessageEvent("message", {
+              data: JSON.stringify({ type, id, success: true, result })
+            })
+          );
+        }
+
+        send(data: string) {
+          this.sent.push(data);
+          if (this.pipeGone) this.close(1006, "pipe gone");
+        }
+
+        close(code = 1000, reason = "") {
+          if (this.readyState === WebSocket.CLOSED) return;
+          this.readyState = WebSocket.CLOSED;
+          this.dispatchEvent(new CloseEvent("close", { code, reason }));
+        }
+      }
+      return { sockets, DeadPipeSocket };
+    }
+
+    it("rejects a call whose send closed the socket instead of waiting for the timeout", async () => {
+      const { host, protocol } = getTestWorkerHost();
+      const { sockets, DeadPipeSocket } = deadPipeSockets();
+      let latestAgent: TestAgent | null = null;
+
+      render(
+        <ControlledAgentComponent
+          initialOptions={{
+            agent: "TestCallableAgent",
+            name: `dead-pipe-${crypto.randomUUID()}`,
+            host,
+            protocol,
+            defaultCallTimeout: 2000,
+            WebSocket: DeadPipeSocket
+          }}
+          onAgent={(agent) => {
+            latestAgent = agent;
+          }}
+          exposeSetOptions={() => {}}
+        />
+      );
+
+      await vi.waitFor(() => expect(sockets).toHaveLength(1));
+      sockets[0].open();
+      await vi.waitFor(() =>
+        expect(latestAgent?.readyState).toBe(WebSocket.OPEN)
+      );
+      sockets[0].pipeGone = true;
+
+      await expect(latestAgent!.call("add", [1, 2])).rejects.toThrow(
+        "Connection closed"
+      );
+      expect(sockets[0].sent).toHaveLength(1);
+    });
+
+    it("keeps calls queued behind a flush whose send closed the socket", async () => {
+      const { host, protocol } = getTestWorkerHost();
+      const { sockets, DeadPipeSocket } = deadPipeSockets();
+      let latestAgent: TestAgent | null = null;
+      let setOptions: ((options: UseAgentOptions<unknown>) => void) | null =
+        null;
+      const baseOptions: UseAgentOptions<unknown> = {
+        agent: "TestCallableAgent",
+        name: `dead-pipe-flush-${crypto.randomUUID()}`,
+        host,
+        protocol,
+        defaultCallTimeout: 2000,
+        query: { generation: "1" },
+        WebSocket: DeadPipeSocket
+      };
+
+      render(
+        <ControlledAgentComponent
+          initialOptions={baseOptions}
+          onAgent={(agent) => {
+            latestAgent = agent;
+          }}
+          exposeSetOptions={(fn) => {
+            setOptions = fn;
+          }}
+        />
+      );
+
+      await vi.waitFor(() => {
+        expect(sockets).toHaveLength(1);
+        expect(latestAgent).not.toBeNull();
+      });
+      const firstAgent = latestAgent!;
+      // Both calls are queued: the socket has not opened yet.
+      const first = firstAgent.call("add", [1, 2]);
+      const second = firstAgent.call("add", [3, 4]);
+      sockets[0].pipeGone = true;
+      sockets[0].open();
+
+      await expect(first).rejects.toThrow("Connection closed");
+      expect(sockets[0].sent).toHaveLength(1);
+
+      // The second call was never handed to the dead socket, so it moves to
+      // the replacement instead of being rejected with it.
+      setOptions!({ ...baseOptions, query: { generation: "2" } });
+      const replacement = () =>
+        sockets.find((socket) => socket.url.includes("generation=2"));
+      await vi.waitFor(() => {
+        expect(replacement()).toBeDefined();
+        expect(latestAgent).not.toBe(firstAgent);
+      });
+      replacement()!.open();
+      await vi.waitFor(() => expect(replacement()!.sent).toHaveLength(1));
+      replacement()!.respond(replacement()!.sent[0], 7);
+      await expect(second).resolves.toBe(7);
+    });
+  });
+
   describe("default call timeout", () => {
     it("rejects calls that never get a response after defaultCallTimeout", async () => {
       const { host, protocol } = getTestWorkerHost();
