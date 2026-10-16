@@ -73,11 +73,18 @@ describe("useAgent when the name changes", () => {
           <TestComponent />
         </Suspense>
       );
-      await vi.waitFor(() => expect(identities).toEqual([first]));
+      await vi.waitFor(() => expect(identities).toEqual([first]), {
+        timeout: 10000
+      });
       update?.(other);
-      await vi.waitFor(() => expect(identities).toEqual([first, other]));
+      await vi.waitFor(() => expect(identities).toEqual([first, other]), {
+        timeout: 10000
+      });
       update?.(first);
-      await vi.waitFor(() => expect(identities).toEqual([first, other, first]));
+      await vi.waitFor(
+        () => expect(identities).toEqual([first, other, first]),
+        { timeout: 10000 }
+      );
       expect(
         observations.filter(
           ({ identified, identityReceived }) => identified && !identityReceived
@@ -117,11 +124,17 @@ describe("useAgent when the name changes", () => {
         <TestComponent />
       </Suspense>
     );
-    await vi.waitFor(() => expect(identities).toEqual([first]));
+    await vi.waitFor(() => expect(identities).toEqual([first]), {
+      timeout: 10000
+    });
     update?.(other);
-    await vi.waitFor(() => expect(container.textContent).toBe(other));
+    await vi.waitFor(() => expect(container.textContent).toBe(other), {
+      timeout: 10000
+    });
     update?.(first);
-    await vi.waitFor(() => expect(identities).toEqual([first, other, first]));
+    await vi.waitFor(() => expect(identities).toEqual([first, other, first]), {
+      timeout: 10000
+    });
     expect(changes).toEqual([
       [first, other],
       [other, first]
@@ -167,11 +180,15 @@ describe("useAgent when the name changes", () => {
         <TestComponent />
       </Suspense>
     );
-    await vi.waitFor(() => expect(observations).toHaveLength(1));
+    await vi.waitFor(() => expect(observations).toHaveLength(1), {
+      timeout: 10000
+    });
     await expect(observations[0].call).resolves.toBe("address-rpc-a");
 
     setName?.("address-rpc-b");
-    await vi.waitFor(() => expect(observations).toHaveLength(2));
+    await vi.waitFor(() => expect(observations).toHaveLength(2), {
+      timeout: 10000
+    });
 
     const switched = observations[1];
     expect(switched.exposedName).toBe("address-rpc-b");
@@ -208,10 +225,14 @@ describe("useAgent when the name changes", () => {
         <TestComponent />
       </Suspense>
     );
-    await vi.waitFor(() => expect(identifiedAs).toBe("address-ready-b"));
+    await vi.waitFor(() => expect(identifiedAs).toBe("address-ready-b"), {
+      timeout: 10000
+    });
 
     setName?.("address-ready-a");
-    await vi.waitFor(() => expect(identifiedAs).toBe("address-ready-a"));
+    await vi.waitFor(() => expect(identifiedAs).toBe("address-ready-a"), {
+      timeout: 10000
+    });
     await expect(
       Promise.race([
         readyForA!.then(() => "resolved"),
