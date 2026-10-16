@@ -77,3 +77,39 @@ test(
   },
   30_000,
 );
+
+test(
+  "whole-pool backup and restore roll back a terminated worker's hot journal instead of refusing it",
+  async () => {
+    const poolName = `do-runtime-actor-backup-${Math.random().toString(36).slice(2)}`;
+    const dirty = ["/actor.facets.sqlite", "/actor.root.sqlite", "/actor.root.sqlite-journal"];
+    const clean = ["/actor.facets.sqlite", "/actor.root.sqlite"];
+    const crash = async (acknowledged: string): Promise<void> => {
+      const crashed = start({ poolName, phase: "crash", acknowledged });
+      await next(crashed.reports, "acknowledged");
+      await next(crashed.reports, "started");
+      crashed.worker.terminate();
+    };
+    try {
+      await crash("call-1");
+      const backup = start({ poolName, phase: "backup" });
+      const { snapshot, ...backedUp } = await next(backup.reports, "backedUp");
+      backup.worker.terminate();
+      expect(backedUp).toEqual({ kind: "backedUp", before: dirty, after: clean });
+      expect(snapshot.files.map(({ name }) => name)).toEqual(clean);
+
+      // A later acknowledged write, then a crash that leaves the destination another hot journal.
+      await crash("call-3");
+      const restore = start({ poolName, phase: "restore", snapshot });
+      expect(await next(restore.reports, "restored")).toEqual({
+        kind: "restored",
+        before: dirty,
+        // The backup's committed rows: neither the rolled-back call-2 nor the replaced call-3.
+        after: { files: clean, rows: [["call-1", 2_304]] },
+      });
+    } finally {
+      for (const worker of workers.splice(0)) worker.terminate();
+    }
+  },
+  60_000,
+);

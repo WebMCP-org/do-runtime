@@ -394,7 +394,12 @@ export class SqliteWasmActorStorage implements SqlDatabaseProvider {
       () => images.length,
       () => {
         this.close();
-        return replaceDatabases(this.#host.pool, this.#prefix, images);
+        return replaceDatabases(
+          this.#host.pool,
+          this.#prefix,
+          images,
+          "clone actor storage"
+        );
       }
     );
   }
@@ -445,7 +450,7 @@ export function createSqliteWasmProvider(
     async exportSnapshot(): Promise<SqlDatabaseSnapshot> {
       requireClosed(openDatabases);
       const files = ownedFiles();
-      requireNoRecoverySidecars(files);
+      requireNoRecoverySidecars(files, "export a snapshot");
       const databases = await Promise.all(
         files
           .filter((file) => file.endsWith(".sqlite"))
@@ -473,7 +478,12 @@ export function createSqliteWasmProvider(
         () => {
           // Again in the queue, where an open queued ahead of this restore has opened.
           requireClosed(openDatabases);
-          return replaceDatabases(host.pool, prefix, snapshot.databases);
+          return replaceDatabases(
+            host.pool,
+            prefix,
+            snapshot.databases,
+            "restore a snapshot"
+          );
         }
       );
     }
@@ -659,8 +669,7 @@ export async function exportSqliteWasmPoolSnapshot(
   pool: OpfsSahPool
 ): Promise<SqliteWasmPoolSnapshot> {
   requireIdlePool(pool);
-  const names = pool.getFileNames().sort();
-  requireNoRecoverySidecars(names);
+  const names = rollBackJournals(pool, "export a snapshot").sort();
   const files = await Promise.all(
     names.map(async (name) => ({
       name,
@@ -696,8 +705,7 @@ export async function importSqliteWasmPoolSnapshot(
     () => replacement.length,
     async () => {
       requireIdlePool(pool);
-      const files = pool.getFileNames();
-      requireNoRecoverySidecars(files);
+      const files = rollBackJournals(pool, "restore a snapshot");
       await replaceDatabaseFiles(pool, files, replacement);
     }
   );
@@ -728,12 +736,13 @@ export class SqliteWasmPoolRestoreError extends AggregateError {
 async function replaceDatabases(
   pool: OpfsSahPool,
   prefix: string,
-  databases: SqlDatabaseSnapshot["databases"]
+  databases: SqlDatabaseSnapshot["databases"],
+  action: string
 ): Promise<void> {
   const files = pool
     .getFileNames()
     .filter((file) => file.startsWith(`${prefix}.`));
-  requireNoRecoverySidecars(files);
+  requireNoRecoverySidecars(files, action);
   for (const file of files)
     requireSafeDatabaseName(file.slice(prefix.length + 1, -".sqlite".length));
   try {
@@ -928,13 +937,49 @@ function requireClosed(openDatabases: ReadonlySet<SqliteWasmDatabase>): void {
   }
 }
 
-function requireNoRecoverySidecars(files: readonly string[]): void {
+function requireNoRecoverySidecars(
+  files: readonly string[],
+  action: string
+): void {
   const sidecar = files.find((file) => !file.endsWith(".sqlite"));
   if (sidecar !== undefined) {
     throw new Error(
-      `Cannot export a snapshot with a SQLite recovery sidecar: ${sidecar}`
+      `Cannot ${action} with a SQLite recovery sidecar: ${sidecar}`
     );
   }
+}
+
+/**
+ * Lets SQLite roll back every hot journal in an idle pool, then returns its
+ * files, refusing any sidecar that remains.
+ *
+ * A terminated worker leaves `<database>-journal` holding the pages that undo its
+ * half-written transaction, which may already be in the database file, so the
+ * journal is never unlinked. A connection's first read replays and deletes it
+ * (see `rollBackHotJournals`). A journal SQLite does not consume, such as one
+ * without its database or one in a pool not installed by `installSqliteWasmHost`,
+ * stays and is refused. The VFS has no shared memory, so there is no WAL.
+ */
+function rollBackJournals(pool: OpfsSahPool, action: string): string[] {
+  const before = pool.getFileNames();
+  for (const file of before) {
+    const database = file.slice(0, -"-journal".length);
+    if (!file.endsWith("-journal") || !before.includes(database)) continue;
+    const handle = new pool.OpfsSAHPoolDb(database);
+    try {
+      const statement = handle.prepare("PRAGMA schema_version");
+      try {
+        statement.step();
+      } finally {
+        statement.finalize();
+      }
+    } finally {
+      handle.close();
+    }
+  }
+  const files = pool.getFileNames();
+  requireNoRecoverySidecars(files, action);
+  return files;
 }
 
 class WasmSqlStatement implements SqlDatabaseStatement {

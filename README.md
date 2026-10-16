@@ -510,8 +510,11 @@ Replacement reserves headroom, removes orphan files and shares the scoped
 provider's rollback mechanism. A failed rollback throws
 `SqliteWasmPoolRestoreError` carrying the original images. Stop all pool users
 first; rollback survives operation failures, while recovery across process
-termination requires the host's external backup. Export does not run storage
-migrations and remains available for a database stamped by a newer runtime.
+termination requires the host's external backup. Both first open each
+database a terminated worker left with a hot rollback journal, so SQLite rolls
+back its uncommitted transaction, and refuse any sidecar that remains. Export
+does not run storage migrations and remains available for a database stamped by
+a newer runtime.
 
 ## What is not supported
 

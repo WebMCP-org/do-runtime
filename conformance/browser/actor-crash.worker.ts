@@ -1,6 +1,6 @@
 /**
  * An actor whose worker is terminated in the middle of a synchronous slice, and
- * the fresh worker that inspects its pool afterwards.
+ * the fresh worker that inspects, backs up or restores its pool afterwards.
  *
  * The crash slice rewrites every acknowledged row instead of appending rows,
  * which is measured rather than stylistic. SQLite can spill a page it appended
@@ -12,11 +12,24 @@
  * file. Only then does recovery depend on replaying the journal.
  */
 
+import sqlite3InitModule from "@sqlite.org/sqlite-wasm";
 import { createActorContainer, DEFAULT_ALARM_OUTLET, noFacets } from "../../src/index";
-import { createSqliteWasmProvider, SqliteWasmActorStorage } from "../../backends/sqlite-wasm";
+import {
+  createSqliteWasmProvider,
+  exportSqliteWasmPoolSnapshot,
+  importSqliteWasmPoolSnapshot,
+  installSqliteWasmHost,
+  SqliteWasmActorStorage,
+  type SqliteWasmPoolSnapshot,
+} from "../../backends/sqlite-wasm";
 import { installPool, timer, UNIQUE_KEY } from "./substrate";
 
-export type CrashBoot = { readonly poolName: string; readonly phase: "crash" | "reopen" };
+export type CrashBoot = { readonly poolName: string } & (
+  | { readonly phase: "crash"; readonly acknowledged?: string }
+  | { readonly phase: "reopen" }
+  | { readonly phase: "backup" }
+  | { readonly phase: "restore"; readonly snapshot: SqliteWasmPoolSnapshot }
+);
 
 type Files = { readonly files: readonly string[] };
 
@@ -31,21 +44,34 @@ export type CrashReport =
         readonly exported: string;
       };
     }
+  | {
+      readonly kind: "backedUp";
+      readonly before: readonly string[];
+      readonly after: readonly string[];
+      readonly snapshot: SqliteWasmPoolSnapshot;
+    }
+  | {
+      readonly kind: "restored";
+      readonly before: readonly string[];
+      readonly after: Files & { readonly rows: readonly (readonly unknown[])[] };
+    }
   | { readonly kind: "error"; readonly error: string };
 
 /** One row per 8 KiB page, and more pages than the cache can hold dirty. */
 const ROWS = 2_304;
 const PAD = "x".repeat(7_000);
+/** Each acknowledged value and its row count. */
+const LEDGER_ROWS = "SELECT substr(value, 1, 6), count(*) FROM ledger GROUP BY 1 ORDER BY 1";
 /** SQLite's rollback-journal magic, which only a synced (hot) journal header carries. */
 const JOURNAL_MAGIC = [0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7];
 
 class Ledger {
   constructor(private readonly ctx: DurableObjectState) {}
 
-  acknowledge(): void {
+  acknowledge(value: string): void {
     const sql = this.ctx.storage.sql;
     sql.exec("CREATE TABLE ledger (id INTEGER PRIMARY KEY, value TEXT NOT NULL)");
-    for (let id = 1; id <= ROWS; id++) sql.exec("INSERT INTO ledger VALUES (?, ?)", id, `call-1${PAD}`);
+    for (let id = 1; id <= ROWS; id++) sql.exec("INSERT INTO ledger VALUES (?, ?)", id, `${value}${PAD}`);
   }
 
   crash(): void {
@@ -65,8 +91,9 @@ self.addEventListener("message", (event: MessageEvent<CrashBoot>) => {
   });
 });
 
-async function run({ poolName, phase }: CrashBoot): Promise<void> {
-  if (phase === "crash") {
+async function run(boot: CrashBoot): Promise<void> {
+  const { poolName } = boot;
+  if (boot.phase === "crash") {
     const container = await createActorContainer({
       id: "ledger",
       uniqueKey: UNIQUE_KEY,
@@ -81,9 +108,28 @@ async function run({ poolName, phase }: CrashBoot): Promise<void> {
     });
     const ledger = container.entry(await container.start((ctx) => new Ledger(ctx)));
     // The entry answers only after the output gate releases, so this is a committed write.
-    await ledger.acknowledge();
+    await ledger.acknowledge(boot.acknowledged ?? "call-1");
     self.postMessage({ kind: "acknowledged" } satisfies CrashReport);
     await ledger.crash();
+    return;
+  }
+
+  if (boot.phase === "backup" || boot.phase === "restore") {
+    const sqlite3 = await sqlite3InitModule();
+    const { pool } = await installSqliteWasmHost(sqlite3, { name: poolName, initialCapacity: 64 });
+    const files = (): string[] => pool.getFileNames().sort();
+    const before = files();
+    if (boot.phase === "backup") {
+      const snapshot = await exportSqliteWasmPoolSnapshot(sqlite3, pool);
+      self.postMessage({ kind: "backedUp", before, after: files(), snapshot } satisfies CrashReport);
+      return;
+    }
+    await importSqliteWasmPoolSnapshot(sqlite3, pool, boot.snapshot);
+    const after = files();
+    const provider = createSqliteWasmProvider({ pool, capi: sqlite3.capi }, { prefix: "/actor" });
+    const rows = (await provider.open("root")).exec(LEDGER_ROWS, []).rawRows;
+    provider.close();
+    self.postMessage({ kind: "restored", before, after: { files: after, rows } } satisfies CrashReport);
     return;
   }
 
@@ -97,10 +143,7 @@ async function run({ poolName, phase }: CrashBoot): Promise<void> {
     exported: await exported(provider),
   };
   const db = await provider.open("root");
-  const rows = db.exec(
-    "SELECT substr(value, 1, 6), count(*) FROM ledger GROUP BY 1 ORDER BY 1",
-    [],
-  ).rawRows;
+  const rows = db.exec(LEDGER_ROWS, []).rawRows;
   provider.close();
   const afterReopen = { files: files(), rows, exported: await exported(provider) };
   self.postMessage({ kind: "reopened", beforeReopen, afterReopen } satisfies CrashReport);
