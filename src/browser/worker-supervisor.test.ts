@@ -72,8 +72,9 @@ class TestWorker extends EventTarget implements Worker {
     if (value === null || typeof value !== "object" || !("key" in value) || typeof value.key !== "string") {
       throw new TypeError("Invalid worker configuration");
     }
-    if ("fail" in value && typeof value.fail !== "boolean") throw new TypeError("Invalid failure fixture flag");
-    return { key: value.key, ...("fail" in value ? { fail: value.fail } : {}) };
+    const fail = "fail" in value ? value.fail : undefined;
+    if (fail !== undefined && typeof fail !== "boolean") throw new TypeError("Invalid failure fixture flag");
+    return { key: value.key, ...(fail === undefined ? {} : { fail }) };
   }) {
     super();
     this.service = new Service(generation);

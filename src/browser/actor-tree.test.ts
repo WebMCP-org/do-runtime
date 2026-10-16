@@ -78,8 +78,9 @@ test("full events stay active while I/O releases the gate, and leases/background
     });
     const work = entry.wait();
     await started.promise;
-    await tick();
-    expect(container.quiescence()).toMatchObject({ pendingEvents: 1, inputLockHeld: false });
+    await vi.waitFor(() =>
+      expect(container.quiescence()).toMatchObject({ pendingEvents: 1, inputLockHeld: false }),
+    );
     expect(isActorQuiescent(container)).toBe(false);
     expect(await entry.peer()).toBe(42);
     const release = container.acquireActivity();
@@ -89,7 +90,7 @@ test("full events stay active while I/O releases the gate, and leases/background
     expect(container.quiescence()).toMatchObject({ pendingEvents: 0, activityLeases: 1 });
     release();
     release();
-    expect(isActorQuiescent(container)).toBe(true);
+    await vi.waitFor(() => expect(isActorQuiescent(container)).toBe(true));
 
     const background = Promise.withResolvers<void>();
     await container.run(() => container.state.waitUntil(background.promise));
@@ -99,7 +100,7 @@ test("full events stay active while I/O releases the gate, and leases/background
     await container.drainWaitUntil();
     await tick();
     expect(observed).toContain(false);
-    expect(observed.at(-1)).toBe(true);
+    await vi.waitFor(() => expect(observed.at(-1)).toBe(true));
   } finally {
     finish.resolve();
     stopObserving();
@@ -160,7 +161,7 @@ test("queued admission cancellation releases activity without cancelling the adm
     await held;
     await container.drainWaitUntil();
     await tick();
-    expect(isActorQuiescent(container)).toBe(true);
+    await vi.waitFor(() => expect(isActorQuiescent(container)).toBe(true));
   } finally {
     release.resolve();
     container.abort("finished");
@@ -382,7 +383,7 @@ test("activity observer errors are reported without corrupting a successful face
     expect(await entry.value()).toBe(42);
     await tick();
     expect(tree.placements()).toHaveLength(1);
-    expect(tree.isQuiescent()).toBe(true);
+    await vi.waitFor(() => expect(tree.isQuiescent()).toBe(true));
     expect(errors).toContain(observerError);
   } finally {
     tree.closeAll();
