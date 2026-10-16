@@ -356,9 +356,8 @@ const ops = {
   storageStatus: async (): Promise<string> => await storageStatus,
   sdkStream: async (): Promise<{ chunks: unknown[]; final: unknown }> => {
     const chunks: unknown[] = [];
-    const final = await (
-      await connectedAgent()
-    ).call("streamValues", [], {
+    const client = await connectedAgent();
+    const final = await client.call("streamValues", [], {
       stream: { onChunk: (chunk) => chunks.push(chunk) },
     });
     return { chunks, final };

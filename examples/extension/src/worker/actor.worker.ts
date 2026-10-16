@@ -1,9 +1,3 @@
-import {
-  BrowserActorTree,
-  isActorQuiescent,
-  type BrowserFacetScope,
-  type BrowserFacetSnapshot,
-} from "@mcp-b/do-runtime/browser/actor-tree";
 /**
  * The actor worker: one module Worker, one root actor, one OPFS SAH pool, and
  * the namespace's one `AlarmScheduler`.
@@ -57,6 +51,11 @@ import {
   installWebSocketUpgradeGlobals,
   withWebSocketUpgrade,
 } from "@mcp-b/do-runtime/browser";
+import {
+  BrowserActorTree,
+  isActorQuiescent,
+  type BrowserFacetSnapshot,
+} from "@mcp-b/do-runtime/browser/actor-tree";
 import { createBrowserAlarmProjector } from "@mcp-b/do-runtime/browser/alarm-coordinator";
 import { MessagePortWebSocket } from "@mcp-b/do-runtime/browser/message-port-websocket";
 import { serveBrowserWorker } from "@mcp-b/do-runtime/browser/worker-supervisor";
@@ -199,7 +198,8 @@ let placing: Promise<Live> | undefined;
 /** The last `onBroken` rejection, surfaced through `status()`. */
 let brokenReason: string | null = null;
 
-function counterNamespace(gate?: Pick<BrowserFacetScope<undefined>, "container">) {
+/** `gate` names the calling actor's container; without one, calls come from the host. */
+function counterNamespace(gate?: { readonly container: ActorContainer | undefined }) {
   return createDurableObjectNamespace<Counter>(UNIQUE_KEY, {
     getGlobalActor: ({ id }) => {
       const name = id.getName();
@@ -541,6 +541,7 @@ async function waitUntilEvictable(container: ActorContainer): Promise<void> {
  * is not.
  */
 class HostTarget extends RpcTarget implements HostRpc {
+  /** This example's worker stays resident. */
   async prepareHibernation(): Promise<null> {
     return null;
   }

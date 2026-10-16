@@ -1,5 +1,3 @@
-import type { DurableObjectState } from "../../src/api/actor-state";
-import { BrowserActorTree, type BrowserFacetScope } from "../../src/browser/actor-tree";
 /**
  * One worker, one actor TREE. A root probe and every facet under it are
  * containers in this module.
@@ -43,14 +41,13 @@ import { BrowserActorTree, type BrowserFacetScope } from "../../src/browser/acto
  * class arrives as the source of a dynamically-loaded Worker, and upstream a
  * dynamic Worker has its own global scope bound to its own context. There is one
  * realm here, so the module gets a module-scoped `scheduler` instead — bound to
- * that facet's container, minted per placement. That is exact rather than
+ * that facet's current container, one binding per facet. That is exact rather than
  * ambient: no guess about which container is running is ever made. Its limit is
  * stated where it is built (`facetModule` below).
  */
 
 import {
   ACTOR_SCOPE_GLOBALS,
-  actorScopeBindings,
   createActorContainer,
   HibernationMirror,
   installActorScope,
@@ -61,11 +58,6 @@ import {
   type AlarmOutlet,
   type AlarmResult,
   type EntrypointRequest,
-  type FacetHandle,
-  type FacetHost,
-  type FacetId,
-  type FacetStartRequest,
-  type FacetTree,
   type IsolateChannelFactory,
   type LoadIsolateRequest,
   type WorkerSource,
@@ -77,6 +69,7 @@ import {
   LoopbackDurableObjectClass,
 } from "../../src/api/export-loopback";
 import { SqliteWasmActorStorage, type SqliteWasmHost } from "../../backends/sqlite-wasm";
+import { BrowserActorTree, type BrowserFacetScope } from "../../src/browser/actor-tree";
 import { Probe } from "../fixtures/probe";
 import {
   installWebSocketUpgradeGlobals,
@@ -346,7 +339,7 @@ const facets = new BrowserActorTree({
   async load(request, scope) {
     const { ActorClass, exports } = await facetModule(request.className, scope);
     return {
-      construct: (ctx: DurableObjectState, env: unknown) => new ActorClass(ctx, env),
+      construct: (ctx, env) => new ActorClass(ctx, env),
       env: facetEnv,
       exports,
     };
@@ -355,8 +348,6 @@ const facets = new BrowserActorTree({
 
 // =======================================================================================
 // The facet class: one evaluation per placement
-
-/** Filled in between evaluating the module and starting the instance. */
 
 type FacetClass = {
   readonly ActorClass: new (ctx: unknown, env: unknown) => object;
@@ -422,12 +413,11 @@ async function facetModule(
   const workers: unknown = await import("../../src/api/cloudflare-workers");
   (globalThis as Record<string, unknown>)[CLOUDFLARE_WORKERS_GLOBAL] = workers;
 
-  const key = scope.key;
-  facetScopes[key] = scope.globals;
+  facetScopes[scope.key] = scope.globals;
 
   const rewritten =
     `const { ${ACTOR_SCOPE_GLOBALS.join(", ")} } = ` +
-    `globalThis.${FACET_SCOPE_GLOBAL}[${JSON.stringify(key)}];\n` +
+    `globalThis.${FACET_SCOPE_GLOBAL}[${JSON.stringify(scope.key)}];\n` +
     (await isolates.mainModule(isolateName)).replace(
       /import\s+(\{[^}]*\})\s+from\s+["']cloudflare:workers["'];?/g,
       (_match, clause: string) =>
@@ -551,16 +541,6 @@ function alarmOutlet(actorName: string): AlarmOutlet {
   };
 }
 
-/**
- * Never reached: a facet container installs `DEFAULT_ALARM_OUTLET` for itself and
- * `assertCanSetAlarm` refuses before anything can call it. Here for the reason
- * the node lane has the same line — a facet with a live outlet would look like a
- * facet with an alarm slot.
- */
-const FACET_HAS_NO_ALARM_SLOT: AlarmOutlet = {
-  scheduleRun: () => Promise.reject(new Error("facets have no alarm slot")),
-};
-
 // =======================================================================================
 // The container lifecycle
 
@@ -613,10 +593,12 @@ async function place(): Promise<Live> {
 
   facetPool = lane;
   facetEnv = env;
+  // The root's tree, by reference: facet ids are sequential across the whole tree, so a
+  // nested container cannot build its own index and every facet shares this one.
   facets.attach({
-    id: requireBoot().actorName,
+    id: current.actorName,
     uniqueKey: UNIQUE_KEY,
-    tree: treeOf(container),
+    tree: container.facetTree,
     ports: { timer },
   });
 
@@ -643,15 +625,6 @@ async function place(): Promise<Live> {
 }
 
 /**
- * The root's `FacetTree`, which the host has to hand down to any facet that may
- * have facets of its own — the one thing a nested container cannot build for
- * itself, because ids are sequential across the whole tree.
- */
-function treeOf(container: ActorContainer): FacetTree {
-  return container.facetTree;
-}
-
-/**
  * Drop the containers, keep the files.
  *
  * The node lane's `respawn` does exactly this — it re-places over the same
@@ -673,7 +646,7 @@ function teardown(): void {
 // The RPC surface
 //
 // One RPC surface for the supervised root. Facet get, abort, and delete are
-// in-process calls on BrowserFacetHost and never enter this transport.
+// in-process calls on the BrowserActorTree and never enter this transport.
 
 class RootTarget extends RpcTarget implements ActorRpc {
   ready(): Promise<void> {
@@ -697,9 +670,10 @@ class RootTarget extends RpcTarget implements ActorRpc {
   }
 
   async connect(tags: string[]): Promise<{ id: string; readyState: number }> {
-    const response = (await (
-      await placed()
-    ).entry.fetch(webSocketUpgradeRequest("https://probe.invalid/socket", tags))) as Response;
+    const { entry } = await placed();
+    const response = (await entry.fetch(
+      webSocketUpgradeRequest("https://probe.invalid/socket", tags),
+    )) as Response;
     const socket = upgradeWebSocket(response);
     if (socket === undefined) throw new Error("Browser lane: probe fetch did not upgrade.");
     const id = registerClient(socket);

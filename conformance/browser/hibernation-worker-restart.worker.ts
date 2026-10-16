@@ -15,6 +15,7 @@ import { MessagePortWebSocket } from "../../src/browser/message-port-websocket";
 import {
   serveBrowserWorker,
   rehydrateWorkerSockets,
+  type HibernatableWorkerService,
   type WorkerHibernationSnapshot,
 } from "../../src/browser/worker-supervisor";
 import { isActorQuiescent } from "../../src/browser/actor-tree";
@@ -32,8 +33,7 @@ export type RoomInspection = {
   }[];
   readonly closes: readonly { code: number; reason: string; wasClean: boolean }[];
 };
-export interface RoomService {
-  prepareHibernation(): Promise<WorkerHibernationSnapshot | null>;
+export interface RoomService extends HibernatableWorkerService {
   inspect(): Promise<RoomInspection>;
 }
 const messages: RoomInspection["messages"][number][] = [];
@@ -41,6 +41,7 @@ const closes: RoomInspection["closes"][number][] = [];
 let container: ActorContainer;
 let entry: ActorEntry<Room>;
 let mirror: HibernationMirror;
+/** The room's one client socket, carried across hibernation by its transport identity. */
 let transportId: string | undefined;
 
 class Room {
@@ -129,7 +130,7 @@ serveBrowserWorker<RoomConfiguration, object>({
   },
   async connect({ id, url, port }) {
     transportId = id;
-    await connectMessagePortWebSocket(new MessagePortWebSocket(url, port, false), url, () => entry.fetch(),
-    );
+    const socket = new MessagePortWebSocket(url, port, false);
+    await connectMessagePortWebSocket(socket, url, () => entry.fetch());
   },
 });

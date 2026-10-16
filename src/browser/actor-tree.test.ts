@@ -6,11 +6,13 @@ import { createNodeSqlProvider } from "../../backends/node-sqlite";
 import { DEFAULT_ALARM_OUTLET } from "../io/actor-sqlite";
 import {
   createActorContainer,
+  noFacets,
   type ActorEntry,
+  type FacetHost,
   type FacetStartRequest,
 } from "../server/actor-container";
 import { platformTimer } from "../api/platform";
-import { BrowserActorTree, isActorQuiescent } from "./actor-tree";
+import { BrowserActorTree, isActorQuiescent, type BrowserActorTreeOptions } from "./actor-tree";
 
 class Storage {
   readonly provider;
@@ -38,27 +40,55 @@ class Storage {
 const request: FacetStartRequest = { id: 1, depth: 1, className: "Child", name: "Child\0one" };
 const tick = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
-test("full events stay active while I/O releases the gate, and leases/background work notify their settlement", async () => {
-  const storage = new Storage(mkdtempSync(join(tmpdir(), "actor-activity-")));
-  const container = await createActorContainer({
+/** A root container on real SQLite in a scratch directory, removed on dispose. */
+async function createRoot(uniqueKey: string, facets: FacetHost = noFacets, directory = scratch()) {
+  const storage = new Storage(join(directory, "root"));
+  const root = await createActorContainer({
     id: "root",
-    uniqueKey: "activity",
+    uniqueKey,
     env: {},
     exports: {},
-    ports: {
-      sql: storage,
-      facets: {
-        start() {
-          throw new Error("No facets");
-        },
-        abort() {},
-        async deleteStorage() {},
-        async copyStorage() {},
-      },
-      alarms: DEFAULT_ALARM_OUTLET,
-      timer: platformTimer,
-    },
+    ports: { sql: storage, facets, alarms: DEFAULT_ALARM_OUTLET, timer: platformTimer },
   });
+  return {
+    root,
+    [Symbol.dispose]() {
+      root.abort("finished");
+      storage.close();
+      rmSync(directory, { recursive: true, force: true });
+    },
+  };
+}
+
+/** A browser actor tree attached to its root, with each facet's storage beside the root's. */
+async function createTree<Context = undefined>(
+  uniqueKey: string,
+  options: Omit<BrowserActorTreeOptions<Storage, Context>, "storage">,
+) {
+  const directory = scratch();
+  const tree = new BrowserActorTree<Storage, Context>({
+    ...options,
+    storage: (id) => new Storage(join(directory, `facet-${id}`)),
+  });
+  const placed = await createRoot(uniqueKey, tree, directory);
+  tree.attach({ id: "root", uniqueKey, tree: placed.root.facetTree, ports: { timer: platformTimer } });
+  return {
+    tree,
+    root: placed.root,
+    [Symbol.dispose]() {
+      tree.closeAll();
+      placed[Symbol.dispose]();
+    },
+  };
+}
+
+function scratch(): string {
+  return mkdtempSync(join(tmpdir(), "browser-actor-tree-"));
+}
+
+test("full events stay active while I/O releases the gate, and leases/background work notify their settlement", async () => {
+  using placed = await createRoot("activity");
+  const container = placed.root;
   const observed: boolean[] = [];
   const stopObserving = container.onActivityChange(() =>
     observed.push(isActorQuiescent(container)),
@@ -86,50 +116,32 @@ test("full events stay active while I/O releases the gate, and leases/background
     const release = container.acquireActivity();
     finish.resolve();
     expect(await work).toBe("done");
-    await tick();
-    expect(container.quiescence()).toMatchObject({ pendingEvents: 0, activityLeases: 1 });
+    await vi.waitFor(() =>
+      expect(container.quiescence()).toMatchObject({ pendingEvents: 0, activityLeases: 1 }),
+    );
     release();
     release();
     await vi.waitFor(() => expect(isActorQuiescent(container)).toBe(true));
 
     const background = Promise.withResolvers<void>();
     await container.run(() => container.state.waitUntil(background.promise));
-    await tick();
+    await vi.waitFor(() =>
+      expect(container.quiescence()).toMatchObject({ pendingEvents: 0, pendingWaitUntil: 1 }),
+    );
     expect(isActorQuiescent(container)).toBe(false);
     background.resolve();
     await container.drainWaitUntil();
-    await tick();
     expect(observed).toContain(false);
     await vi.waitFor(() => expect(observed.at(-1)).toBe(true));
   } finally {
     finish.resolve();
     stopObserving();
-    container.abort("finished");
-    storage.deleteAll();
   }
 });
 
 test("queued admission cancellation releases activity without cancelling the admitted event", async () => {
-  const storage = new Storage(mkdtempSync(join(tmpdir(), "actor-admission-")));
-  const container = await createActorContainer({
-    id: "root",
-    uniqueKey: "admission",
-    env: {},
-    exports: {},
-    ports: {
-      sql: storage,
-      facets: {
-        start() {
-          throw new Error("No facets");
-        },
-        abort() {},
-        async deleteStorage() {},
-        async copyStorage() {},
-      },
-      alarms: DEFAULT_ALARM_OUTLET,
-      timer: platformTimer,
-    },
-  });
+  using placed = await createRoot("admission");
+  const container = placed.root;
   const entered = Promise.withResolvers<void>();
   const release = Promise.withResolvers<void>();
   const abort = new AbortController();
@@ -160,24 +172,18 @@ test("queued admission cancellation releases activity without cancelling the adm
     release.resolve();
     await held;
     await container.drainWaitUntil();
-    await tick();
     await vi.waitFor(() => expect(isActorQuiescent(container)).toBe(true));
   } finally {
     release.resolve();
-    container.abort("finished");
-    storage.deleteAll();
   }
 });
 
 test("facet construction failure releases capabilities and storage; replacement reuses its bound scope", async () => {
-  const directory = mkdtempSync(join(tmpdir(), "browser-tree-"));
-  const rootStorage = new Storage(join(directory, "root"));
   const released: number[] = [];
   let sequence = 0;
   let fail = true;
   let originalScope: object | undefined;
-  const tree = new BrowserActorTree<Storage, number>({
-    storage: (id) => new Storage(join(directory, `facet-${id}`)),
+  using placed = await createTree<number>("tree", {
     async load(_request, scope) {
       originalScope ??= scope;
       expect(scope).toBe(originalScope);
@@ -212,58 +218,36 @@ test("facet construction failure releases capabilities and storage; replacement 
       };
     },
   });
-  const root = await createActorContainer({
-    id: "root",
-    uniqueKey: "tree",
-    env: {},
-    exports: {},
-    ports: { sql: rootStorage, facets: tree, alarms: DEFAULT_ALARM_OUTLET, timer: platformTimer },
-  });
-  tree.attach({
-    id: "root",
-    uniqueKey: "tree",
-    tree: root.facetTree,
-    ports: { timer: platformTimer },
-  });
+  const { tree, root } = placed;
   type Child = { identity(): number; write(value: number): void; read(): { value: number }[] };
-  try {
-    await expect(tree.start(request).stub).rejects.toThrow("constructor refused");
-    expect(released).toEqual([1]);
-    expect(tree.placements()).toHaveLength(0);
-    const entry = (await tree.start(request).stub) as ActorEntry<Child>;
-    expect(await entry.identity()).toBe(2);
-    await entry.write(7);
-    tree.abort(request.id);
-    expect(released).toEqual([1, 2]);
-    const replaced = (await tree.start(request).stub) as ActorEntry<Child>;
-    expect(await replaced.identity()).toBe(3);
-    expect(await replaced.read()).toEqual([{ value: 7 }]);
-    await root
-      .entry({
-        alive() {
-          return "alive";
-        },
-      })
-      .alive();
-  } finally {
-    tree.closeAll();
-    root.abort("finished");
-    rootStorage.close();
-    rmSync(directory, { recursive: true, force: true });
-  }
+  await expect(tree.start(request).stub).rejects.toThrow("constructor refused");
+  expect(released).toEqual([1]);
+  expect(tree.placements()).toHaveLength(0);
+  const entry = (await tree.start(request).stub) as ActorEntry<Child>;
+  expect(await entry.identity()).toBe(2);
+  await entry.write(7);
+  tree.abort(request.id);
+  expect(released).toEqual([1, 2]);
+  const replaced = (await tree.start(request).stub) as ActorEntry<Child>;
+  expect(await replaced.identity()).toBe(3);
+  expect(await replaced.read()).toEqual([{ value: 7 }]);
+  await root
+    .entry({
+      alive() {
+        return "alive";
+      },
+    })
+    .alive();
 });
 
 test.each(["load", "construct"])(
   "concurrent starts share admission and abort during %s never resurrects a placement or releases its replacement",
   async (phase) => {
-    const directory = mkdtempSync(join(tmpdir(), "browser-tree-load-"));
-    const rootStorage = new Storage(join(directory, "root"));
     const entered = Promise.withResolvers<void>();
     const resume = Promise.withResolvers<void>();
     const released: number[] = [];
     let loads = 0;
-    const tree = new BrowserActorTree({
-      storage: (id) => new Storage(join(directory, `facet-${id}`)),
+    using placed = await createTree("load", {
       async load(_request, scope) {
         const identity = ++loads;
         scope.use({
@@ -292,19 +276,7 @@ test.each(["load", "construct"])(
         };
       },
     });
-    const root = await createActorContainer({
-      id: "root",
-      uniqueKey: "load",
-      env: {},
-      exports: {},
-      ports: { sql: rootStorage, facets: tree, alarms: DEFAULT_ALARM_OUTLET, timer: platformTimer },
-    });
-    tree.attach({
-      id: "root",
-      uniqueKey: "load",
-      tree: root.facetTree,
-      ports: { timer: platformTimer },
-    });
+    const { tree } = placed;
     try {
       const first = tree.start(request);
       const duplicate = tree.start(request);
@@ -323,17 +295,11 @@ test.each(["load", "construct"])(
       expect(released).toEqual([1, 2]);
     } finally {
       resume.resolve();
-      tree.closeAll();
-      root.abort("finished");
-      rootStorage.close();
-      rmSync(directory, { recursive: true, force: true });
     }
   },
 );
 
 test("activity observer errors are reported without corrupting a successful facet placement", async () => {
-  const directory = mkdtempSync(join(tmpdir(), "browser-tree-observer-"));
-  const rootStorage = new Storage(join(directory, "root"));
   const errors: unknown[] = [];
   const nativeQueue = globalThis.queueMicrotask;
   // A platform error sink preserves real microtask scheduling while collecting
@@ -348,59 +314,39 @@ test("activity observer errors are reported without corrupting a successful face
     }),
   );
   const observerError = new Error("activity observer failed");
-  const tree = new BrowserActorTree({
-    storage: (id) => new Storage(join(directory, `facet-${id}`)),
-    async load() {
-      return {
-        env: {},
-        exports: {},
-        construct: () => ({
-          value() {
-            return 42;
-          },
-        }),
-      };
-    },
-    activityChanged() {
-      throw observerError;
-    },
-  });
-  const root = await createActorContainer({
-    id: "root",
-    uniqueKey: "observer",
-    env: {},
-    exports: {},
-    ports: { sql: rootStorage, facets: tree, alarms: DEFAULT_ALARM_OUTLET, timer: platformTimer },
-  });
-  tree.attach({
-    id: "root",
-    uniqueKey: "observer",
-    tree: root.facetTree,
-    ports: { timer: platformTimer },
-  });
   try {
+    // Disposed inside the try: teardown reports observer errors to the sink too.
+    using placed = await createTree("observer", {
+      async load() {
+        return {
+          env: {},
+          exports: {},
+          construct: () => ({
+            value() {
+              return 42;
+            },
+          }),
+        };
+      },
+      activityChanged() {
+        throw observerError;
+      },
+    });
+    const { tree } = placed;
     const entry = (await tree.start(request).stub) as ActorEntry<{ value(): number }>;
     expect(await entry.value()).toBe(42);
-    await tick();
-    expect(tree.placements()).toHaveLength(1);
     await vi.waitFor(() => expect(tree.isQuiescent()).toBe(true));
+    expect(tree.placements()).toHaveLength(1);
     expect(errors).toContain(observerError);
   } finally {
-    tree.closeAll();
-    root.abort("finished");
     await tick();
     errorSink.mockRestore();
-    rootStorage.close();
-    rmSync(directory, { recursive: true, force: true });
   }
 });
 
 test("a placed facet whose container breaks reports its request and reason to the host", async () => {
-  const directory = mkdtempSync(join(tmpdir(), "browser-tree-broken-"));
-  const rootStorage = new Storage(join(directory, "root"));
   const broken: [FacetStartRequest, unknown][] = [];
-  const tree = new BrowserActorTree({
-    storage: (id) => new Storage(join(directory, `facet-${id}`)),
+  using placed = await createTree("broken", {
     async load() {
       return {
         env: {},
@@ -416,32 +362,12 @@ test("a placed facet whose container breaks reports its request and reason to th
       broken.push([request, reason]);
     },
   });
-  const root = await createActorContainer({
-    id: "root",
-    uniqueKey: "broken",
-    env: {},
-    exports: {},
-    ports: { sql: rootStorage, facets: tree, alarms: DEFAULT_ALARM_OUTLET, timer: platformTimer },
-  });
-  tree.attach({
-    id: "root",
-    uniqueKey: "broken",
-    tree: root.facetTree,
-    ports: { timer: platformTimer },
-  });
-  try {
-    const handle = tree.start(request);
-    const entry = (await handle.stub) as ActorEntry<{ crash(): void }>;
-    expect(broken).toEqual([]);
-    await entry.crash().catch(() => {});
-    await expect(handle.broken).rejects.toThrow("child crashed");
-    expect(broken).toHaveLength(1);
-    expect(broken[0]![0]).toEqual(request);
-    expect(String(broken[0]![1])).toContain("child crashed");
-  } finally {
-    tree.closeAll();
-    root.abort("finished");
-    rootStorage.close();
-    rmSync(directory, { recursive: true, force: true });
-  }
+  const handle = placed.tree.start(request);
+  const entry = (await handle.stub) as ActorEntry<{ crash(): void }>;
+  expect(broken).toEqual([]);
+  await entry.crash().catch(() => {});
+  await expect(handle.broken).rejects.toThrow("child crashed");
+  expect(broken).toHaveLength(1);
+  expect(broken[0]![0]).toEqual(request);
+  expect(String(broken[0]![1])).toContain("child crashed");
 });

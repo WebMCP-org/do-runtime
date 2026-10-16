@@ -53,9 +53,26 @@ export type BrowserFacetPlacement = {
   readonly entry: ActorEntry<object>;
 };
 
+export type BrowserActorTreeOptions<Storage, Context> = {
+  storage(id: FacetId): Storage;
+  load(
+    request: FacetStartRequest,
+    scope: BrowserFacetScope<Context>,
+  ): Promise<BrowserFacetDefinition>;
+  /** Observe the whole tree using the runtime's event/lease activity owner. */
+  activityChanged?(): void;
+  /** A placed facet's container broke (including an abort); its work is gone. */
+  broken?(request: FacetStartRequest, reason: unknown): void;
+};
+
 type Attachment = Pick<ActorContainerOptions, "id" | "uniqueKey" | "gateHooks"> & {
   readonly tree: FacetTree;
   readonly ports: Pick<ActorPorts, "timer" | "fetch">;
+};
+
+type LivePlacement<Storage> = BrowserFacetPlacement & {
+  readonly storage: Storage;
+  readonly mirror: HibernationMirror;
 };
 
 class Scope<Context> implements BrowserFacetScope<Context> {
@@ -67,12 +84,12 @@ class Scope<Context> implements BrowserFacetScope<Context> {
   });
   #resources = new DisposableStack();
 
+  constructor(readonly key: string) {}
+
   begin(): void {
     this.context = undefined;
     this.#resources = new DisposableStack();
   }
-
-  constructor(readonly key: string) {}
 
   use<T extends Disposable>(resource: T): T {
     if (this.#resources.disposed) {
@@ -85,8 +102,7 @@ class Scope<Context> implements BrowserFacetScope<Context> {
   release(): void {
     this.container = undefined;
     this.context = undefined;
-    const resources = this.#resources;
-    resources.dispose();
+    this.#resources.dispose();
   }
 }
 
@@ -101,29 +117,17 @@ export class BrowserActorTree<
   Storage extends FacetStorage<Storage>,
   Context = undefined,
 > implements FacetHost {
-  readonly #live = new Map<
-    FacetId,
-    BrowserFacetPlacement & { storage: Storage; mirror: HibernationMirror }
-  >();
+  readonly #options: BrowserActorTreeOptions<Storage, Context>;
+  readonly #live = new Map<FacetId, LivePlacement<Storage>>();
   readonly #scopes = new Map<FacetId, Scope<Context>>();
   readonly #scopeNamespace = `actor-tree-${nextScopeNamespace++}`;
   readonly #starting = new Map<FacetId, { cancelled: boolean; handle: FacetHandle }>();
   #attachment: Attachment | undefined;
   #restoring = new Map<FacetId, BrowserFacetSnapshot>();
 
-  constructor(
-    private readonly options: {
-      storage(id: FacetId): Storage;
-      load(
-        request: FacetStartRequest,
-        scope: BrowserFacetScope<Context>,
-      ): Promise<BrowserFacetDefinition>;
-      /** Observe the whole tree using the runtime's event/lease activity owner. */
-      activityChanged?(): void;
-      /** A placed facet's container broke (including an abort); its work is gone. */
-      broken?(request: FacetStartRequest, reason: unknown): void;
-    },
-  ) {}
+  constructor(options: BrowserActorTreeOptions<Storage, Context>) {
+    this.#options = options;
+  }
 
   attach(attachment: Attachment, restoring: readonly BrowserFacetSnapshot[] = []): void {
     if (this.#live.size || this.#starting.size)
@@ -139,13 +143,11 @@ export class BrowserActorTree<
     const prior = this.#starting.get(request.id);
     if (prior) {
       if (!prior.cancelled) return prior.handle;
+      // An aborted start still owns its storage until it unwinds.
       const next = prior.handle.stub.catch(() => {}).then(() => this.start(request));
       const broken = next.then((handle) => handle.broken);
       void broken.catch(() => {});
-      return {
-        stub: next.then((handle) => handle.stub),
-        broken,
-      };
+      return { stub: next.then((handle) => handle.stub), broken };
     }
     const attachment = this.#attachment;
     if (!attachment) throw new Error("Browser actor tree reached before root attachment");
@@ -156,20 +158,27 @@ export class BrowserActorTree<
     }
     const binding = scope;
     binding.begin();
-    const { promise: stub, resolve, reject: fail } = Promise.withResolvers<object>();
-    const { promise: broken, reject } = Promise.withResolvers<never>();
-    void broken.catch(() => {});
-    const operation = { cancelled: false, handle: { stub, broken } };
+    const stub = Promise.withResolvers<object>();
+    const broken = Promise.withResolvers<never>();
+    void broken.promise.catch(() => {});
+    const operation = {
+      cancelled: false,
+      handle: { stub: stub.promise, broken: broken.promise },
+    };
+    // Registered before `load` runs, so a re-entrant start shares this placement.
     this.#starting.set(request.id, operation);
+    const throwIfAborted = (): void => {
+      if (operation.cancelled) throw new Error(`Facet ${request.id} placement was aborted`);
+    };
     const started = (async () => {
       let storage: Storage | undefined;
       let container: ActorContainer | undefined;
       try {
         // load may acquire and register placement capabilities before it imports
         // the bundle. Its captured scope survives abort; its resources do not.
-        const definition = await this.options.load(request, binding);
-        if (operation.cancelled) throw new Error(`Facet ${request.id} placement was aborted`);
-        storage = this.options.storage(request.id);
+        const definition = await this.#options.load(request, binding);
+        throwIfAborted();
+        storage = this.#options.storage(request.id);
         const restored = this.#restoring.get(request.id);
         if (restored) assertSameRequest(request, restored.request);
         const mirror = new HibernationMirror(restored?.sockets, restored?.autoResponse);
@@ -189,14 +198,14 @@ export class BrowserActorTree<
           webSockets: mirror.snapshot(),
           facet: { depth: request.depth, id: request.id, tree: attachment.tree },
         });
-        if (operation.cancelled) throw new Error(`Facet ${request.id} placement was aborted`);
+        throwIfAborted();
         binding.container = container;
-        if (this.options.activityChanged) {
-          const stop = container.onActivityChange(this.options.activityChanged);
+        if (this.#options.activityChanged) {
+          const stop = container.onActivityChange(this.#options.activityChanged);
           binding.use({ [Symbol.dispose]: stop });
         }
         const instance = await container.start(definition.construct);
-        if (operation.cancelled) throw new Error(`Facet ${request.id} placement was aborted`);
+        throwIfAborted();
         const placement = {
           request: { ...request },
           container,
@@ -206,18 +215,14 @@ export class BrowserActorTree<
         };
         this.#live.set(request.id, placement);
         this.#restoring.delete(request.id);
-        this.#activityChanged();
         return placement;
       } catch (error) {
-        try {
-          container?.abort(error);
-        } finally {
-          try {
-            storage?.close();
-          } finally {
-            binding.release();
-          }
-        }
+        // Disposes in reverse: the container, its storage, then the scope's resources.
+        const cleanup = new DisposableStack();
+        cleanup.defer(() => binding.release());
+        cleanup.defer(() => storage?.close());
+        cleanup.defer(() => container?.abort(error));
+        cleanup.dispose();
         throw error;
       } finally {
         if (this.#starting.get(request.id) === operation) this.#starting.delete(request.id);
@@ -226,11 +231,11 @@ export class BrowserActorTree<
     })();
     void started.then(({ container, entry }) => {
       void container.onBroken.catch((reason: unknown) => {
-        reject(reason);
-        this.options.broken?.(request, reason);
+        broken.reject(reason);
+        this.#options.broken?.(request, reason);
       });
-      resolve(entry);
-    }, fail);
+      stub.resolve(entry);
+    }, stub.reject);
     return operation.handle;
   }
 
@@ -239,16 +244,14 @@ export class BrowserActorTree<
     if (starting) starting.cancelled = true;
     const placement = this.#live.get(id);
     this.#live.delete(id);
-    try {
-      const container = placement?.container ?? this.#scopes.get(id)?.container;
-      container?.abort(new Error(reason ?? "Facet placement closed"));
-    } finally {
-      try {
-        placement?.storage.close();
-      } finally {
-        this.#scopes.get(id)?.release();
-      }
-    }
+    const scope = this.#scopes.get(id);
+    const container = placement?.container ?? scope?.container;
+    // Disposes in reverse: the container, its storage, then the scope's resources.
+    const cleanup = new DisposableStack();
+    cleanup.defer(() => scope?.release());
+    cleanup.defer(() => placement?.storage.close());
+    cleanup.defer(() => container?.abort(new Error(reason ?? "Facet placement closed")));
+    cleanup.dispose();
   }
 
   async deleteStorage(id: FacetId, subtree: readonly FacetId[]): Promise<void> {
@@ -284,10 +287,12 @@ export class BrowserActorTree<
     );
   }
 
+  /** Start every facet supplied to `attach()` as hibernated. */
   async restore(): Promise<void> {
     await Promise.all([...this.#restoring.values()].map(({ request }) => this.start(request).stub));
   }
 
+  /** The live facets holding hibernatable sockets or an auto-response. */
   snapshot(): BrowserFacetSnapshot[] {
     return [...this.#live.values()]
       .map(({ request, mirror }) => ({
@@ -300,7 +305,7 @@ export class BrowserActorTree<
 
   #activityChanged(): void {
     try {
-      this.options.activityChanged?.();
+      this.#options.activityChanged?.();
     } catch (error) {
       // Match IoContext observers: reporting an observer failure must not
       // invalidate an admitted placement or abandon its finalizer.
@@ -311,11 +316,14 @@ export class BrowserActorTree<
   }
 
   #storage(id: FacetId): Storage {
-    return this.#live.get(id)?.storage ?? this.options.storage(id);
+    return this.#live.get(id)?.storage ?? this.#options.storage(id);
   }
 }
 
-/** Observe outside actor entry/await transforms, so the probe cannot count itself. */
+/**
+ * No pending event, lease, timer or background work. Call it from outside the
+ * actor: an event that asks counts itself.
+ */
 export function isActorQuiescent(container: ActorContainer): boolean {
   const state = container.quiescence();
   return (

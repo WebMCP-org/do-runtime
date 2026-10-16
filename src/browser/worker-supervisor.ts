@@ -5,6 +5,7 @@ import {
   isWorkerHibernationSnapshot,
   parseBrowserWorkerEvent,
   type BrowserWorkerMessage,
+  type WorkerHibernationPlacement,
   type WorkerHibernationSnapshot,
   type WorkerLifecycleState,
   type WorkerRehydrationPlacement,
@@ -14,13 +15,17 @@ import {
 export * from "./worker-protocol";
 
 export interface HibernatableWorkerService {
+  /** `null` while busy, or always for a worker that must stay resident. */
   prepareHibernation(): Promise<WorkerHibernationSnapshot | null>;
 }
+
 export interface WorkerSocketPeer {
   /** A peer absorbs an already-disconnected transport; callers do not retry sends. */
   send(message: MessagePortWebSocketWireMessage): void;
   close(): void;
 }
+
+/** The current physical worker for one key. */
 export interface SupervisedWorker<Configuration, Service> {
   readonly configuration: Configuration;
   readonly key: string;
@@ -28,10 +33,26 @@ export interface SupervisedWorker<Configuration, Service> {
   readonly ready: Promise<void>;
   readonly readyNow: boolean;
 }
+
 export interface SupervisedWorkerSocket {
   receive(message: MessagePortWebSocketWireMessage): void;
   close(code?: number, reason?: string): void;
 }
+
+export interface BrowserWorkerHostContext {
+  /** Reports are bound to this physical worker, never a replacement for the same key. */
+  reportLifecycle(state: WorkerLifecycleState): void;
+}
+
+export type BrowserWorkerSupervisorOptions<Configuration> = {
+  key(configuration: Configuration): string;
+  createWorker(configuration: Configuration): Worker;
+  hostExports(configuration: Configuration, context: BrowserWorkerHostContext): object;
+  removeStorage(configuration: Configuration): Promise<void>;
+  /** Release resources a terminated worker's finalizers can no longer release. */
+  discarded?(configuration: Configuration, reason: string): void;
+  readonly idleGraceMs: number;
+};
 
 type Placement<Configuration, Service> = SupervisedWorker<Configuration, Service> & {
   readyNow: boolean;
@@ -39,23 +60,35 @@ type Placement<Configuration, Service> = SupervisedWorker<Configuration, Service
   readonly worker: Worker;
   readonly hostSession: ReturnType<typeof newRpcSession>;
   hibernation?: { canceled: boolean };
+  /** The worker's last lifecycle report was idle. */
   idle: boolean;
   idleTimer?: ReturnType<typeof setTimeout>;
 };
-type Socket<Configuration, Service> = {
+
+type Socket<Configuration> = {
   readonly configuration: Configuration;
   readonly id: string;
   readonly key: string;
   readonly peer: WorkerSocketPeer;
+  /** Frames held while the worker starts or hibernates. */
   readonly pending: MessagePortWebSocketWireMessage[];
   readonly url: string;
   closed: boolean;
   closing: boolean;
-  generation?: { placement: Placement<Configuration, Service>; port: MessagePort };
+  /** This socket's port into the key's current worker; absent until one is attached. */
+  port?: MessagePort;
 };
+
 type Identity<Configuration> = { readonly configuration: Configuration; epoch: number };
 
-/** A logical capability survives worker eviction, but never deletion of its address. */
+type Deletion<Configuration> = {
+  includes(configuration: Configuration): boolean;
+  readonly promise: Promise<void>;
+};
+
+type Close = Extract<MessagePortWebSocketWireMessage, { type: "close" }>;
+
+/** A logical capability survives worker eviction, but never deletion of its configuration. */
 export class BrowserWorkerReference<Service> extends RpcTarget {
   constructor(
     private readonly resolveCurrent: () => Promise<ReturnType<typeof newRpcSession<Service>>>,
@@ -68,23 +101,10 @@ export class BrowserWorkerReference<Service> extends RpcTarget {
 }
 
 /**
- * A browser supervisor owns physical workers, their Cap'n Web sessions and the
- * live transports which outlast an idle worker. Configuration names an actor;
- * application policy decides which configurations may be requested/deleted.
+ * Owns physical workers, their Cap'n Web sessions and the client transports
+ * which outlast an idle worker. A configuration names an actor; application
+ * policy decides which configurations may be requested or deleted.
  */
-export interface BrowserWorkerHostContext {
-  /** Reports are bound to this physical placement, never a replacement for the same key. */
-  reportLifecycle(state: WorkerLifecycleState): void;
-}
-export type BrowserWorkerSupervisorOptions<Configuration> = {
-  key(configuration: Configuration): string;
-  createWorker(configuration: Configuration): Worker;
-  hostExports(configuration: Configuration, context: BrowserWorkerHostContext): object;
-  removeStorage(configuration: Configuration): Promise<void>;
-  discarded?(configuration: Configuration, reason: string): void;
-  readonly idleGraceMs: number;
-};
-
 export class BrowserWorkerSupervisor<
   Configuration,
   Service extends HibernatableWorkerService,
@@ -92,12 +112,10 @@ export class BrowserWorkerSupervisor<
   readonly #options: BrowserWorkerSupervisorOptions<Configuration>;
   readonly #workers = new Map<string, Placement<Configuration, Service>>();
   readonly #hibernated = new Map<string, WorkerHibernationSnapshot>();
-  readonly #sockets = new Set<Socket<Configuration, Service>>();
+  readonly #sockets = new Set<Socket<Configuration>>();
+  /** Every configuration seen, so deletion can reach storage whose worker is not running. */
   readonly #identities = new Map<string, Identity<Configuration>>();
-  readonly #deletions = new Set<{
-    includes(configuration: Configuration): boolean;
-    promise: Promise<void>;
-  }>();
+  readonly #deletions = new Set<Deletion<Configuration>>();
   #deletionTail = Promise.resolve();
   #disposed = false;
 
@@ -119,133 +137,19 @@ export class BrowserWorkerSupervisor<
     return this.#ensure(configuration);
   }
 
-  #ensure(configuration: Configuration): Placement<Configuration, Service> {
-    if (this.#disposed) throw new Error("Browser worker supervisor is disposed");
-    if ([...this.#deletions].some((deletion) => deletion.includes(configuration)))
-      throw new Error("Worker storage is being deleted");
-    const key = this.#options.key(configuration);
-    this.#identity(configuration);
-    const existing = this.#workers.get(key);
-    if (existing) {
-      if (existing.hibernation) existing.hibernation.canceled = true;
-      if (existing.idleTimer !== undefined) this.#scheduleIdle(existing);
-      return existing;
-    }
-    const worker = this.#options.createWorker(configuration);
-    const host = new MessageChannel();
-    const agent = new MessageChannel();
-    const readiness = Promise.withResolvers<void>();
-    void readiness.promise.catch(() => undefined);
-    let placement: Placement<Configuration, Service>;
-    try {
-      placement = {
-        configuration,
-        key,
-        worker,
-        readiness,
-        ready: readiness.promise,
-        readyNow: false,
-        idle: false,
-        hostSession: newRpcSession(
-          host.port1,
-          this.#options.hostExports(configuration, {
-            reportLifecycle: (state) => {
-              if (placement) this.#reportLifecycle(placement, state);
-            },
-          }),
-        ),
-        service: newRpcSession<Service>(agent.port1),
-      };
-    } catch (error) {
-      host.port1.close();
-      host.port2.close();
-      agent.port1.close();
-      agent.port2.close();
-      worker.terminate();
-      throw error;
-    }
-    this.#workers.set(key, placement);
-    worker.addEventListener("message", (event: MessageEvent<unknown>) => {
-      if (this.#workers.get(key) !== placement) return;
-      const message = parseBrowserWorkerEvent(event.data);
-      if (!message) {
-        console.warn(`Worker ${key} sent an invalid event`, describeWorkerEvent(event.data));
-        return;
-      }
-      if (message.type === "failed") this.#discard(placement, message.message, false);
-      else {
-        placement.readyNow = true;
-        readiness.resolve();
-        this.#flush(placement);
-      }
-    });
-    worker.addEventListener("error", (event) =>
-      this.#discard(placement, event.message || `Worker ${key} failed`, false),
-    );
-    worker.addEventListener("messageerror", () =>
-      this.#discard(placement, `Worker ${key} could not deserialize a message`, false),
-    );
-    const snapshot = this.#hibernated.get(key);
-    this.#hibernated.delete(key);
-    try {
-      let restored: { snapshot: WorkerRehydrationSnapshot; ports: MessagePort[] } | undefined;
-      if (snapshot && this.#matches(key, snapshot)) restored = this.#rehydrate(placement, snapshot);
-      else if (snapshot)
-        this.#closeOwner(key, 1011, "Worker snapshot no longer matches its transports");
-      worker.postMessage(
-        {
-          type: "initialize",
-          configuration,
-          agentPort: agent.port2,
-          hostPort: host.port2,
-          ...(restored ? { rehydration: restored.snapshot } : {}),
-        } satisfies BrowserWorkerMessage<Configuration>,
-        [agent.port2, host.port2, ...(restored?.ports ?? [])],
-      );
-    } catch (error) {
-      agent.port2.close();
-      host.port2.close();
-      this.#discard(placement, String(error), false);
-      throw error;
-    }
-    return placement;
-  }
-
   /** Each caller receives its own capability; disposal cannot tear down the registry's session. */
-  async resolve(configuration: Configuration): Promise<ReturnType<typeof newRpcSession<Service>>> {
-    await this.waitForDeletion(configuration);
-    const placement = this.#ensure(configuration);
-    await placement.ready;
-    return placement.service.dup();
+  resolve(configuration: Configuration): Promise<ReturnType<typeof newRpcSession<Service>>> {
+    return this.#resolve(configuration, () => {});
   }
 
   reference(configuration: Configuration): BrowserWorkerReference<Service> {
     const identity = this.#identity(configuration);
     const epoch = identity.epoch;
-    const assertCurrent = (): void => {
-      if (identity.epoch !== epoch) throw new Error("Worker reference is stale after deletion");
-    };
-    return new BrowserWorkerReference(async () => {
-      assertCurrent();
-      await this.waitForDeletion(configuration);
-      assertCurrent();
-      const placement = this.#ensure(configuration);
-      await placement.ready;
-      assertCurrent();
-      return placement.service.dup();
-    });
-  }
-
-  #reportLifecycle(
-    placement: Placement<Configuration, Service>,
-    state: WorkerLifecycleState,
-  ): void {
-    if (this.#workers.get(placement.key) !== placement) return;
-    placement.idle = state === "idle";
-    if (state === "active") {
-      if (placement.hibernation) placement.hibernation.canceled = true;
-      this.#clearIdle(placement);
-    } else this.#scheduleIdle(placement);
+    return new BrowserWorkerReference(() =>
+      this.#resolve(configuration, () => {
+        if (identity.epoch !== epoch) throw new Error("Worker reference is stale after deletion");
+      }),
+    );
   }
 
   connect(
@@ -253,7 +157,7 @@ export class BrowserWorkerSupervisor<
     connection: { readonly id: string; readonly url: string; readonly peer: WorkerSocketPeer },
   ): SupervisedWorkerSocket {
     const key = this.#options.key(configuration);
-    const socket: Socket<Configuration, Service> = {
+    const socket: Socket<Configuration> = {
       configuration,
       key,
       ...connection,
@@ -263,18 +167,17 @@ export class BrowserWorkerSupervisor<
     };
     const control: SupervisedWorkerSocket = {
       receive: (message) => this.#receive(socket, message),
-      close: (code = 1000, reason = "") => this.#closeFromPeer(socket, code, reason, false),
+      close: (code = 1000, reason = "") => this.#close(socket, code, reason, false),
     };
-    const previous = [...this.#sockets].find(
-      (candidate) => candidate.key === key && candidate.id === socket.id,
-    );
+    const previous = this.#socketsFor(key).find((candidate) => candidate.id === socket.id);
     if (previous) {
-      this.#closeFromPeer(previous, 1008, "Connection superseded", true);
+      this.#close(previous, 1008, "Connection superseded", true);
       socket.peer.send({ type: "close", code: 1012, reason: "Previous connection is closing" });
       this.#finish(socket);
       return control;
     }
     try {
+      // Wake before registering: a hibernation snapshot describes only the existing transports.
       const placement = this.#ensure(configuration);
       this.#sockets.add(socket);
       this.#connect(socket, placement);
@@ -310,7 +213,7 @@ export class BrowserWorkerSupervisor<
   closeSockets(configuration: Configuration, code: number, reason: string): void {
     const key = this.#options.key(configuration);
     this.#hibernated.delete(key);
-    this.#closeOwner(key, code, reason);
+    this.#endSockets(key, code, reason);
   }
 
   /** Probe now; lifecycle reports normally arrange this after the configured idle grace. */
@@ -318,13 +221,14 @@ export class BrowserWorkerSupervisor<
     const placement = this.#workers.get(this.#options.key(configuration));
     return placement ? this.#hibernate(placement) : false;
   }
+
   stop(configuration: Configuration, reason = "Worker stopped"): void {
     const key = this.#options.key(configuration);
     const placement = this.#workers.get(key);
     if (placement) this.#discard(placement, reason, false);
     else {
       this.#hibernated.delete(key);
-      this.#closeOwner(key, 1011, reason);
+      this.#endSockets(key, 1011, reason);
     }
   }
 
@@ -337,29 +241,25 @@ export class BrowserWorkerSupervisor<
   }
 
   /**
-   * Invalidates captured references synchronously. The optional scope predicate
-   * is the application's actual ancestry rule; keys are never prefix-matched.
-   * All physical deletions serialize because terminated OPFS pools release asynchronously.
+   * Invalidates captured references synchronously. `includes` is the
+   * application's actual ancestry rule; keys are never prefix-matched. All
+   * physical deletions serialize because terminated OPFS pools release
+   * asynchronously.
    */
   delete(
     configuration: Configuration,
-    includes: (candidate: Configuration) => boolean = (candidate) =>
-      this.#options.key(candidate) === this.#options.key(configuration),
+    includes?: (candidate: Configuration) => boolean,
   ): Promise<void> {
     const key = this.#options.key(configuration);
     const within = (candidate: Configuration): boolean =>
-      this.#options.key(candidate) === key || includes(candidate);
+      this.#options.key(candidate) === key || (includes?.(candidate) ?? false);
     this.#identity(configuration);
     const targets = [...this.#identities.values()].filter((identity) =>
       within(identity.configuration),
     );
-    // Install the barrier before discard callbacks can re-enter the supervisor.
-    const settled = Promise.withResolvers<void>();
-    const promise = settled.promise;
-    const deletion = { includes: within, promise };
-    this.#deletions.add(deletion);
     const failures: unknown[] = [];
-    const operation = this.#deletionTail.then(async () => {
+    // This callback runs after the synchronous teardown below, so it reports those failures too.
+    const promise = this.#deletionTail.then(async () => {
       for (const identity of targets) {
         try {
           await this.#options.removeStorage(identity.configuration);
@@ -370,8 +270,14 @@ export class BrowserWorkerSupervisor<
       if (failures.length === 1) throw failures[0];
       if (failures.length > 1) throw new AggregateError(failures, "Worker deletion failed");
     });
-    this.#deletionTail = operation.catch(() => undefined);
-    void operation.then(settled.resolve, settled.reject);
+    this.#deletionTail = promise.catch(() => undefined);
+    // Install the barrier before discard callbacks can re-enter the supervisor.
+    const deletion: Deletion<Configuration> = { includes: within, promise };
+    this.#deletions.add(deletion);
+    const clear = (): void => {
+      this.#deletions.delete(deletion);
+    };
+    void promise.then(clear, clear);
     for (const identity of targets) identity.epoch++;
     for (const identity of targets) {
       try {
@@ -381,10 +287,6 @@ export class BrowserWorkerSupervisor<
         failures.push(error);
       }
     }
-    const clear = (): void => {
-      this.#deletions.delete(deletion);
-    };
-    void promise.then(clear, clear);
     return promise;
   }
 
@@ -399,9 +301,122 @@ export class BrowserWorkerSupervisor<
         failures.push(error);
       }
     }
-    for (const key of this.#hibernated.keys()) this.#closeOwner(key, 1001, "Supervisor disposed");
+    for (const key of this.#hibernated.keys()) this.#endSockets(key, 1001, "Supervisor disposed");
     this.#hibernated.clear();
     if (failures.length) throw new AggregateError(failures, "Supervisor cleanup failed");
+  }
+
+  #ensure(configuration: Configuration): Placement<Configuration, Service> {
+    if (this.#disposed) throw new Error("Browser worker supervisor is disposed");
+    if ([...this.#deletions].some((deletion) => deletion.includes(configuration)))
+      throw new Error("Worker storage is being deleted");
+    const key = this.#options.key(configuration);
+    this.#identity(configuration);
+    const existing = this.#workers.get(key);
+    if (!existing) return this.#spawn(configuration, key);
+    // New work cancels a hibernation probe and restarts a pending idle grace.
+    if (existing.hibernation) existing.hibernation.canceled = true;
+    if (existing.idleTimer !== undefined) this.#scheduleIdle(existing);
+    return existing;
+  }
+
+  #spawn(configuration: Configuration, key: string): Placement<Configuration, Service> {
+    const worker = this.#options.createWorker(configuration);
+    const host = new MessageChannel();
+    const agent = new MessageChannel();
+    const readiness = Promise.withResolvers<void>();
+    void readiness.promise.catch(() => undefined);
+    let placement: Placement<Configuration, Service>;
+    try {
+      placement = {
+        configuration,
+        key,
+        worker,
+        readiness,
+        ready: readiness.promise,
+        readyNow: false,
+        idle: false,
+        hostSession: newRpcSession(
+          host.port1,
+          this.#options.hostExports(configuration, {
+            reportLifecycle: (state) => {
+              if (placement) this.#reportLifecycle(placement, state);
+            },
+          }),
+        ),
+        service: newRpcSession<Service>(agent.port1),
+      };
+    } catch (error) {
+      host.port1.close();
+      host.port2.close();
+      agent.port1.close();
+      agent.port2.close();
+      worker.terminate();
+      throw error;
+    }
+    this.#workers.set(key, placement);
+    worker.addEventListener("message", (event: MessageEvent<unknown>) => {
+      if (!this.#isCurrent(placement)) return;
+      const message = parseBrowserWorkerEvent(event.data);
+      if (!message) {
+        console.warn(`Worker ${key} sent an invalid event`, describeWorkerEvent(event.data));
+        return;
+      }
+      if (message.type === "failed") this.#discard(placement, message.message, false);
+      else {
+        placement.readyNow = true;
+        readiness.resolve();
+        this.#flush(placement);
+      }
+    });
+    worker.addEventListener("error", (event) =>
+      this.#discard(placement, event.message || `Worker ${key} failed`, false),
+    );
+    worker.addEventListener("messageerror", () =>
+      this.#discard(placement, `Worker ${key} could not deserialize a message`, false),
+    );
+    const snapshot = this.#hibernated.get(key);
+    this.#hibernated.delete(key);
+    try {
+      let restored: { snapshot: WorkerRehydrationSnapshot; ports: MessagePort[] } | undefined;
+      if (snapshot) {
+        if (this.#describesLiveSockets(key, snapshot)) restored = this.#rehydrate(key, snapshot);
+        else this.#endSockets(key, 1011, "Worker snapshot no longer matches its transports");
+      }
+      worker.postMessage(
+        {
+          type: "initialize",
+          configuration,
+          agentPort: agent.port2,
+          hostPort: host.port2,
+          ...(restored ? { rehydration: restored.snapshot } : {}),
+        } satisfies BrowserWorkerMessage<Configuration>,
+        [agent.port2, host.port2, ...(restored?.ports ?? [])],
+      );
+    } catch (error) {
+      agent.port2.close();
+      host.port2.close();
+      this.#discard(placement, String(error), false);
+      throw error;
+    }
+    return placement;
+  }
+
+  async #resolve(
+    configuration: Configuration,
+    assertCurrent: () => void,
+  ): Promise<ReturnType<typeof newRpcSession<Service>>> {
+    assertCurrent();
+    await this.waitForDeletion(configuration);
+    assertCurrent();
+    const placement = this.#ensure(configuration);
+    await placement.ready;
+    assertCurrent();
+    return placement.service.dup();
+  }
+
+  #isCurrent(placement: Placement<Configuration, Service>): boolean {
+    return this.#workers.get(placement.key) === placement;
   }
 
   #identity(configuration: Configuration): Identity<Configuration> {
@@ -413,12 +428,26 @@ export class BrowserWorkerSupervisor<
     }
     return identity;
   }
-  #connect(
-    socket: Socket<Configuration, Service>,
+
+  #reportLifecycle(
     placement: Placement<Configuration, Service>,
+    state: WorkerLifecycleState,
   ): void {
+    if (!this.#isCurrent(placement)) return;
+    placement.idle = state === "idle";
+    if (state === "active") {
+      if (placement.hibernation) placement.hibernation.canceled = true;
+      this.#clearIdle(placement);
+    } else this.#scheduleIdle(placement);
+  }
+
+  #socketsFor(key: string): Socket<Configuration>[] {
+    return [...this.#sockets].filter((socket) => socket.key === key);
+  }
+
+  #connect(socket: Socket<Configuration>, placement: Placement<Configuration, Service>): void {
     const channel = new MessageChannel();
-    this.#attach(socket, placement, channel.port1);
+    this.#attach(socket, channel.port1);
     placement.worker.postMessage(
       {
         type: "connect",
@@ -429,98 +458,91 @@ export class BrowserWorkerSupervisor<
       [channel.port2],
     );
   }
-  #attach(
-    socket: Socket<Configuration, Service>,
-    placement: Placement<Configuration, Service>,
-    port: MessagePort,
-  ): void {
-    socket.generation?.port.close();
-    socket.generation = { placement, port };
+
+  #attach(socket: Socket<Configuration>, port: MessagePort): void {
+    socket.port?.close();
+    socket.port = port;
     port.addEventListener("message", (event: MessageEvent<MessagePortWebSocketWireMessage>) => {
-      if (socket.generation?.placement !== placement || socket.generation.port !== port) return;
+      if (socket.port !== port) return;
       socket.peer.send(event.data);
       if (event.data.type === "close") this.#finish(socket);
     });
     port.start();
   }
-  #receive(socket: Socket<Configuration, Service>, message: MessagePortWebSocketWireMessage): void {
+
+  #receive(socket: Socket<Configuration>, message: MessagePortWebSocketWireMessage): void {
     if (socket.closed || (socket.closing && message.type !== "close")) return;
     const placement = this.#ensure(socket.configuration);
+    // Waking a worker whose snapshot no longer matches its transports ends this socket.
     if (socket.closed) return;
-    if (!socket.generation) this.#connect(socket, placement);
+    if (!socket.port) this.#connect(socket, placement);
     if (!placement.readyNow || placement.hibernation) socket.pending.push(message);
-    else this.#post(socket, placement, message);
+    else this.#post(socket, message);
   }
-  #closeFromPeer(
-    socket: Socket<Configuration, Service>,
-    code: number,
-    reason: string,
-    notify: boolean,
-  ): void {
+
+  /** Route a close through the worker, waking it if needed, so the actor observes it. */
+  #close(socket: Socket<Configuration>, code: number, reason: string, notifyPeer: boolean): void {
     if (socket.closed || socket.closing) return;
     socket.closing = true;
-    const close = { type: "close", code, reason } as const;
-    if (notify) socket.peer.send(close);
+    const close: Close = { type: "close", code, reason };
+    if (notifyPeer) socket.peer.send(close);
     this.#receive(socket, close);
   }
-  #post(
-    socket: Socket<Configuration, Service>,
-    placement: Placement<Configuration, Service>,
-    message: MessagePortWebSocketWireMessage,
-  ): void {
-    const generation = socket.generation;
-    if (generation?.placement !== placement) {
+
+  #post(socket: Socket<Configuration>, message: MessagePortWebSocketWireMessage): void {
+    if (!socket.port) {
       socket.pending.push(message);
       return;
     }
-    generation.port.postMessage(message);
+    socket.port.postMessage(message);
     if (message.type === "close") this.#finish(socket);
   }
+
   #flush(placement: Placement<Configuration, Service>): void {
     if (!placement.readyNow || placement.hibernation) return;
-    for (const socket of this.#sockets) {
-      if (socket.generation?.placement !== placement) continue;
+    for (const socket of this.#socketsFor(placement.key)) {
+      if (!socket.port) continue;
       for (const message of socket.pending.splice(0)) {
-        this.#post(socket, placement, message);
+        this.#post(socket, message);
         if (socket.closed) break;
       }
     }
   }
-  #finish(socket: Socket<Configuration, Service>): void {
+
+  #finish(socket: Socket<Configuration>): void {
     if (socket.closed) return;
     socket.closed = true;
     this.#sockets.delete(socket);
-    socket.generation?.port.close();
-    delete socket.generation;
+    socket.port?.close();
+    delete socket.port;
     socket.peer.close();
   }
-  #closeOwner(key: string, code: number, reason: string): void {
-    for (const socket of [...this.#sockets]) {
-      if (socket.key !== key) continue;
-      socket.closing = true;
-      const close = { type: "close", code, reason } as const;
-      socket.generation?.port.postMessage(close);
-      socket.peer.send(close);
-      this.#finish(socket);
-    }
+
+  /** Close one socket at both ends without waiting for the worker. */
+  #end(socket: Socket<Configuration>, close: Close): void {
+    socket.closing = true;
+    socket.port?.postMessage(close);
+    socket.peer.send(close);
+    this.#finish(socket);
   }
+
+  #endSockets(key: string, code: number, reason: string): void {
+    for (const socket of this.#socketsFor(key)) this.#end(socket, { type: "close", code, reason });
+  }
+
   #rehydrate(
-    placement: Placement<Configuration, Service>,
+    key: string,
     snapshot: WorkerHibernationSnapshot,
   ): { ports: MessagePort[]; snapshot: WorkerRehydrationSnapshot } {
-    const sockets = new Map(
-      [...this.#sockets]
-        .filter((socket) => socket.key === placement.key)
-        .map((socket) => [socket.id, socket]),
-    );
+    const sockets = new Map(this.#socketsFor(key).map((socket) => [socket.id, socket]));
     const ports: MessagePort[] = [];
-    const restore = (part: WorkerHibernationSnapshot["root"]): WorkerRehydrationPlacement => ({
+    const restore = (part: WorkerHibernationPlacement): WorkerRehydrationPlacement => ({
       autoResponse: part.autoResponse,
       sockets: part.sockets.map((state) => {
         const socket = sockets.get(state.id);
         if (!socket) throw new Error(`Missing host transport ${state.id}`);
         const channel = new MessageChannel();
-        this.#attach(socket, placement, channel.port1);
+        this.#attach(socket, channel.port1);
         ports.push(channel.port2);
         return { ...state, url: socket.url, port: channel.port2 };
       }),
@@ -533,11 +555,11 @@ export class BrowserWorkerSupervisor<
       },
     };
   }
-  #matches(key: string, snapshot: WorkerHibernationSnapshot): boolean {
+
+  /** The snapshot names exactly the key's live transport IDs, each once. */
+  #describesLiveSockets(key: string, snapshot: WorkerHibernationSnapshot): boolean {
     if (!isWorkerHibernationSnapshot(snapshot)) return false;
-    const live = new Set(
-      [...this.#sockets].filter((socket) => socket.key === key).map((socket) => socket.id),
-    );
+    const live = new Set(this.#socketsFor(key).map((socket) => socket.id));
     const ids = [snapshot.root, ...snapshot.facets].flatMap((part) =>
       part.sockets.map((socket) => socket.id),
     );
@@ -547,86 +569,79 @@ export class BrowserWorkerSupervisor<
       ids.every((id) => live.has(id))
     );
   }
+
   #clearIdle(placement: Placement<Configuration, Service>): void {
     if (placement.idleTimer !== undefined) clearTimeout(placement.idleTimer);
     delete placement.idleTimer;
   }
+
   #scheduleIdle(placement: Placement<Configuration, Service>): void {
     this.#clearIdle(placement);
-    const timer = setTimeout(() => {
-      if (placement.idleTimer !== timer) return;
+    placement.idleTimer = setTimeout(() => {
       delete placement.idleTimer;
       void this.#hibernate(placement).catch((error: unknown) => {
         console.error(`Worker ${placement.key} hibernation failed`, error);
-        if (this.#workers.get(placement.key) === placement && placement.idle)
-          this.#scheduleIdle(placement);
+        if (this.#isCurrent(placement) && placement.idle) this.#scheduleIdle(placement);
       });
     }, this.#options.idleGraceMs);
-    placement.idleTimer = timer;
   }
+
   async #hibernate(placement: Placement<Configuration, Service>): Promise<boolean> {
-    if (this.#workers.get(placement.key) !== placement || placement.hibernation) return false;
+    if (!this.#isCurrent(placement) || placement.hibernation) return false;
     const attempt = { canceled: false };
     placement.hibernation = attempt;
     let snapshot: WorkerHibernationSnapshot | null;
     try {
       snapshot = await placement.service.prepareHibernation();
     } catch (error) {
-      if (this.#workers.get(placement.key) === placement && placement.hibernation === attempt) {
-        delete placement.hibernation;
-        this.#flush(placement);
-      }
+      if (this.#isCurrent(placement)) this.#resume(placement);
       throw error;
     }
-    if (this.#workers.get(placement.key) !== placement) return false;
-    if (attempt.canceled || snapshot === null || !this.#matches(placement.key, snapshot)) {
-      delete placement.hibernation;
-      this.#flush(placement);
+    if (!this.#isCurrent(placement)) return false;
+    if (
+      attempt.canceled ||
+      snapshot === null ||
+      !this.#describesLiveSockets(placement.key, snapshot)
+    ) {
+      this.#resume(placement);
       if (placement.idle) this.#scheduleIdle(placement);
       return false;
     }
     this.#hibernated.set(placement.key, snapshot);
-    delete placement.hibernation;
     this.#discard(placement, "Idle grace elapsed", true);
     return true;
   }
+
+  /** End a hibernation attempt and deliver the frames it held. */
+  #resume(placement: Placement<Configuration, Service>): void {
+    delete placement.hibernation;
+    this.#flush(placement);
+  }
+
   #discard(
     placement: Placement<Configuration, Service>,
     reason: string,
-    preserveSockets: boolean,
+    keepSockets: boolean,
   ): void {
-    if (this.#workers.get(placement.key) !== placement) return;
+    if (!this.#isCurrent(placement)) return;
     this.#clearIdle(placement);
     delete placement.hibernation;
     this.#workers.delete(placement.key);
-    if (!preserveSockets) this.#hibernated.delete(placement.key);
+    if (!keepSockets) this.#hibernated.delete(placement.key);
     placement.readiness.reject(new Error(reason));
-    for (const socket of [...this.#sockets]) {
-      if (socket.key !== placement.key) continue;
-      if (socket.generation?.placement === placement) {
-        socket.generation.port.close();
-        delete socket.generation;
-      }
-      if (!preserveSockets) {
-        socket.closing = true;
-        socket.peer.send({ type: "close", code: 1011, reason: "Worker stopped" });
-        this.#finish(socket);
-      }
+    for (const socket of this.#socketsFor(placement.key)) {
+      socket.port?.close();
+      delete socket.port;
+      if (!keepSockets) this.#end(socket, { type: "close", code: 1011, reason: "Worker stopped" });
     }
-    // The placement left #workers above, so this runs once per worker even when teardown throws.
-    try {
-      try {
-        placement.service[Symbol.dispose]();
-      } finally {
-        try {
-          placement.hostSession[Symbol.dispose]();
-        } finally {
-          placement.worker.terminate();
-        }
-      }
-    } finally {
-      this.#options.discarded?.(placement.configuration, reason);
-    }
+    // The placement left #workers above, so `discarded` runs once per worker even when teardown
+    // throws. The stack disposes in reverse: sessions, then the worker, then the callback.
+    const teardown = new DisposableStack();
+    teardown.defer(() => this.#options.discarded?.(placement.configuration, reason));
+    teardown.defer(() => placement.worker.terminate());
+    teardown.defer(() => placement.hostSession[Symbol.dispose]());
+    teardown.defer(() => placement.service[Symbol.dispose]());
+    teardown.dispose();
   }
 }
 
