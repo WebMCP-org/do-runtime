@@ -23,6 +23,36 @@ Instead of parsing shell syntax, `@cloudflare/shell` runs JavaScript inside an i
 
 This is **not** a bash interpreter. It does not parse shell syntax, expose pipes, or emulate POSIX shell behavior. It executes JavaScript.
 
+## Existing browser directories
+
+`DirectoryHandleWorkspace` from `@cloudflare/shell/browser` implements the
+filesystem contract over an existing `FileSystemDirectoryHandle`. It reads the
+folder directly, without creating OPFS's private `data/` or `meta/` directories.
+The host persists the handle, obtains permission in a visible context and passes
+one stable `lockName` shared by every instance opening that folder:
+
+```ts
+import { DirectoryHandleWorkspace } from "@cloudflare/shell/browser";
+
+const workspace = new DirectoryHandleWorkspace({
+  root: directoryHandle,
+  lockName: directoryIdentity
+});
+await workspace.writeFile("/notes.txt", "Hello");
+```
+
+`WorkspaceFileSystem` is also exported by the browser entry for consumers of
+the lower-level filesystem interface; it shares the same class as the main entry
+without loading the state-backend factory. It follows intermediate symlinks,
+reads every listing page, and uses native binary append when available.
+
+The backend uses Web Locks and native writable-stream commits. It preserves the
+root handle, reports unsupported symbolic links, and implements range reads,
+append, streaming writes, metadata, pagination, globbing and copy/move. Pure path
+utilities are available from `@cloudflare/shell/paths`; File System Access
+metadata and errno helpers are available from
+`@cloudflare/shell/browser/native-file-system`.
+
 ## Example — in-memory state
 
 ```ts

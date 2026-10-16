@@ -1,8 +1,11 @@
 import { fileURLToPath } from "node:url";
+import { transformAsync, types as babelTypes, type PluginObject } from "@babel/core";
+import asyncGenerators from "@babel/plugin-transform-async-generator-functions";
+import asyncFunctions from "@babel/plugin-transform-async-to-generator";
+import remapping from "@jridgewell/remapping";
 import MagicString from "magic-string";
 import {
   createFilter,
-  transformWithOxc,
   Visitor,
   type Alias,
   type ESTree,
@@ -16,38 +19,42 @@ import {
 import { ACTOR_SCOPE_GLOBALS } from "./api/actor-scope-globals.js";
 
 const MARKER = "/* @do-runtime-gated */";
-const ASYNC_METHOD = "/* @do-runtime-async-method */";
+const ASYNC_METHOD = "/*! @do-runtime-async-method */";
 const IMPORT =
   'import { __gateAsyncIterable, __gateAwait, __resumeAwait } from "@mcp-b/do-runtime/gate";';
-const OXC_ASYNC_GENERATOR = /^@oxc-project\+runtime@[^/]+\/helpers\/esm\/wrapAsyncGenerator\.js$/;
 
-function correctAsyncGeneratorReturn(code: string, id: string) {
-  // Oxc 0.149.0 repeats .return() after an await in finally, skipping cleanup.
-  // Match Babel's distinction between await (k=0) and delegated yield (k=1):
-  // https://github.com/babel/babel/blob/main/packages/babel-helpers/src/helpers/wrapAsyncGenerator.ts
-  // Keep this shape check until Vite's bundled Oxc helper incorporates that fix.
-  // Another async-context transform in the same pipeline may have corrected it already.
-  if (code.includes('var i = "return" === r && o.k ? "return" : "next";')) return null;
-  const before = 'var i = "return" === r ? "return" : "next";';
-  const start = code.indexOf(before);
-  if (
-    start < 0 ||
-    code.indexOf(before, start + before.length) >= 0 ||
-    !code.includes("if (!o.k || t.done) return resume(i, t);")
-  ) {
-    throw new Error(
-      `do-runtime: Oxc async-generator helper changed; review or remove the return/await correction: ${id}`,
-    );
-  }
-  const source = new MagicString(code);
-  source.overwrite(
-    start,
-    start + before.length,
-    'var i = "return" === r && o.k ? "return" : "next";',
-  );
+function bindOptionalSuperCalls(): PluginObject {
   return {
-    code: source.toString(),
-    map: source.generateMap({ hires: "boundary", includeContent: true, source: id }),
+    visitor: {
+      Program(path) {
+        // Babel captures super properties through getter arrows, losing an
+        // optional call's receiver. Bind only that callee before async lowering;
+        // leave the optional chain and its argument evaluation entirely native.
+        let helper: babelTypes.Identifier | undefined;
+        path.traverse({
+          OptionalCallExpression(call) {
+            if (
+              babelTypes.isMemberExpression(call.node.callee) &&
+              babelTypes.isSuper(call.node.callee.object)
+            ) {
+              helper ??= path.scope.generateUidIdentifier("optionalSuperMethod");
+              call.get("callee").replaceWith(
+                babelTypes.callExpression(
+                  babelTypes.cloneNode(helper),
+                  [babelTypes.thisExpression(), call.node.callee],
+                ),
+              );
+            }
+          },
+        });
+        if (helper) {
+          path.unshiftContainer("body", babelTypes.importDeclaration(
+            [babelTypes.importSpecifier(helper, babelTypes.identifier("__bindOptionalSuperMethod"))],
+            babelTypes.stringLiteral("@mcp-b/do-runtime/gate"),
+          ));
+        }
+      },
+    },
   };
 }
 
@@ -131,9 +138,9 @@ function countAwaitCoverage(program: ESTree.Program): AwaitCoverage {
   return { total, transformed };
 }
 
-/** Keep native method identity after Oxc has lowered every continuation in its body. */
-function restoreAsyncMethods(code: string, program: ESTree.Program, expected: number): string {
-  const source = new MagicString(code);
+/** Keep native method identity after the compiler has lowered every continuation in its body. */
+function restoreAsyncMethods(source: MagicString, program: ESTree.Program, expected: number): void {
+  const code = source.original;
   let restored = 0;
   const restore = (node: ESTree.Node, isStatic = false) => {
     const start = code.lastIndexOf(ASYNC_METHOD, node.start);
@@ -141,15 +148,11 @@ function restoreAsyncMethods(code: string, program: ESTree.Program, expected: nu
     const between = code.slice(start + ASYNC_METHOD.length, node.start);
     // Only consume our own compiler metadata immediately before an AST method/function.
     if (!/^\s*$/.test(between)) return;
-    if (/[\r\n]/.test(between)) {
-      throw new Error(
-        "do-runtime: Oxc moved async-method metadata; review async identity preservation",
-      );
-    }
-    const end = node.start + (isStatic ? "static".length : 0);
-    const prefix = isStatic ? "static async" : "async";
-    // Equal-width, single-line replacement leaves Oxc's composed source map valid.
-    source.overwrite(start, end, prefix.padEnd(end - start));
+    source.remove(start, start + ASYNC_METHOD.length);
+    source.appendLeft(
+      node.start + (isStatic ? "static".length : 0),
+      isStatic ? " async" : "async ",
+    );
     restored += 1;
   };
   new Visitor({
@@ -159,17 +162,12 @@ function restoreAsyncMethods(code: string, program: ESTree.Program, expected: nu
     Property(node) {
       if (node.method) restore(node);
     },
-    // Oxc moves private methods to standalone functions when targeting ES2016.
-    FunctionDeclaration(node) {
-      restore(node);
-    },
   }).visit(program);
   if (restored !== expected) {
     throw new Error(
-      `do-runtime: Oxc preserved ${restored}/${expected} async-method markers; review async identity preservation`,
+      `do-runtime: Babel preserved ${restored}/${expected} async-method markers; review async identity preservation`,
     );
   }
-  return source.toString();
 }
 
 /** Rewrite syntactic awaits in selected actor-bundled modules to re-enter their input gate. */
@@ -192,9 +190,6 @@ export function doRuntimeAwaitTransform(options?: DoRuntimeAwaitTransformOptions
       development = config.command === "serve";
     },
     async transform(code, id) {
-      if (options?.asyncContext && id.startsWith("\0") && OXC_ASYNC_GENERATOR.test(id.slice(1))) {
-        return correctAsyncGeneratorReturn(code, id);
-      }
       if (
         (!code.includes("await") && !(options?.asyncContext && code.includes("async"))) ||
         code.includes(MARKER) ||
@@ -251,20 +246,39 @@ export function doRuntimeAwaitTransform(options?: DoRuntimeAwaitTransformOptions
         }
         loweredCoverage.set(id, coverage);
         source.appendLeft(insertionPoint, 'import "@mcp-b/do-runtime/browser/async-hooks";\n');
-        // Native await never calls Promise.prototype.then. Oxc's generator
-        // helpers do, making each continuation an ordinary bound callback.
-        const lowered = await transformWithOxc(
-          source.toString(),
-          id,
-          { target: "es2016", lang: "js" },
-          source.generateMap({ hires: "boundary", includeContent: true, source: id }),
+        // Native await never calls Promise.prototype.then. Generator helpers do,
+        // making each continuation an ordinary bound callback. Lower only async
+        // syntax: ES2016 lowering turns optional method calls into `.call()`,
+        // which traverses a remote property on Cap'n Web callable capabilities.
+        const lowered = await transformAsync(
+          `${source}\n//# sourceMappingURL=${source.generateMap({ hires: "boundary", includeContent: true, source: id }).toUrl()}`,
+          {
+            babelrc: false,
+            configFile: false,
+            filename: id,
+            sourceFileName: id,
+            sourceMaps: true,
+            inputSourceMap: true,
+            plugins: [bindOptionalSuperCalls, asyncGenerators, asyncFunctions],
+          },
         );
+        if (!lowered?.code || !lowered.map) {
+          throw new Error(`do-runtime: Babel produced no code or source map: ${id}`);
+        }
         // No native await remains in these shells: promise adoption needs no user-code
         // continuation. Preserve AsyncFunction identity used by RPC lifecycle dispatch.
-        if (asyncMethods > 0) {
-          lowered.code = restoreAsyncMethods(lowered.code, this.parse(lowered.code), asyncMethods);
-        }
-        return lowered;
+        const restored = new MagicString(lowered.code);
+        if (asyncMethods > 0) restoreAsyncMethods(restored, this.parse(lowered.code), asyncMethods);
+        return {
+          code: restored.toString(),
+          map: remapping(
+            [
+              restored.generateMap({ hires: "boundary", source: id }).toString(),
+              JSON.stringify(lowered.map),
+            ],
+            () => null,
+          ).toString(),
+        };
       }
       return {
         code: source.toString(),

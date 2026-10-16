@@ -59,6 +59,8 @@ export {
 } from "./resumable-stream";
 export {
   createChatTurnTaskDefinition,
+  listUnfinishedChatTurnTasks,
+  readChatTurnTaskSnapshot,
   type ChatTurnClosureEntry,
   type ChatTurnTaskHooks
 } from "./turn-task";
@@ -66,6 +68,7 @@ export {
   CHAT_RECOVERY_TASK_NAME,
   chatRecoveryTaskRunOptions,
   createChatRecoveryTaskDefinition,
+  listPendingChatRecoveryTasks,
   dispatchChatRecoveryToHandoff,
   type ChatRecoveryHandoff,
   type ChatRecoveryTaskHooks,

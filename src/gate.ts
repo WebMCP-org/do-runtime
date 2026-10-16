@@ -25,6 +25,17 @@ const TRANSFORMED_AWAIT = Symbol("@mcp-b/do-runtime/transformed-await");
  */
 const CURRENT_PUBLICATION = Symbol.for("@mcp-b/do-runtime/current-await-publication");
 const warnedUngatedAwaits = new Set<string>();
+const apply = Reflect.apply;
+
+/** Preserve the receiver of an optional super call through compiler getter capture. */
+export function __bindOptionalSuperMethod<Receiver, Args extends unknown[], Result>(
+  receiver: Receiver,
+  method: ((this: Receiver, ...args: Args) => Result) | null | undefined,
+): ((...args: Args) => Result) | undefined {
+  return method === null || method === undefined
+    ? undefined
+    : (...args) => apply(method, receiver, args);
+}
 
 type PublicationReservation = {
   readonly context: IoContext;

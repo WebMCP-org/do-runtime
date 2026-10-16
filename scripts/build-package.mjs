@@ -17,6 +17,9 @@ await build({
       entry: {
         index: new URL("src/index.ts", root).pathname,
         browser: new URL("src/browser.ts", root).pathname,
+        "browser/worker-supervisor": new URL("src/browser/worker-supervisor.ts", root).pathname,
+        "browser/actor-tree": new URL("src/browser/actor-tree.ts", root).pathname,
+        "browser/chrome-port-websocket": new URL("src/browser/chrome-port-websocket.ts", root).pathname,
         "browser/alarm-coordinator": new URL(
           "src/browser/alarm-coordinator.ts",
           root,
@@ -44,6 +47,10 @@ await build({
         id === "capnweb" ||
         id === "@ungap/structured-clone" ||
         id === "magic-string" ||
+        id === "@babel/core" ||
+        id === "@babel/plugin-transform-async-generator-functions" ||
+        id === "@babel/plugin-transform-async-to-generator" ||
+        id === "@jridgewell/remapping" ||
         id === "vite" ||
         id.startsWith("node:"),
       output: {

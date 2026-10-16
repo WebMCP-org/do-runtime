@@ -29,6 +29,7 @@
     "docs/assets/browser-agent-runtime.png",
     "docs/assets/extension-agent-runtime.svg",
     "docs/migrations.md",
+    "docs/browser-hosting.md",
     "CHANGELOG.md",
     "LICENSE",
     "LICENSE.workerd",
@@ -48,9 +49,21 @@
       "types": "./dist/src/browser.d.ts",
       "import": "./dist/browser.js"
     },
+    "./browser/chrome-port-websocket": {
+      "types": "./dist/src/browser/chrome-port-websocket.d.ts",
+      "import": "./dist/browser/chrome-port-websocket.js"
+    },
     "./browser/alarm-coordinator": {
       "types": "./dist/src/browser/alarm-coordinator.d.ts",
       "import": "./dist/browser/alarm-coordinator.js"
+    },
+    "./browser/worker-supervisor": {
+      "types": "./dist/src/browser/worker-supervisor.d.ts",
+      "import": "./dist/browser/worker-supervisor.js"
+    },
+    "./browser/actor-tree": {
+      "types": "./dist/src/browser/actor-tree.d.ts",
+      "import": "./dist/browser/actor-tree.js"
     },
     "./browser/message-port-websocket": {
       "types": "./dist/src/browser/message-port-websocket.d.ts",
@@ -122,6 +135,10 @@
     "sdk:pack": "pnpm sdk:build && rm -rf .sdk-pack && pnpm --dir vendor/agents --filter agents --filter \"@cloudflare/*\" --fail-if-no-match -r pack --pack-destination \"$PWD/.sdk-pack\""
   },
   "dependencies": {
+    "@babel/core": "8.0.1",
+    "@babel/plugin-transform-async-generator-functions": "8.0.6",
+    "@babel/plugin-transform-async-to-generator": "8.0.1",
+    "@jridgewell/remapping": "2.3.5",
     "@ungap/structured-clone": "1.4.0",
     "capnweb": "0.12.0",
     "magic-string": "1.3.1"

@@ -229,6 +229,9 @@ import {
   chatRecoveryTaskRunOptions,
   createChatRecoveryTaskDefinition,
   createChatTurnTaskDefinition,
+  listUnfinishedChatTurnTasks,
+  readChatTurnTaskSnapshot,
+  listPendingChatRecoveryTasks,
   dispatchChatRecoveryToHandoff,
   createChatFiberSnapshot,
   unwrapChatFiberSnapshot,
@@ -465,6 +468,7 @@ function settleMessengerRecoveryDelivery(
 type PendingResponseHook = {
   requestId: string;
   messageId: string;
+  recoveryRootRequestId?: string;
   continuation: boolean;
   status: ChatResponseResult["status"];
   error?: string;
@@ -2997,14 +3001,22 @@ export interface TurnContext {
   messenger?: MessengerContext;
 }
 
-/**
- * The turn currently running on this agent. See {@link Think.activeTurn}.
- */
+/** Native work that will resume or deliver a terminal hook after startup. */
+export interface RecoverableChatRequest {
+  /** Request whose terminal hook or recovery handoff is still owed. */
+  requestId: string;
+  /** Stable identity inherited by every successor of the interrupted input. */
+  recoveryRootRequestId: string;
+}
+
+/** The turn currently running on this agent. See {@link Think.activeTurn}. */
 export interface ActiveTurn {
   /** Request id shared by every hook, tool call and event of this turn. */
   requestId: string;
   trigger: TurnTrigger;
   continuation: boolean;
+  /** Original input when this turn is its recovery successor. */
+  recoveryRootRequestId?: string;
   /** Channel the turn resolved to, when it has one. */
   channel?: string;
 }
@@ -5738,6 +5750,9 @@ export class Think<
       requestId: turn.requestId,
       trigger: turn.trigger,
       continuation: turn.continuation ?? false,
+      ...(turn.recoveryRootRequestId !== undefined && {
+        recoveryRootRequestId: turn.recoveryRootRequestId
+      }),
       ...(turn.channel !== undefined && { channel: turn.channel })
     };
   }
@@ -13465,14 +13480,154 @@ export class Think<
    * wrapper wrote, so string equality matches the requestId.
    */
   private _recoverableChatTurnTaskCreatedAt(requestId: string): number | null {
-    const rows = this.sql<{ created_at: number }>`
-      SELECT created_at FROM cf_agents_task_runs
-      WHERE definition = ${(this.constructor as typeof Think).CHAT_FIBER_NAME}
-        AND state IN ('pending', 'running', 'waiting', 'recovering')
-        AND metadata = ${JSON.stringify({ requestId })}
-      LIMIT 1
-    `;
-    return rows[0]?.created_at ?? null;
+    return (
+      listUnfinishedChatTurnTasks(
+        this.ctx.storage,
+        (this.constructor as typeof Think).CHAT_FIBER_NAME
+      ).find((task) => task.requestId === requestId)?.createdAt ?? null
+    );
+  }
+
+  /**
+   * Request identities still awaiting native execution, recovery, or a
+   * persisted terminal-response hook. Safe in `onStart`, before the alarm
+   * resumes interrupted chat Tasks. Settled model-step journals are excluded
+   * even when their Task run has not finished its queue cleanup.
+   */
+  async listRecoverableChatRequests(): Promise<RecoverableChatRequest[]> {
+    // One recovery root has one current handoff owner. A successor's Task or
+    // owed hook takes precedence over its predecessor's queued retry.
+    const requests = new Map<string, RecoverableChatRequest>();
+    const incidents = await listActiveChatRecoveryIncidents(this.ctx.storage);
+    const leaf = await this.session.getLatestLeaf();
+    const includeRecovery = async (
+      callback: ChatRecoveryScheduleCallback,
+      data: ChatRecoveryRetryData & ChatRecoveryContinueData
+    ) => {
+      if (
+        this._isStoppedRecovery(data.stopEpoch ?? 0) ||
+        (await this._chatRecoveryEngine().isRecoveryCancelled(
+          data.incidentId
+        )) ||
+        (data.recoveredRequestId &&
+          !this._readRunningSubmissionForRecovery(data.recoveredRequestId)) ||
+        this._chatRecoveryTargetMismatch(callback, data, leaf)
+      )
+        return;
+      const incident = incidents.find(
+        ({ incident }) => incident.incidentId === data.incidentId
+      )?.incident;
+      const root =
+        data.originalRequestId ??
+        incident?.recoveryRootRequestId ??
+        incident?.requestId;
+      if (!root) return;
+      requests.set(root, {
+        requestId: incident?.requestId ?? root,
+        recoveryRootRequestId: root
+      });
+    };
+    for (const input of listPendingChatRecoveryTasks(this.ctx.storage)) {
+      await includeRecovery(input.callback, input.data);
+    }
+    // Released schedule transport drains through the same callback guards.
+    for (const schedule of await this.listSchedules()) {
+      if (
+        schedule.callback === "_chatRecoveryContinue" ||
+        schedule.callback === "_chatRecoveryRetry"
+      ) {
+        await includeRecovery(
+          schedule.callback,
+          schedule.payload as ChatRecoveryRetryData & ChatRecoveryContinueData
+        );
+      }
+    }
+    const includeTurn = async (requestId: string, envelope: unknown) => {
+      const { snapshot } = unwrapChatFiberSnapshot<"think-chat-turn">(
+        "__cfThinkChatFiberSnapshot",
+        envelope,
+        "think-chat-turn"
+      );
+      if (this._isStoppedRecovery(snapshot?.stopEpoch ?? 0)) return;
+      const stream =
+        this._resumableStream.latestStreamInfoForRequest(requestId);
+      if (stream?.status === "completed" || stream?.status === "error") return;
+      const partial = stream
+        ? this._getPartialStreamText(stream.id)
+        : { text: "", parts: [] };
+      const retryTarget = await this._recoverablePreStreamUserId(
+        snapshot,
+        partial
+      );
+      // No assistant/partial and no unanswered matching user means continuation
+      // would silently skip. A completed model-step journal was excluded by the
+      // shared Task owner before reaching this classification.
+      if (
+        retryTarget === null &&
+        leaf?.role !== "assistant" &&
+        !partial.text &&
+        !partial.parts.length
+      )
+        return;
+      const root = snapshot?.recoveryRootRequestId ?? requestId;
+      requests.set(root, { requestId, recoveryRootRequestId: root });
+    };
+    for (const task of listUnfinishedChatTurnTasks(
+      this.ctx.storage,
+      (this.constructor as typeof Think).CHAT_FIBER_NAME
+    )) {
+      await includeTurn(
+        task.requestId,
+        await readChatTurnTaskSnapshot(this.ctx.storage, task.runId)
+      );
+    }
+    const prefix = (this.constructor as typeof Think).CHAT_FIBER_NAME + ":";
+    for (const fiber of this.sql<{ name: string; snapshot: string | null }>`
+      SELECT name, snapshot FROM cf_agents_runs
+      WHERE completed_at IS NULL AND substr(name, 1, ${prefix.length}) = ${prefix}
+      ORDER BY created_at, id
+    `) {
+      await includeTurn(
+        fiber.name.slice(prefix.length),
+        fiber.snapshot === null ? null : JSON.parse(fiber.snapshot)
+      );
+    }
+    const pending = await this.ctx.storage.list<PendingResponseHook>({
+      prefix: PENDING_RESPONSE_HOOK_PREFIX
+    });
+    for (const hook of pending.values()) {
+      if (await this.session.getMessage(hook.messageId)) {
+        const root = hook.recoveryRootRequestId ?? hook.requestId;
+        requests.set(root, {
+          requestId: hook.requestId,
+          recoveryRootRequestId: root
+        });
+      }
+    }
+    return [...requests.values()];
+  }
+
+  private _chatRecoveryTargetMismatch(
+    callback: ChatRecoveryScheduleCallback,
+    data: ChatRecoveryRetryData & ChatRecoveryContinueData,
+    leaf: SessionMessage | null
+  ): "no_unanswered_user_message" | "conversation_changed" | undefined {
+    if (callback === "_chatRecoveryRetry") {
+      if (
+        !leaf ||
+        (data.regeneratedLeafId === undefined && leaf.role !== "user")
+      )
+        return "no_unanswered_user_message";
+      const expected = data.regeneratedLeafId ?? data.targetUserId;
+      if (expected && leaf.id !== expected) return "conversation_changed";
+    } else if (
+      data.targetAssistantId
+        ? leaf?.id !== data.targetAssistantId
+        : leaf?.role !== "assistant"
+    ) {
+      return "conversation_changed";
+    }
+    return undefined;
   }
 
   private _hasRecoverableChatTurn(requestId: string): boolean {
@@ -19081,10 +19236,12 @@ export class Think<
 
       const lastLeaf = await this.session.getLatestLeaf();
       const regeneratedLeafId = data?.regeneratedLeafId;
-      if (
-        !lastLeaf ||
-        (regeneratedLeafId === undefined && lastLeaf.role !== "user")
-      ) {
+      const targetMismatch = this._chatRecoveryTargetMismatch(
+        "_chatRecoveryRetry",
+        data ?? {},
+        lastLeaf
+      );
+      if (targetMismatch === "no_unanswered_user_message") {
         // The user turn is no longer the leaf — it was already answered (an
         // assistant message now follows) or the conversation moved on. This is
         // a benign skip, not an error: a completing turn marks the submission
@@ -19105,8 +19262,7 @@ export class Think<
         return;
       }
 
-      const expectedLeafId = regeneratedLeafId ?? data?.targetUserId;
-      if (expectedLeafId && lastLeaf.id !== expectedLeafId) {
+      if (targetMismatch === "conversation_changed") {
         // Superseded by a genuinely newer user turn — terminal `skipped`, not an
         // error (recovery being superseded is benign).
         await this._updateChatRecoveryIncident(
@@ -19408,7 +19564,14 @@ export class Think<
 
       const targetId = data?.targetAssistantId;
       const lastLeaf = await this.session.getLatestLeaf();
-      if (targetId && lastLeaf?.id !== targetId) {
+      if (
+        targetId &&
+        this._chatRecoveryTargetMismatch(
+          "_chatRecoveryContinue",
+          data ?? {},
+          lastLeaf
+        )
+      ) {
         // The target assistant message is no longer the leaf. This is NOT an
         // error and must never clobber the submission to `error`:
         //  - leaf is an ASSISTANT message → recovery's OWN later continuation
@@ -20118,6 +20281,9 @@ export class Think<
     const pending: PendingResponseHook = {
       requestId: result.requestId,
       messageId: result.message.id,
+      ...(this.activeTurn?.recoveryRootRequestId !== undefined && {
+        recoveryRootRequestId: this.activeTurn.recoveryRootRequestId
+      }),
       continuation: result.continuation,
       status: result.status,
       ...(result.error !== undefined && { error: result.error })

@@ -17,32 +17,41 @@ type Kind = CrashReport["kind"];
 /** Every worker the test started, terminated however it ends. */
 const workers: Worker[] = [];
 
-function start(boot: CrashBoot): { worker: Worker; reports: CrashReport[] } {
+type Started = {
+  readonly worker: Worker;
+  /** The first report of a kind, whether it has arrived yet or not; a worker error fails at once. */
+  next<K extends Kind>(kind: K): Promise<Extract<CrashReport, { kind: K }>>;
+};
+
+function start(boot: CrashBoot): Started {
   const worker = new Worker(new URL("./actor-crash.worker.ts", import.meta.url), {
     type: "module",
   });
   workers.push(worker);
   const reports: CrashReport[] = [];
-  worker.addEventListener("message", (event: MessageEvent<CrashReport>) => reports.push(event.data));
-  worker.addEventListener("error", (event) => reports.push({ kind: "error", error: event.message }));
+  let arrived = Promise.withResolvers<void>();
+  const receive = (report: CrashReport): void => {
+    reports.push(report);
+    arrived.resolve();
+    arrived = Promise.withResolvers<void>();
+  };
+  worker.addEventListener("message", (event: MessageEvent<CrashReport>) => receive(event.data));
+  worker.addEventListener("error", (event) => receive({ kind: "error", error: event.message }));
   worker.postMessage(boot);
-  return { worker, reports };
-}
-
-/** The first report of a kind, polled until a deadline; a worker error fails at once. */
-async function next<K extends Kind>(
-  reports: CrashReport[],
-  kind: K,
-): Promise<Extract<CrashReport, { kind: K }>> {
-  const deadline = Date.now() + 15_000;
-  for (;;) {
-    const failure = reports.find((report) => report.kind === "error");
-    if (failure?.kind === "error") throw new Error(failure.error);
-    const found = reports.find((report): report is Extract<CrashReport, { kind: K }> => report.kind === kind);
-    if (found !== undefined) return found;
-    if (Date.now() > deadline) throw new Error(`timed out waiting for ${kind}`);
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
+  return {
+    worker,
+    async next<K extends Kind>(kind: K): Promise<Extract<CrashReport, { kind: K }>> {
+      for (;;) {
+        const failure = reports.find((report) => report.kind === "error");
+        if (failure?.kind === "error") throw new Error(failure.error);
+        const found = reports.find(
+          (report): report is Extract<CrashReport, { kind: K }> => report.kind === kind,
+        );
+        if (found !== undefined) return found;
+        await arrived.promise;
+      }
+    },
+  };
 }
 
 test(
@@ -51,12 +60,12 @@ test(
     const poolName = `do-runtime-actor-crash-${Math.random().toString(36).slice(2)}`;
     try {
       const crashed = start({ poolName, phase: "crash" });
-      await next(crashed.reports, "acknowledged");
-      await next(crashed.reports, "started");
+      await crashed.next("acknowledged");
+      await crashed.next("started");
       crashed.worker.terminate();
 
       const reopened = start({ poolName, phase: "reopen" });
-      expect(await next(reopened.reports, "reopened")).toEqual({
+      expect(await reopened.next("reopened")).toEqual({
         kind: "reopened",
         beforeReopen: {
           files: ["/actor.facets.sqlite", "/actor.root.sqlite", "/actor.root.sqlite-journal"],
@@ -76,4 +85,40 @@ test(
     }
   },
   30_000,
+);
+
+test(
+  "whole-pool backup and restore roll back a terminated worker's hot journal instead of refusing it",
+  async () => {
+    const poolName = `do-runtime-actor-backup-${Math.random().toString(36).slice(2)}`;
+    const dirty = ["/actor.facets.sqlite", "/actor.root.sqlite", "/actor.root.sqlite-journal"];
+    const clean = ["/actor.facets.sqlite", "/actor.root.sqlite"];
+    const crash = async (acknowledged: string): Promise<void> => {
+      const crashed = start({ poolName, phase: "crash", acknowledged });
+      await crashed.next("acknowledged");
+      await crashed.next("started");
+      crashed.worker.terminate();
+    };
+    try {
+      await crash("call-1");
+      const backup = start({ poolName, phase: "backup" });
+      const { snapshot, ...backedUp } = await backup.next("backedUp");
+      backup.worker.terminate();
+      expect(backedUp).toEqual({ kind: "backedUp", before: dirty, after: clean });
+      expect(snapshot.files.map(({ name }) => name)).toEqual(clean);
+
+      // A later acknowledged write, then a crash that leaves the destination another hot journal.
+      await crash("call-3");
+      const restore = start({ poolName, phase: "restore", snapshot });
+      expect(await restore.next("restored")).toEqual({
+        kind: "restored",
+        before: dirty,
+        // The backup's committed rows: neither the rolled-back call-2 nor the replaced call-3.
+        after: { files: clean, rows: [["call-1", 2_304]] },
+      });
+    } finally {
+      for (const worker of workers.splice(0)) worker.terminate();
+    }
+  },
+  60_000,
 );

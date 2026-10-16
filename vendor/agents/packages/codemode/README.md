@@ -23,6 +23,26 @@ npm install @cloudflare/codemode
 
 The main entry point (`@cloudflare/codemode`) has **no peer dependency on `ai`, `@tanstack/ai`, or `zod`**. Framework-specific packages are only required when importing from `@cloudflare/codemode/ai` or `@cloudflare/codemode/tanstack-ai`.
 
+## Raw JSON Schema types
+
+Use the framework-free `@cloudflare/codemode/json-schema-types` entry point to
+print a raw JSON Schema as a TypeScript expression:
+
+```ts
+import { jsonSchemaToTypeExpression } from "@cloudflare/codemode/json-schema-types";
+
+const expression = jsonSchemaToTypeExpression({
+  type: "array",
+  items: { type: ["string", "null"] }
+});
+// Array<string | null>
+```
+
+Expressions are compact by default. Pass `{ indent: "" }` for a multiline object
+with property documentation, or the containing line's indentation when embedding
+it. Declaration generation and framework adapters share this printer; unsupported,
+malformed and recursive schema branches become `unknown`.
+
 ## Quick Start
 
 `createCodeTool` takes your tools and an executor, and returns a single AI SDK tool that lets the LLM write code instead of making individual tool calls.

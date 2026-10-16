@@ -293,7 +293,10 @@ describe("hibernation embedder contract", () => {
       client.accept();
       client.addEventListener("message", (event) => replies.push(String(event.data)));
       container.state.setWebSocketAutoResponse(
-        new container.globals.WebSocketRequestResponsePair("ping", "pong") as WebSocketRequestResponsePair,
+        new container.globals.WebSocketRequestResponsePair(
+          "ping",
+          "pong",
+        ) as WebSocketRequestResponsePair,
       );
     });
 
@@ -382,7 +385,9 @@ describe("hibernation embedder contract", () => {
       const hibernatable = new container.globals.WebSocketPair();
       container.state.acceptWebSocket(hibernatable[1]);
       expect(() => container.state.acceptWebSocket(hibernatable[1])).toThrowError(
-        new Error("Cannot call `acceptWebSocket()` if the WebSocket was already accepted via `accept()`"),
+        new Error(
+          "Cannot call `acceptWebSocket()` if the WebSocket was already accepted via `accept()`",
+        ),
       );
       expect(() => hibernatable[1].accept()).toThrowError(
         new TypeError("Can't accept() WebSocket after enabling hibernation."),
@@ -391,7 +396,9 @@ describe("hibernation embedder contract", () => {
       const classic = new container.globals.WebSocketPair();
       classic[1].accept();
       expect(() => container.state.acceptWebSocket(classic[1])).toThrowError(
-        new Error("Cannot call `acceptWebSocket()` if the WebSocket was already accepted via `accept()`"),
+        new Error(
+          "Cannot call `acceptWebSocket()` if the WebSocket was already accepted via `accept()`",
+        ),
       );
 
       const attachment = { nested: { value: 1 } };
@@ -443,6 +450,8 @@ test("quiescence reports eviction state and gateHooks reach both gates", async (
     return container.quiescence();
   });
   expect(inside).toEqual({
+    pendingEvents: 1,
+    activityLeases: 0,
     armedTimers: 1,
     pendingWaitUntil: 2,
     inputLockHeld: true,
@@ -450,6 +459,8 @@ test("quiescence reports eviction state and gateHooks reach both gates", async (
   });
   await quiesce(2);
   expect(container.quiescence()).toEqual({
+    pendingEvents: 0,
+    activityLeases: 0,
     armedTimers: 1,
     pendingWaitUntil: 2,
     inputLockHeld: false,
@@ -461,6 +472,8 @@ test("quiescence reports eviction state and gateHooks reach both gates", async (
   await container.drainWaitUntil();
   await quiesce(2);
   expect(container.quiescence()).toEqual({
+    pendingEvents: 0,
+    activityLeases: 0,
     armedTimers: 0,
     pendingWaitUntil: 0,
     inputLockHeld: false,

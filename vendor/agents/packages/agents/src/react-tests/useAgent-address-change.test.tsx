@@ -24,6 +24,123 @@ type Observation = {
 };
 
 describe("useAgent when the name changes", () => {
+  it.each(["namespace", "base-path"] as const)(
+    "identifies only the current socket when returning to a %s address",
+    async (routing) => {
+      const { host, protocol } = getTestWorkerHost();
+      const first = `identity-socket-a-${crypto.randomUUID()}`;
+      const other = `identity-socket-b-${crypto.randomUUID()}`;
+      const identifiedSockets = new WeakSet<object>();
+      const observations: {
+        name: string;
+        identified: boolean;
+        identityReceived: boolean;
+      }[] = [];
+      const identities: string[] = [];
+      const changes: string[][] = [];
+      let update: ((name: string) => void) | undefined;
+
+      function TestComponent() {
+        const [name, setName] = useState(first);
+        function onIdentity(name: string): void {
+          identifiedSockets.add(agent);
+          identities.push(name);
+        }
+        const agent = useAgent({
+          agent: "TestStateAgent",
+          host,
+          protocol,
+          name,
+          basePath:
+            routing === "base-path" ? `custom-state/${name}` : undefined,
+          onIdentity,
+          onIdentityChange: (oldName, newName) =>
+            changes.push([oldName, newName])
+        });
+        observations.push({
+          name,
+          identified: agent.identified,
+          identityReceived: identifiedSockets.has(agent) && agent.name === name
+        });
+        useEffect(() => {
+          update = setName;
+        }, []);
+        return <div>{agent.identified ? agent.name : "connecting"}</div>;
+      }
+
+      await render(
+        <Suspense fallback="loading">
+          <TestComponent />
+        </Suspense>
+      );
+      await vi.waitFor(() => expect(identities).toEqual([first]), {
+        timeout: 10000
+      });
+      update?.(other);
+      await vi.waitFor(() => expect(identities).toEqual([first, other]), {
+        timeout: 10000
+      });
+      update?.(first);
+      await vi.waitFor(
+        () => expect(identities).toEqual([first, other, first]),
+        { timeout: 10000 }
+      );
+      expect(
+        observations.filter(
+          ({ identified, identityReceived }) => identified && !identityReceived
+        )
+      ).toEqual([]);
+      expect(changes).toEqual([]);
+    }
+  );
+
+  it("reports server identity changes when credentials refresh at the same address", async () => {
+    const { host, protocol } = getTestWorkerHost();
+    const first = `identity-user-a-${crypto.randomUUID()}`;
+    const other = `identity-user-b-${crypto.randomUUID()}`;
+    const identities: string[] = [];
+    const changes: string[][] = [];
+    let update: ((name: string) => void) | undefined;
+
+    function TestComponent() {
+      const [user, setUser] = useState(first);
+      const agent = useAgent({
+        agent: "TestStateAgent",
+        host,
+        protocol,
+        basePath: "user",
+        query: { user },
+        onIdentity: (name) => identities.push(name),
+        onIdentityChange: (oldName, newName) => changes.push([oldName, newName])
+      });
+      useEffect(() => {
+        update = setUser;
+      }, []);
+      return <div>{agent.identified ? agent.name : "connecting"}</div>;
+    }
+
+    const { container } = await render(
+      <Suspense fallback="loading">
+        <TestComponent />
+      </Suspense>
+    );
+    await vi.waitFor(() => expect(identities).toEqual([first]), {
+      timeout: 10000
+    });
+    update?.(other);
+    await vi.waitFor(() => expect(container.textContent).toBe(other), {
+      timeout: 10000
+    });
+    update?.(first);
+    await vi.waitFor(() => expect(identities).toEqual([first, other, first]), {
+      timeout: 10000
+    });
+    expect(changes).toEqual([
+      [first, other],
+      [other, first]
+    ]);
+  });
+
   it("resolves ready for the new agent's identity and routes calls to it", async () => {
     const { host, protocol } = getTestWorkerHost();
     const observations: Observation[] = [];
@@ -63,11 +180,15 @@ describe("useAgent when the name changes", () => {
         <TestComponent />
       </Suspense>
     );
-    await vi.waitFor(() => expect(observations).toHaveLength(1));
+    await vi.waitFor(() => expect(observations).toHaveLength(1), {
+      timeout: 10000
+    });
     await expect(observations[0].call).resolves.toBe("address-rpc-a");
 
     setName?.("address-rpc-b");
-    await vi.waitFor(() => expect(observations).toHaveLength(2));
+    await vi.waitFor(() => expect(observations).toHaveLength(2), {
+      timeout: 10000
+    });
 
     const switched = observations[1];
     expect(switched.exposedName).toBe("address-rpc-b");
@@ -104,10 +225,14 @@ describe("useAgent when the name changes", () => {
         <TestComponent />
       </Suspense>
     );
-    await vi.waitFor(() => expect(identifiedAs).toBe("address-ready-b"));
+    await vi.waitFor(() => expect(identifiedAs).toBe("address-ready-b"), {
+      timeout: 10000
+    });
 
     setName?.("address-ready-a");
-    await vi.waitFor(() => expect(identifiedAs).toBe("address-ready-a"));
+    await vi.waitFor(() => expect(identifiedAs).toBe("address-ready-a"), {
+      timeout: 10000
+    });
     await expect(
       Promise.race([
         readyForA!.then(() => "resolved"),

@@ -127,7 +127,8 @@ describe("attachments", () => {
       rich: { map: true, date: true, bigint: "bigint", bytes: true, cyclic: true },
       functionError: {
         name: "DataCloneError",
-        message: "function foo() {} could not be cloned.",
+        // Native clone errors include Function#toString, whose whitespace is compiler-owned.
+        message: expect.stringMatching(/^function foo\(\)\s*\{\s*\} could not be cloned\.$/),
       },
       symbolError: { name: "DataCloneError", message: "Symbol(s) could not be cloned." },
       sizePass: null,

@@ -582,6 +582,18 @@ describe("WorkspaceFsLike substitutability", () => {
     });
   });
 
+  it("lists a large directory once from a proxy that ignores readDir paging", async () => {
+    const files = new Map<string, string>(
+      Array.from(
+        { length: 1001 },
+        (_, index) => [`/many/${index}`, ""] as const
+      )
+    );
+    const fs = new WorkspaceFileSystem(createWorkspaceLike(files));
+
+    await expect(fs.readdir("/many")).resolves.toHaveLength(1001);
+  });
+
   it("createWorkspaceStateBackend drives state.* through a proxy that adds an async hop per call", async () => {
     // Simulate the cross-DO shape: every call roundtrips through a
     // Promise microtask (as it would through a real RPC hop). Storage

@@ -179,6 +179,13 @@ export type WorkspaceFsLike = Pick<
   | "readlink"
   | "glob"
 > & {
+  /** Optional native binary append. Backends providing it serialize the entire
+   * append, avoiding the adapter's read/concatenate/write fallback. */
+  appendFileBytes?(
+    path: string,
+    content: Uint8Array | ArrayBuffer,
+    mimeType?: string
+  ): Promise<void>;
   /** Optional bounded byte read; follows symlinks, returns null for missing files.
    * Offset and length must be nonnegative safe integers with a safe sum.
    * Reads past EOF return an empty buffer; short reads at EOF are allowed.

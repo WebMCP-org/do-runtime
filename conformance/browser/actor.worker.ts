@@ -41,14 +41,13 @@
  * class arrives as the source of a dynamically-loaded Worker, and upstream a
  * dynamic Worker has its own global scope bound to its own context. There is one
  * realm here, so the module gets a module-scoped `scheduler` instead — bound to
- * that facet's container, minted per placement. That is exact rather than
+ * that facet's current container, one binding per facet. That is exact rather than
  * ambient: no guess about which container is running is ever made. Its limit is
  * stated where it is built (`facetModule` below).
  */
 
 import {
   ACTOR_SCOPE_GLOBALS,
-  actorScopeBindings,
   createActorContainer,
   HibernationMirror,
   installActorScope,
@@ -59,11 +58,6 @@ import {
   type AlarmOutlet,
   type AlarmResult,
   type EntrypointRequest,
-  type FacetHandle,
-  type FacetHost,
-  type FacetId,
-  type FacetStartRequest,
-  type FacetTree,
   type IsolateChannelFactory,
   type LoadIsolateRequest,
   type WorkerSource,
@@ -74,19 +68,15 @@ import {
   asLoopbackDurableObjectClass,
   LoopbackDurableObjectClass,
 } from "../../src/api/export-loopback";
-import {
-  SqliteWasmActorStorage,
-  type SqliteWasmHost,
-} from "../../backends/sqlite-wasm";
+import { SqliteWasmActorStorage, type SqliteWasmHost } from "../../backends/sqlite-wasm";
+import { BrowserActorTree, type BrowserFacetScope } from "../../src/browser/actor-tree";
 import { Probe } from "../fixtures/probe";
 import {
   installWebSocketUpgradeGlobals,
   upgradeWebSocket,
   type UpgradeWebSocket,
 } from "../../src/browser";
-import {
-  webSocketUpgradeRequest,
-} from "../websocket-upgrade";
+import { webSocketUpgradeRequest } from "../websocket-upgrade";
 import type { ActorBoot, ActorRpc, SupervisorRpc } from "./protocol";
 import { installPool, timer, UNIQUE_KEY } from "./substrate";
 
@@ -339,161 +329,25 @@ function classNameFor(isolateName: string, exportName: string): string {
 // =======================================================================================
 // Placement
 
-type Placement = {
-  readonly container: ActorContainer;
-  readonly storage: SqliteWasmActorStorage;
-  readonly stub: object;
-};
-
-/**
- * One host for the whole actor tree, as `FacetHost`'s contract requires: every id
- * it is handed is an id in the root's index, so it has to be able to place and
- * remove any facet of any depth.
- *
- * Modelled on `conformance/node/host.ts`'s `NodeFacetHost`, which is the worked
- * in-process example. What differs is only the substrate: a prefix inside the
- * root's OPFS pool where Node has a directory.
- */
-class BrowserFacetHost implements FacetHost {
-  readonly #placements = new Map<FacetId, Placement>();
-  #pool: SqliteWasmHost | undefined;
-  #tree: FacetTree | undefined;
-  #env: unknown;
-
-  /** Called by the root placement, which is the only thing that knows the tree. */
-  attach(lane: SqliteWasmHost, tree: FacetTree, env: unknown): void {
-    this.#pool = lane;
-    this.#tree = tree;
-    this.#env = env;
-  }
-
-  start(request: FacetStartRequest): FacetHandle {
-    const existing = this.#placements.get(request.id);
-    if (existing !== undefined) {
-      return { stub: Promise.resolve(existing.stub), broken: existing.container.onBroken };
-    }
-
-    const tree = this.#tree;
-    if (tree === undefined) throw new Error("Browser lane: no actor tree attached.");
-
-    const started = (async (): Promise<Placement> => {
-      // The gate is filled in below, before anything the class can run: the module's `scheduler`
-      // needs this container and this container needs the module's class, so one of the two has
-      // to be late-bound and the binding is the one with no work in it.
-      const gate: FacetGate = { container: undefined };
-      const { ActorClass, exports } = await facetModule(request.className, gate);
-      const storage = new SqliteWasmActorStorage(this.#requirePool(), prefixFor(request.id));
-      const container = await createActorContainer({
-        // Absent `routedId` means the child inherits its parent's id, which in this tree is the
-        // root actor's name.
-        id: request.routedId ?? requireBoot().actorName,
-        uniqueKey: UNIQUE_KEY,
-        exports,
-        // The root's `env`, as the node lane does: on workerd a facet's env is the env of the
-        // Worker its class came from, and nothing in the suite reads a facet's env at all.
-        env: this.#env,
-        ports: {
-          sql: storage,
-          alarms: FACET_HAS_NO_ALARM_SLOT,
-          facets: this,
-          timer,
-        },
-        // The root's tree, by reference. This is the line cross-worker placement could not
-        // write — `getId` is synchronous — and it is what lets this facet have facets of its own.
-        facet: { depth: request.depth, id: request.id, tree },
-      });
-      gate.container = container;
-      let instance: object;
-      try {
-        instance = await container.start((ctx, env) => new ActorClass(ctx as never, env as never));
-      } catch (exception) {
-        // The container opened this facet's database and took an exclusive sync access handle on
-        // its pool file; the instance does not exist, so nothing will ever reach this placement
-        // through `#placements` to close it. Leaving it would accumulate a dead writer per failed
-        // attempt inside a VFS that expects to own what it opens — see the backend storage's
-        // `close()`, which is the same hazard for the same reason.
-        container.abort(exception);
-        storage.close();
-        throw exception;
-      }
-      const placement: Placement = { container, storage, stub: container.entry(instance) };
-      this.#placements.set(request.id, placement);
-      return placement;
-    })();
-
-    // `broken` carries a RUNNING facet breaking and nothing else. A placement that never completed
-    // is a start that failed, and it reaches the caller through `stub` — which is what workerd
-    // does, measured: a facet whose constructor throws does not break its parent.
-    const { promise: broken, reject } = Promise.withResolvers<never>();
-    void broken.catch(() => {});
-    void started.then(
-      ({ container }) => {
-        void container.onBroken.catch(reject);
-      },
-      () => {
-        // Deliberately nothing: `stub` below is the rejection's route home.
-      },
-    );
-
-    return { stub: started.then((placement) => placement.stub), broken };
-  }
-
-  /** Kills the instance; the storage survives, which is what the §1.10 abort row measures. */
-  abort(id: FacetId, reason?: string): void {
-    const placement = this.#placements.get(id);
-    if (placement === undefined) return;
-    this.#placements.delete(id);
-    placement.container.abort(new Error(reason ?? "Facet placement closed."));
-    // Where the node lane drops a connection the GC will collect, this drops an exclusive sync
-    // access handle on a pool file — see `SqliteWasmActorStorage.close()`.
-    placement.storage.close();
-  }
-
-  async deleteStorage(id: FacetId, subtree: readonly FacetId[]): Promise<void> {
-    for (const target of [...subtree, id]) {
-      // Read before the abort removes the placement. A facet that was never placed has no
-      // placement and no files, and `unlink` on an empty prefix removes nothing — which is not
-      // the same as declining to remove it.
-      const storage = this.#storageFor(target);
-      this.abort(target);
-      storage.deleteAll();
-    }
-  }
-
-  async copyStorage(src: FacetId, dst: FacetId): Promise<void> {
-    await this.#storageFor(dst).copyFrom(this.#storageFor(src));
-  }
-
-  /** Every placement in this tree, for `respawn`. */
-  closeAll(): void {
-    for (const id of [...this.#placements.keys()]) this.abort(id);
-  }
-
-  #storageFor(id: FacetId): SqliteWasmActorStorage {
-    return (
-      this.#placements.get(id)?.storage ??
-      new SqliteWasmActorStorage(this.#requirePool(), prefixFor(id))
-    );
-  }
-
-  #requirePool(): SqliteWasmHost {
-    if (this.#pool === undefined) throw new Error("Browser lane: no pool attached.");
-    return this.#pool;
-  }
-}
-
-/** One prefix per facet inside the tree's one pool, where the node lane has one directory. */
-function prefixFor(id: FacetId): string {
-  return `/facet-${id}`;
-}
-
-const facets = new BrowserFacetHost();
+let facetPool: SqliteWasmHost | undefined;
+let facetEnv: unknown;
+const facets = new BrowserActorTree({
+  storage(id) {
+    if (!facetPool) throw new Error("Facet storage reached before root placement");
+    return new SqliteWasmActorStorage(facetPool, `/facet-${id}`);
+  },
+  async load(request, scope) {
+    const { ActorClass, exports } = await facetModule(request.className, scope);
+    return {
+      construct: (ctx, env) => new ActorClass(ctx, env),
+      env: facetEnv,
+      exports,
+    };
+  },
+});
 
 // =======================================================================================
 // The facet class: one evaluation per placement
-
-/** Filled in between evaluating the module and starting the instance. */
-type FacetGate = { container: ActorContainer | undefined };
 
 type FacetClass = {
   readonly ActorClass: new (ctx: unknown, env: unknown) => object;
@@ -546,9 +400,11 @@ const FACET_SCOPE_GLOBAL = "__doRuntimeFacetScopes";
 
 const facetScopes: Record<string, ActorScopeBindings> = {};
 (globalThis as Record<string, unknown>)[FACET_SCOPE_GLOBAL] = facetScopes;
-let facetScopeCounter = 0;
 
-async function facetModule(className: string, gate: FacetGate): Promise<FacetClass> {
+async function facetModule(
+  className: string,
+  scope: BrowserFacetScope<undefined>,
+): Promise<FacetClass> {
   const hash = className.lastIndexOf("#");
   if (hash < 0) throw new Error(`Browser lane cannot resolve facet class ${className}.`);
   const isolateName = className.slice(0, hash);
@@ -557,21 +413,11 @@ async function facetModule(className: string, gate: FacetGate): Promise<FacetCla
   const workers: unknown = await import("../../src/api/cloudflare-workers");
   (globalThis as Record<string, unknown>)[CLOUDFLARE_WORKERS_GLOBAL] = workers;
 
-  const key = `s${facetScopeCounter++}`;
-  facetScopes[key] = actorScopeBindings(() => {
-    const container = gate.container;
-    if (container === undefined) {
-      throw new Error(
-        "Browser lane: a facet reached a platform async primitive before its container existed " +
-          "or after it was torn down, so the continuation could not resume gated.",
-      );
-    }
-    return container.globals;
-  });
+  facetScopes[scope.key] = scope.globals;
 
   const rewritten =
     `const { ${ACTOR_SCOPE_GLOBALS.join(", ")} } = ` +
-    `globalThis.${FACET_SCOPE_GLOBAL}[${JSON.stringify(key)}];\n` +
+    `globalThis.${FACET_SCOPE_GLOBAL}[${JSON.stringify(scope.key)}];\n` +
     (await isolates.mainModule(isolateName)).replace(
       /import\s+(\{[^}]*\})\s+from\s+["']cloudflare:workers["'];?/g,
       (_match, clause: string) =>
@@ -695,16 +541,6 @@ function alarmOutlet(actorName: string): AlarmOutlet {
   };
 }
 
-/**
- * Never reached: a facet container installs `DEFAULT_ALARM_OUTLET` for itself and
- * `assertCanSetAlarm` refuses before anything can call it. Here for the reason
- * the node lane has the same line — a facet with a live outlet would look like a
- * facet with an alarm slot.
- */
-const FACET_HAS_NO_ALARM_SLOT: AlarmOutlet = {
-  scheduleRun: () => Promise.reject(new Error("facets have no alarm slot")),
-};
-
 // =======================================================================================
 // The container lifecycle
 
@@ -755,7 +591,16 @@ async function place(): Promise<Live> {
     allowExperimentalFeatures: true,
   });
 
-  facets.attach(lane, treeOf(container), env);
+  facetPool = lane;
+  facetEnv = env;
+  // The root's tree, by reference: facet ids are sequential across the whole tree, so a
+  // nested container cannot build its own index and every facet shares this one.
+  facets.attach({
+    id: current.actorName,
+    uniqueKey: UNIQUE_KEY,
+    tree: container.facetTree,
+    ports: { timer },
+  });
 
   let instance: object;
   try {
@@ -780,15 +625,6 @@ async function place(): Promise<Live> {
 }
 
 /**
- * The root's `FacetTree`, which the host has to hand down to any facet that may
- * have facets of its own — the one thing a nested container cannot build for
- * itself, because ids are sequential across the whole tree.
- */
-function treeOf(container: ActorContainer): FacetTree {
-  return container.facetTree;
-}
-
-/**
  * Drop the containers, keep the files.
  *
  * The node lane's `respawn` does exactly this — it re-places over the same
@@ -810,7 +646,7 @@ function teardown(): void {
 // The RPC surface
 //
 // One RPC surface for the supervised root. Facet get, abort, and delete are
-// in-process calls on BrowserFacetHost and never enter this transport.
+// in-process calls on the BrowserActorTree and never enter this transport.
 
 class RootTarget extends RpcTarget implements ActorRpc {
   ready(): Promise<void> {
@@ -834,7 +670,8 @@ class RootTarget extends RpcTarget implements ActorRpc {
   }
 
   async connect(tags: string[]): Promise<{ id: string; readyState: number }> {
-    const response = (await (await placed()).entry.fetch(
+    const { entry } = await placed();
+    const response = (await entry.fetch(
       webSocketUpgradeRequest("https://probe.invalid/socket", tags),
     )) as Response;
     const socket = upgradeWebSocket(response);

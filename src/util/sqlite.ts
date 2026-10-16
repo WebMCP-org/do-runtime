@@ -200,14 +200,22 @@ export function requireValidSqlDatabaseSnapshot(snapshot: SqlDatabaseSnapshot): 
       throw new Error(`SQLite snapshot contains duplicate database name: ${name}`);
     }
     names.add(name);
-    if (
-      !(image instanceof Uint8Array) ||
-      image.byteLength < 512 ||
-      image.byteLength % 512 !== 0 ||
-      [...SQLITE_HEADER].some((character, index) => image[index] !== character.charCodeAt(0))
-    ) {
-      throw new Error(`Snapshot entry ${name} is not a valid SQLite database image.`);
-    }
+    requireSqliteDatabaseImage(image, name);
+  }
+}
+
+/** The size and header checks the driver's `importDb` makes, run before any file is replaced. */
+export function requireSqliteDatabaseImage(
+  image: unknown,
+  name: string,
+): asserts image is Uint8Array {
+  if (
+    !(image instanceof Uint8Array) ||
+    image.byteLength < 512 ||
+    image.byteLength % 512 !== 0 ||
+    [...SQLITE_HEADER].some((character, index) => image[index] !== character.charCodeAt(0))
+  ) {
+    throw new Error(`Snapshot entry ${name} is not a valid SQLite database image.`);
   }
 }
 

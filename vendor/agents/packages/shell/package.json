@@ -43,6 +43,14 @@
       "types": "./dist/git/index.d.ts",
       "import": "./dist/git/index.js",
       "require": "./dist/git/index.js"
+    },
+    "./paths": {
+      "types": "./dist/browser/paths.d.ts",
+      "import": "./dist/browser/paths.js"
+    },
+    "./browser/native-file-system": {
+      "types": "./dist/browser/native-file-system.d.ts",
+      "import": "./dist/browser/native-file-system.js"
     }
   },
   "scripts": {
@@ -65,7 +73,8 @@
   "files": [
     "dist",
     "docs",
-    "README.md"
+    "README.md",
+    "THIRD_PARTY_NOTICES"
   ],
   "nx": {
     "targets": {

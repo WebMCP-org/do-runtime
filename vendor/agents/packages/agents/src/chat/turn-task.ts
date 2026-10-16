@@ -13,6 +13,48 @@
 
 import type { FiberRecoveryContext } from "agents";
 import type { TaskStep } from "../tasks";
+import { TaskStore } from "../tasks/store";
+
+/**
+ * Chat turns whose model step still needs execution or recovery. A Task run
+ * can outlive its completed step while its final queue write is pending; that
+ * cleanup is not another chat turn and must not suppress a terminal hook.
+ * @internal Shared framework inspection; the Tasks store owns the journal.
+ */
+export function listUnfinishedChatTurnTasks(
+  storage: DurableObjectStorage,
+  definitionName: string
+): Array<{ runId: string; requestId: string; createdAt: number }> {
+  const rows = new TaskStore(storage).sql<{
+    run_id: string;
+    request_id: string | null;
+    created_at: number;
+  }>`
+    SELECT task.run_id, json_extract(task.metadata, '$.requestId') AS request_id,
+           task.created_at
+    FROM cf_agents_task_runs AS task
+    WHERE task.definition = ${definitionName}
+      AND task.state IN ('pending', 'running', 'waiting')
+      AND task.cancel_requested = 0
+      AND NOT EXISTS (
+        SELECT 1 FROM cf_agents_task_steps AS step
+        WHERE step.run_id = task.run_id AND step.step_name = 'model-turn'
+          AND step.state IN ('completed', 'failed')
+      )
+    ORDER BY task.created_at, task.run_id
+  `;
+  return rows.flatMap((row) =>
+    row.request_id === null
+      ? []
+      : [
+          {
+            runId: row.run_id,
+            requestId: row.request_id,
+            createdAt: row.created_at
+          }
+        ]
+  );
+}
 
 /** One live turn closure, registered under its nonce while this isolate runs it. */
 export type ChatTurnClosureEntry = {
@@ -54,6 +96,14 @@ export type ChatTurnTaskHooks = {
 /** Durable snapshot key for one chat turn's stash envelope. */
 function turnSnapshotKey(runId: string): string {
   return `__cf_chat_turn_snapshot:${runId}`;
+}
+
+/** Read the canonical stash envelope used by interrupted chat Task replay. @internal */
+export function readChatTurnTaskSnapshot(
+  storage: DurableObjectStorage,
+  runId: string
+): Promise<unknown> {
+  return storage.get(turnSnapshotKey(runId));
 }
 
 /**

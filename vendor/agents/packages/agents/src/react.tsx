@@ -548,9 +548,11 @@ export function useAgent<State>(options: UseAgentOptions<unknown>): Omit<
     const socket = socketRef.current;
     if (!socket || socket.readyState !== socket.OPEN) return;
     for (const pending of pendingCallsRef.current.values()) {
+      // A send that closed the socket leaves the rest queued for the next one.
+      if (socket.readyState !== socket.OPEN) break;
       if (pending.sentOn === null) {
-        socket.send(pending.request);
         pending.sentOn = socket;
+        socket.send(pending.request);
       }
     }
     const native =
@@ -720,13 +722,12 @@ export function useAgent<State>(options: UseAgentOptions<unknown>): Omit<
   // Store identity in React state for reactivity. Seed with the
   // leaf's address — what the server will echo back in
   // `cf_agent_identity`.
-  // `destination` records which socket destination the identity came from,
-  // so an address change can stop exposing the previous agent's identity
-  // before the new socket reports its own.
+  // Identity belongs to the socket that received it, even when replacement
+  // credentials or a return to the same destination reuse an address.
   const [identity, setIdentity] = useState(() => ({
     name: leafName,
     agent: camelCaseToKebabCase(leafAgent),
-    identified: false,
+    socket: null as PartySocket | null,
     destination: null as string | null
   }));
 
@@ -867,6 +868,15 @@ export function useAgent<State>(options: UseAgentOptions<unknown>): Omit<
     newAgent: string,
     identifiedSocket: PartySocket | null
   ) => {
+    // Event handlers use the latest options while PartySocket replaces its
+    // socket in an effect. An old socket cannot identify the new address.
+    if (
+      !identifiedSocket ||
+      identifiedSocket !== socketRef.current ||
+      socketDestinationKey(identifiedSocket.partySocketOptions) !== destination
+    ) {
+      return;
+    }
     const oldName = previousIdentityRef.current.name;
     const oldAgent = previousIdentityRef.current.agent;
 
@@ -878,20 +888,15 @@ export function useAgent<State>(options: UseAgentOptions<unknown>): Omit<
     }
 
     // Update reactive state (triggers re-render)
-    const identifiedDestination = identifiedSocket
-      ? socketDestinationKey(identifiedSocket.partySocketOptions)
-      : null;
     setIdentity({
       name: newName,
       agent: newAgent,
-      identified: true,
-      destination: identifiedDestination
+      socket: identifiedSocket,
+      destination
     });
 
     // Resolve ready promise
-    if (identifiedDestination !== null) {
-      readyFor(identifiedDestination).resolve();
-    }
+    readyFor(destination).resolve();
 
     // Detect identity change on reconnect
     if (
@@ -1085,7 +1090,7 @@ export function useAgent<State>(options: UseAgentOptions<unknown>): Omit<
         if (mutableAgentRef.current) {
           mutableAgentRef.current.identified = false;
         }
-        setIdentity((prev) => ({ ...prev, identified: false }));
+        setIdentity((prev) => ({ ...prev, socket: null }));
 
         if (reconnecting) {
           // Pause reconnection for async queries until fresh query params are ready.
@@ -1181,13 +1186,6 @@ export function useAgent<State>(options: UseAgentOptions<unknown>): Omit<
 
     if (prev && prev !== agent) {
       rejectCallsSentOn(prev, "Connection closed");
-      resetReady(socketDestinationKey(agent.partySocketOptions));
-      if (mutableAgentRef.current) {
-        mutableAgentRef.current.identified = false;
-      }
-      setIdentity((current) =>
-        current.identified ? { ...current, identified: false } : current
-      );
     }
     // The helpers only touch refs; re-running on socket/address change is all we need.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1291,10 +1289,12 @@ export function useAgent<State>(options: UseAgentOptions<unknown>): Omit<
         // request stays queued and is flushed on the next open event.
         // We never hand requests to a non-open socket: its internal
         // buffer is lost forever if the socket gets replaced.
+        // Tag before sending: a transport may report its close from inside
+        // send(), and that close must reject this call.
         if (socket && socket.readyState === socket.OPEN) {
-          socket.send(request);
           const pending = pendingCallsRef.current.get(id);
           if (pending) pending.sentOn = socket;
+          socket.send(request);
         }
       });
     },
@@ -1316,10 +1316,9 @@ export function useAgent<State>(options: UseAgentOptions<unknown>): Omit<
   agent.call = call;
   // Use reactive identity state (updates on identity message). Once the
   // address moves away from the one the identity came from, expose the new
-  // leaf until the new socket identifies. A `basePath` connection keeps the
-  // server-reported identity: the server owns its name.
+  // leaf until the new socket identifies. At the same `basePath`, keep the
+  // server-reported name: the server owns that identity.
   const identityIsCurrent =
-    !!options.basePath ||
     (identity.destination ?? seedDestinationRef.current) === destination;
   agent.agent = identityIsCurrent
     ? identity.agent
@@ -1333,9 +1332,14 @@ export function useAgent<State>(options: UseAgentOptions<unknown>): Omit<
   (
     agent as unknown as { path: ReadonlyArray<{ agent: string; name: string }> }
   ).path = fullPath;
-  agent.identified = identityIsCurrent && identity.identified;
+  agent.identified =
+    !socketAddressPending && identityIsCurrent && identity.socket === agent;
   agentToolReplayBuffers.set(agent, agentToolReplayRef.current);
   agentChatReplayBuffers.set(agent, agentChatReplayRef.current);
+  // A replaced socket's close may never reach onClose. Reset here, not in an
+  // effect, so the replacement's first render already hands out a pending
+  // promise; later renders keep that entry.
+  if (!agent.identified) resetReady(destination);
   agent.ready = readyFor(destination).promise;
   agent.state = agentState;
   agent.connectionError = visibleConnectionError;

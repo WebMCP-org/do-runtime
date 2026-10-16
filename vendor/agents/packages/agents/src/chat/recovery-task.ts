@@ -9,6 +9,7 @@
  * @internal Sibling-package support for AI Chat and Think.
  */
 
+import { TaskStore } from "../tasks/store";
 import { isPlatformFailure, tryN } from "../retries";
 import type { TaskRunOptions, TaskStep } from "../tasks/types";
 import type { ChatRecoveryScheduleCallback } from "./recovery-engine";
@@ -139,6 +140,23 @@ function parseChatRecoveryTaskInput(input: unknown): ChatRecoveryTaskInput {
     );
   }
   return { callback, data: input.data, delaySeconds };
+}
+
+/** Recovery callbacks whose continuation step still owns dispatch. @internal */
+export function listPendingChatRecoveryTasks(
+  storage: DurableObjectStorage
+): ChatRecoveryTaskInput[] {
+  return new TaskStore(storage).sql<{ input: string }>`
+    SELECT task.input FROM cf_agents_task_runs AS task
+    WHERE task.definition = ${CHAT_RECOVERY_TASK_NAME}
+      AND task.state IN ('pending', 'running', 'waiting')
+      AND task.cancel_requested = 0
+      AND NOT EXISTS (
+        SELECT 1 FROM cf_agents_task_steps AS step
+        WHERE step.run_id = task.run_id AND step.step_name = 'continuation'
+          AND step.state IN ('completed', 'failed')
+      )
+  `.map((row) => parseChatRecoveryTaskInput(JSON.parse(row.input)));
 }
 
 /**

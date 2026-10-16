@@ -1,7 +1,10 @@
 import { existsSync, readFileSync } from "node:fs";
+import { SourceMap } from "node:module";
 import { fileURLToPath } from "node:url";
 import { build, parseSync, type Plugin, type UserConfig } from "vite";
 import { describe, expect, test } from "vitest";
+import { RpcTarget } from "./api/cloudflare-workers";
+import { newRpcSession } from "./transport/rpc-session";
 import {
   browserHost,
   doRuntimeAwaitTransform,
@@ -46,6 +49,165 @@ async function transform(
 }
 
 describe("doRuntimeAwaitTransform", () => {
+  test("preserves optional method invocation over a real RPC session", async () => {
+    const actorId = "/callback.actor.js";
+    const actorSource = `export async function run(callback) {
+      await callback.onInterrupted?.(await Promise.resolve({ deliversRecoveredReply: true }));
+      class Base { callback() { return callback; } }
+      class Child extends Base {
+        async invoke() {
+          await super.callback?.().onInterrupted?.(await Promise.resolve({ deliversRecoveredReply: true }));
+        }
+      }
+      await new Child().invoke();
+    }
+    export async function localCalls() {
+      const Reflect = { apply() { throw new Error("source lexical Reflect"); } };
+      const events = [];
+      const method = function(value) { events.push(this.offset + value); };
+      method.call = () => { throw new Error("user call property"); };
+      const target = { offset: 7, get method() { events.push("get"); return method; } };
+      const receiver = () => { events.push("receiver"); return target; };
+      const key = async () => { events.push("key"); return "method"; };
+      const argument = async () => { events.push("argument"); return 3; };
+      await receiver()?.[await key()]?.(await argument());
+      (null)?.method?.(events.push("absent receiver"));
+      ({})?.method?.(events.push("absent method"));
+      const object = { offset: 17, value: 1, method() { return this.offset; } };
+      let superReads = 0;
+      class Base {
+        get method() {
+          superReads++;
+          return function(value) { return this.offset + value; };
+        }
+        get nonCallable() { return 1; }
+        object() { return object; }
+      }
+      class Child extends Base {
+        offset = 11;
+        #method(value) { return this.offset + value; }
+        async immediate() { return super.method?.(5); }
+        async invoke() {
+          await Promise.resolve();
+          events.push("source-map-target");
+          let nonCallableThrew = false;
+          try { super.nonCallable?.(events.push("non-callable argument")); }
+          catch (error) { nonCallableThrew = error instanceof TypeError; }
+          return [
+            super.method?.(2),
+            this.#method?.(3),
+            super[await Promise.resolve("method")]?.(await Promise.resolve(4)),
+            super.missing?.().value,
+            super.missing?.().rpc?.(events.push("absent super")),
+            (super.object?.().method)(),
+            delete super.object?.().value,
+            Object.hasOwn(object, "value"),
+            delete super.missing?.().value,
+            await this.immediate(),
+            nonCallableThrew,
+          ];
+        }
+      }
+      async function* values() {
+        yield receiver()?.[yield "key"]?.(yield "argument");
+      }
+      const iterator = values();
+      events.push((await iterator.next()).value);
+      events.push((await iterator.next("method")).value);
+      await iterator.next(5);
+      return { events, inherited: await new Child().invoke(), superReads };
+    }`;
+    const generated = await build({
+      configFile: false,
+      logLevel: "silent",
+      plugins: [
+        {
+          name: "virtual-callback",
+          resolveId: (id) =>
+            id === "callback-entry"
+              ? actorId
+              : id.startsWith("@mcp-b/do-runtime/")
+                ? `\0${id}`
+                : null,
+          load: (id) =>
+            id === actorId
+              ? actorSource
+              : id === "\0@mcp-b/do-runtime/gate"
+                ? `export { __bindOptionalSuperMethod } from ${JSON.stringify(fileURLToPath(new URL("./gate.ts", import.meta.url)))};
+                   export const __gateAwait = x => x, __resumeAwait = x => x, __gateAsyncIterable = x => x;`
+                : id === "\0@mcp-b/do-runtime/browser/async-hooks"
+                  ? "export {};"
+                  : null,
+        },
+        doRuntimeAwaitTransform({ include: actorId, asyncContext: true }),
+      ],
+      build: {
+        write: false,
+        minify: false,
+        sourcemap: true,
+        target: "esnext",
+        rollupOptions: { input: "callback-entry", preserveEntrySignatures: "strict" },
+      },
+    });
+    if (Array.isArray(generated) || !("output" in generated))
+      throw new Error("Expected one bundle");
+    const chunk = generated.output.find((output) => output.type === "chunk");
+    if (!chunk) throw new Error("Expected generated JavaScript");
+    const module = (await import(
+      `data:text/javascript;base64,${Buffer.from(chunk.code).toString("base64")}`
+    )) as {
+      run(callback: unknown): Promise<void>;
+      localCalls(): Promise<unknown>;
+    };
+    await expect(module.localCalls()).resolves.toEqual({
+      events: [
+        "receiver", "key", "get", "argument", 10,
+        "receiver", "key", "get", "argument", 12, "source-map-target", "non-callable argument",
+      ],
+      inherited: [13, 14, 15, undefined, undefined, 17, true, false, true, 16, true],
+      superReads: 3,
+    });
+    // Check all three map stages: gate insertion, async lowering, and method restoration.
+    if (!chunk.map) throw new Error("Expected generated source map");
+    const marker = '"source-map-target"';
+    const generatedLines = chunk.code.split("\n");
+    const originalLines = actorSource.split("\n");
+    const generatedLine = generatedLines.findIndex((line) => line.includes(marker));
+    const originalLine = originalLines.findIndex((line) => line.includes(marker));
+    expect(new SourceMap({ ...chunk.map, sourceRoot: "" }).findEntry(
+      generatedLine,
+      generatedLines[generatedLine]!.indexOf(marker),
+    )).toMatchObject({
+      originalLine,
+      originalColumn: originalLines[originalLine]!.indexOf(marker),
+    });
+    class Callback extends RpcTarget {
+      interrupted = false;
+      calls = 0;
+      onInterrupted(options: { deliversRecoveredReply: boolean }) {
+        this.calls += 1;
+        this.interrupted = options.deliversRecoveredReply;
+      }
+    }
+    class Peer extends RpcTarget {
+      async run(callback: unknown) {
+        await module.run(callback);
+      }
+    }
+    const { port1, port2 } = new MessageChannel();
+    try {
+      newRpcSession(port1, new Peer());
+      const peer = newRpcSession<Peer>(port2);
+      const callback = new Callback();
+      await peer.run(callback);
+      expect(callback.interrupted).toBe(true);
+      expect(callback.calls).toBe(2);
+    } finally {
+      port1.close();
+      port2.close();
+    }
+  });
+
   test("preserves awaited async-generator cleanup on return and throw, including yield delegation", async () => {
     const actorId = "/generator.actor.js";
     const actorSource = `
@@ -134,15 +296,6 @@ describe("doRuntimeAwaitTransform", () => {
     }
   });
 
-  test("requires review when the opt-in Oxc helper correction no longer matches", async () => {
-    const id = "\0@oxc-project+runtime@next/helpers/esm/wrapAsyncGenerator.js";
-    const source = "export default function changedHelper() {}";
-    await expect(transform(source, id)).resolves.toBe(source);
-    await expect(transform(source, id, { asyncContext: true })).rejects.toThrow(
-      "Oxc async-generator helper changed",
-    );
-  });
-
   test("lowers async functions and generators for browser context while preserving gates", async () => {
     const output = await transform(
       "export async function* values() { yield await item; } export const immediate = async () => 1;",
@@ -150,8 +303,8 @@ describe("doRuntimeAwaitTransform", () => {
       { asyncContext: true },
     );
     expect(output).toContain("@mcp-b/do-runtime/browser/async-hooks");
-    expect(output).toContain("helpers/wrapAsyncGenerator");
-    expect(output).toContain("helpers/asyncToGenerator");
+    expect(output).toContain("_wrapAsyncGenerator");
+    expect(output).toContain("_asyncToGenerator");
     expect(output).toContain("__gateAwait");
     expect(output).not.toMatch(/async (function|\()/);
   });

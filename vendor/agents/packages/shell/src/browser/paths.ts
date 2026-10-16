@@ -18,7 +18,9 @@ export function workspaceBasename(path: string): string {
   return normalizeWorkspacePath(path).split("/").at(-1) ?? "";
 }
 
-export const workspaceDirname = dirname;
+export function workspaceDirname(path: string): string {
+  return dirname(normalizeWorkspacePath(path));
+}
 export const workspaceGlobToRegex = createGlobMatcher;
 
 export function workspacePathParts(path: string): string[] {
@@ -39,3 +41,5 @@ export function fileSystemError(
 ): Error & { code: string } {
   return Object.assign(new Error(`${code}: ${message}`), { code });
 }
+
+export { validateReadRange } from "../fs/read-range";
