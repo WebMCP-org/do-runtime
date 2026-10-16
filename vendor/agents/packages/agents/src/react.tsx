@@ -548,9 +548,11 @@ export function useAgent<State>(options: UseAgentOptions<unknown>): Omit<
     const socket = socketRef.current;
     if (!socket || socket.readyState !== socket.OPEN) return;
     for (const pending of pendingCallsRef.current.values()) {
+      // A send that closed the socket leaves the rest queued for the next one.
+      if (socket.readyState !== socket.OPEN) break;
       if (pending.sentOn === null) {
-        socket.send(pending.request);
         pending.sentOn = socket;
+        socket.send(pending.request);
       }
     }
     const native =
@@ -1290,10 +1292,12 @@ export function useAgent<State>(options: UseAgentOptions<unknown>): Omit<
         // request stays queued and is flushed on the next open event.
         // We never hand requests to a non-open socket: its internal
         // buffer is lost forever if the socket gets replaced.
+        // Tag before sending: a transport may report its close from inside
+        // send(), and that close must reject this call.
         if (socket && socket.readyState === socket.OPEN) {
-          socket.send(request);
           const pending = pendingCallsRef.current.get(id);
           if (pending) pending.sentOn = socket;
+          socket.send(request);
         }
       });
     },

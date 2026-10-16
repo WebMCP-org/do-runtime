@@ -51,6 +51,7 @@ export function bindChromePortWebSocket(
   }
 ): ChromePortWebSocketPeer {
   let closed = false;
+  let lost = false;
   let lastAnswer = Date.now();
   let heartbeat: ReturnType<typeof setInterval> | undefined;
   const detach = (): void => {
@@ -136,7 +137,7 @@ export function bindChromePortWebSocket(
   }
   return {
     send(message) {
-      if (closed) return;
+      if (closed || lost) return;
       try {
         port.postMessage(
           message.type === "message" && typeof message.data !== "string"
@@ -147,7 +148,10 @@ export function bindChromePortWebSocket(
             : message
         );
       } catch {
-        finish(1006, "the runtime port is gone", false);
+        // Like a native socket, report the loss after send() returns, so a
+        // caller records what it sent before it observes the close.
+        lost = true;
+        queueMicrotask(() => finish(1006, "the runtime port is gone", false));
       }
     },
     close: detach

@@ -131,6 +131,23 @@ test("closing immediately after send preserves frame order", async () => {
   ]);
 });
 
+test("a send on a dead port returns before the socket reports its close", async () => {
+  const { port, socket } = await open();
+  const events: string[] = [];
+  socket.addEventListener("close", (event) =>
+    events.push(`close ${event.code}`)
+  );
+  port.postMessage = () => {
+    throw new Error("Attempting to use a disconnected port object");
+  };
+  socket.send("first");
+  socket.send("second");
+  events.push("sent");
+  expect(socket.readyState).toBe(socket.OPEN);
+  await vi.waitFor(() => expect(events).toEqual(["sent", "close 1006"]));
+  expect(socket.readyState).toBe(socket.CLOSED);
+});
+
 test("a replaced CONNECTING socket shares the readiness deadline without waking the host", async () => {
   vi.useFakeTimers();
   const port = runtimePort();
