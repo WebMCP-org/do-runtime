@@ -73,8 +73,7 @@ export interface SqlDatabaseStatement {
   close(): void;
 }
 
-export const SQL_WRONG_BINDINGS_MESSAGE =
-  "Wrong number of parameter bindings for SQL query.";
+export const SQL_WRONG_BINDINGS_MESSAGE = "Wrong number of parameter bindings for SQL query.";
 
 /** ← workerd 1b9b6ea02 `MAX_ROW_LENGTH`: 8 MiB plus V8 serialization padding. */
 export const SQLITE_LENGTH_LIMIT = 8 * 1024 * 1024 + 34;
@@ -172,9 +171,7 @@ export function requireSafeDatabaseName(name: string): void {
 }
 
 /** Validate the complete snapshot before a backend replaces any files. */
-export function requireValidSqlDatabaseSnapshot(
-  snapshot: SqlDatabaseSnapshot
-): void {
+export function requireValidSqlDatabaseSnapshot(snapshot: SqlDatabaseSnapshot): void {
   const candidate: unknown = snapshot;
   if (
     candidate === null ||
@@ -200,30 +197,25 @@ export function requireValidSqlDatabaseSnapshot(
     const { name, image } = database;
     requireSafeDatabaseName(name);
     if (names.has(name)) {
-      throw new Error(
-        `SQLite snapshot contains duplicate database name: ${name}`
-      );
+      throw new Error(`SQLite snapshot contains duplicate database name: ${name}`);
     }
     names.add(name);
     requireSqliteDatabaseImage(image, name);
   }
 }
 
+/** The size and header checks the driver's `importDb` makes, run before any file is replaced. */
 export function requireSqliteDatabaseImage(
   image: unknown,
-  name: string
+  name: string,
 ): asserts image is Uint8Array {
   if (
     !(image instanceof Uint8Array) ||
     image.byteLength < 512 ||
     image.byteLength % 512 !== 0 ||
-    [...SQLITE_HEADER].some(
-      (character, index) => image[index] !== character.charCodeAt(0)
-    )
+    [...SQLITE_HEADER].some((character, index) => image[index] !== character.charCodeAt(0))
   ) {
-    throw new Error(
-      `Snapshot entry ${name} is not a valid SQLite database image.`
-    );
+    throw new Error(`Snapshot entry ${name} is not a valid SQLite database image.`);
   }
 }
 
@@ -280,9 +272,7 @@ export function isNull(row: readonly unknown[], column: number): boolean {
 export function getBlob(row: readonly unknown[], column: number): Uint8Array {
   const value = row[column];
   if (value instanceof Uint8Array) return value;
-  throw new Error(
-    `Expected a BLOB in column ${column}, got ${describe(value)}.`
-  );
+  throw new Error(`Expected a BLOB in column ${column}, got ${describe(value)}.`);
 }
 
 /** ← `SqliteDatabase::Query::getText(uint column)`. Fails closed on any other column type. */
@@ -304,12 +294,9 @@ export function getInt64(row: readonly unknown[], column: number): number {
   if (typeof value === "number" && Number.isSafeInteger(value)) return value;
   if (typeof value === "bigint") {
     const narrowed = Number(value);
-    if (Number.isSafeInteger(narrowed) && BigInt(narrowed) === value)
-      return narrowed;
+    if (Number.isSafeInteger(narrowed) && BigInt(narrowed) === value) return narrowed;
   }
-  throw new Error(
-    `Expected a safe integer in column ${column}, got ${describe(value)}.`
-  );
+  throw new Error(`Expected a safe integer in column ${column}, got ${describe(value)}.`);
 }
 
 function describe(value: unknown): string {
@@ -351,9 +338,7 @@ export class SqliteDatabase {
   /** ← `onWriteCallback`. */
   #onWriteCallback: ((allowUnconfirmed: boolean) => void) | undefined;
   /** ← `onCriticalErrorCallback`. */
-  #onCriticalErrorCallback:
-    | ((exception: SqliteCriticalError) => void)
-    | undefined;
+  #onCriticalErrorCallback: ((exception: SqliteCriticalError) => void) | undefined;
 
   constructor(backend: SqlDatabase) {
     this.#backend = backend;
@@ -409,14 +394,8 @@ export class SqliteDatabase {
     if (typeof first === "string") return this.#exec(first, rest, false);
 
     const [sql, ...bindings] = rest;
-    if (typeof sql !== "string")
-      throw new Error("run(options, sql, ...) takes a SQL string.");
-    return this.#exec(
-      sql,
-      bindings,
-      first.allowUnconfirmed ?? false,
-      first.regulate
-    );
+    if (typeof sql !== "string") throw new Error("run(options, sql, ...) takes a SQL string.");
+    return this.#exec(sql, bindings, first.allowUnconfirmed ?? false, first.regulate);
   }
 
   /** ← `SqliteDatabase::ingestSql`: execute complete statements, retain the partial tail. */
@@ -432,16 +411,14 @@ export class SqliteDatabase {
       try {
         statement = this.#backend.prepare(remainder);
       } catch (error) {
-        if (error instanceof Error && /incomplete input/i.test(error.message))
-          break;
+        if (error instanceof Error && /incomplete input/i.test(error.message)) break;
         throw error;
       }
       try {
         // sqlite3_complete_length(), which upstream uses, requires the terminating semicolon.
         if (!statement.sql.trimEnd().endsWith(";")) break;
         regulate?.(statement.sql);
-        if (statement.parameterCount !== 0)
-          throw new Error(SQL_WRONG_BINDINGS_MESSAGE);
+        if (statement.parameterCount !== 0) throw new Error(SQL_WRONG_BINDINGS_MESSAGE);
         const result = this.#execStatement(statement, [], false);
         rowsRead += result.rawRows.length;
         rowsWritten += result.rowsWritten;
@@ -459,7 +436,7 @@ export class SqliteDatabase {
     sql: string,
     bindings: readonly SqlValue[],
     allowUnconfirmed: boolean,
-    regulate?: (sql: string) => void
+    regulate?: (sql: string) => void,
   ): SqlResult {
     this.assertUsable();
 
@@ -480,15 +457,14 @@ export class SqliteDatabase {
         result = this.#execStatement(
           statement,
           isFinal ? bindings : [],
-          isFinal ? allowUnconfirmed : false
+          isFinal ? allowUnconfirmed : false,
         );
       } finally {
         statement.close();
       }
       remaining = tail;
     }
-    if (result === undefined)
-      throw new Error("Expected at least one SQL statement.");
+    if (result === undefined) throw new Error("Expected at least one SQL statement.");
     return result;
   }
 
@@ -496,7 +472,7 @@ export class SqliteDatabase {
   #execStatement(
     statement: SqlDatabaseStatement,
     bindings: readonly SqlValue[],
-    allowUnconfirmed: boolean
+    allowUnconfirmed: boolean,
   ): SqlResult {
     const { sql } = statement;
     const change = classify(sql);
@@ -546,7 +522,7 @@ export class SqliteDatabase {
     const critical = new SqliteCriticalError(
       "SQLite rolled back the open transaction in response to a critical error, so every " +
         "in-memory view of this database is now stale and it can no longer be used.",
-      { cause }
+      { cause },
     );
     this.#criticalError = critical;
     this.#onCriticalErrorCallback?.(critical);
@@ -631,20 +607,20 @@ export class SqliteDatabase {
         if (change.savepointName !== null) {
           this.#savepoints.push({
             name: change.savepointName,
-            rollbackCallbackIndex: this.#rollbackCallbacks.length
+            rollbackCallbackIndex: this.#rollbackCallbacks.length,
           });
         } else {
           assert(
             this.#savepoints.length === 0,
-            "BEGIN TRANSACTION should have failed when savepoints are present?"
+            "BEGIN TRANSACTION should have failed when savepoints are present?",
           );
           assert(
             !this.#inTransaction,
-            "BEGIN TRANSACTION should have failed when already in a transaction?"
+            "BEGIN TRANSACTION should have failed when already in a transaction?",
           );
           assert(
             this.#rollbackCallbacks.length === 0,
-            "we shouldn't have been keeping rollback callbacks with no transaction open!"
+            "we shouldn't have been keeping rollback callbacks with no transaction open!",
           );
           this.#inTransaction = true;
         }
@@ -656,17 +632,11 @@ export class SqliteDatabase {
           // all later savepoints.
           for (;;) {
             const savepoint = this.#savepoints.pop();
-            assert(
-              savepoint !== undefined,
-              "released a savepoint that didn't exist?"
-            );
+            assert(savepoint !== undefined, "released a savepoint that didn't exist?");
             if (savepoint.name === change.savepointName) break;
           }
         } else {
-          assert(
-            this.#inTransaction,
-            "COMMIT TRANSACTION without BEGIN TRANSACTION?"
-          );
+          assert(this.#inTransaction, "COMMIT TRANSACTION without BEGIN TRANSACTION?");
           // Since BEGIN TRANSACTION cannot be nested within a savepoint, this must have released
           // all savepoints implicitly.
           this.#savepoints = [];
@@ -681,10 +651,7 @@ export class SqliteDatabase {
         if (change.savepointName !== null) {
           for (;;) {
             const savepoint = this.#savepoints[this.#savepoints.length - 1];
-            assert(
-              savepoint !== undefined,
-              "released a savepoint that didn't exist?"
-            );
+            assert(savepoint !== undefined, "released a savepoint that didn't exist?");
             if (savepoint.name === change.savepointName) {
               this.#runRollbackCallbacksDownTo(savepoint.rollbackCallbackIndex);
               // Rolling back to a savepoint does not release it, so it stays on the stack and
@@ -694,10 +661,7 @@ export class SqliteDatabase {
             this.#savepoints.pop();
           }
         } else {
-          assert(
-            this.#inTransaction,
-            "ROLLBACK TRANSACTION without BEGIN TRANSACTION?"
-          );
+          assert(this.#inTransaction, "ROLLBACK TRANSACTION without BEGIN TRANSACTION?");
           this.#savepoints = [];
           this.#inTransaction = false;
           this.#runRollbackCallbacksDownTo(0);
@@ -707,10 +671,7 @@ export class SqliteDatabase {
   }
 
   #runRollbackCallbacksDownTo(index: number): void {
-    assert(
-      this.#rollbackCallbacks.length >= index,
-      "rollback callback stack shrank?"
-    );
+    assert(this.#rollbackCallbacks.length >= index, "rollback callback stack shrank?");
     while (this.#rollbackCallbacks.length > index) {
       // Upstream pops first and then invokes, so a callback that throws does not leave itself on
       // the stack to be invoked a second time by the next rollback.
@@ -721,9 +682,7 @@ export class SqliteDatabase {
   }
 }
 
-type SqliteSchemaDatabase =
-  | Pick<SqlDatabase, "exec">
-  | Pick<SqliteDatabase, "run">;
+type SqliteSchemaDatabase = Pick<SqlDatabase, "exec"> | Pick<SqliteDatabase, "run">;
 
 /**
  * Returns whether a runtime-owned table exists, and refuses any present shape
@@ -732,14 +691,12 @@ type SqliteSchemaDatabase =
 export function hasCurrentSqliteTable(
   db: SqliteSchemaDatabase,
   name: string,
-  createSql: string
+  createSql: string,
 ): boolean {
   // SQLite identifiers are ASCII case-insensitive, so schema validation must
   // find the same object that CREATE TABLE IF NOT EXISTS would collide with.
-  const query =
-    "SELECT type, sql FROM sqlite_master WHERE name = ? COLLATE NOCASE";
-  const rows =
-    "run" in db ? db.run(query, name).rawRows : db.exec(query, [name]).rawRows;
+  const query = "SELECT type, sql FROM sqlite_master WHERE name = ? COLLATE NOCASE";
+  const rows = "run" in db ? db.run(query, name).rawRows : db.exec(query, [name]).rawRows;
   const row = rows[0];
   if (row === undefined) return false;
   if (
@@ -753,7 +710,7 @@ export function hasCurrentSqliteTable(
         "Runtime storage migrations already brought this database to the " +
         "current version, so this is a shape no release produced — the " +
         "database is foreign or corrupt. Restore it from a snapshot or " +
-        "delete it to start over."
+        "delete it to start over.",
     );
   }
   return true;
@@ -797,7 +754,7 @@ function savepointName(raw: string): string {
 const NAME = String.raw`("[^"]*"|'[^']*'|\`[^\`]*\`|\[[^\]]*\]|[A-Za-z_][A-Za-z0-9_$]*)`;
 const BEGIN = new RegExp(
   String.raw`^BEGIN(\s+(DEFERRED|IMMEDIATE|EXCLUSIVE))?(\s+TRANSACTION)?$`,
-  "i"
+  "i",
 );
 const SAVEPOINT = new RegExp(String.raw`^SAVEPOINT\s+${NAME}$`, "i");
 const COMMIT = new RegExp(String.raw`^(COMMIT|END)(\s+TRANSACTION)?$`, "i");
@@ -805,15 +762,14 @@ const RELEASE = new RegExp(String.raw`^RELEASE(\s+SAVEPOINT)?\s+${NAME}$`, "i");
 const ROLLBACK = new RegExp(String.raw`^ROLLBACK(\s+TRANSACTION)?$`, "i");
 const ROLLBACK_TO = new RegExp(
   String.raw`^ROLLBACK(\s+TRANSACTION)?\s+TO(\s+SAVEPOINT)?\s+${NAME}$`,
-  "i"
+  "i",
 );
 const TRANSACTION_KEYWORD = /^(BEGIN|COMMIT|END|ROLLBACK|SAVEPOINT|RELEASE)\b/i;
 
 /** Every group referenced below is mandatory in its pattern, so an absent one is a broken pattern. */
 function group(match: RegExpExecArray, index: number): string {
   const value = match[index];
-  if (value === undefined)
-    throw new Error(`SQL pattern group ${index} did not match: ${match[0]}`);
+  if (value === undefined) throw new Error(`SQL pattern group ${index} did not match: ${match[0]}`);
   return value;
 }
 
@@ -831,13 +787,9 @@ function classify(sql: string): StateChange {
 
   const rollbackTo = ROLLBACK_TO.exec(statement);
   if (rollbackTo !== null) {
-    return {
-      kind: "rollback",
-      savepointName: savepointName(group(rollbackTo, 3))
-    };
+    return { kind: "rollback", savepointName: savepointName(group(rollbackTo, 3)) };
   }
-  if (ROLLBACK.test(statement))
-    return { kind: "rollback", savepointName: null };
+  if (ROLLBACK.test(statement)) return { kind: "rollback", savepointName: null };
 
   const savepoint = SAVEPOINT.exec(statement);
   if (savepoint !== null) {
@@ -887,7 +839,7 @@ const NON_WRITE_KEYWORDS = new Set([
   "END",
   "ROLLBACK",
   "SAVEPOINT",
-  "RELEASE"
+  "RELEASE",
 ]);
 
 /** The first bare word, skipping whitespace and both comment forms. */
@@ -902,8 +854,7 @@ function hasSqlStatement(sql: string): boolean {
 function stripLeadingTrivia(statement: string): string {
   let index = 0;
   for (;;) {
-    while (index < statement.length && /\s/.test(statement.charAt(index)))
-      index += 1;
+    while (index < statement.length && /\s/.test(statement.charAt(index))) index += 1;
     if (statement[index] === "-" && statement[index + 1] === "-") {
       const newline = statement.indexOf("\n", index);
       index = newline === -1 ? statement.length : newline + 1;

@@ -115,21 +115,31 @@ async function run(boot: CrashBoot): Promise<void> {
   }
 
   if (boot.phase === "backup" || boot.phase === "restore") {
+    // The whole-pool snapshot functions take the sqlite3 module, so this installs the pool itself.
     const sqlite3 = await sqlite3InitModule();
-    const { pool } = await installSqliteWasmHost(sqlite3, { name: poolName, initialCapacity: 64 });
-    const files = (): string[] => pool.getFileNames().sort();
+    const host = await installSqliteWasmHost(sqlite3, { name: poolName, initialCapacity: 64 });
+    const files = (): string[] => host.pool.getFileNames().sort();
     const before = files();
     if (boot.phase === "backup") {
-      const snapshot = await exportSqliteWasmPoolSnapshot(sqlite3, pool);
-      self.postMessage({ kind: "backedUp", before, after: files(), snapshot } satisfies CrashReport);
+      const snapshot = await exportSqliteWasmPoolSnapshot(sqlite3, host.pool);
+      self.postMessage({
+        kind: "backedUp",
+        before,
+        after: files(),
+        snapshot,
+      } satisfies CrashReport);
       return;
     }
-    await importSqliteWasmPoolSnapshot(sqlite3, pool, boot.snapshot);
+    await importSqliteWasmPoolSnapshot(sqlite3, host.pool, boot.snapshot);
     const after = files();
-    const provider = createSqliteWasmProvider({ pool, capi: sqlite3.capi }, { prefix: "/actor" });
+    const provider = createSqliteWasmProvider(host, { prefix: "/actor" });
     const rows = (await provider.open("root")).exec(LEDGER_ROWS, []).rawRows;
     provider.close();
-    self.postMessage({ kind: "restored", before, after: { files: after, rows } } satisfies CrashReport);
+    self.postMessage({
+      kind: "restored",
+      before,
+      after: { files: after, rows },
+    } satisfies CrashReport);
     return;
   }
 
