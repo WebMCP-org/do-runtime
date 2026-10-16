@@ -1,5 +1,6 @@
 import { afterEach, expect, test, vi } from "vitest";
 import { RpcTarget } from "../api/cloudflare-workers";
+import { bindChromePortWebSocket, type ChromeRuntimePort } from "./chrome-port-websocket";
 import { MessagePortWebSocket, type MessagePortWebSocketWireMessage } from "./message-port-websocket";
 import { BrowserWorkerSupervisor, type BrowserWorkerHostContext } from "./worker-supervisor";
 import {
@@ -335,13 +336,65 @@ test("old generation lifecycle reports cannot evict its replacement", async () =
 
 test("a throwing cleanup callback cannot strand a deletion barrier", async () => {
   let throwCleanup = true;
-  const { supervisor } = fixture({ discarded: () => {
+  const removeStorage = vi.fn(async (_configuration: Configuration) => {});
+  const { supervisor, workers } = fixture({ removeStorage, discarded: () => {
     if (throwCleanup) { throwCleanup = false; throw new Error("cleanup failed"); }
   } });
-  const first = await supervisor.resolve(configuration);
-  first[Symbol.dispose]();
+  const client = peer();
+  const socket = supervisor.connect(configuration, { id: "socket", url, peer: client });
+  await supervisor.ensure(configuration).ready;
+  await vi.waitFor(() => expect(workers[0]!.service.sockets.size).toBe(1));
   let deletion: Promise<void> | undefined;
   expect(() => { deletion = supervisor.delete(configuration); }).not.toThrow();
   await expect(deletion).rejects.toThrow("cleanup failed");
+  expect(client.messages).toEqual([{ type: "close", code: 1001, reason: "Worker deleted" }]);
+  expect(client.close).toHaveBeenCalledOnce();
+  expect(workers[0]!.terminated).toBe(true);
+  expect(removeStorage).toHaveBeenCalledExactlyOnceWith(configuration);
+  socket.receive({ type: "message", data: "retired" });
+  expect(workers).toHaveLength(1);
   expect(() => supervisor.ensure(configuration)).not.toThrow();
+});
+
+test.each(["live", "hibernated"])("deleting %s state sends going-away and retires a broken Chrome transport before storage removal", async (state) => {
+  const removeStorage = vi.fn(async (_configuration: Configuration) => {});
+  const { supervisor, workers } = fixture({ removeStorage });
+  const port = {
+    postMessage: vi.fn((_message: unknown) => { throw new Error("Chrome port disconnected"); }),
+    disconnect: vi.fn(),
+    onMessage: { addListener: vi.fn(), removeListener: vi.fn() },
+    onDisconnect: { addListener: vi.fn(), removeListener: vi.fn() },
+  } satisfies ChromeRuntimePort;
+  const client = bindChromePortWebSocket(port, {
+    onMessage: (message) => socket.receive(message),
+    onClose: ({ code, reason }) => socket.close(code, reason),
+  });
+  const socket = supervisor.connect(configuration, { id: "socket", url, peer: client });
+  await supervisor.ensure(configuration).ready;
+  await vi.waitFor(() => expect(workers[0]!.service.sockets.size).toBe(1));
+  if (state === "hibernated") {
+    expect(await supervisor.hibernate(configuration)).toBe(true);
+    expect(workers[0]!.terminated).toBe(true);
+  }
+  await supervisor.delete(configuration);
+  expect(port.postMessage).toHaveBeenCalledExactlyOnceWith({ type: "close", code: 1001, reason: "Worker deleted" });
+  expect(port.disconnect).toHaveBeenCalledOnce();
+  expect(removeStorage).toHaveBeenCalledExactlyOnceWith(configuration);
+  expect(workers[0]!.terminated).toBe(true);
+  socket.receive({ type: "message", data: "retired" });
+  socket.close();
+  expect(supervisor.size).toBe(0);
+  expect(workers).toHaveLength(1);
+});
+
+test("ordinary stop keeps its failure close code", async () => {
+  const { supervisor, workers } = fixture();
+  const client = peer();
+  supervisor.connect(configuration, { id: "socket", url, peer: client });
+  await supervisor.ensure(configuration).ready;
+  await vi.waitFor(() => expect(workers[0]!.service.sockets.size).toBe(1));
+  supervisor.stop(configuration);
+  expect(client.messages).toEqual([{ type: "close", code: 1011, reason: "Worker stopped" }]);
+  expect(client.close).toHaveBeenCalledOnce();
+  expect(workers[0]!.terminated).toBe(true);
 });

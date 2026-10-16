@@ -36,8 +36,10 @@ physical worker, so an old worker cannot mark a replacement idle.
 resolution returns a separately owned capability. The reference survives idle
 eviction and restart. `delete(address)` invalidates previously captured
 references synchronously, stops the worker, and serializes physical storage
-removal. New resolution waits for the deletion barrier. A host with hierarchical
-addresses supplies its actual ancestry predicate to `delete(address, includes)`;
+removal. Deletion closes live and hibernated client transports with code 1001;
+worker failures and ordinary stops use 1011. New resolution waits for the deletion
+barrier. A host with hierarchical addresses supplies its actual ancestry
+predicate to `delete(address, includes)`;
 the runtime never guesses ancestry from key prefixes.
 
 `connect(address, { id, url, peer })` retains the client transport and returns

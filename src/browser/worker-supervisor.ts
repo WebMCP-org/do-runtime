@@ -372,6 +372,7 @@ export class BrowserWorkerSupervisor<
     for (const identity of targets) identity.epoch++;
     for (const identity of targets) {
       try {
+        this.closeSockets(identity.configuration, 1001, "Worker deleted");
         this.stop(identity.configuration, "Worker deleted");
       } catch (error) {
         failures.push(error);
@@ -493,6 +494,7 @@ export class BrowserWorkerSupervisor<
   #closeOwner(key: string, code: number, reason: string): void {
     for (const socket of [...this.#sockets]) {
       if (socket.key !== key) continue;
+      socket.closing = true;
       const close = { type: "close", code, reason } as const;
       socket.generation?.port.postMessage(close);
       socket.peer.send(close);
@@ -603,6 +605,7 @@ export class BrowserWorkerSupervisor<
         delete socket.generation;
       }
       if (!preserveSockets) {
+        socket.closing = true;
         socket.peer.send({ type: "close", code: 1011, reason: "Worker stopped" });
         this.#finish(socket);
       }
