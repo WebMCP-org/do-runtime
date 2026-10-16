@@ -1,6 +1,9 @@
 import { RpcTarget } from "../api/cloudflare-workers";
 import { newRpcSession } from "../transport/rpc-session";
-import type { MessagePortWebSocketWireMessage } from "./message-port-websocket";
+import type {
+  MessagePortWebSocketPeer,
+  MessagePortWebSocketWireMessage,
+} from "./message-port-websocket";
 import {
   isWorkerHibernationSnapshot,
   parseBrowserWorkerEvent,
@@ -17,12 +20,6 @@ export * from "./worker-protocol";
 export interface HibernatableWorkerService {
   /** `null` while busy, or always for a worker that must stay resident. */
   prepareHibernation(): Promise<WorkerHibernationSnapshot | null>;
-}
-
-export interface WorkerSocketPeer {
-  /** A peer absorbs an already-disconnected transport; callers do not retry sends. */
-  send(message: MessagePortWebSocketWireMessage): void;
-  close(): void;
 }
 
 /** The current physical worker for one key. */
@@ -69,7 +66,7 @@ type Socket<Configuration> = {
   readonly configuration: Configuration;
   readonly id: string;
   readonly key: string;
-  readonly peer: WorkerSocketPeer;
+  readonly peer: MessagePortWebSocketPeer;
   /** Frames held while the worker starts or hibernates. */
   readonly pending: MessagePortWebSocketWireMessage[];
   readonly url: string;
@@ -154,7 +151,7 @@ export class BrowserWorkerSupervisor<
 
   connect(
     configuration: Configuration,
-    connection: { readonly id: string; readonly url: string; readonly peer: WorkerSocketPeer },
+    connection: { readonly id: string; readonly url: string; readonly peer: MessagePortWebSocketPeer },
   ): SupervisedWorkerSocket {
     const key = this.#options.key(configuration);
     const socket: Socket<Configuration> = {

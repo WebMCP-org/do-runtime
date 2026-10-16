@@ -1,6 +1,7 @@
 import {
   MessagePortWebSocket,
   type MessagePortWebSocketConstructor,
+  type MessagePortWebSocketPeer,
   type MessagePortWebSocketPort,
   type MessagePortWebSocketWireMessage,
 } from "./message-port-websocket";
@@ -17,11 +18,6 @@ export interface ChromeRuntimePort {
     addListener(listener: () => void): void;
     removeListener(listener: () => void): void;
   };
-}
-
-export interface ChromePortWebSocketPeer {
-  send(message: MessagePortWebSocketWireMessage): void;
-  close(): void;
 }
 
 type PortClose = { readonly code: number; readonly reason: string; readonly wasClean: boolean };
@@ -49,7 +45,7 @@ export function bindChromePortWebSocket(
     /** Ping the peer and close when it stops answering. Off unless set. */
     probeLiveness?: boolean;
   },
-): ChromePortWebSocketPeer {
+): MessagePortWebSocketPeer {
   let closed = false;
   // A failed send() closes the port a microtask later; until then, drop further sends.
   let lost = false;
@@ -199,7 +195,7 @@ export function createChromePortWebSocketConstructor(options: {
  * would queue each frame and could reorder a send against the close behind it.
  */
 class PeerPort extends EventTarget implements MessagePortWebSocketPort {
-  peer: ChromePortWebSocketPeer | undefined;
+  peer: MessagePortWebSocketPeer | undefined;
 
   postMessage(message: MessagePortWebSocketWireMessage): void {
     this.peer?.send(message);

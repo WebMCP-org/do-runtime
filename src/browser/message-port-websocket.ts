@@ -7,6 +7,12 @@ export type MessagePortWebSocketWireMessage =
   | { readonly type: "message"; readonly data: MessagePortWebSocketData }
   | { readonly type: "close"; readonly code: number; readonly reason: string };
 
+/** The far end of a socket the host owns; it absorbs an already-disconnected transport, so callers never retry sends. */
+export interface MessagePortWebSocketPeer {
+  send(message: MessagePortWebSocketWireMessage): void;
+  close(): void;
+}
+
 type MessagePortWebSocketReadyMessage = { readonly type: "open" };
 
 /** The part of a MessagePort the socket uses, so another transport can stand in for one. */

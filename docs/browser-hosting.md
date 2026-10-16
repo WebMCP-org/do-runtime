@@ -39,8 +39,10 @@ references synchronously, stops the worker, and serializes physical storage
 removal. Deletion closes live and hibernated client transports with code 1001;
 worker failures and ordinary stops use 1011. New resolution waits for the deletion
 barrier. A host with hierarchical addresses supplies its actual ancestry
-predicate to `delete(address, includes)`;
-the runtime never guesses ancestry from key prefixes.
+predicate to `delete(address, includes)`; the runtime never guesses ancestry
+from key prefixes. `includes` can only match addresses this supervisor has
+resolved since it started, so a host that must remove descendants never woken
+in this session deletes their storage itself.
 
 `connect(address, { id, url, peer })` retains the client transport and returns
 its `receive` and `close` controls. `connectPort()` provides the same lifetime

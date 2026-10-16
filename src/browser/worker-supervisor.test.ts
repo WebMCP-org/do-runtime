@@ -3,12 +3,12 @@ import { RpcTarget } from "../api/cloudflare-workers";
 import { bindChromePortWebSocket, type ChromeRuntimePort } from "./chrome-port-websocket";
 import {
   MessagePortWebSocket,
+  type MessagePortWebSocketPeer,
   type MessagePortWebSocketWireMessage,
 } from "./message-port-websocket";
 import {
   BrowserWorkerSupervisor,
   type BrowserWorkerHostContext,
-  type WorkerSocketPeer,
 } from "./worker-supervisor";
 import {
   serveBrowserWorker,
@@ -197,7 +197,7 @@ function peer() {
 async function connected(
   supervisor: BrowserWorkerSupervisor<Configuration, Service>,
   workers: readonly TestWorker[],
-  client: WorkerSocketPeer,
+  client: MessagePortWebSocketPeer,
 ) {
   const socket = supervisor.connect(configuration, { id: "socket", url, peer: client });
   await supervisor.ensure(configuration).ready;
