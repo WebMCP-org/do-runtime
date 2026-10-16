@@ -53,8 +53,11 @@ connection and rejects the new attempt so a reconnect cannot produce duplicate
 actor connections.
 
 The host keeps authorization, trusted client roles, URL conventions, maintenance
-admission policy, and browser resource cleanup. `discarded` releases resources
-owned by a terminated worker whose finalizers cannot execute. `closeSockets`
+admission policy, and browser resource cleanup. `discarded(address, reason)`
+releases resources owned by a terminated worker whose finalizers cannot execute;
+it runs exactly once per physical worker, even when tearing down its sessions
+throws. A worker event that fails protocol validation is ignored with one
+`console.warn` naming the worker key and the rejected event's shape. `closeSockets`
 lets admission policy end existing transports without waking an idle worker.
 
 ## Worker bootstrap
@@ -81,6 +84,9 @@ runtime owns facet containers, scopes, storage handles, cancellation, and mirror
 restoration. A loader registers a capability with `scope.use()` before module
 evaluation when the module can make host calls. Failed or aborted placement
 releases that capability, including a resource acquired after an abort.
+The optional `broken(request, reason)` option observes a placed facet's
+container breaking, including an abort, so the host can name work that died
+with it.
 
 `ActorContainer.quiescence()` includes full pending events, background work,
 timers and explicit activity leases. Releasing the input gate at an await does

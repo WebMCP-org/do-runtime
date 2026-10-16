@@ -120,6 +120,8 @@ export class BrowserActorTree<
       ): Promise<BrowserFacetDefinition>;
       /** Observe the whole tree using the runtime's event/lease activity owner. */
       activityChanged?(): void;
+      /** A placed facet's container broke (including an abort); its work is gone. */
+      broken?(request: FacetStartRequest, reason: unknown): void;
     },
   ) {}
 
@@ -223,7 +225,10 @@ export class BrowserActorTree<
       }
     })();
     void started.then(({ container, entry }) => {
-      void container.onBroken.catch(reject);
+      void container.onBroken.catch((reason: unknown) => {
+        reject(reason);
+        this.options.broken?.(request, reason);
+      });
       resolve(entry);
     }, fail);
     return operation.handle;

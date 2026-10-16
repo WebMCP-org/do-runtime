@@ -168,7 +168,10 @@ export class BrowserWorkerSupervisor<
     worker.addEventListener("message", (event: MessageEvent<unknown>) => {
       if (this.#workers.get(key) !== placement) return;
       const message = parseBrowserWorkerEvent(event.data);
-      if (!message) return;
+      if (!message) {
+        console.warn(`Worker ${key} sent an invalid event`, describeWorkerEvent(event.data));
+        return;
+      }
       if (message.type === "failed") this.#discard(placement, message.message, false);
       else {
         placement.readyNow = true;
@@ -610,15 +613,30 @@ export class BrowserWorkerSupervisor<
         this.#finish(socket);
       }
     }
+    // The placement left #workers above, so this runs once per worker even when teardown throws.
     try {
-      placement.service[Symbol.dispose]();
-    } finally {
       try {
-        placement.hostSession[Symbol.dispose]();
+        placement.service[Symbol.dispose]();
       } finally {
-        placement.worker.terminate();
+        try {
+          placement.hostSession[Symbol.dispose]();
+        } finally {
+          placement.worker.terminate();
+        }
       }
+    } finally {
+      this.#options.discarded?.(placement.configuration, reason);
     }
-    this.#options.discarded?.(placement.configuration, reason);
   }
+}
+
+/** Name what was rejected without echoing a payload of arbitrary size. */
+function describeWorkerEvent(value: unknown): string {
+  if (value === null || typeof value !== "object") return value === null ? "null" : typeof value;
+  const keys = Object.keys(value);
+  const type = "type" in value && typeof value.type === "string" ? value.type : undefined;
+  return [
+    type === undefined ? "no string type" : `type ${JSON.stringify(type.slice(0, 64))}`,
+    `keys ${keys.slice(0, 8).join(", ")}${keys.length > 8 ? ", ..." : ""}`,
+  ].join("; ");
 }

@@ -394,3 +394,54 @@ test("activity observer errors are reported without corrupting a successful face
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test("a placed facet whose container breaks reports its request and reason to the host", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "browser-tree-broken-"));
+  const rootStorage = new Storage(join(directory, "root"));
+  const broken: [FacetStartRequest, unknown][] = [];
+  const tree = new BrowserActorTree({
+    storage: (id) => new Storage(join(directory, `facet-${id}`)),
+    async load() {
+      return {
+        env: {},
+        exports: {},
+        construct: (ctx) => ({
+          crash() {
+            ctx.abort("child crashed");
+          },
+        }),
+      };
+    },
+    broken(request, reason) {
+      broken.push([request, reason]);
+    },
+  });
+  const root = await createActorContainer({
+    id: "root",
+    uniqueKey: "broken",
+    env: {},
+    exports: {},
+    ports: { sql: rootStorage, facets: tree, alarms: DEFAULT_ALARM_OUTLET, timer: platformTimer },
+  });
+  tree.attach({
+    id: "root",
+    uniqueKey: "broken",
+    tree: root.facetTree,
+    ports: { timer: platformTimer },
+  });
+  try {
+    const handle = tree.start(request);
+    const entry = (await handle.stub) as ActorEntry<{ crash(): void }>;
+    expect(broken).toEqual([]);
+    await entry.crash().catch(() => {});
+    await expect(handle.broken).rejects.toThrow("child crashed");
+    expect(broken).toHaveLength(1);
+    expect(broken[0]![0]).toEqual(request);
+    expect(String(broken[0]![1])).toContain("child crashed");
+  } finally {
+    tree.closeAll();
+    root.abort("finished");
+    rootStorage.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});

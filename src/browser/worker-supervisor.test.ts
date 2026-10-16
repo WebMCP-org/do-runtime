@@ -68,6 +68,8 @@ class TestWorker extends EventTarget implements Worker {
   readonly ports = new Set<MessagePort>();
   readonly server: Disposable;
   terminated = false;
+  /** The platform terminate call can fail after the worker is gone. */
+  terminateFailure: Error | undefined;
 
   constructor(generation: number, parseConfiguration = (value: unknown): Configuration => {
     if (value === null || typeof value !== "object" || !("key" in value) || typeof value.key !== "string") {
@@ -122,6 +124,7 @@ class TestWorker extends EventTarget implements Worker {
     this.terminated = true;
     this.server[Symbol.dispose]();
     for (const port of this.ports) port.close();
+    if (this.terminateFailure) throw this.terminateFailure;
   }
 }
 interface TestWorker {
@@ -168,6 +171,8 @@ function peer() {
   const closed = vi.fn();
   return { messages, send: (message: MessagePortWebSocketWireMessage) => messages.push(message), close: closed };
 }
+/** Node has no ErrorEvent; a worker crash reaches the supervisor as an error event with a message. */
+const workerError = (message: string) => Object.assign(new Event("error"), { message });
 const configuration: Configuration = { key: "employee/thread" };
 const url = "ws://host/agents/test/thread";
 
@@ -397,4 +402,43 @@ test("ordinary stop keeps its failure close code", async () => {
   expect(client.messages).toEqual([{ type: "close", code: 1011, reason: "Worker stopped" }]);
   expect(client.close).toHaveBeenCalledOnce();
   expect(workers[0]!.terminated).toBe(true);
+});
+
+test("discarded runs exactly once per worker even when physical teardown throws", async () => {
+  const discarded = vi.fn((_configuration: Configuration, _reason: string) => {});
+  const { supervisor, workers } = fixture({ discarded });
+  await supervisor.ensure(configuration).ready;
+  workers[0]!.terminateFailure = new Error("terminate failed");
+  expect(() => supervisor.stop(configuration, "explicit stop")).toThrow("terminate failed");
+  expect(discarded).toHaveBeenCalledExactlyOnceWith(configuration, "explicit stop");
+  supervisor.stop(configuration);
+  workers[0]!.dispatchEvent(workerError("late crash"));
+  expect(discarded).toHaveBeenCalledOnce();
+
+  await supervisor.ensure(configuration).ready;
+  workers[1]!.dispatchEvent(workerError("worker crashed"));
+  workers[1]!.dispatchEvent(workerError("second report"));
+  expect(discarded).toHaveBeenCalledTimes(2);
+  expect(discarded).toHaveBeenLastCalledWith(configuration, "worker crashed");
+  expect(workers[1]!.terminated).toBe(true);
+});
+
+test("an invalid worker event is reported with its key and a short summary, then ignored", async () => {
+  const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  try {
+    const { supervisor, workers } = fixture();
+    const placement = supervisor.ensure(configuration);
+    workers[0]!.dispatchEvent(new MessageEvent("message", {
+      data: { type: "failed", message: 42, payload: "x".repeat(10_000) },
+    }));
+    expect(warn).toHaveBeenCalledOnce();
+    const [text, summary] = warn.mock.calls[0]!;
+    expect(text).toBe(`Worker ${configuration.key} sent an invalid event`);
+    expect(summary).toBe('type "failed"; keys type, message, payload');
+    await placement.ready;
+    expect(supervisor.size).toBe(1);
+    expect(warn).toHaveBeenCalledOnce();
+  } finally {
+    warn.mockRestore();
+  }
 });
