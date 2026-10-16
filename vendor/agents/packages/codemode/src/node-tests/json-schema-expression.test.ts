@@ -153,4 +153,87 @@ describe("raw JSON Schema type expressions", () => {
     );
     expect(jsonSchemaToTypeExpression(deep)).not.toContain("boolean");
   });
+
+  it("still inlines a shared $ref target at each use", () => {
+    expect(
+      jsonSchemaToTypeExpression({
+        type: "object",
+        properties: {
+          home: { $ref: "#/$defs/Address" },
+          work: { $ref: "#/$defs/Address" }
+        },
+        required: ["home"],
+        $defs: {
+          Address: {
+            type: "object",
+            properties: { street: { type: "string" } }
+          }
+        }
+      })
+    ).toBe(
+      "{ home: { street?: string; [key: string]: unknown; }; work?: { street?: string; [key: string]: unknown; }; [key: string]: unknown; }"
+    );
+  });
+
+  // The printer stops emitting at 100,000 characters; the node that crosses
+  // it may still repeat its fields once in an index signature.
+  const bound = 200_000;
+
+  it("bounds output when $defs reference each other", () => {
+    // Each definition inlines the next three, and its index signature repeats
+    // them: 2.7 MB for ten definitions without a bound.
+    const $defs: Record<string, unknown> = {
+      Tree: {
+        type: "object",
+        properties: {
+          children: { type: "array", items: { $ref: "#/$defs/Tree" } }
+        }
+      }
+    };
+    for (let i = 0; i < 10; i++) {
+      const properties: Record<string, unknown> = { id: { type: "string" } };
+      for (const [name, j] of [
+        ["a", i + 1],
+        ["b", i + 2],
+        ["c", i + 3]
+      ] as const)
+        if (j < 10) properties[name] = { $ref: `#/$defs/Node${j}` };
+      $defs[`Node${i}`] = {
+        type: "object",
+        properties,
+        additionalProperties: { type: "string" }
+      };
+    }
+    const schema = {
+      type: "object",
+      properties: {
+        root: { $ref: "#/$defs/Node0" },
+        tree: { $ref: "#/$defs/Tree" }
+      },
+      $defs
+    };
+    const started = performance.now();
+    const declaration = jsonSchemaToType(schema, "Value");
+    expect(performance.now() - started).toBeLessThan(1000);
+    expect(declaration.length).toBeLessThan(bound);
+    expect(
+      diagnostics(schema, 'const valid: Value = { root: { id: "0" } };')
+    ).toEqual([]);
+  });
+
+  it("bounds nested index signatures that repeat their field types", () => {
+    // 185 MB at depth 19 without a bound, with no $ref at all.
+    let schema: Record<string, unknown> = { type: "string" };
+    for (let depth = 0; depth < 19; depth++)
+      schema = {
+        type: "object",
+        properties: { a: schema, b: { type: "number" } },
+        additionalProperties: { type: "string" }
+      };
+    const started = performance.now();
+    const declaration = jsonSchemaToType(schema, "Value");
+    expect(performance.now() - started).toBeLessThan(1000);
+    expect(declaration.length).toBeLessThan(bound);
+    expect(diagnostics(schema, "const valid: Value = { b: 1 };")).toEqual([]);
+  });
 });

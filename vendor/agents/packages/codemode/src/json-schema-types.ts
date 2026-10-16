@@ -12,10 +12,18 @@ export interface JsonSchemaTypeOptions {
   indent?: string;
 }
 
+/** Type text one print call may emit before further schema nodes become
+ * `unknown`. Inlined `$ref` uses and index signatures that repeat their field
+ * types can otherwise grow exponentially in the schema's size. A useful tool
+ * type is far smaller; this only stops a hostile or degenerate schema. */
+const OUTPUT_BUDGET = 100_000;
+
 interface ConversionContext {
   root: unknown;
   depth: number;
   seen: Set<unknown>;
+  /** Text emitted so far by this print call, shared by every node. */
+  budget: { spent: number };
 }
 
 /** Convert raw JSON Schema to a type expression without AI SDK or Zod imports.
@@ -29,7 +37,8 @@ export function jsonSchemaToTypeExpression(
     return printSchema(schema, options?.indent, {
       root: schema,
       depth: 0,
-      seen: new Set()
+      seen: new Set(),
+      budget: { spent: 0 }
     });
   } catch {
     // In particular, non-JSON const/enum values may contain cycles or BigInts.
@@ -71,10 +80,26 @@ function nullable(result: string, schema: Record<string, unknown>): string {
     : result;
 }
 
+/** Each node is charged the text it adds beyond its children's, including
+ * repeated copies of them, so `spent` tracks the emitted size. Nodes already
+ * printed are kept; once the budget is spent every later node is `unknown`. */
 function printSchema(
   schema: unknown,
   indent: string | undefined,
   ctx: ConversionContext
+): string {
+  if (ctx.budget.spent >= OUTPUT_BUDGET) return "unknown";
+  const children = { length: 0 };
+  const result = printNode(schema, indent, ctx, children);
+  ctx.budget.spent += Math.max(0, result.length - children.length);
+  return result;
+}
+
+function printNode(
+  schema: unknown,
+  indent: string | undefined,
+  ctx: ConversionContext,
+  children: { length: number }
 ): string {
   if (schema === true) return "unknown";
   if (schema === false) return "never";
@@ -82,8 +107,11 @@ function printSchema(
     return "unknown";
   ctx.seen.add(schema);
   const next = { ...ctx, depth: ctx.depth + 1 };
-  const print = (value: unknown, inner = indent) =>
-    printSchema(value, inner, next);
+  const print = (value: unknown, inner = indent) => {
+    const text = printSchema(value, inner, next);
+    children.length += text.length;
+    return text;
+  };
   try {
     if (typeof schema.$ref === "string")
       return nullable(print(resolveRef(schema.$ref, ctx.root)), schema);
