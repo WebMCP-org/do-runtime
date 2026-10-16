@@ -8,13 +8,14 @@ import {
   DEFAULT_READ_DIR_LIMIT,
   compareBinaryString,
   compareTypeThenName,
-  nativeDirectoryEntries,
+  isMissingEntry,
+  isTypeMismatch,
   moveNativeFile,
+  nativeDirectoryEntries,
   nativeDirectoryInfo,
   nativeFileInfo,
-  translateFileSystemError,
-  domErrorName,
   toArrayBuffer,
+  translateFileSystemError,
   type NativeEntry
 } from "./native-file-system";
 import {
@@ -79,16 +80,14 @@ export class DirectoryHandleWorkspace implements WorkspaceFsLike {
     return this.withNativeFile(path, async (file) => file);
   }
 
-  /** Keep the mount's shared lock through snapshot creation and any byte read. */
+  /** Hold the shared lock through snapshot creation and any byte read. */
   private async withNativeFile<T>(
     path: string,
     read: (file: File) => Promise<T>
   ): Promise<T | null> {
     try {
-      return await this.withTree(path, "shared", async ({ parts, root }) => {
-        if (parts.length === 0)
-          throw fsError("EISDIR", `${path} is a directory`);
-        const entry = await getEntry(root, parts);
+      return await this.withTree(path, "shared", async (parts) => {
+        const entry = await getEntry(this.root, parts);
         if (!entry) return null;
         if (entry.kind !== "file") {
           throw fsError("EISDIR", `${path} is a directory`);
@@ -114,9 +113,9 @@ export class DirectoryHandleWorkspace implements WorkspaceFsLike {
     content: Uint8Array | ArrayBuffer,
     _mimeType?: string
   ): Promise<void> {
-    await this.withTree(path, "exclusive", async ({ parts, root }) => {
+    await this.withTree(path, "exclusive", async (parts) => {
       assertMutableEntry(parts, path);
-      await writeBytes(root, parts, normalizeBytes(content));
+      await writeBytes(this.root, parts, normalizeBytes(content));
     });
   }
 
@@ -133,12 +132,9 @@ export class DirectoryHandleWorkspace implements WorkspaceFsLike {
     content: Uint8Array | ArrayBuffer,
     _mimeType?: string
   ): Promise<void> {
-    await this.withTree(path, "exclusive", async ({ parts, root }) => {
+    await this.withTree(path, "exclusive", async (parts) => {
       assertMutableEntry(parts, path);
-      const parent = await getDirectory(root, parts.slice(0, -1), true);
-      const handle = await parent.getFileHandle(parts.at(-1)!, {
-        create: true
-      });
+      const handle = await createFileHandle(this.root, parts);
       const file = await handle.getFile();
       const writable = await handle.createWritable({ keepExistingData: true });
       await useWritable(writable, async () => {
@@ -153,12 +149,9 @@ export class DirectoryHandleWorkspace implements WorkspaceFsLike {
     stream: ReadableStream<Uint8Array>,
     signal?: AbortSignal
   ): Promise<void> {
-    await this.withTree(path, "exclusive", async ({ parts, root }) => {
+    await this.withTree(path, "exclusive", async (parts) => {
       assertMutableEntry(parts, path);
-      const parent = await getDirectory(root, parts.slice(0, -1), true);
-      const handle = await parent.getFileHandle(parts.at(-1)!, {
-        create: true
-      });
+      const handle = await createFileHandle(this.root, parts);
       const writable = await handle.createWritable();
       try {
         await stream.pipeTo(writable, { signal });
@@ -176,8 +169,7 @@ export class DirectoryHandleWorkspace implements WorkspaceFsLike {
       return await this.withTree(
         normalized,
         "shared",
-        async ({ parts, root }) =>
-          parts.length === 0 ? true : (await getEntry(root, parts)) !== null
+        async (parts) => (await getEntry(this.root, parts)) !== null
       );
     } catch (error) {
       if (hasFsCode(error, "ENOENT")) return false;
@@ -189,15 +181,10 @@ export class DirectoryHandleWorkspace implements WorkspaceFsLike {
     const normalized = normalizeWorkspacePath(path);
     if (normalized === "/") return nativeDirectoryInfo("/");
     try {
-      return await this.withTree(
-        normalized,
-        "shared",
-        async ({ parts, root }) => {
-          if (parts.length === 0) return nativeDirectoryInfo("/");
-          const entry = await getEntry(root, parts);
-          return entry ? entryInfo(normalized, entry) : null;
-        }
-      );
+      return await this.withTree(normalized, "shared", async (parts) => {
+        const entry = await getEntry(this.root, parts);
+        return entry ? entryInfo(normalized, entry) : null;
+      });
     } catch (error) {
       if (hasFsCode(error, "ENOENT")) return null;
       throw error;
@@ -209,20 +196,21 @@ export class DirectoryHandleWorkspace implements WorkspaceFsLike {
   }
 
   async mkdir(path: string, options?: { recursive?: boolean }): Promise<void> {
-    await this.withTree(path, "exclusive", async ({ parts, root }) => {
+    await this.withTree(path, "exclusive", async (parts) => {
       if (parts.length === 0) {
         if (options?.recursive) return;
         throw fsError("EEXIST", `directory already exists: ${path}`);
       }
       if (options?.recursive) {
-        await getDirectory(root, parts, true);
+        await getDirectory(this.root, parts, true);
         return;
       }
-      const parent = await getDirectory(root, parts.slice(0, -1), false);
-      if (await getEntry(root, parts)) {
+      const parent = await getDirectory(this.root, parts.slice(0, -1), false);
+      const name = parts.at(-1)!;
+      if (await getChild(parent, name)) {
         throw fsError("EEXIST", `path already exists: ${path}`);
       }
-      await parent.getDirectoryHandle(parts.at(-1)!, { create: true });
+      await parent.getDirectoryHandle(name, { create: true });
     });
   }
 
@@ -232,36 +220,32 @@ export class DirectoryHandleWorkspace implements WorkspaceFsLike {
   ): Promise<FileInfo[]> {
     const normalized = normalizeWorkspacePath(path);
     try {
-      return await this.withTree(
-        normalized,
-        "shared",
-        async ({ parts, root }) => {
-          const entry = parts.length === 0 ? root : await getEntry(root, parts);
-          if (!entry || entry.kind !== "directory") return [];
-          // Do not retain every native child handle while sorting a large
-          // directory. The iterator may yield thousands of capability objects;
-          // keep only clone-safe names/kinds and reopen handles for the page we
-          // actually return.
-          const children: Pick<FileInfo, "name" | "type">[] = [];
-          for await (const [name, child] of nativeDirectoryEntries(entry)) {
-            children.push({ name, type: child.kind });
-          }
-          const offset = Math.max(0, options?.offset ?? 0);
-          const limit = Math.max(0, options?.limit ?? DEFAULT_READ_DIR_LIMIT);
-          const page = children
-            .sort(compareTypeThenName)
-            .slice(offset, offset + limit);
-          return Promise.all(
-            page.map(async ({ name, type }) => {
-              const child =
-                type === "directory"
-                  ? await entry.getDirectoryHandle(name)
-                  : await entry.getFileHandle(name);
-              return entryInfo(`/${parts.concat(name).join("/")}`, child);
-            })
-          );
+      return await this.withTree(normalized, "shared", async (parts) => {
+        const entry = await getEntry(this.root, parts);
+        if (!entry || entry.kind !== "directory") return [];
+        // Do not retain every native child handle while sorting a large
+        // directory. The iterator may yield thousands of capability objects;
+        // keep only clone-safe names/kinds and reopen handles for the page we
+        // actually return.
+        const children: Pick<FileInfo, "name" | "type">[] = [];
+        for await (const [name, child] of nativeDirectoryEntries(entry)) {
+          children.push({ name, type: child.kind });
         }
-      );
+        const offset = Math.max(0, options?.offset ?? 0);
+        const limit = Math.max(0, options?.limit ?? DEFAULT_READ_DIR_LIMIT);
+        const page = children
+          .sort(compareTypeThenName)
+          .slice(offset, offset + limit);
+        return Promise.all(
+          page.map(async ({ name, type }) => {
+            const child =
+              type === "directory"
+                ? await entry.getDirectoryHandle(name)
+                : await entry.getFileHandle(name);
+            return entryInfo(`/${parts.concat(name).join("/")}`, child);
+          })
+        );
+      });
     } catch (error) {
       if (hasFsCode(error, "ENOENT")) return [];
       throw error;
@@ -273,22 +257,17 @@ export class DirectoryHandleWorkspace implements WorkspaceFsLike {
     options?: { recursive?: boolean; force?: boolean }
   ): Promise<void> {
     try {
-      await this.withTree(path, "exclusive", async ({ parts, root }) => {
+      await this.withTree(path, "exclusive", async (parts) => {
         assertMutableEntry(parts, path);
-        const entry = await getEntry(root, parts);
-        if (!entry) {
+        const name = parts.at(-1)!;
+        const parent = await findParent(this.root, parts);
+        if (!parent || !(await getChild(parent, name))) {
           if (options?.force) return;
           throw fsError("ENOENT", `no such file or directory: ${path}`);
         }
-        const parent = await getDirectory(root, parts.slice(0, -1), false);
-        try {
-          await parent.removeEntry(parts.at(-1)!, {
-            recursive: options?.recursive ?? false
-          });
-        } catch (error) {
-          if (options?.force && domErrorName(error) === "NotFoundError") return;
-          throw error;
-        }
+        await parent.removeEntry(name, {
+          recursive: options?.recursive ?? false
+        });
       });
     } catch (error) {
       if (options?.force && hasFsCode(error, "ENOENT")) return;
@@ -305,17 +284,11 @@ export class DirectoryHandleWorkspace implements WorkspaceFsLike {
     const destinationParts = workspacePathParts(destination);
     assertMutableEntry(destinationParts, destination);
     await this.withLock("exclusive", async () => {
-      const sourceEntry = await getEntry(this.root, sourceParts).catch(
-        (error) => {
-          throw translateFileSystemError(error, source);
-        }
-      );
-      if (!sourceEntry) {
-        throw fsError("ENOENT", `no such file or directory: ${source}`);
-      }
+      const sourceEntry = await requireEntry(this.root, sourceParts, source);
       try {
         await copyEntry(
           this.root,
+          sourceEntry,
           sourceParts,
           destinationParts,
           options?.recursive ?? false
@@ -336,16 +309,7 @@ export class DirectoryHandleWorkspace implements WorkspaceFsLike {
     assertMutableEntry(sourceParts, source);
     assertMutableEntry(destinationParts, destination);
     await this.withLock("exclusive", async () => {
-      let sourceEntry: NativeEntry;
-      try {
-        const resolved = await getEntry(this.root, sourceParts);
-        if (!resolved) {
-          throw fsError("ENOENT", `no such file or directory: ${source}`);
-        }
-        sourceEntry = resolved;
-      } catch (error) {
-        throw translateFileSystemError(error, source);
-      }
+      const sourceEntry = await requireEntry(this.root, sourceParts, source);
       if (sameParts(sourceParts, destinationParts)) return;
       if (sourceEntry.kind === "file") {
         try {
@@ -376,6 +340,7 @@ export class DirectoryHandleWorkspace implements WorkspaceFsLike {
       try {
         await copyEntry(
           this.root,
+          sourceEntry,
           sourceParts,
           destinationParts,
           options?.recursive ?? true
@@ -389,9 +354,7 @@ export class DirectoryHandleWorkspace implements WorkspaceFsLike {
           sourceParts.slice(0, -1),
           false
         );
-        await parent.removeEntry(sourceParts.at(-1)!, {
-          recursive: sourceEntry.kind === "directory"
-        });
+        await parent.removeEntry(sourceParts.at(-1)!, { recursive: true });
       } catch (error) {
         const translated = translateFileSystemError(error, source);
         throw fsError(
@@ -429,10 +392,7 @@ export class DirectoryHandleWorkspace implements WorkspaceFsLike {
       try {
         const output: FileInfo[] = [];
         const prefix = workspaceGlobPrefix(normalized);
-        const start = await getEntry(
-          this.root,
-          prefix.split("/").filter(Boolean)
-        );
+        const start = await getEntry(this.root, workspacePathParts(prefix));
         if (!start) return [];
         if (regex.test(prefix)) output.push(await entryInfo(prefix, start));
         const maxDepth = normalized.includes("**")
@@ -459,15 +419,12 @@ export class DirectoryHandleWorkspace implements WorkspaceFsLike {
   private async withTree<T>(
     path: string,
     mode: LockMode,
-    operation: (entry: {
-      parts: string[];
-      root: FileSystemDirectoryHandle;
-    }) => Promise<T>
+    operation: (parts: string[]) => Promise<T>
   ): Promise<T> {
     const parts = workspacePathParts(path);
     return this.withLock(mode, async () => {
       try {
-        return await operation({ parts, root: this.root });
+        return await operation(parts);
       } catch (error) {
         throw translateFileSystemError(error, path);
       }
@@ -501,21 +458,16 @@ async function walkDirectory(
 }
 
 function pathDepth(path: string): number {
-  return normalizeWorkspacePath(path).split("/").filter(Boolean).length;
+  return workspacePathParts(path).length;
 }
 
 async function copyEntry(
   root: FileSystemDirectoryHandle,
+  source: NativeEntry,
   sourceParts: string[],
   destinationParts: string[],
   recursive: boolean
 ): Promise<void> {
-  const sourcePath = `/${sourceParts.join("/")}`;
-  const destinationPath = `/${destinationParts.join("/")}`;
-  const source = await getEntry(root, sourceParts);
-  if (!source) {
-    throw fsError("ENOENT", `no such file or directory: ${sourcePath}`);
-  }
   if (source.kind === "file") {
     await writeBytes(
       root,
@@ -524,6 +476,7 @@ async function copyEntry(
     );
     return;
   }
+  const sourcePath = `/${sourceParts.join("/")}`;
   if (!recursive) {
     throw fsError(
       "EISDIR",
@@ -533,13 +486,14 @@ async function copyEntry(
   if (isSameOrDescendant(sourceParts, destinationParts)) {
     throw fsError(
       "EINVAL",
-      `cannot copy a directory into itself: ${sourcePath} -> ${destinationPath}`
+      `cannot copy a directory into itself: ${sourcePath} -> /${destinationParts.join("/")}`
     );
   }
   await getDirectory(root, destinationParts, true);
-  for await (const [name] of nativeDirectoryEntries(source)) {
+  for await (const [name, child] of nativeDirectoryEntries(source)) {
     await copyEntry(
       root,
+      child,
       sourceParts.concat(name),
       destinationParts.concat(name),
       true
@@ -552,8 +506,7 @@ async function writeBytes(
   parts: string[],
   bytes: Uint8Array
 ): Promise<void> {
-  const parent = await getDirectory(root, parts.slice(0, -1), true);
-  const handle = await parent.getFileHandle(parts.at(-1)!, { create: true });
+  const handle = await createFileHandle(root, parts);
   const writable = await handle.createWritable();
   await useWritable(writable, () => writable.write(toArrayBuffer(bytes)));
 }
@@ -571,26 +524,65 @@ async function useWritable(
   }
 }
 
+async function createFileHandle(
+  root: FileSystemDirectoryHandle,
+  parts: string[]
+): Promise<FileSystemFileHandle> {
+  const parent = await getDirectory(root, parts.slice(0, -1), true);
+  return parent.getFileHandle(parts.at(-1)!, { create: true });
+}
+
 async function getEntry(
   root: FileSystemDirectoryHandle,
   parts: string[]
 ): Promise<NativeEntry | null> {
   if (parts.length === 0) return root;
-  let parent: FileSystemDirectoryHandle;
+  const parent = await findParent(root, parts);
+  return parent && getChild(parent, parts.at(-1)!);
+}
+
+async function requireEntry(
+  root: FileSystemDirectoryHandle,
+  parts: string[],
+  path: string
+): Promise<NativeEntry> {
+  let entry: NativeEntry | null;
   try {
-    parent = await getDirectory(root, parts.slice(0, -1), false);
+    entry = await getEntry(root, parts);
+  } catch (error) {
+    throw translateFileSystemError(error, path);
+  }
+  if (!entry) throw fsError("ENOENT", `no such file or directory: ${path}`);
+  return entry;
+}
+
+/** The directory holding the last part, or null when a level is missing or is
+ * a file. */
+async function findParent(
+  root: FileSystemDirectoryHandle,
+  parts: string[]
+): Promise<FileSystemDirectoryHandle | null> {
+  try {
+    return await getDirectory(root, parts.slice(0, -1), false);
   } catch (error) {
     if (isMissingOrTypeMismatch(error)) return null;
     throw error;
   }
-  const name = parts.at(-1)!;
+}
+
+/** File System Access reports a child's kind only through the lookup that
+ * fails, so try file then directory. */
+async function getChild(
+  directory: FileSystemDirectoryHandle,
+  name: string
+): Promise<NativeEntry | null> {
   try {
-    return await parent.getFileHandle(name);
+    return await directory.getFileHandle(name);
   } catch (error) {
     if (!isMissingOrTypeMismatch(error)) throw error;
   }
   try {
-    return await parent.getDirectoryHandle(name);
+    return await directory.getDirectoryHandle(name);
   } catch (error) {
     if (isMissingOrTypeMismatch(error)) return null;
     throw error;
@@ -639,8 +631,7 @@ function normalizeBytes(content: Uint8Array | ArrayBuffer): Uint8Array {
 }
 
 function isMissingOrTypeMismatch(error: unknown): boolean {
-  const name = domErrorName(error);
-  return name === "NotFoundError" || name === "TypeMismatchError";
+  return isMissingEntry(error) || isTypeMismatch(error);
 }
 
 function partialCopyError(
@@ -658,9 +649,6 @@ function partialCopyError(
   );
 }
 
-function hasFsCode(
-  error: Parameters<typeof translateFileSystemError>[0],
-  code: string
-): boolean {
+function hasFsCode(error: unknown, code: string): boolean {
   return error instanceof Error && "code" in error && error.code === code;
 }

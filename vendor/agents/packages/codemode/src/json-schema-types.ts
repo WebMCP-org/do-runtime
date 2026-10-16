@@ -55,12 +55,10 @@ function resolveRef(ref: string, root: unknown): unknown {
   if (!ref.startsWith("#/")) return undefined;
   let current = root;
   for (const segment of ref.slice(2).split("/")) {
-    if (
-      !schemaObject(current) ||
-      !Object.hasOwn(current, segment.replace(/~1/g, "/").replace(/~0/g, "~"))
-    )
+    const key = segment.replace(/~1/g, "/").replace(/~0/g, "~");
+    if (!schemaObject(current) || !Object.hasOwn(current, key))
       return undefined;
-    current = current[segment.replace(/~1/g, "/").replace(/~0/g, "~")];
+    current = current[key];
   }
   return current;
 }

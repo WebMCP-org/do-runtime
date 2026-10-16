@@ -4,9 +4,9 @@ import type { FileSystem, FileSystemDirent, FsStat } from "./fs/interface";
 
 import {
   MAX_SYMLINK_DEPTH,
-  dirname,
   normalizePath,
-  resolvePath
+  resolvePath,
+  resolveSymlinkTarget
 } from "./fs/path-utils";
 
 const READ_DIRECTORY_PAGE_SIZE = 1000;
@@ -130,14 +130,19 @@ export class WorkspaceFileSystem implements FileSystem {
   }
 
   private async readAllEntries(path: string): Promise<FileInfo[]> {
-    const entries: FileInfo[] = [];
+    const entries = new Map<string, FileInfo>();
     for (;;) {
       const page = await this.ws.readDir(path, {
         limit: READ_DIRECTORY_PAGE_SIZE,
-        offset: entries.length
+        offset: entries.size
       });
-      entries.push(...page);
-      if (page.length < READ_DIRECTORY_PAGE_SIZE) return entries;
+      const before = entries.size;
+      for (const entry of page) {
+        if (!entries.has(entry.name)) entries.set(entry.name, entry);
+      }
+      // A backend that ignores `offset` repeats a page it already returned.
+      if (page.length < READ_DIRECTORY_PAGE_SIZE || entries.size === before)
+        return [...entries.values()];
     }
   }
 
@@ -188,9 +193,11 @@ export class WorkspaceFileSystem implements FileSystem {
           { code: "ELOOP" }
         );
       }
-      const target = await this.ws.readlink(candidate);
-      const resolvedTarget = resolvePath(dirname(candidate), target);
-      pending = normalizePath(`${resolvedTarget}/${pending.join("/")}`)
+      const target = resolveSymlinkTarget(
+        candidate,
+        await this.ws.readlink(candidate)
+      );
+      pending = normalizePath(`${target}/${pending.join("/")}`)
         .split("/")
         .filter(Boolean);
       resolved.length = 0;

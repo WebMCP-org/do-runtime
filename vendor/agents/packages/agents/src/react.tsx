@@ -871,8 +871,8 @@ export function useAgent<State>(options: UseAgentOptions<unknown>): Omit<
     // Event handlers use the latest options while PartySocket replaces its
     // socket in an effect. An old socket cannot identify the new address.
     if (
-      identifiedSocket !== socketRef.current ||
       !identifiedSocket ||
+      identifiedSocket !== socketRef.current ||
       socketDestinationKey(identifiedSocket.partySocketOptions) !== destination
     ) {
       return;
@@ -888,18 +888,15 @@ export function useAgent<State>(options: UseAgentOptions<unknown>): Omit<
     }
 
     // Update reactive state (triggers re-render)
-    const identifiedDestination = socketDestinationKey(
-      identifiedSocket.partySocketOptions
-    );
     setIdentity({
       name: newName,
       agent: newAgent,
       socket: identifiedSocket,
-      destination: identifiedDestination
+      destination
     });
 
     // Resolve ready promise
-    readyFor(identifiedDestination).resolve();
+    readyFor(destination).resolve();
 
     // Detect identity change on reconnect
     if (
@@ -1339,6 +1336,9 @@ export function useAgent<State>(options: UseAgentOptions<unknown>): Omit<
     !socketAddressPending && identityIsCurrent && identity.socket === agent;
   agentToolReplayBuffers.set(agent, agentToolReplayRef.current);
   agentChatReplayBuffers.set(agent, agentChatReplayRef.current);
+  // A replaced socket's close may never reach onClose. Reset here, not in an
+  // effect, so the replacement's first render already hands out a pending
+  // promise; later renders keep that entry.
   if (!agent.identified) resetReady(destination);
   agent.ready = readyFor(destination).promise;
   agent.state = agentState;

@@ -123,6 +123,22 @@ it("copies trees, atomically replaces files, and rejects overlapping copies and 
   expect(await workspace.exists("/link")).toBe(false);
 });
 
+it("moves directory trees and reports entries below a missing or file parent", async () => {
+  await workspace.writeFile("/tree/nested/file.txt", "value");
+  await workspace.mv("/tree", "/moved");
+  expect(await workspace.readFile("/moved/nested/file.txt")).toBe("value");
+  expect(await workspace.exists("/tree")).toBe(false);
+  await expect(workspace.mkdir("/moved")).rejects.toMatchObject({
+    code: "EEXIST"
+  });
+  for (const missing of ["/absent/child", "/moved/nested/file.txt/child"]) {
+    await expect(workspace.rm(missing)).rejects.toMatchObject({
+      code: "ENOENT"
+    });
+    await workspace.rm(missing, { force: true });
+  }
+});
+
 it("uses the same validated path family for traversal, dirname, and glob prefixes", () => {
   expect(normalizeWorkspacePath("a/../b//c")).toBe("/b/c");
   expect(workspaceDirname("a/../b//c")).toBe("/b");
