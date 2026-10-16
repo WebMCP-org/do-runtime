@@ -3,13 +3,17 @@ import sqlite3InitModule from "@sqlite.org/sqlite-wasm";
 import { expect, test, vi } from "vitest";
 import {
   createSqliteWasmProvider,
+  exportSqliteWasmPoolSnapshot,
+  importSqliteWasmPoolSnapshot,
+  validateSqliteWasmPoolSnapshot,
+  SqliteWasmPoolRestoreError,
   installSqliteWasmHost,
   SqliteWasmActorStorage,
   SqliteWasmDatabase,
   SqliteWasmRestoreError,
   type SqliteWasmDatabaseHandle,
   type SqliteWasmHost,
-  type SqliteWasmStatement,
+  type SqliteWasmStatement
 } from "./sqlite-wasm";
 
 class FakeDatabase implements SqliteWasmDatabaseHandle {
@@ -30,16 +34,28 @@ test("a column-less statement reports its own changeCount: 0 after DDL, 1 for an
   // The real engine over Emscripten's in-memory filesystem; the pool is not involved.
   const sqlite3 = await sqlite3InitModule();
   const pool = { ...memoryHost(new Map()).pool, OpfsSAHPoolDb: sqlite3.oo1.DB };
-  const database = new SqliteWasmDatabase({ pool, capi: sqlite3.capi }, "/actor.root.sqlite");
+  const database = new SqliteWasmDatabase(
+    { pool, capi: sqlite3.capi },
+    "/actor.root.sqlite"
+  );
   database.exec("CREATE TABLE things (id INTEGER PRIMARY KEY)", []);
 
-  expect(database.exec("INSERT INTO things VALUES (1), (2), (3)", []).rowsWritten).toBe(3);
+  expect(
+    database.exec("INSERT INTO things VALUES (1), (2), (3)", []).rowsWritten
+  ).toBe(3);
   // sqlite3_changes() is not reset by DDL, so it would still say 3 here.
-  expect(database.exec("CREATE TABLE other (id INTEGER)", []).rowsWritten).toBe(0);
+  expect(database.exec("CREATE TABLE other (id INTEGER)", []).rowsWritten).toBe(
+    0
+  );
   // total_changes() also counts FTS5's shadow-table writes.
   database.exec("CREATE VIRTUAL TABLE docs USING fts5(body)", []);
-  expect(database.exec("INSERT INTO docs VALUES ('one')", []).rowsWritten).toBe(1);
-  expect(database.exec("INSERT INTO docs VALUES ('two') RETURNING rowid", []).rowsWritten).toBe(1);
+  expect(database.exec("INSERT INTO docs VALUES ('one')", []).rowsWritten).toBe(
+    1
+  );
+  expect(
+    database.exec("INSERT INTO docs VALUES ('two') RETURNING rowid", [])
+      .rowsWritten
+  ).toBe(1);
   database.close();
 });
 
@@ -50,7 +66,7 @@ test("reset fails closed when the SAH pool does not remove the database", () => 
       SQLITE_LIMIT_LENGTH: 0,
       sqlite3_complete: () => 1 as const,
       sqlite3_get_autocommit: () => 1,
-      sqlite3_limit: () => 1,
+      sqlite3_limit: () => 1
     },
     pool: {
       OpfsSAHPoolDb: class extends FakeDatabase {
@@ -63,49 +79,59 @@ test("reset fails closed when the SAH pool does not remove the database", () => 
       importDb: async () => 0,
       getFileNames: () => [],
       unlink: () => false,
-      reserveMinimumCapacity: async (minimum: number) => minimum,
-    },
+      reserveMinimumCapacity: async (minimum: number) => minimum
+    }
   } satisfies SqliteWasmHost;
   const database = new SqliteWasmDatabase(host, "/actor.root.sqlite");
 
-  expect(() => database.reset()).toThrow("SAH pool did not unlink /actor.root.sqlite");
+  expect(() => database.reset()).toThrow(
+    "SAH pool did not unlink /actor.root.sqlite"
+  );
   expect(opened).toEqual(["/actor.root.sqlite"]);
 });
 
-test.each(["open", "reset"])("%s closes the new handle when SQLite setup fails", async (operation) => {
-  const handles = new Set<SqliteWasmDatabaseHandle>();
-  const host = memoryHost(new Map([["/actor.root.sqlite", new Uint8Array()]]));
-  const provider = createSqliteWasmProvider(
-    {
-      ...host,
-      pool: {
-        ...host.pool,
-        OpfsSAHPoolDb: class extends FakeDatabase {
-          constructor() {
-            super();
-            handles.add(this);
+test.each(["open", "reset"])(
+  "%s closes the new handle when SQLite setup fails",
+  async (operation) => {
+    const handles = new Set<SqliteWasmDatabaseHandle>();
+    const host = memoryHost(
+      new Map([["/actor.root.sqlite", new Uint8Array()]])
+    );
+    const provider = createSqliteWasmProvider(
+      {
+        ...host,
+        pool: {
+          ...host.pool,
+          OpfsSAHPoolDb: class extends FakeDatabase {
+            constructor() {
+              super();
+              handles.add(this);
+            }
+            override close(): void {
+              handles.delete(this);
+            }
           }
-          override close(): void {
-            handles.delete(this);
-          }
-        },
+        }
       },
-    },
-    { prefix: "/actor" },
-  );
-  const database = operation === "reset" ? await provider.open("root") : undefined;
-  host.capi.sqlite3_limit = () => {
-    throw new Error("SQLite setup failed");
-  };
+      { prefix: "/actor" }
+    );
+    const database =
+      operation === "reset" ? await provider.open("root") : undefined;
+    host.capi.sqlite3_limit = () => {
+      throw new Error("SQLite setup failed");
+    };
 
-  if (database === undefined) {
-    await expect(provider.open("root")).rejects.toThrow("SQLite setup failed");
-  } else {
-    expect(() => database.reset()).toThrow("SQLite setup failed");
+    if (database === undefined) {
+      await expect(provider.open("root")).rejects.toThrow(
+        "SQLite setup failed"
+      );
+    } else {
+      expect(() => database.reset()).toThrow("SQLite setup failed");
+    }
+    expect(handles.size).toBe(0);
+    provider.close();
   }
-  expect(handles.size).toBe(0);
-  provider.close();
-});
+);
 
 test("opens reserve every file plus a journal per connection, one at a time", async () => {
   const files = new Map<string, Uint8Array>();
@@ -126,14 +152,16 @@ test("opens reserve every file plus a journal per connection, one at a time", as
         reserveMinimumCapacity: async (minimum: number) => {
           reserved.push(minimum);
           return minimum;
-        },
-      },
+        }
+      }
     },
-    { prefix: "/actor" },
+    { prefix: "/actor" }
   );
 
   // Concurrent, as a root and its facets open; each reservation sees every open before it.
-  await Promise.all(["root", "facets", "facet"].map((name) => provider.open(name)));
+  await Promise.all(
+    ["root", "facets", "facet"].map((name) => provider.open(name))
+  );
   expect(reserved).toEqual([2, 4, 6]);
   provider.close();
   // Three files and one connection; closing asked for nothing.
@@ -165,7 +193,7 @@ test("imports reserve their files in the open queue and refuse an open queued ah
   image.set(new TextEncoder().encode("SQLite format 3\0"));
   const files = new Map([
     ["/source.root.sqlite", image],
-    ["/source.facets.sqlite", image],
+    ["/source.facets.sqlite", image]
   ]);
   const host = memoryHost(files);
   const reserved: number[] = [];
@@ -174,17 +202,26 @@ test("imports reserve their files in the open queue and refuse an open queued ah
     return minimum;
   };
   // A running actor, whose journal needs a slot through every import below.
-  const running = await createSqliteWasmProvider(host, { prefix: "/running" }).open("root");
-  await new SqliteWasmActorStorage(host, "/clone").copyFrom(new SqliteWasmActorStorage(host, "/source"));
+  const running = await createSqliteWasmProvider(host, {
+    prefix: "/running"
+  }).open("root");
+  await new SqliteWasmActorStorage(host, "/clone").copyFrom(
+    new SqliteWasmActorStorage(host, "/source")
+  );
   const restore = createSqliteWasmProvider(host, { prefix: "/restore" });
-  await restore.importSnapshot({ version: 1, databases: [{ name: "root", image }] });
+  await restore.importSnapshot({
+    version: 1,
+    databases: [{ name: "root", image }]
+  });
   // 2 files + 2 for the open; then 2 files + 2 cloned + 1 journal; then 4 + 1 restored + 1.
   expect(reserved).toEqual([4, 5, 6]);
 
   const opening = restore.open("root");
   await expect(
-    restore.importSnapshot({ version: 1, databases: [{ name: "root", image }] }),
-  ).rejects.toThrow("Cannot snapshot or restore while database handles are open.");
+    restore.importSnapshot({ version: 1, databases: [{ name: "root", image }] })
+  ).rejects.toThrow(
+    "Cannot snapshot or restore while database handles are open."
+  );
   (await opening).close();
   running.close();
 });
@@ -194,7 +231,7 @@ test("a clone closes a destination open queued ahead of it before replacing its 
   image.set(new TextEncoder().encode("SQLite format 3\0"));
   const files = new Map([
     ["/source.root.sqlite", image],
-    ["/clone.root.sqlite", image],
+    ["/clone.root.sqlite", image]
   ]);
   const base = memoryHost(files);
   const handles = new Set<SqliteWasmDatabaseHandle>();
@@ -218,8 +255,8 @@ test("a clone closes a destination open queued ahead of it before replacing its 
       },
       // A macrotask, so the open is still queued when the clone starts.
       reserveMinimumCapacity: (minimum) =>
-        new Promise<number>((resolve) => setTimeout(() => resolve(minimum))),
-    },
+        new Promise<number>((resolve) => setTimeout(() => resolve(minimum)))
+    }
   };
   const destination = new SqliteWasmActorStorage(host, "/clone");
   const opening = destination.open("root");
@@ -231,7 +268,10 @@ test("a clone closes a destination open queued ahead of it before replacing its 
 
 test("a failed growth fails that open with the pool's error and does not hold up the next", async () => {
   const host = memoryHost(new Map());
-  const quota = new DOMException("The pool could not grow.", "QuotaExceededError");
+  const quota = new DOMException(
+    "The pool could not grow.",
+    "QuotaExceededError"
+  );
   let full = true;
   const provider = createSqliteWasmProvider(
     {
@@ -241,14 +281,16 @@ test("a failed growth fails that open with the pool's error and does not hold up
         reserveMinimumCapacity: async (minimum: number) => {
           if (full) throw quota;
           return minimum;
-        },
-      },
+        }
+      }
     },
-    { prefix: "/actor" },
+    { prefix: "/actor" }
   );
   await expect(provider.open("root")).rejects.toBe(quota);
   full = false;
-  await expect(provider.open("root")).resolves.toBeInstanceOf(SqliteWasmDatabase);
+  await expect(provider.open("root")).resolves.toBeInstanceOf(
+    SqliteWasmDatabase
+  );
   provider.close();
 });
 
@@ -256,14 +298,14 @@ test("actor storage copies and deletes every database under its prefix", async (
   const files = new Map<string, Uint8Array>([
     ["/source.root.sqlite", new Uint8Array([1])],
     ["/source.facets.sqlite", new Uint8Array([2])],
-    ["/destination.old.sqlite", new Uint8Array([3])],
+    ["/destination.old.sqlite", new Uint8Array([3])]
   ]);
   const host = {
     capi: {
       SQLITE_LIMIT_LENGTH: 0,
       sqlite3_complete: () => 1 as const,
       sqlite3_get_autocommit: () => 1,
-      sqlite3_limit: () => 1,
+      sqlite3_limit: () => 1
     },
     pool: {
       OpfsSAHPoolDb: FakeDatabase,
@@ -278,8 +320,8 @@ test("actor storage copies and deletes every database under its prefix", async (
       },
       getFileNames: () => [...files.keys()],
       unlink: (name: string) => files.delete(name),
-      reserveMinimumCapacity: async (minimum: number) => minimum,
-    },
+      reserveMinimumCapacity: async (minimum: number) => minimum
+    }
   } satisfies SqliteWasmHost;
 
   const source = new SqliteWasmActorStorage(host, "/source");
@@ -290,24 +332,27 @@ test("actor storage copies and deletes every database under its prefix", async (
     ["/source.root.sqlite", new Uint8Array([1])],
     ["/source.facets.sqlite", new Uint8Array([2])],
     ["/destination.root.sqlite", new Uint8Array([1])],
-    ["/destination.facets.sqlite", new Uint8Array([2])],
+    ["/destination.facets.sqlite", new Uint8Array([2])]
   ]);
 
   destination.deleteAll();
-  expect([...files.keys()]).toEqual(["/source.root.sqlite", "/source.facets.sqlite"]);
+  expect([...files.keys()]).toEqual([
+    "/source.root.sqlite",
+    "/source.facets.sqlite"
+  ]);
 });
 
 test("actor storage preserves the destination when the source cannot be exported", async () => {
   const files = new Map<string, Uint8Array>([
     ["/source.root.sqlite", new Uint8Array([1])],
-    ["/destination.root.sqlite", new Uint8Array([2])],
+    ["/destination.root.sqlite", new Uint8Array([2])]
   ]);
   const host = {
     capi: {
       SQLITE_LIMIT_LENGTH: 0,
       sqlite3_complete: () => 1 as const,
       sqlite3_get_autocommit: () => 1,
-      sqlite3_limit: () => 1,
+      sqlite3_limit: () => 1
     },
     pool: {
       OpfsSAHPoolDb: FakeDatabase,
@@ -320,74 +365,94 @@ test("actor storage preserves the destination when the source cannot be exported
       },
       getFileNames: () => [...files.keys()],
       unlink: (name: string) => files.delete(name),
-      reserveMinimumCapacity: async (minimum: number) => minimum,
-    },
+      reserveMinimumCapacity: async (minimum: number) => minimum
+    }
   } satisfies SqliteWasmHost;
 
   const source = new SqliteWasmActorStorage(host, "/source");
   const destination = new SqliteWasmActorStorage(host, "/destination");
-  await expect(destination.copyFrom(source)).rejects.toThrow("source export failed");
+  await expect(destination.copyFrom(source)).rejects.toThrow(
+    "source export failed"
+  );
 
   expect(files.get("/destination.root.sqlite")).toEqual(new Uint8Array([2]));
 });
 
-test.each(["snapshot", "clone"])("failed %s replacement restores every destination database", async (operation) => {
-  const image = new Uint8Array(512);
-  image.set(new TextEncoder().encode("SQLite format 3\0"));
-  const files = new Map<string, Uint8Array>([
-    ["/source.root.sqlite", image],
-    ["/source.facets.sqlite", image],
-    ["/destination.root.sqlite", new Uint8Array([1])],
-    ["/destination.old.sqlite", new Uint8Array([2])],
-    ["/unrelated.root.sqlite", new Uint8Array([3])],
-  ]);
-  const original = new Map(files);
-  const host = memoryHost(files);
-  const importDb = host.pool.importDb;
-  let imports = 0;
-  host.pool.importDb = (name, bytes) => {
-    // The real pool may have removed/truncated its file before import throws.
-    if (++imports === 2) {
-      files.delete(name);
-      throw new Error("injected import failure");
-    }
-    return importDb(name, bytes);
-  };
+test.each(["snapshot", "clone"])(
+  "failed %s replacement restores every destination database",
+  async (operation) => {
+    const image = new Uint8Array(512);
+    image.set(new TextEncoder().encode("SQLite format 3\0"));
+    const files = new Map<string, Uint8Array>([
+      ["/source.root.sqlite", image],
+      ["/source.facets.sqlite", image],
+      ["/destination.root.sqlite", new Uint8Array([1])],
+      ["/destination.old.sqlite", new Uint8Array([2])],
+      ["/unrelated.root.sqlite", new Uint8Array([3])]
+    ]);
+    const original = new Map(files);
+    const host = memoryHost(files);
+    const importDb = host.pool.importDb;
+    let imports = 0;
+    host.pool.importDb = (name, bytes) => {
+      // The real pool may have removed/truncated its file before import throws.
+      if (++imports === 2) {
+        files.delete(name);
+        throw new Error("injected import failure");
+      }
+      return importDb(name, bytes);
+    };
 
-  const restore = operation === "snapshot"
-    ? createSqliteWasmProvider(host, { prefix: "/destination" }).importSnapshot({
-        version: 1,
-        databases: [{ name: "root", image }, { name: "facets", image }],
-      })
-    : new SqliteWasmActorStorage(host, "/destination").copyFrom(
-        new SqliteWasmActorStorage(host, "/source"),
-      );
-  await expect(restore).rejects.toThrow("injected import failure");
-  expect(files).toEqual(original);
-});
+    const restore =
+      operation === "snapshot"
+        ? createSqliteWasmProvider(host, {
+            prefix: "/destination"
+          }).importSnapshot({
+            version: 1,
+            databases: [
+              { name: "root", image },
+              { name: "facets", image }
+            ]
+          })
+        : new SqliteWasmActorStorage(host, "/destination").copyFrom(
+            new SqliteWasmActorStorage(host, "/source")
+          );
+    await expect(restore).rejects.toThrow("injected import failure");
+    expect(files).toEqual(original);
+  }
+);
 
 test("a failed rollback retains the original images for host recovery", async () => {
   const image = new Uint8Array(512);
   image.set(new TextEncoder().encode("SQLite format 3\0"));
   const files = new Map([["/destination.root.sqlite", image]]);
   const host = memoryHost(files);
-  host.pool.importDb = () => { throw new Error("persistent I/O failure"); };
+  host.pool.importDb = () => {
+    throw new Error("persistent I/O failure");
+  };
   const provider = createSqliteWasmProvider(host, { prefix: "/destination" });
-  const error = await provider.importSnapshot({ version: 1, databases: [{ name: "root", image }] })
+  const error = await provider
+    .importSnapshot({ version: 1, databases: [{ name: "root", image }] })
     .catch((error: unknown) => error);
   expect(error).toBeInstanceOf(SqliteWasmRestoreError);
-  if (!(error instanceof SqliteWasmRestoreError)) throw new Error("Expected recovery images");
+  if (!(error instanceof SqliteWasmRestoreError))
+    throw new Error("Expected recovery images");
   expect(error.errors).toHaveLength(2);
   const recoveryHost = memoryHost(new Map());
-  const recovery = createSqliteWasmProvider(recoveryHost, { prefix: "/recovery" });
+  const recovery = createSqliteWasmProvider(recoveryHost, {
+    prefix: "/recovery"
+  });
   await recovery.importSnapshot(error.recoverySnapshot);
-  expect(await recovery.exportSnapshot()).toEqual({ version: 1, databases: [{ name: "root", image }] });
+  expect(await recovery.exportSnapshot()).toEqual({
+    version: 1,
+    databases: [{ name: "root", image }]
+  });
 });
 
 test("rollback does not rewrite files that replacement never touched", async () => {
   const files = new Map([
     ["/destination.root.sqlite", new Uint8Array([1])],
-    ["/destination.facets.sqlite", new Uint8Array([2])],
+    ["/destination.facets.sqlite", new Uint8Array([2])]
   ]);
   const host = memoryHost(files);
   host.pool.unlink = (name) => {
@@ -399,9 +464,12 @@ test("rollback does not rewrite files that replacement never touched", async () 
     attempted.push(name);
     throw new Error("rollback I/O failure");
   };
-  await expect(createSqliteWasmProvider(host, { prefix: "/destination" }).importSnapshot({
-    version: 1, databases: [],
-  })).rejects.toBeInstanceOf(SqliteWasmRestoreError);
+  await expect(
+    createSqliteWasmProvider(host, { prefix: "/destination" }).importSnapshot({
+      version: 1,
+      databases: []
+    })
+  ).rejects.toBeInstanceOf(SqliteWasmRestoreError);
   expect(attempted).toEqual(["/destination.root.sqlite"]);
   expect(files.get("/destination.facets.sqlite")).toEqual(new Uint8Array([2]));
 });
@@ -417,8 +485,11 @@ test("snapshot import copies Buffer inputs before exporting existing storage", a
     image.fill(0);
     return exportFile(name);
   };
-  await createSqliteWasmProvider(host, { prefix: "/destination" }).importSnapshot({
-    version: 1, databases: [{ name: "root", image }],
+  await createSqliteWasmProvider(host, {
+    prefix: "/destination"
+  }).importSnapshot({
+    version: 1,
+    databases: [{ name: "root", image }]
   });
   expect(files.get("/destination.root.sqlite")).toEqual(expected);
 });
@@ -431,10 +502,15 @@ test("a pool is installed only after its previous owner has released every file"
     createSyncAccessHandle: async () => {
       if (held === 0) return { close: () => {} };
       held -= 1;
-      throw new DOMException("held by a terminated worker", "NoModificationAllowedError");
-    },
+      throw new DOMException(
+        "held by a terminated worker",
+        "NoModificationAllowedError"
+      );
+    }
   };
-  const root = opfsDirectory({ ".pool": opfsDirectory({ ".opaque": opfsDirectory({ slot: file }) }) });
+  const root = opfsDirectory({
+    ".pool": opfsDirectory({ ".opaque": opfsDirectory({ slot: file }) })
+  });
   vi.stubGlobal("navigator", { storage: { getDirectory: async () => root } });
   const heldAtInstall: number[] = [];
   try {
@@ -445,9 +521,9 @@ test("a pool is installed only after its previous owner has released every file"
         installOpfsSAHPoolVfs: async () => {
           heldAtInstall.push(held);
           throw new Error("installed");
-        },
+        }
       },
-      { name: "pool" },
+      { name: "pool" }
     );
     await expect(installing).rejects.toThrow("installed");
   } finally {
@@ -458,7 +534,9 @@ test("a pool is installed only after its previous owner has released every file"
 
 test("concurrent installs of one pool share a single install", async () => {
   // Otherwise the second call's wait would see the first call's handles as held.
-  vi.stubGlobal("navigator", { storage: { getDirectory: async () => opfsDirectory({}) } });
+  vi.stubGlobal("navigator", {
+    storage: { getDirectory: async () => opfsDirectory({}) }
+  });
   let installs = 0;
   const sqlite3 = {
     capi: { ...memoryHost(new Map()).capi, sqlite3_vfs_find: () => 0 },
@@ -466,12 +544,12 @@ test("concurrent installs of one pool share a single install", async () => {
     installOpfsSAHPoolVfs: async () => {
       installs += 1;
       return memoryHost(new Map()).pool;
-    },
+    }
   };
   try {
     const [first, second] = await Promise.all([
       installSqliteWasmHost(sqlite3, { name: "pool" }),
-      installSqliteWasmHost(sqlite3, { name: "pool" }),
+      installSqliteWasmHost(sqlite3, { name: "pool" })
     ]);
     expect(second).toBe(first);
   } finally {
@@ -490,7 +568,7 @@ function opfsDirectory(entries: Record<string, unknown>) {
     },
     values: async function* () {
       yield* Object.values(entries);
-    },
+    }
   };
 }
 
@@ -500,7 +578,7 @@ function memoryHost(files: Map<string, Uint8Array>): SqliteWasmHost {
       SQLITE_LIMIT_LENGTH: 0,
       sqlite3_complete: () => 1,
       sqlite3_get_autocommit: () => 1,
-      sqlite3_limit: () => 1,
+      sqlite3_limit: () => 1
     },
     pool: {
       OpfsSAHPoolDb: FakeDatabase,
@@ -515,7 +593,141 @@ function memoryHost(files: Map<string, Uint8Array>): SqliteWasmHost {
         return 0;
       },
       unlink: (name) => files.delete(name),
-      reserveMinimumCapacity: async (minimum) => minimum,
-    },
+      reserveMinimumCapacity: async (minimum) => minimum
+    }
   };
 }
+
+test("whole-pool snapshots cover every prefix and replace larger/orphan files", async () => {
+  const sqlite3 = await sqlite3InitModule();
+  const database = new sqlite3.oo1.DB();
+  database.exec(
+    "CREATE TABLE state(value TEXT); INSERT INTO state VALUES ('before')"
+  );
+  const image = sqlite3.capi.sqlite3_js_db_export(database);
+  database.close();
+  const files = new Map([
+    ["/actor.root.sqlite", image],
+    ["/facet-1.root.sqlite", image]
+  ]);
+  const { pool } = memoryHost(files);
+  const snapshot = await exportSqliteWasmPoolSnapshot(sqlite3, pool);
+  expect(snapshot.files.map(({ name }) => name)).toEqual([
+    "/actor.root.sqlite",
+    "/facet-1.root.sqlite"
+  ]);
+  files.set("/orphan.root.sqlite", image);
+  files.set("/actor.root.sqlite", new Uint8Array(image.byteLength * 2));
+  await importSqliteWasmPoolSnapshot(sqlite3, pool, snapshot);
+  expect(await exportSqliteWasmPoolSnapshot(sqlite3, pool)).toEqual(snapshot);
+});
+
+test("whole-pool preflight refuses native filename/image failures before mutation", async () => {
+  const sqlite3 = await sqlite3InitModule();
+  const database = new sqlite3.oo1.DB();
+  database.exec("CREATE TABLE state(value TEXT)");
+  const image = sqlite3.capi.sqlite3_js_db_export(database);
+  database.close();
+  const files = new Map([["/actor.root.sqlite", image]]);
+  const original = new Map(files);
+  const { pool } = memoryHost(files);
+  const trailing = new Uint8Array(image.byteLength + 1);
+  trailing.set(image);
+  const corrupt = new Uint8Array(image);
+  corrupt.fill(255, 100);
+  const newer = new Uint8Array(image);
+  new DataView(newer.buffer).setInt32(60, 0x7fffffff);
+  for (const invalid of [
+    { name: `/${"é".repeat(255)}`, image },
+    { name: "/bad\0name.sqlite", image },
+    { name: "/actor.root.sqlite", image: trailing },
+    { name: "/actor.root.sqlite", image: corrupt },
+    { name: "/actor.root.sqlite", image: newer }
+  ]) {
+    await expect(
+      importSqliteWasmPoolSnapshot(sqlite3, pool, {
+        version: 1,
+        files: [{ name: "/new.root.sqlite", image }, invalid]
+      })
+    ).rejects.toThrow();
+    expect(files).toEqual(original);
+  }
+  expect(() =>
+    validateSqliteWasmPoolSnapshot(sqlite3, {
+      version: 1,
+      files: [
+        { name: "/same.sqlite", image },
+        { name: "/same.sqlite", image }
+      ]
+    })
+  ).toThrow("Duplicate");
+});
+
+test("whole-pool failed replacement rolls back and preserves recoverable originals", async () => {
+  const sqlite3 = await sqlite3InitModule();
+  const database = new sqlite3.oo1.DB();
+  database.exec("CREATE TABLE state(value TEXT)");
+  const image = sqlite3.capi.sqlite3_js_db_export(database);
+  database.close();
+  const files = new Map([
+    ["/actor.root.sqlite", image],
+    ["/facet-1.root.sqlite", image]
+  ]);
+  const original = new Map(files);
+  const { pool } = memoryHost(files);
+  const importDb = pool.importDb;
+  let calls = 0;
+  pool.importDb = (name, bytes) => {
+    if (++calls === 2) throw new Error("native import failed");
+    return importDb(name, bytes);
+  };
+  const snapshot = {
+    version: 1,
+    files: [
+      { name: "/actor.root.sqlite", image },
+      { name: "/facet-2.root.sqlite", image }
+    ]
+  } as const;
+  await expect(
+    importSqliteWasmPoolSnapshot(sqlite3, pool, snapshot)
+  ).rejects.toThrow("native import failed");
+  expect(files).toEqual(original);
+  pool.importDb = () => {
+    throw new Error("persistent I/O failure");
+  };
+  const error = await importSqliteWasmPoolSnapshot(
+    sqlite3,
+    pool,
+    snapshot
+  ).catch((error: unknown) => error);
+  expect(error).toBeInstanceOf(SqliteWasmPoolRestoreError);
+  if (!(error instanceof SqliteWasmPoolRestoreError))
+    throw new Error("missing recovery images");
+  expect(error.recoverySnapshot.files).toEqual([
+    { name: "/actor.root.sqlite", image },
+    { name: "/facet-1.root.sqlite", image }
+  ]);
+});
+
+test("whole-pool export is a rescue path for a newer storage version and refuses open handles", async () => {
+  const sqlite3 = await sqlite3InitModule();
+  const database = new sqlite3.oo1.DB();
+  database.exec(
+    "CREATE TABLE state(value TEXT); PRAGMA user_version = 2147483647"
+  );
+  const image = sqlite3.capi.sqlite3_js_db_export(database);
+  database.close();
+  const files = new Map([["/actor.root.sqlite", image]]);
+  const host = memoryHost(files);
+  expect(await exportSqliteWasmPoolSnapshot(sqlite3, host.pool)).toEqual({
+    version: 1,
+    files: [{ name: "/actor.root.sqlite", image }]
+  });
+  const open = await createSqliteWasmProvider(host, { prefix: "/actor" }).open(
+    "root"
+  );
+  await expect(
+    exportSqliteWasmPoolSnapshot(sqlite3, host.pool)
+  ).rejects.toThrow("handles are open");
+  open.close();
+});

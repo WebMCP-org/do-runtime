@@ -3,10 +3,7 @@ import type { ZodType } from "zod";
 import type { ToolSet } from "ai";
 import type { JSONSchema7 } from "json-schema";
 import { sanitizeToolName, toPascalCase, escapeJsDoc } from "./utils";
-import {
-  jsonSchemaToTypeString,
-  type ConversionContext
-} from "./json-schema-types";
+import { jsonSchemaToType } from "./json-schema-types";
 
 export interface ToolDescriptor {
   description?: string;
@@ -148,28 +145,14 @@ function safeSchemaToTs(schema: unknown, typeName: string): string {
       const wrapped = asSchema(schema as ZodType);
       const jsonSchema = wrapped.jsonSchema as JSONSchema7;
       if (jsonSchema) {
-        const ctx: ConversionContext = {
-          root: jsonSchema,
-          depth: 0,
-          seen: new Set(),
-          maxDepth: 20
-        };
-        const typeBody = jsonSchemaToTypeString(jsonSchema, "", ctx);
-        return `type ${typeName} = ${typeBody}`;
+        return jsonSchemaToType(jsonSchema, typeName);
       }
     }
 
     if (isJsonSchemaWrapper(schema)) {
       const jsonSchema = extractJsonSchema(schema);
       if (jsonSchema) {
-        const ctx: ConversionContext = {
-          root: jsonSchema,
-          depth: 0,
-          seen: new Set(),
-          maxDepth: 20
-        };
-        const typeBody = jsonSchemaToTypeString(jsonSchema, "", ctx);
-        return `type ${typeName} = ${typeBody}`;
+        return jsonSchemaToType(jsonSchema, typeName);
       }
     }
 

@@ -29,6 +29,7 @@
     "docs/assets/browser-agent-runtime.png",
     "docs/assets/extension-agent-runtime.svg",
     "docs/migrations.md",
+    "docs/browser-hosting.md",
     "CHANGELOG.md",
     "LICENSE",
     "LICENSE.workerd",
@@ -48,9 +49,21 @@
       "types": "./dist/src/browser.d.ts",
       "import": "./dist/browser.js"
     },
+    "./browser/chrome-port-websocket": {
+      "types": "./dist/src/browser/chrome-port-websocket.d.ts",
+      "import": "./dist/browser/chrome-port-websocket.js"
+    },
     "./browser/alarm-coordinator": {
       "types": "./dist/src/browser/alarm-coordinator.d.ts",
       "import": "./dist/browser/alarm-coordinator.js"
+    },
+    "./browser/worker-supervisor": {
+      "types": "./dist/src/browser/worker-supervisor.d.ts",
+      "import": "./dist/browser/worker-supervisor.js"
+    },
+    "./browser/actor-tree": {
+      "types": "./dist/src/browser/actor-tree.d.ts",
+      "import": "./dist/browser/actor-tree.js"
     },
     "./browser/message-port-websocket": {
       "types": "./dist/src/browser/message-port-websocket.d.ts",

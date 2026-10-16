@@ -1,3 +1,5 @@
+import type { DurableObjectState } from "../../src/api/actor-state";
+import { BrowserActorTree, type BrowserFacetScope } from "../../src/browser/actor-tree";
 /**
  * One worker, one actor TREE. A root probe and every facet under it are
  * containers in this module.
@@ -74,19 +76,14 @@ import {
   asLoopbackDurableObjectClass,
   LoopbackDurableObjectClass,
 } from "../../src/api/export-loopback";
-import {
-  SqliteWasmActorStorage,
-  type SqliteWasmHost,
-} from "../../backends/sqlite-wasm";
+import { SqliteWasmActorStorage, type SqliteWasmHost } from "../../backends/sqlite-wasm";
 import { Probe } from "../fixtures/probe";
 import {
   installWebSocketUpgradeGlobals,
   upgradeWebSocket,
   type UpgradeWebSocket,
 } from "../../src/browser";
-import {
-  webSocketUpgradeRequest,
-} from "../websocket-upgrade";
+import { webSocketUpgradeRequest } from "../websocket-upgrade";
 import type { ActorBoot, ActorRpc, SupervisorRpc } from "./protocol";
 import { installPool, timer, UNIQUE_KEY } from "./substrate";
 
@@ -339,161 +336,27 @@ function classNameFor(isolateName: string, exportName: string): string {
 // =======================================================================================
 // Placement
 
-type Placement = {
-  readonly container: ActorContainer;
-  readonly storage: SqliteWasmActorStorage;
-  readonly stub: object;
-};
-
-/**
- * One host for the whole actor tree, as `FacetHost`'s contract requires: every id
- * it is handed is an id in the root's index, so it has to be able to place and
- * remove any facet of any depth.
- *
- * Modelled on `conformance/node/host.ts`'s `NodeFacetHost`, which is the worked
- * in-process example. What differs is only the substrate: a prefix inside the
- * root's OPFS pool where Node has a directory.
- */
-class BrowserFacetHost implements FacetHost {
-  readonly #placements = new Map<FacetId, Placement>();
-  #pool: SqliteWasmHost | undefined;
-  #tree: FacetTree | undefined;
-  #env: unknown;
-
-  /** Called by the root placement, which is the only thing that knows the tree. */
-  attach(lane: SqliteWasmHost, tree: FacetTree, env: unknown): void {
-    this.#pool = lane;
-    this.#tree = tree;
-    this.#env = env;
-  }
-
-  start(request: FacetStartRequest): FacetHandle {
-    const existing = this.#placements.get(request.id);
-    if (existing !== undefined) {
-      return { stub: Promise.resolve(existing.stub), broken: existing.container.onBroken };
-    }
-
-    const tree = this.#tree;
-    if (tree === undefined) throw new Error("Browser lane: no actor tree attached.");
-
-    const started = (async (): Promise<Placement> => {
-      // The gate is filled in below, before anything the class can run: the module's `scheduler`
-      // needs this container and this container needs the module's class, so one of the two has
-      // to be late-bound and the binding is the one with no work in it.
-      const gate: FacetGate = { container: undefined };
-      const { ActorClass, exports } = await facetModule(request.className, gate);
-      const storage = new SqliteWasmActorStorage(this.#requirePool(), prefixFor(request.id));
-      const container = await createActorContainer({
-        // Absent `routedId` means the child inherits its parent's id, which in this tree is the
-        // root actor's name.
-        id: request.routedId ?? requireBoot().actorName,
-        uniqueKey: UNIQUE_KEY,
-        exports,
-        // The root's `env`, as the node lane does: on workerd a facet's env is the env of the
-        // Worker its class came from, and nothing in the suite reads a facet's env at all.
-        env: this.#env,
-        ports: {
-          sql: storage,
-          alarms: FACET_HAS_NO_ALARM_SLOT,
-          facets: this,
-          timer,
-        },
-        // The root's tree, by reference. This is the line cross-worker placement could not
-        // write — `getId` is synchronous — and it is what lets this facet have facets of its own.
-        facet: { depth: request.depth, id: request.id, tree },
-      });
-      gate.container = container;
-      let instance: object;
-      try {
-        instance = await container.start((ctx, env) => new ActorClass(ctx as never, env as never));
-      } catch (exception) {
-        // The container opened this facet's database and took an exclusive sync access handle on
-        // its pool file; the instance does not exist, so nothing will ever reach this placement
-        // through `#placements` to close it. Leaving it would accumulate a dead writer per failed
-        // attempt inside a VFS that expects to own what it opens — see the backend storage's
-        // `close()`, which is the same hazard for the same reason.
-        container.abort(exception);
-        storage.close();
-        throw exception;
-      }
-      const placement: Placement = { container, storage, stub: container.entry(instance) };
-      this.#placements.set(request.id, placement);
-      return placement;
-    })();
-
-    // `broken` carries a RUNNING facet breaking and nothing else. A placement that never completed
-    // is a start that failed, and it reaches the caller through `stub` — which is what workerd
-    // does, measured: a facet whose constructor throws does not break its parent.
-    const { promise: broken, reject } = Promise.withResolvers<never>();
-    void broken.catch(() => {});
-    void started.then(
-      ({ container }) => {
-        void container.onBroken.catch(reject);
-      },
-      () => {
-        // Deliberately nothing: `stub` below is the rejection's route home.
-      },
-    );
-
-    return { stub: started.then((placement) => placement.stub), broken };
-  }
-
-  /** Kills the instance; the storage survives, which is what the §1.10 abort row measures. */
-  abort(id: FacetId, reason?: string): void {
-    const placement = this.#placements.get(id);
-    if (placement === undefined) return;
-    this.#placements.delete(id);
-    placement.container.abort(new Error(reason ?? "Facet placement closed."));
-    // Where the node lane drops a connection the GC will collect, this drops an exclusive sync
-    // access handle on a pool file — see `SqliteWasmActorStorage.close()`.
-    placement.storage.close();
-  }
-
-  async deleteStorage(id: FacetId, subtree: readonly FacetId[]): Promise<void> {
-    for (const target of [...subtree, id]) {
-      // Read before the abort removes the placement. A facet that was never placed has no
-      // placement and no files, and `unlink` on an empty prefix removes nothing — which is not
-      // the same as declining to remove it.
-      const storage = this.#storageFor(target);
-      this.abort(target);
-      storage.deleteAll();
-    }
-  }
-
-  async copyStorage(src: FacetId, dst: FacetId): Promise<void> {
-    await this.#storageFor(dst).copyFrom(this.#storageFor(src));
-  }
-
-  /** Every placement in this tree, for `respawn`. */
-  closeAll(): void {
-    for (const id of [...this.#placements.keys()]) this.abort(id);
-  }
-
-  #storageFor(id: FacetId): SqliteWasmActorStorage {
-    return (
-      this.#placements.get(id)?.storage ??
-      new SqliteWasmActorStorage(this.#requirePool(), prefixFor(id))
-    );
-  }
-
-  #requirePool(): SqliteWasmHost {
-    if (this.#pool === undefined) throw new Error("Browser lane: no pool attached.");
-    return this.#pool;
-  }
-}
-
-/** One prefix per facet inside the tree's one pool, where the node lane has one directory. */
-function prefixFor(id: FacetId): string {
-  return `/facet-${id}`;
-}
-
-const facets = new BrowserFacetHost();
+let facetPool: SqliteWasmHost | undefined;
+let facetEnv: unknown;
+const facets = new BrowserActorTree({
+  storage(id) {
+    if (!facetPool) throw new Error("Facet storage reached before root placement");
+    return new SqliteWasmActorStorage(facetPool, `/facet-${id}`);
+  },
+  async load(request, scope) {
+    const { ActorClass, exports } = await facetModule(request.className, scope);
+    return {
+      construct: (ctx: DurableObjectState, env: unknown) => new ActorClass(ctx, env),
+      env: facetEnv,
+      exports,
+    };
+  },
+});
 
 // =======================================================================================
 // The facet class: one evaluation per placement
 
 /** Filled in between evaluating the module and starting the instance. */
-type FacetGate = { container: ActorContainer | undefined };
 
 type FacetClass = {
   readonly ActorClass: new (ctx: unknown, env: unknown) => object;
@@ -546,9 +409,11 @@ const FACET_SCOPE_GLOBAL = "__doRuntimeFacetScopes";
 
 const facetScopes: Record<string, ActorScopeBindings> = {};
 (globalThis as Record<string, unknown>)[FACET_SCOPE_GLOBAL] = facetScopes;
-let facetScopeCounter = 0;
 
-async function facetModule(className: string, gate: FacetGate): Promise<FacetClass> {
+async function facetModule(
+  className: string,
+  scope: BrowserFacetScope<undefined>,
+): Promise<FacetClass> {
   const hash = className.lastIndexOf("#");
   if (hash < 0) throw new Error(`Browser lane cannot resolve facet class ${className}.`);
   const isolateName = className.slice(0, hash);
@@ -557,17 +422,8 @@ async function facetModule(className: string, gate: FacetGate): Promise<FacetCla
   const workers: unknown = await import("../../src/api/cloudflare-workers");
   (globalThis as Record<string, unknown>)[CLOUDFLARE_WORKERS_GLOBAL] = workers;
 
-  const key = `s${facetScopeCounter++}`;
-  facetScopes[key] = actorScopeBindings(() => {
-    const container = gate.container;
-    if (container === undefined) {
-      throw new Error(
-        "Browser lane: a facet reached a platform async primitive before its container existed " +
-          "or after it was torn down, so the continuation could not resume gated.",
-      );
-    }
-    return container.globals;
-  });
+  const key = scope.key;
+  facetScopes[key] = scope.globals;
 
   const rewritten =
     `const { ${ACTOR_SCOPE_GLOBALS.join(", ")} } = ` +
@@ -755,7 +611,14 @@ async function place(): Promise<Live> {
     allowExperimentalFeatures: true,
   });
 
-  facets.attach(lane, treeOf(container), env);
+  facetPool = lane;
+  facetEnv = env;
+  facets.attach({
+    id: requireBoot().actorName,
+    uniqueKey: UNIQUE_KEY,
+    tree: treeOf(container),
+    ports: { timer },
+  });
 
   let instance: object;
   try {
@@ -834,9 +697,9 @@ class RootTarget extends RpcTarget implements ActorRpc {
   }
 
   async connect(tags: string[]): Promise<{ id: string; readyState: number }> {
-    const response = (await (await placed()).entry.fetch(
-      webSocketUpgradeRequest("https://probe.invalid/socket", tags),
-    )) as Response;
+    const response = (await (
+      await placed()
+    ).entry.fetch(webSocketUpgradeRequest("https://probe.invalid/socket", tags))) as Response;
     const socket = upgradeWebSocket(response);
     if (socket === undefined) throw new Error("Browser lane: probe fetch did not upgrade.");
     const id = registerClient(socket);

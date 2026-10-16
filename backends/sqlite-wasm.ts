@@ -32,6 +32,7 @@ import {
   requireSqliteLength,
   requireSafeDatabaseName,
   requireValidSqlDatabaseSnapshot,
+  requireSqliteDatabaseImage,
   SQLITE_LENGTH_LIMIT,
   SQL_WRONG_BINDINGS_MESSAGE,
   type SqlDatabase,
@@ -40,7 +41,7 @@ import {
   type SqlDatabaseSnapshotProvider,
   type SqlDatabaseStatement,
   type SqlResult,
-  type SqlValue,
+  type SqlValue
 } from "../src/util/sqlite";
 import { requireImportableRuntimeStorage } from "../src/util/sqlite-migrations";
 
@@ -48,7 +49,9 @@ import { requireImportableRuntimeStorage } from "../src/util/sqlite-migrations";
 export interface SqliteWasmStatement {
   readonly columnCount: number;
   readonly parameterCount: number;
-  bind(bindings: readonly (string | number | bigint | null | Uint8Array)[]): unknown;
+  bind(
+    bindings: readonly (string | number | bigint | null | Uint8Array)[]
+  ): unknown;
   step(): boolean;
   get(index: number): unknown;
   getColumnNames(target?: string[]): string[];
@@ -160,13 +163,16 @@ export interface SqliteWasmModule<Pool extends OpfsSahPool> {
  */
 export function installSqliteWasmHost<Pool extends OpfsSahPool>(
   sqlite3: SqliteWasmModule<Pool>,
-  options: SqliteWasmPoolOptions = {},
+  options: SqliteWasmPoolOptions = {}
 ): Promise<SqliteWasmHost & { readonly pool: Pool }> {
   const name = options.name || "opfs-sahpool";
-  const flights = installing.get(sqlite3) ?? new Map<string, Promise<unknown>>();
+  const flights =
+    installing.get(sqlite3) ?? new Map<string, Promise<unknown>>();
   installing.set(sqlite3, flights);
   // One `sqlite3` instance's install of one pool name always yields that instance's pool type.
-  const current = flights.get(name) as Promise<SqliteWasmHost & { readonly pool: Pool }> | undefined;
+  const current = flights.get(name) as
+    | Promise<SqliteWasmHost & { readonly pool: Pool }>
+    | undefined;
   if (current !== undefined) return current;
   const flight = install(sqlite3, name, options);
   flights.set(name, flight);
@@ -183,7 +189,7 @@ const installing = new WeakMap<object, Map<string, Promise<unknown>>>();
 async function install<Pool extends OpfsSahPool>(
   sqlite3: SqliteWasmModule<Pool>,
   name: string,
-  options: SqliteWasmPoolOptions,
+  options: SqliteWasmPoolOptions
 ): Promise<SqliteWasmHost & { readonly pool: Pool }> {
   const installed = sqlite3.capi.sqlite3_vfs_find(name) !== 0;
   if (!installed) await released(options.directory || `.${name}`);
@@ -214,20 +220,25 @@ async function released(directory: string): Promise<void> {
     if (error instanceof DOMException && error.name === "NotFoundError") return;
     throw error;
   }
-  for (const deadline = Date.now() + POOL_RELEASE_TIMEOUT_MS; ; ) {
+  for (const deadline = Date.now() + POOL_RELEASE_TIMEOUT_MS; ;) {
     try {
       for await (const file of files.values()) {
         if (file.kind === "file") (await file.createSyncAccessHandle()).close();
       }
       return;
     } catch (error) {
-      if (!(error instanceof DOMException && error.name === "NoModificationAllowedError")) {
+      if (
+        !(
+          error instanceof DOMException &&
+          error.name === "NoModificationAllowedError"
+        )
+      ) {
         throw error;
       }
       if (Date.now() > deadline) {
         throw new DOMException(
           `OPFS SAH pool ${directory} is still held by another context.`,
-          "NoModificationAllowedError",
+          "NoModificationAllowedError"
         );
       }
       await new Promise((resolve) => platformSetTimeout(resolve, 20));
@@ -240,15 +251,21 @@ async function released(directory: string): Promise<void> {
  * declarations omit the `$`-prefixed pointer members, so they are read here
  * rather than required of the host's `sqlite3` type.
  */
-type WasmStruct = { installMethod(name: string, func: (...args: number[]) => number): unknown };
+type WasmStruct = {
+  installMethod(name: string, func: (...args: number[]) => number): unknown;
+};
 type SqliteWasmInternals = {
   readonly capi: {
-    readonly sqlite3_vfs: new (pointer: number) => WasmStruct & { $xOpen: number };
+    readonly sqlite3_vfs: new (
+      pointer: number
+    ) => WasmStruct & { $xOpen: number };
     readonly sqlite3_io_methods: new (pointer: number) => WasmStruct;
     sqlite3_vfs_find(name: string): number;
   };
   readonly wasm: {
-    functionEntry(pointer: number): ((...args: number[]) => number) | null | undefined;
+    functionEntry(
+      pointer: number
+    ): ((...args: number[]) => number) | null | undefined;
     peekPtr(pointer: number): number;
     poke32(pointer: number, value: number): unknown;
   };
@@ -270,7 +287,7 @@ type SqliteWasmInternals = {
  */
 function rollBackHotJournals(
   sqlite3: { readonly capi: object; readonly wasm: object },
-  vfsName: string,
+  vfsName: string
 ): void {
   const { capi, wasm } = sqlite3 as unknown as SqliteWasmInternals;
   const pointer = capi.sqlite3_vfs_find(vfsName);
@@ -293,7 +310,7 @@ function rollBackHotJournals(
       (_file, pOut) => {
         wasm.poke32(pOut, 0);
         return 0;
-      },
+      }
     );
     vfs.$xOpen = xOpen;
     return result;
@@ -337,7 +354,8 @@ export class SqliteWasmActorStorage implements SqlDatabaseProvider {
   deleteAll(): void {
     this.close();
     for (const file of this.#ownedFiles()) {
-      if (!this.#host.pool.unlink(file)) throw new Error(`SAH pool did not unlink ${file}`);
+      if (!this.#host.pool.unlink(file))
+        throw new Error(`SAH pool did not unlink ${file}`);
     }
   }
 
@@ -355,21 +373,30 @@ export class SqliteWasmActorStorage implements SqlDatabaseProvider {
     const files = source.#ownedFiles();
     const sidecar = files.find((file) => !file.endsWith(".sqlite"));
     if (sidecar !== undefined) {
-      throw new Error(`Cannot clone actor storage with a SQLite recovery sidecar: ${sidecar}`);
+      throw new Error(
+        `Cannot clone actor storage with a SQLite recovery sidecar: ${sidecar}`
+      );
     }
     // Every export starts in the check's task, before a running source can open a journal.
     const images = await Promise.all(
       files.map(async (file) => {
         const name = file.slice(source.#prefix.length + 1, -".sqlite".length);
         requireSafeDatabaseName(name);
-        return { name, image: new Uint8Array(await source.#host.pool.exportFile(file)) };
-      }),
+        return {
+          name,
+          image: new Uint8Array(await source.#host.pool.exportFile(file))
+        };
+      })
     );
     // Closed in the pool's queue, so an open queued ahead of the copy closes before replacement.
-    await withHeadroom(this.#host.pool, () => images.length, () => {
-      this.close();
-      return replaceDatabases(this.#host.pool, this.#prefix, images);
-    });
+    await withHeadroom(
+      this.#host.pool,
+      () => images.length,
+      () => {
+        this.close();
+        return replaceDatabases(this.#host.pool, this.#prefix, images);
+      }
+    );
   }
 
   #ownedFiles(): string[] {
@@ -381,11 +408,13 @@ export class SqliteWasmActorStorage implements SqlDatabaseProvider {
 
 export function createSqliteWasmProvider(
   host: SqliteWasmHost,
-  options: SqliteWasmProviderOptions,
+  options: SqliteWasmProviderOptions
 ): SqlDatabaseSnapshotProvider {
   const { prefix } = options;
   if (!prefix.startsWith("/")) {
-    throw new Error(`SAH pool names are absolute; prefix must start with "/": ${prefix}`);
+    throw new Error(
+      `SAH pool names are absolute; prefix must start with "/": ${prefix}`
+    );
   }
   const openDatabases = new Set<SqliteWasmDatabase>();
   const ownedFiles = (): string[] =>
@@ -397,12 +426,18 @@ export function createSqliteWasmProvider(
       requireSafeDatabaseName(name);
       const filename = `${prefix}.${name}.sqlite`;
       // Its file if new, and its own journal: a connection is counted only once it is open.
-      return withHeadroom(host.pool, (files) => (files.includes(filename) ? 0 : 1) + 1, () => {
-        let database: SqliteWasmDatabase;
-        database = new SqliteWasmDatabase(host, filename, () => openDatabases.delete(database));
-        openDatabases.add(database);
-        return database;
-      });
+      return withHeadroom(
+        host.pool,
+        (files) => (files.includes(filename) ? 0 : 1) + 1,
+        () => {
+          let database: SqliteWasmDatabase;
+          database = new SqliteWasmDatabase(host, filename, () =>
+            openDatabases.delete(database)
+          );
+          openDatabases.add(database);
+          return database;
+        }
+      );
     },
     close(): void {
       for (const database of [...openDatabases]) database.close();
@@ -418,8 +453,11 @@ export function createSqliteWasmProvider(
           .map(async (file) => {
             const name = file.slice(prefix.length + 1, -".sqlite".length);
             requireSafeDatabaseName(name);
-            return { name, image: new Uint8Array(await host.pool.exportFile(file)) };
-          }),
+            return {
+              name,
+              image: new Uint8Array(await host.pool.exportFile(file))
+            };
+          })
       );
       const snapshot: SqlDatabaseSnapshot = { version: 1, databases };
       requireValidSqlDatabaseSnapshot(snapshot);
@@ -429,12 +467,16 @@ export function createSqliteWasmProvider(
       requireClosed(openDatabases);
       requireValidSqlDatabaseSnapshot(snapshot);
       requireImportableRuntimeStorage(snapshot);
-      await withHeadroom(host.pool, () => snapshot.databases.length, () => {
-        // Again in the queue, where an open queued ahead of this restore has opened.
-        requireClosed(openDatabases);
-        return replaceDatabases(host.pool, prefix, snapshot.databases);
-      });
-    },
+      await withHeadroom(
+        host.pool,
+        () => snapshot.databases.length,
+        () => {
+          // Again in the queue, where an open queued ahead of this restore has opened.
+          requireClosed(openDatabases);
+          return replaceDatabases(host.pool, prefix, snapshot.databases);
+        }
+      );
+    }
   };
 }
 
@@ -484,79 +526,290 @@ const queues = new WeakMap<OpfsSahPool, Promise<unknown>>();
 function withHeadroom<T>(
   pool: OpfsSahPool,
   adding: (files: readonly string[]) => number,
-  run: () => T | Promise<T>,
+  run: () => T | Promise<T>
 ): Promise<T> {
   const step = (queues.get(pool) ?? Promise.resolve()).then(async () => {
     const files = pool.getFileNames();
     const connections = openConnections.get(pool) ?? 0;
-    await pool.reserveMinimumCapacity(files.length + adding(files) + connections);
+    await pool.reserveMinimumCapacity(
+      files.length + adding(files) + connections
+    );
     return run();
   });
-  queues.set(pool, step.catch(() => {}));
+  queues.set(
+    pool,
+    step.catch(() => {})
+  );
   return step;
 }
 
 /** A failed rollback retains the original images so the host can recover to another prefix. */
 export class SqliteWasmRestoreError extends AggregateError {
-  constructor(errors: unknown[], readonly recoverySnapshot: SqlDatabaseSnapshot) {
+  constructor(
+    errors: unknown[],
+    readonly recoverySnapshot: SqlDatabaseSnapshot
+  ) {
     super(
       errors,
-      "SQLite replacement and rollback failed; restore recoverySnapshot to an idle provider.",
+      "SQLite replacement and rollback failed; restore recoverySnapshot to an idle provider."
     );
     this.name = "SqliteWasmRestoreError";
+  }
+}
+
+/** Every database file in an idle SAH pool, including root and facet prefixes. */
+export type SqliteWasmPoolSnapshot = {
+  readonly version: 1;
+  readonly files: readonly {
+    readonly name: string;
+    readonly image: Uint8Array;
+  }[];
+};
+
+/** Structural subset of sqlite-wasm used to validate images in an isolated in-memory database. */
+export interface SqliteWasmImageValidator {
+  readonly oo1: {
+    readonly DB: new () => {
+      readonly pointer?: number;
+      checkRc(code: number): unknown;
+      selectValue(sql: string): unknown;
+      close(): void;
+    };
+  };
+  readonly capi: {
+    readonly SQLITE_DESERIALIZE_READONLY: number;
+    sqlite3_deserialize(
+      database: number,
+      schema: string,
+      memory: number,
+      size: number,
+      capacity: number,
+      flags: number
+    ): number;
+  };
+  readonly wasm: {
+    allocFromTypedArray(image: Uint8Array): number;
+    dealloc(memory: number): void;
+  };
+}
+
+/** Preflight restore, including the runtime storage version, without changing a destination. */
+export function validateSqliteWasmPoolSnapshot(
+  sqlite3: SqliteWasmImageValidator,
+  snapshot: SqliteWasmPoolSnapshot
+): void {
+  validatePoolImages(sqlite3, snapshot);
+  requireImportableRuntimeStorage({
+    version: snapshot.version,
+    databases: snapshot.files
+  });
+}
+
+function validatePoolImages(
+  sqlite3: SqliteWasmImageValidator,
+  snapshot: SqliteWasmPoolSnapshot
+): void {
+  if (snapshot.version !== 1 || !Array.isArray(snapshot.files)) {
+    throw new Error("Unsupported SQLite pool snapshot format.");
+  }
+  const names = new Set<string>();
+  for (const { name, image } of snapshot.files) {
+    // SAH's setAssociatedPath writes the image before rejecting its fixed header field.
+    if (
+      typeof name !== "string" ||
+      !name.startsWith("/") ||
+      name.includes("\0") ||
+      new TextEncoder().encode(name).byteLength >= 511
+    ) {
+      throw new Error(`Invalid SQLite pool filename: ${name}`);
+    }
+    if (names.has(name))
+      throw new Error(`Duplicate SQLite pool filename: ${name}`);
+    names.add(name);
+    requireSqliteDatabaseImage(image, name);
+    const database = new sqlite3.oo1.DB();
+    let memory: number | undefined;
+    try {
+      if (database.pointer === undefined)
+        throw new Error("SQLite validation database is closed.");
+      memory = sqlite3.wasm.allocFromTypedArray(image);
+      database.checkRc(
+        sqlite3.capi.sqlite3_deserialize(
+          database.pointer,
+          "main",
+          memory,
+          image.byteLength,
+          image.byteLength,
+          sqlite3.capi.SQLITE_DESERIALIZE_READONLY
+        )
+      );
+      if (database.selectValue("PRAGMA quick_check") !== "ok") {
+        throw new Error(`Invalid SQLite database: ${name}`);
+      }
+    } finally {
+      database.close();
+      if (memory !== undefined) sqlite3.wasm.dealloc(memory);
+    }
+  }
+}
+
+/** Caller must stop all users of this pool; no actor or storage migration is started. */
+export async function exportSqliteWasmPoolSnapshot(
+  sqlite3: SqliteWasmImageValidator,
+  pool: OpfsSahPool
+): Promise<SqliteWasmPoolSnapshot> {
+  requireIdlePool(pool);
+  const names = pool.getFileNames().sort();
+  requireNoRecoverySidecars(names);
+  const files = await Promise.all(
+    names.map(async (name) => ({
+      name,
+      image: new Uint8Array(await pool.exportFile(name))
+    }))
+  );
+  const snapshot: SqliteWasmPoolSnapshot = { version: 1, files };
+  // Export is also a rescue path for a pool stamped by a newer runtime.
+  validatePoolImages(sqlite3, snapshot);
+  return snapshot;
+}
+
+/**
+ * Replace every idle pool file, reserving native headroom and rolling back a
+ * failed import. Crash-atomic switching across pools remains the host's job.
+ */
+export async function importSqliteWasmPoolSnapshot(
+  sqlite3: SqliteWasmImageValidator,
+  pool: OpfsSahPool,
+  snapshot: SqliteWasmPoolSnapshot
+): Promise<void> {
+  const replacement = snapshot.files.map(({ name, image }) => ({
+    name,
+    image: new Uint8Array(image)
+  }));
+  validateSqliteWasmPoolSnapshot(sqlite3, {
+    version: snapshot.version,
+    files: replacement
+  });
+  requireIdlePool(pool);
+  await withHeadroom(
+    pool,
+    () => replacement.length,
+    async () => {
+      requireIdlePool(pool);
+      const files = pool.getFileNames();
+      requireNoRecoverySidecars(files);
+      await replaceDatabaseFiles(pool, files, replacement);
+    }
+  );
+}
+
+function requireIdlePool(pool: OpfsSahPool): void {
+  if ((openConnections.get(pool) ?? 0) !== 0) {
+    throw new Error(
+      "Cannot snapshot or restore while database handles are open."
+    );
+  }
+}
+
+/** Failed rollback keeps all original pool files available to a recovery host. */
+export class SqliteWasmPoolRestoreError extends AggregateError {
+  constructor(
+    errors: unknown[],
+    readonly recoverySnapshot: SqliteWasmPoolSnapshot
+  ) {
+    super(
+      errors,
+      "SQLite pool replacement and rollback failed; restore recoverySnapshot to an idle pool."
+    );
+    this.name = "SqliteWasmPoolRestoreError";
   }
 }
 
 async function replaceDatabases(
   pool: OpfsSahPool,
   prefix: string,
-  databases: SqlDatabaseSnapshot["databases"],
+  databases: SqlDatabaseSnapshot["databases"]
 ): Promise<void> {
-  const replacement = databases.map(({ name, image }) => ({ name, image: new Uint8Array(image) }));
-  const ownedFiles = () => pool.getFileNames().filter((file) => file.startsWith(`${prefix}.`));
-  const files = ownedFiles();
+  const files = pool
+    .getFileNames()
+    .filter((file) => file.startsWith(`${prefix}.`));
   requireNoRecoverySidecars(files);
-  const original: Array<{ name: string; image: Uint8Array }> = [];
-  for (const file of files) {
-    const name = file.slice(prefix.length + 1, -".sqlite".length);
-    requireSafeDatabaseName(name);
-    original.push({ name, image: new Uint8Array(await pool.exportFile(file)) });
+  for (const file of files)
+    requireSafeDatabaseName(file.slice(prefix.length + 1, -".sqlite".length));
+  try {
+    await replaceDatabaseFiles(
+      pool,
+      files,
+      databases.map(({ name, image }) => ({
+        name: `${prefix}.${name}.sqlite`,
+        image
+      }))
+    );
+  } catch (error) {
+    if (error instanceof SqliteWasmPoolRestoreError) {
+      throw new SqliteWasmRestoreError(error.errors, {
+        version: 1,
+        databases: error.recoverySnapshot.files.map(({ name, image }) => ({
+          name: name.slice(prefix.length + 1, -".sqlite".length),
+          image
+        }))
+      });
+    }
+    throw error;
   }
+}
+
+async function replaceDatabaseFiles(
+  pool: OpfsSahPool,
+  files: readonly string[],
+  replacement: SqliteWasmPoolSnapshot["files"]
+): Promise<void> {
+  const images = replacement.map(({ name, image }) => ({
+    name,
+    image: new Uint8Array(image)
+  }));
+  const original = await Promise.all(
+    files.map(async (name) => ({
+      name,
+      image: new Uint8Array(await pool.exportFile(name))
+    }))
+  );
   const touched = new Set<string>();
   try {
     for (const file of files) {
-      // unlink can remove the pool's mapping before a backing-file write fails.
       touched.add(file);
-      if (!pool.unlink(file)) throw new Error(`SAH pool did not unlink ${file}`);
+      if (!pool.unlink(file))
+        throw new Error(`SAH pool did not unlink ${file}`);
     }
-    for (const { name, image } of replacement) {
-      const file = `${prefix}.${name}.sqlite`;
-      touched.add(file);
-      await pool.importDb(file, image);
+    for (const { name, image } of images) {
+      touched.add(name);
+      await pool.importDb(name, image);
     }
   } catch (error) {
-    // ponytail: rollback lives in memory; use a fresh prefix and a host-owned switch
-    // when replacement must survive the worker/process dying during import.
+    // Rollback is in memory; a host needs an external backup across worker death.
     const errors = [error];
-    for (const file of ownedFiles()) {
+    for (const file of pool.getFileNames()) {
       if (!touched.has(file)) continue;
       try {
-        if (!pool.unlink(file)) throw new Error(`SAH pool did not unlink ${file}`);
+        if (!pool.unlink(file))
+          throw new Error(`SAH pool did not unlink ${file}`);
       } catch (rollbackError) {
         errors.push(rollbackError);
       }
     }
     for (const { name, image } of original) {
-      const file = `${prefix}.${name}.sqlite`;
-      if (!touched.has(file)) continue;
+      if (!touched.has(name)) continue;
       try {
-        await pool.importDb(file, new Uint8Array(image));
+        await pool.importDb(name, new Uint8Array(image));
       } catch (rollbackError) {
         errors.push(rollbackError);
       }
     }
     if (errors.length > 1) {
-      throw new SqliteWasmRestoreError(errors, { version: 1, databases: original });
+      throw new SqliteWasmPoolRestoreError(errors, {
+        version: 1,
+        files: original
+      });
     }
     throw error;
   }
@@ -571,7 +824,7 @@ export class SqliteWasmDatabase implements SqlDatabase {
   constructor(
     host: SqliteWasmHost,
     filename: string,
-    private readonly onClose: () => void = () => {},
+    private readonly onClose: () => void = () => {}
   ) {
     this.#host = host;
     this.#filename = filename;
@@ -582,7 +835,11 @@ export class SqliteWasmDatabase implements SqlDatabase {
 
   prepare(sql: string): SqlDatabaseStatement {
     const source = firstCompleteStatement(this.#host.capi, sql);
-    return new WasmSqlStatement(this.#database, this.#database.prepare(source), source);
+    return new WasmSqlStatement(
+      this.#database,
+      this.#database.prepare(source),
+      source
+    );
   }
 
   exec(sql: string, params: readonly SqlValue[]): SqlResult {
@@ -606,7 +863,8 @@ export class SqliteWasmDatabase implements SqlDatabase {
    */
   get inTransaction(): boolean {
     const pointer = this.#database.pointer;
-    if (pointer === undefined) throw new Error("The database handle is closed.");
+    if (pointer === undefined)
+      throw new Error("The database handle is closed.");
     return this.#host.capi.sqlite3_get_autocommit(pointer) === 0;
   }
 
@@ -626,7 +884,10 @@ export class SqliteWasmDatabase implements SqlDatabase {
     if (this.#closed) return;
     this.#database.close();
     this.#closed = true;
-    openConnections.set(this.#host.pool, (openConnections.get(this.#host.pool) ?? 1) - 1);
+    openConnections.set(
+      this.#host.pool,
+      (openConnections.get(this.#host.pool) ?? 1) - 1
+    );
     this.onClose();
   }
 
@@ -635,11 +896,12 @@ export class SqliteWasmDatabase implements SqlDatabase {
     const database = new this.#host.pool.OpfsSAHPoolDb(this.#filename);
     try {
       const pointer = database.pointer;
-      if (pointer === undefined) throw new Error("The database handle is closed.");
+      if (pointer === undefined)
+        throw new Error("The database handle is closed.");
       this.#host.capi.sqlite3_limit(
         pointer,
         this.#host.capi.SQLITE_LIMIT_LENGTH,
-        SQLITE_LENGTH_LIMIT,
+        SQLITE_LENGTH_LIMIT
       );
       return database;
     } catch (error) {
@@ -660,14 +922,18 @@ export class SqliteWasmDatabase implements SqlDatabase {
 
 function requireClosed(openDatabases: ReadonlySet<SqliteWasmDatabase>): void {
   if (openDatabases.size > 0) {
-    throw new Error("Cannot snapshot or restore while database handles are open.");
+    throw new Error(
+      "Cannot snapshot or restore while database handles are open."
+    );
   }
 }
 
 function requireNoRecoverySidecars(files: readonly string[]): void {
   const sidecar = files.find((file) => !file.endsWith(".sqlite"));
   if (sidecar !== undefined) {
-    throw new Error(`Cannot export a snapshot with a SQLite recovery sidecar: ${sidecar}`);
+    throw new Error(
+      `Cannot export a snapshot with a SQLite recovery sidecar: ${sidecar}`
+    );
   }
 }
 
@@ -679,7 +945,7 @@ class WasmSqlStatement implements SqlDatabaseStatement {
   constructor(
     database: SqliteWasmDatabaseHandle,
     statement: SqliteWasmStatement,
-    readonly sql: string,
+    readonly sql: string
   ) {
     this.#database = database;
     this.#statement = statement;
@@ -690,7 +956,8 @@ class WasmSqlStatement implements SqlDatabaseStatement {
   }
 
   execute(params: readonly SqlValue[]): SqlResult {
-    if (params.length !== this.parameterCount) throw new Error(SQL_WRONG_BINDINGS_MESSAGE);
+    if (params.length !== this.parameterCount)
+      throw new Error(SQL_WRONG_BINDINGS_MESSAGE);
     params.forEach(requireSqliteLength);
     if (params.length > 0) this.#statement.bind(params);
 
@@ -701,7 +968,11 @@ class WasmSqlStatement implements SqlDatabaseStatement {
       const before = this.#database.changes(true);
       this.#statement.step();
       const wrote = this.#database.changes(true) !== before;
-      return { columnNames: [], rawRows: [], rowsWritten: wrote ? this.#database.changes(false) : 0 };
+      return {
+        columnNames: [],
+        rawRows: [],
+        rowsWritten: wrote ? this.#database.changes(false) : 0
+      };
     }
 
     const changesBefore = this.#database.changes(true);
@@ -720,7 +991,7 @@ class WasmSqlStatement implements SqlDatabaseStatement {
     return {
       columnNames,
       rawRows,
-      rowsWritten: wrote ? this.#database.changes(false) : 0,
+      rowsWritten: wrote ? this.#database.changes(false) : 0
     };
   }
 

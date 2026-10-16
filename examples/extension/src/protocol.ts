@@ -9,12 +9,6 @@
  * see this example's README.
  */
 
-/** The `MessagePort` boot message, sent raw because capnweb cannot carry a port. */
-export type WorkerBoot = {
-  readonly port: MessagePort;
-  readonly sockets: MessagePort;
-};
-
 /** The one Chrome watchdog mirroring the scheduler's earliest durable wake. */
 export const WAKE_ALARM = "do-runtime-wake";
 
@@ -132,6 +126,7 @@ export type HostStatus = {
  * `ArrayBuffer` view survives the hop.
  */
 export interface HostRpc {
+  prepareHibernation(): Promise<null>;
   directStubIncrement(): Promise<number>;
   email(subject: string, body: string): Promise<void>;
   evict(): Promise<void>;
@@ -162,7 +157,7 @@ export interface HostRpc {
 
 /** The operation names the popup, the page hook, and the e2e driver all use. */
 export type HostOp =
-  | keyof HostRpc
+  | Exclude<keyof HostRpc, "prepareHibernation">
   | "sdkIncrement"
   | "sdkSetLegacyState"
   | "sdkSetState"

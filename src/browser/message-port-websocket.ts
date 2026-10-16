@@ -9,6 +9,14 @@ export type MessagePortWebSocketWireMessage =
 
 type MessagePortWebSocketReadyMessage = { readonly type: "open" };
 
+/** The socket uses only this part of a MessagePort; JSON transports can bind it directly. */
+export interface MessagePortWebSocketPort {
+  postMessage(message: MessagePortWebSocketWireMessage): void;
+  addEventListener(type: "message", listener: (event: MessageEvent<unknown>) => void): void;
+  start(): void;
+  close(): void;
+}
+
 /** One WebSocket-shaped endpoint backed by one dedicated MessagePort. */
 export class MessagePortWebSocket extends EventTarget implements RawWebSocket {
   static readonly CONNECTING = 0;
@@ -36,7 +44,7 @@ export class MessagePortWebSocket extends EventTarget implements RawWebSocket {
 
   constructor(
     readonly url: string,
-    private readonly port: MessagePort,
+    private readonly port: MessagePortWebSocketPort,
     autoOpen = true,
   ) {
     super();

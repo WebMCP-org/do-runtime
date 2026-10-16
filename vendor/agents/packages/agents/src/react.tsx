@@ -720,13 +720,12 @@ export function useAgent<State>(options: UseAgentOptions<unknown>): Omit<
   // Store identity in React state for reactivity. Seed with the
   // leaf's address — what the server will echo back in
   // `cf_agent_identity`.
-  // `destination` records which socket destination the identity came from,
-  // so an address change can stop exposing the previous agent's identity
-  // before the new socket reports its own.
+  // Identity belongs to the socket that received it, even when replacement
+  // credentials or a return to the same destination reuse an address.
   const [identity, setIdentity] = useState(() => ({
     name: leafName,
     agent: camelCaseToKebabCase(leafAgent),
-    identified: false,
+    socket: null as PartySocket | null,
     destination: null as string | null
   }));
 
@@ -867,6 +866,15 @@ export function useAgent<State>(options: UseAgentOptions<unknown>): Omit<
     newAgent: string,
     identifiedSocket: PartySocket | null
   ) => {
+    // Event handlers use the latest options while PartySocket replaces its
+    // socket in an effect. An old socket cannot identify the new address.
+    if (
+      identifiedSocket !== socketRef.current ||
+      !identifiedSocket ||
+      socketDestinationKey(identifiedSocket.partySocketOptions) !== destination
+    ) {
+      return;
+    }
     const oldName = previousIdentityRef.current.name;
     const oldAgent = previousIdentityRef.current.agent;
 
@@ -878,20 +886,18 @@ export function useAgent<State>(options: UseAgentOptions<unknown>): Omit<
     }
 
     // Update reactive state (triggers re-render)
-    const identifiedDestination = identifiedSocket
-      ? socketDestinationKey(identifiedSocket.partySocketOptions)
-      : null;
+    const identifiedDestination = socketDestinationKey(
+      identifiedSocket.partySocketOptions
+    );
     setIdentity({
       name: newName,
       agent: newAgent,
-      identified: true,
+      socket: identifiedSocket,
       destination: identifiedDestination
     });
 
     // Resolve ready promise
-    if (identifiedDestination !== null) {
-      readyFor(identifiedDestination).resolve();
-    }
+    readyFor(identifiedDestination).resolve();
 
     // Detect identity change on reconnect
     if (
@@ -1085,7 +1091,7 @@ export function useAgent<State>(options: UseAgentOptions<unknown>): Omit<
         if (mutableAgentRef.current) {
           mutableAgentRef.current.identified = false;
         }
-        setIdentity((prev) => ({ ...prev, identified: false }));
+        setIdentity((prev) => ({ ...prev, socket: null }));
 
         if (reconnecting) {
           // Pause reconnection for async queries until fresh query params are ready.
@@ -1181,13 +1187,6 @@ export function useAgent<State>(options: UseAgentOptions<unknown>): Omit<
 
     if (prev && prev !== agent) {
       rejectCallsSentOn(prev, "Connection closed");
-      resetReady(socketDestinationKey(agent.partySocketOptions));
-      if (mutableAgentRef.current) {
-        mutableAgentRef.current.identified = false;
-      }
-      setIdentity((current) =>
-        current.identified ? { ...current, identified: false } : current
-      );
     }
     // The helpers only touch refs; re-running on socket/address change is all we need.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1316,10 +1315,9 @@ export function useAgent<State>(options: UseAgentOptions<unknown>): Omit<
   agent.call = call;
   // Use reactive identity state (updates on identity message). Once the
   // address moves away from the one the identity came from, expose the new
-  // leaf until the new socket identifies. A `basePath` connection keeps the
-  // server-reported identity: the server owns its name.
+  // leaf until the new socket identifies. At the same `basePath`, keep the
+  // server-reported name: the server owns that identity.
   const identityIsCurrent =
-    !!options.basePath ||
     (identity.destination ?? seedDestinationRef.current) === destination;
   agent.agent = identityIsCurrent
     ? identity.agent
@@ -1333,9 +1331,11 @@ export function useAgent<State>(options: UseAgentOptions<unknown>): Omit<
   (
     agent as unknown as { path: ReadonlyArray<{ agent: string; name: string }> }
   ).path = fullPath;
-  agent.identified = identityIsCurrent && identity.identified;
+  agent.identified =
+    !socketAddressPending && identityIsCurrent && identity.socket === agent;
   agentToolReplayBuffers.set(agent, agentToolReplayRef.current);
   agentChatReplayBuffers.set(agent, agentChatReplayRef.current);
+  if (!agent.identified) resetReady(destination);
   agent.ready = readyFor(destination).promise;
   agent.state = agentState;
   agent.connectionError = visibleConnectionError;

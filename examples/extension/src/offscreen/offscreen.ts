@@ -21,13 +21,14 @@
  * opens this tab only to prove the Web Lock refuses a duplicate supervisor.
  */
 
-import { newMessagePortRpcSession, RpcTarget } from "capnweb";
+import { RpcTarget } from "capnweb";
+import { BrowserWorkerSupervisor } from "@mcp-b/do-runtime/browser/worker-supervisor";
 import { AgentClient } from "agents/client";
 import {
   browserStorageSummary,
   holdExclusiveBrowserHost,
 } from "../../../platform-shims/browser-storage";
-import { createMessagePortWebSocketConstructor } from "@mcp-b/do-runtime/browser/message-port-websocket";
+import { MessagePortWebSocket } from "@mcp-b/do-runtime/browser/message-port-websocket";
 import {
   parseExtensionResponse,
   RELAY_CLIENT_READY,
@@ -46,7 +47,6 @@ import {
   type ThinkProbeStatus,
   type ThinkProbeSubmission,
   type WakeProjection,
-  type WorkerBoot,
 } from "../protocol";
 
 const storageStatus = browserStorageSummary();
@@ -57,53 +57,6 @@ if (releaseHost === null) {
 }
 if (releaseHost !== null) window.addEventListener("pagehide", releaseHost, { once: true });
 
-/**
- * `{ type: "module" }` and a `new URL(..., import.meta.url)` specifier, which is
- * the form the bundler understands and the form MV3's `worker-src 'self'`
- * permits. A blob worker would be blocked by that CSP.
- */
-const worker = new Worker(new URL("../worker/actor.worker.ts", import.meta.url), {
-  type: "module",
-});
-
-/**
- * **Attach these before the boot message.** A dedicated worker's own
- * `console.error` is not reliably visible anywhere a human is looking, and an
- * uncaught exception inside one goes nowhere at all: the failure it eventually
- * causes is an RPC call that never answers, several layers away from the cause.
- * These two listeners are the whole of this host's fail-loudly wiring.
- */
-worker.addEventListener("error", (event: ErrorEvent) => {
-  console.error("[do-runtime example] actor worker failed:", event.message, event.error ?? event);
-});
-worker.addEventListener("messageerror", () => {
-  console.error("[do-runtime example] actor worker could not deserialise a message");
-});
-
-/**
- * One raw `postMessage` carrying a `MessagePort` in the transfer list, and then
- * capnweb over that port for everything else.
- *
- * The raw hop is not a warm-up: a `MessagePort` is not a value capnweb can
- * serialise, so the port has to arrive by structured clone before any session
- * can exist to carry it.
- */
-const channel = new MessageChannel();
-const sockets = new MessageChannel();
-worker.postMessage(
-  { port: channel.port2, sockets: sockets.port2 } satisfies WorkerBoot,
-  [channel.port2, sockets.port2],
-);
-
-/**
- * The page side uses capnweb directly because it sends no Workers `RpcTarget`.
- * The actor worker uses the runtime's `newRpcSession`, which applies the
- * identity graft before it exposes its Workers targets.
- *
- * The worker calls back for one thing: its alarm scheduler lives in the actor's
- * own worker, and each projected wake has to reach the service worker's alarm
- * coordinator, because `chrome.alarms` is not exposed here.
- */
 class SupervisorTarget extends RpcTarget implements SupervisorRpc {
   async projectWake(projection: WakeProjection): Promise<void> {
     const response: unknown = await chrome.runtime.sendMessage({
@@ -115,8 +68,29 @@ class SupervisorTarget extends RpcTarget implements SupervisorRpc {
   }
 }
 
-const host = newMessagePortRpcSession<HostRpc>(channel.port1, new SupervisorTarget());
-const AgentWebSocket = createMessagePortWebSocketConstructor(sockets.port1);
+const supervisor = new BrowserWorkerSupervisor<string, HostRpc>({
+  key: (name) => name,
+  createWorker: () =>
+    new Worker(new URL("../worker/actor.worker.ts", import.meta.url), { type: "module" }),
+  hostExports: () => new SupervisorTarget(),
+  removeStorage: async () => {
+    throw new Error("The example does not expose actor deletion");
+  },
+  idleGraceMs: 30_000,
+});
+window.addEventListener("pagehide", () => supervisor[Symbol.dispose](), { once: true });
+const host = await supervisor.resolve("counter");
+class AgentWebSocket extends MessagePortWebSocket {
+  constructor(url: string) {
+    super(
+      url,
+      supervisor.connectPort("counter", {
+        id: new URL(url).searchParams.get("_pk") || crypto.randomUUID(),
+        url,
+      }),
+    );
+  }
+}
 let agent: AgentClient<unknown, CounterState> | undefined;
 let firstState: Promise<void> | undefined;
 
@@ -382,7 +356,9 @@ const ops = {
   storageStatus: async (): Promise<string> => await storageStatus,
   sdkStream: async (): Promise<{ chunks: unknown[]; final: unknown }> => {
     const chunks: unknown[] = [];
-    const final = await (await connectedAgent()).call("streamValues", [], {
+    const final = await (
+      await connectedAgent()
+    ).call("streamValues", [], {
       stream: { onChunk: (chunk) => chunks.push(chunk) },
     });
     return { chunks, final };

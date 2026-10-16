@@ -1,291 +1,221 @@
-import type { JSONSchema7, JSONSchema7Definition } from "json-schema";
+import type { JSONSchema7 } from "json-schema";
 import {
   sanitizeToolName,
   toPascalCase,
   escapeJsDoc,
-  escapeStringLiteral,
   quoteProp
 } from "./utils";
 
-export interface ConversionContext {
-  root: JSONSchema7;
+/** Formatting for a raw type expression. Omit indent for a compact expression;
+ * supply the containing line's indentation for a multiline declaration. */
+export interface JsonSchemaTypeOptions {
+  indent?: string;
+}
+
+interface ConversionContext {
+  root: unknown;
   depth: number;
   seen: Set<unknown>;
-  maxDepth: number;
 }
 
-/**
- * Resolve an internal JSON Pointer $ref (e.g. #/definitions/Foo) against the root schema.
- * Returns null for external URLs or unresolvable paths.
- */
-function resolveRef(
-  ref: string,
-  root: JSONSchema7
-): JSONSchema7Definition | null {
-  // "#" is a valid self-reference to the root schema
-  if (ref === "#") return root;
-
-  if (!ref.startsWith("#/")) return null;
-
-  const segments = ref
-    .slice(2)
-    .split("/")
-    .map((s) => s.replace(/~1/g, "/").replace(/~0/g, "~"));
-
-  let current: unknown = root;
-  for (const seg of segments) {
-    if (current === null || typeof current !== "object") return null;
-    current = (current as Record<string, unknown>)[seg];
-    if (current === undefined) return null;
+/** Convert raw JSON Schema to a type expression without AI SDK or Zod imports.
+ * Unsupported, malformed, and recursive branches become unknown so one bad
+ * schema does not prevent generation of the remaining tool declarations. */
+export function jsonSchemaToTypeExpression(
+  schema: unknown,
+  options?: JsonSchemaTypeOptions
+): string {
+  try {
+    return printSchema(schema, options?.indent, {
+      root: schema,
+      depth: 0,
+      seen: new Set()
+    });
+  } catch {
+    // In particular, non-JSON const/enum values may contain cycles or BigInts.
+    return "unknown";
   }
-
-  // Allow both object schemas and boolean schemas (true = any, false = never)
-  if (typeof current === "boolean") return current;
-  if (current === null || typeof current !== "object") return null;
-  return current as JSONSchema7;
 }
 
-/**
- * Apply OpenAPI 3.0 `nullable: true` to a type result.
- */
-function applyNullable(result: string, schema: unknown): string {
-  if (
+function schemaObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function resolveRef(ref: string, root: unknown): unknown {
+  if (ref === "#") return root;
+  if (!ref.startsWith("#/")) return undefined;
+  let current = root;
+  for (const segment of ref.slice(2).split("/")) {
+    if (
+      !schemaObject(current) ||
+      !Object.hasOwn(current, segment.replace(/~1/g, "/").replace(/~0/g, "~"))
+    )
+      return undefined;
+    current = current[segment.replace(/~1/g, "/").replace(/~0/g, "~")];
+  }
+  return current;
+}
+
+function union(types: string[]): string {
+  return [...new Set(types)].join(" | ") || "never";
+}
+
+function nullable(result: string, schema: Record<string, unknown>): string {
+  return schema.nullable === true &&
     result !== "unknown" &&
     result !== "never" &&
-    (schema as Record<string, unknown>)?.nullable === true
-  ) {
-    return `${result} | null`;
-  }
-  return result;
+    result !== "null" &&
+    !(Array.isArray(schema.type) && schema.type.includes("null")) &&
+    !(Array.isArray(schema.enum) && schema.enum.includes(null))
+    ? union([result, "null"])
+    : result;
 }
 
-/**
- * Convert a JSON Schema to a TypeScript type string.
- * This is a direct conversion without going through Zod.
- */
-export function jsonSchemaToTypeString(
-  schema: JSONSchema7Definition,
-  indent: string,
+function printSchema(
+  schema: unknown,
+  indent: string | undefined,
   ctx: ConversionContext
 ): string {
-  // Handle boolean schemas
-  if (typeof schema === "boolean") {
-    return schema ? "unknown" : "never";
-  }
-
-  // Depth guard
-  if (ctx.depth >= ctx.maxDepth) return "unknown";
-
-  // Circular reference guard
-  if (ctx.seen.has(schema)) return "unknown";
-
+  if (schema === true) return "unknown";
+  if (schema === false) return "never";
+  if (!schemaObject(schema) || ctx.depth >= 20 || ctx.seen.has(schema))
+    return "unknown";
   ctx.seen.add(schema);
-  const nextCtx: ConversionContext = {
-    ...ctx,
-    depth: ctx.depth + 1
-  };
-
+  const next = { ...ctx, depth: ctx.depth + 1 };
+  const print = (value: unknown, inner = indent) =>
+    printSchema(value, inner, next);
   try {
-    // Handle $ref
-    if (schema.$ref) {
-      const resolved = resolveRef(schema.$ref, ctx.root);
-      if (!resolved) return "unknown";
-      return applyNullable(
-        jsonSchemaToTypeString(resolved, indent, nextCtx),
+    if (typeof schema.$ref === "string")
+      return nullable(print(resolveRef(schema.$ref, ctx.root)), schema);
+    for (const keyword of ["anyOf", "oneOf"] as const) {
+      const variants = schema[keyword];
+      if (Array.isArray(variants))
+        return nullable(union(variants.map((value) => print(value))), schema);
+    }
+    if (Array.isArray(schema.allOf)) {
+      return nullable(
+        schema.allOf.length === 0
+          ? "unknown"
+          : schema.allOf.map((value) => `(${print(value)})`).join(" & "),
         schema
       );
     }
-
-    // Handle anyOf/oneOf (union types)
-    if (schema.anyOf) {
-      const types = schema.anyOf.map((s) =>
-        jsonSchemaToTypeString(s, indent, nextCtx)
+    if (Array.isArray(schema.enum))
+      return nullable(union(schema.enum.map(printLiteral)), schema);
+    if (Object.hasOwn(schema, "const"))
+      return nullable(printLiteral(schema.const), schema);
+    if (Array.isArray(schema.type)) {
+      return nullable(
+        union(
+          schema.type.map((type) => print({ ...schema, type, nullable: false }))
+        ),
+        schema
       );
-      return applyNullable(types.join(" | "), schema);
     }
-    if (schema.oneOf) {
-      const types = schema.oneOf.map((s) =>
-        jsonSchemaToTypeString(s, indent, nextCtx)
-      );
-      return applyNullable(types.join(" | "), schema);
-    }
-
-    // Handle allOf (intersection types)
-    if (schema.allOf) {
-      const types = schema.allOf.map((s) =>
-        jsonSchemaToTypeString(s, indent, nextCtx)
-      );
-      return applyNullable(types.join(" & "), schema);
-    }
-
-    // Handle enum
-    if (schema.enum) {
-      if (schema.enum.length === 0) return "never";
-      const result = schema.enum
-        .map((v) => {
-          if (v === null) return "null";
-          if (typeof v === "string") return '"' + escapeStringLiteral(v) + '"';
-          if (typeof v === "object") return JSON.stringify(v) ?? "unknown";
-          return String(v);
-        })
-        .join(" | ");
-      return applyNullable(result, schema);
-    }
-
-    // Handle const
-    if (schema.const !== undefined) {
-      const result =
-        schema.const === null
-          ? "null"
-          : typeof schema.const === "string"
-            ? '"' + escapeStringLiteral(schema.const) + '"'
-            : typeof schema.const === "object"
-              ? (JSON.stringify(schema.const) ?? "unknown")
-              : String(schema.const);
-      return applyNullable(result, schema);
-    }
-
-    // Handle type
-    const type = schema.type;
-
-    if (type === "string") return applyNullable("string", schema);
-    if (type === "number" || type === "integer")
-      return applyNullable("number", schema);
-    if (type === "boolean") return applyNullable("boolean", schema);
-    if (type === "null") return "null";
-
-    if (type === "array") {
-      // Tuple support: prefixItems (JSON Schema 2020-12)
-      const prefixItems = (schema as Record<string, unknown>)
-        .prefixItems as JSONSchema7Definition[];
-      if (Array.isArray(prefixItems)) {
-        const types = prefixItems.map((s) =>
-          jsonSchemaToTypeString(s, indent, nextCtx)
-        );
-        return applyNullable(`[${types.join(", ")}]`, schema);
-      }
-
-      // Tuple support: items as array (draft-07)
-      if (Array.isArray(schema.items)) {
-        const types = schema.items.map((s) =>
-          jsonSchemaToTypeString(s, indent, nextCtx)
-        );
-        return applyNullable(`[${types.join(", ")}]`, schema);
-      }
-
-      if (schema.items) {
-        const itemType = jsonSchemaToTypeString(schema.items, indent, nextCtx);
-        return applyNullable(`${itemType}[]`, schema);
-      }
-      return applyNullable("unknown[]", schema);
-    }
-
-    if (type === "object" || schema.properties) {
-      const props = schema.properties || {};
-      const required = new Set(schema.required || []);
-      const lines: string[] = [];
-
-      for (const [propName, propSchema] of Object.entries(props)) {
-        if (typeof propSchema === "boolean") {
-          const boolType = propSchema ? "unknown" : "never";
-          const optionalMark = required.has(propName) ? "" : "?";
-          lines.push(
-            `${indent}    ${quoteProp(propName)}${optionalMark}: ${boolType};`
-          );
-          continue;
-        }
-
-        const isRequired = required.has(propName);
-        const propType = jsonSchemaToTypeString(
-          propSchema,
-          indent + "    ",
-          nextCtx
-        );
-        const desc = propSchema.description;
-        const format = propSchema.format;
-
-        if (desc || format) {
-          const descText = desc
-            ? escapeJsDoc(desc.replace(/\r?\n/g, " "))
+    switch (schema.type) {
+      case "string":
+        return nullable("string", schema);
+      case "number":
+      case "integer":
+        return nullable("number", schema);
+      case "boolean":
+        return nullable("boolean", schema);
+      case "null":
+        return "null";
+      case "array": {
+        const tuple = Array.isArray(schema.prefixItems)
+          ? schema.prefixItems
+          : Array.isArray(schema.items)
+            ? schema.items
             : undefined;
-          const formatTag = format
-            ? `@format ${escapeJsDoc(format)}`
-            : undefined;
-
-          if (descText && formatTag) {
-            lines.push(`${indent}    /**`);
-            lines.push(`${indent}     * ${descText}`);
-            lines.push(`${indent}     * ${formatTag}`);
-            lines.push(`${indent}     */`);
-          } else {
-            lines.push(`${indent}    /** ${descText ?? formatTag} */`);
-          }
-        }
-
-        const quotedName = quoteProp(propName);
-        const optionalMark = isRequired ? "" : "?";
-        lines.push(`${indent}    ${quotedName}${optionalMark}: ${propType};`);
+        return nullable(
+          tuple
+            ? `[${tuple.map((value) => print(value)).join(", ")}]`
+            : `Array<${schema.items === undefined ? "unknown" : print(schema.items)}>`,
+          schema
+        );
       }
-
-      // Handle additionalProperties
-      if (schema.additionalProperties) {
-        const valueType =
-          schema.additionalProperties === true
-            ? "unknown"
-            : jsonSchemaToTypeString(
-                schema.additionalProperties,
-                indent + "    ",
-                nextCtx
-              );
-        lines.push(`${indent}    [key: string]: ${valueType};`);
-      }
-
-      if (lines.length === 0) {
-        if (schema.additionalProperties === false) {
-          return applyNullable("{}", schema);
-        }
-        return applyNullable("Record<string, unknown>", schema);
-      }
-
-      const result = `{\n${lines.join("\n")}\n${indent}}`;
-      return applyNullable(result, schema);
+      default:
+        if (
+          schema.type !== "object" &&
+          schema.properties === undefined &&
+          schema.additionalProperties === undefined
+        )
+          return "unknown";
     }
-
-    // Handle array of types (e.g., ["string", "null"])
-    if (Array.isArray(type)) {
-      const types = type.map((t) => {
-        if (t === "string") return "string";
-        if (t === "number" || t === "integer") return "number";
-        if (t === "boolean") return "boolean";
-        if (t === "null") return "null";
-        if (t === "array") return "unknown[]";
-        if (t === "object") return "Record<string, unknown>";
-        return "unknown";
+    const properties = schemaObject(schema.properties)
+      ? Object.entries(schema.properties)
+      : [];
+    const required = new Set(
+      Array.isArray(schema.required) ? schema.required : []
+    );
+    const inner = indent === undefined ? undefined : indent + "    ";
+    const fields = properties.map(([name, property]) => {
+      const type = print(property, inner);
+      const desc =
+        schemaObject(property) && typeof property.description === "string"
+          ? escapeJsDoc(property.description.replace(/\s+/g, " ").trim())
+          : "";
+      const format =
+        schemaObject(property) && typeof property.format === "string"
+          ? `@format ${escapeJsDoc(property.format)}`
+          : "";
+      const comment =
+        desc && format
+          ? `/**\n${inner} * ${desc}\n${inner} * ${format}\n${inner} */`
+          : desc || format
+            ? `/** ${desc || format} */`
+            : "";
+      return {
+        type,
+        optional: !required.has(name),
+        text: `${quoteProp(name)}${required.has(name) ? "" : "?"}: ${type};`,
+        comment
+      };
+    });
+    const additionalType =
+      schema.additionalProperties === false
+        ? "never"
+        : print(schema.additionalProperties ?? true, inner);
+    if (fields.length === 0)
+      return nullable(`Record<string, ${additionalType}>`, schema);
+    if (schema.additionalProperties !== false) {
+      // A TS index signature also covers named properties. JSON Schema's
+      // additionalProperties does not; include those types (and optional
+      // undefined) so valid records are not rendered uninhabitable.
+      const type =
+        additionalType === "unknown"
+          ? "unknown"
+          : union([
+              additionalType,
+              ...fields.map((field) => field.type),
+              ...(fields.some((field) => field.optional) ? ["undefined"] : [])
+            ]);
+      fields.push({
+        type,
+        optional: false,
+        text: `[key: string]: ${type};`,
+        comment: ""
       });
-      return applyNullable(types.join(" | "), schema);
     }
-
-    return "unknown";
+    const result =
+      indent === undefined
+        ? `{ ${fields.map((field) => field.text).join(" ")} }`
+        : `{\n${fields.map((field) => `${field.comment ? `${inner}${field.comment}\n` : ""}${inner}${field.text}`).join("\n")}\n${indent}}`;
+    return nullable(result, schema);
   } finally {
     ctx.seen.delete(schema);
   }
 }
 
-/**
- * Convert a JSON Schema to a TypeScript type declaration.
- */
-export function jsonSchemaToType(
-  schema: JSONSchema7,
-  typeName: string
-): string {
-  const ctx: ConversionContext = {
-    root: schema,
-    depth: 0,
-    seen: new Set(),
-    maxDepth: 20
-  };
-  const typeBody = jsonSchemaToTypeString(schema, "", ctx);
-  return `type ${typeName} = ${typeBody}`;
+function printLiteral(value: unknown): string {
+  if (typeof value === "number" && !Number.isFinite(value)) return "unknown";
+  return JSON.stringify(value) ?? "unknown";
+}
+
+/** Convert a JSON Schema to a TypeScript type declaration. */
+export function jsonSchemaToType(schema: unknown, typeName: string): string {
+  return `type ${typeName} = ${jsonSchemaToTypeExpression(schema, { indent: "" })}`;
 }
 
 /**
