@@ -254,7 +254,13 @@ describe("handler dispatch and close state", () => {
       close: { code: 4002, reason: "server out", wasClean: true },
       readyState: 3,
       listedDuringHandler: false,
-      tagsDuringHandler: ["socket"],
+      // The own close was written before the echo arrived, so the socket is released
+      // (`web-socket.c++:1430`); oracle 1.20261023.1 onward answers this way.
+      tagsDuringHandler: {
+        name: "Error",
+        message:
+          "you must call 'acceptWebSocket()' before attempting to access the tags of a WebSocket.",
+      },
       sendAfterPeerClose: {
         name: "TypeError",
         message: "Can't call WebSocket send() after close().",

@@ -617,13 +617,12 @@ export class Cursor<T extends SqlRow = SqlRow> implements SqlStorageCursor<T> {
   }
 
   /** ← `Cursor::next`, whose `RowIterator::Next` is this exact shape. */
-  next(): { done?: false; value: T } | { done: true; value?: never } {
+  next(): IteratorResult<T, undefined> {
     const row = this.#nextRow();
     if (row === undefined) {
       // ← `JSG_STRUCT(done, value)` serializes an OWN `value: undefined` on
-      // the done result; the published type says the key is absent. Callers
-      // observe the runtime shape, so it wins — on workerd exactly the same.
-      return { done: true, value: undefined } as unknown as { done: true; value?: never };
+      // the done result, which the published type says since workerd 81ba6e861.
+      return { done: true, value: undefined };
     }
     return { done: false, value: row };
   }

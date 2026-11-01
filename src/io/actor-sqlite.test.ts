@@ -1279,6 +1279,49 @@ actorTest("coalesced move-later followed by move-earlier does not race", async (
 });
 
 actorTest(
+  "parked move-later alarm is not applied when subsequent commit moved alarm earlier",
+  async (test) => {
+    // ← workerd 2093b5b1b (issue #7330): an in-flight move-later resolving while a later commit
+    // persists an alarm earlier than the parked time must not schedule the stale parked time.
+
+    // 1. Initialize alarm state to 1ms.
+    test.setAlarm(oneMs);
+    (await test.pollAndExpectCalls(["scheduleRun(1ms)"]))[0]?.fulfill();
+    (await test.pollAndExpectCalls(["commit"]))[0]?.fulfill();
+    await test.pollAndExpectCalls([]);
+    expect(test.getAlarm()).toBe(oneMs);
+
+    // 2. Move alarm to 3ms (later). Commit finishes, scheduleRun(3ms) goes in-flight.
+    test.setAlarm(threeMs);
+    (await test.pollAndExpectCalls(["commit"]))[0]?.fulfill();
+    const fulfiller3Ms = (await test.pollAndExpectCalls(["scheduleRun(3ms)"]))[0];
+
+    // 3. Move alarm to 10ms (later); it is coalesced into pendingLaterAlarmTime.
+    test.setAlarm(tenMs);
+    (await test.pollAndExpectCalls(["commit"]))[0]?.fulfill();
+    await test.pollAndExpectCalls([]);
+    expect(test.getAlarm()).toBe(tenMs);
+
+    // 4. Move alarm to 6ms: earlier than the parked 10ms, later than the scheduled 3ms. Hold the
+    // db commit so the 3ms scheduleRun can complete while it is in flight.
+    test.setAlarm(sixMs);
+    const commitFulfiller6Ms = (await test.pollAndExpectCalls(["commit"]))[0];
+
+    // 5. The 3ms scheduleRun completes. The stored alarm (6ms) fires earlier than the parked
+    // 10ms, so the parked time is dropped rather than scheduled.
+    fulfiller3Ms?.fulfill();
+    await test.pollAndExpectCalls([]);
+
+    // 6. The 6ms commit completes its post-commit alarm sync.
+    commitFulfiller6Ms?.fulfill();
+    (await test.pollAndExpectCalls(["scheduleRun(6ms)"]))[0]?.fulfill();
+    await test.pollAndExpectCalls([]);
+
+    expect(test.getAlarm()).toBe(sixMs);
+  },
+);
+
+actorTest(
   "an exception thrown during merged commits does not hang",
   async (test) => {
     // Initialize alarm state to 5ms.

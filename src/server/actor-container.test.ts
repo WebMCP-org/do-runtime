@@ -274,6 +274,13 @@ class Counter {
     return child.ping();
   }
 
+  armThenThrow(at: number, mode: "sync" | "async"): Promise<never> {
+    void this.ctx.storage.setAlarm(at);
+    const error = new Error(`thrown ${mode}`);
+    if (mode === "sync") throw error;
+    return Promise.reject(error);
+  }
+
   async alarm(info?: AlarmInvocationInfo): Promise<void> {
     const runs = (((await this.ctx.storage.get<number>("runs")) ?? 0) as number) + 1;
     await this.ctx.storage.put("runs", runs);
@@ -847,6 +854,35 @@ describe("the composition", () => {
     expect(await stub.bump()).toBe(1);
     expect(await stub.bump()).toBe(2);
   });
+
+  // ← workerd 0b348c30b: an error can carry unconfirmed state as easily as a return value.
+  test.each(["sync", "async"] as const)(
+    "entry holds a %s exception behind the output gate too",
+    async (mode) => {
+      const projection = Promise.withResolvers<void>();
+      const scheduleRun = vi.fn(() => projection.promise);
+      const { stub } = await counterContainer({
+        ports: {
+          sql: createNodeSqlProvider(),
+          alarms: { scheduleRun },
+          facets: new RecordingFacetHost(),
+          timer,
+        },
+      });
+
+      let settled = false;
+      const answer = stub.armThenThrow(Date.now() + 1_000, mode).finally(() => {
+        settled = true;
+      });
+      answer.catch(() => {});
+      await vi.waitFor(() => expect(scheduleRun).toHaveBeenCalledOnce());
+      await portHop();
+      expect(settled).toBe(false);
+
+      projection.resolve();
+      await expect(answer).rejects.toThrow(`thrown ${mode}`);
+    },
+  );
 
   test("ctx.id is derived from the name under the host's unique key", async () => {
     const a = await createActorContainer(options({ id: "alice" }));

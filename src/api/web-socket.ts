@@ -127,6 +127,12 @@ type SocketMetadata = {
   attachment?: Uint8Array;
   /** The actor's gated side of a host transport, kept across registries. */
   wrapper?: AcceptedWebSocket;
+  /**
+   * The socket's own close() has been written. ← workerd `web-socket.c++:1430`
+   * `tryReleaseNative()`: once the outgoing close is pumped the native socket is
+   * Released, and `getTags()` no longer finds an accepted socket.
+   */
+  ownCloseSent?: true;
 };
 
 /** Raw listeners follow transport ownership without retaining a released actor wrapper. */
@@ -370,7 +376,10 @@ export class AcceptedWebSocket extends EventTarget implements RawWebSocket, WebS
     this.#markPairUsed();
     this.#ownClose = true;
     this.#readyState = this.#peerClose ? AcceptedWebSocket.CLOSED : AcceptedWebSocket.CLOSING;
-    this.#enqueue(() => this.#socket.close(code, reason));
+    this.#enqueue(() => {
+      this.#socket.close(code, reason);
+      socketMetadata(this).ownCloseSent = true;
+    });
   }
 
   /**
@@ -650,7 +659,7 @@ export class HibernatableWebSocketRegistry {
 
   getTags(socket: RawWebSocket): string[] {
     const state = isRawWebSocket(socket) ? metadata.get(socket) : undefined;
-    if (state?.accepted === undefined) {
+    if (state?.accepted === undefined || state.ownCloseSent) {
       throw new Error(
         "you must call 'acceptWebSocket()' before attempting to access the tags of a WebSocket.",
       );

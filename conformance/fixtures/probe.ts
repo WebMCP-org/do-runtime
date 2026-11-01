@@ -363,6 +363,24 @@ export class Probe extends DurableObject<ProbeEnv> {
     return log;
   }
 
+  /**
+   * ← workerd 1fa562228 (`actor-block-concurrency-timer-test.js`). A timer armed
+   * outside `blockConcurrencyWhile` whose deadline passes while the section holds
+   * the input gate waits for the gate, and must not hold back a later timer the
+   * section itself is waiting on. Before that commit workerd's single ordered
+   * timer queue deadlocked here.
+   */
+  async outsideTimerBehindCriticalSection(): Promise<string[]> {
+    const events: string[] = [];
+    const outer = scheduler.wait(10).then(() => events.push("outer"));
+    await this.ctx.blockConcurrencyWhile(async () => {
+      await scheduler.wait(200);
+      events.push("critical section");
+    });
+    await outer;
+    return events;
+  }
+
   /** `setInterval` repeats, each tick is gated, and `clearInterval` stops it. */
   #intervalTicks = 0;
   armInterval(): string {
@@ -980,6 +998,40 @@ export class Probe extends DurableObject<ProbeEnv> {
     } catch (error) {
       return { allowed: allowed.length, padded: padded.length, tooBig: String(error) };
     }
+  }
+
+  /**
+   * ← workerd 35780cd85 (`sql-test.js`). An EXPLAIN reused by `exec` keeps
+   * describing the current schema after its table is dropped and recreated, or
+   * rebuilt and renamed back, and fails with "no such table" once it is gone.
+   */
+  sqlExplainAfterSchemaChange(): Record<string, unknown> {
+    const sql = this.ctx.storage.sql;
+    const explain = "EXPLAIN INSERT INTO explainTest VALUES (?, ?)";
+    const rowCounts: boolean[] = [];
+    sql.exec("DROP TABLE IF EXISTS explainTest");
+    sql.exec("DROP TABLE IF EXISTS explainTest2");
+    sql.exec("CREATE TABLE explainTest (id TEXT PRIMARY KEY, name TEXT)");
+    for (let i = 0; i < 3; i++) {
+      rowCounts.push(sql.exec(explain, null, null).toArray().length > 0);
+      sql.exec("DROP TABLE explainTest");
+      sql.exec("CREATE TABLE explainTest (id TEXT PRIMARY KEY, name TEXT)");
+    }
+    for (let i = 0; i < 3; i++) {
+      rowCounts.push(sql.exec(explain, null, null).toArray().length > 0);
+      sql.exec("CREATE TABLE explainTest2 (id TEXT PRIMARY KEY, name TEXT)");
+      sql.exec("DROP TABLE explainTest");
+      sql.exec("ALTER TABLE explainTest2 RENAME TO explainTest");
+    }
+    rowCounts.push(sql.exec(explain, null, null).toArray().length > 0);
+    sql.exec("DROP TABLE explainTest");
+    let dropped = "no error";
+    try {
+      sql.exec(explain, null, null);
+    } catch (error) {
+      dropped = /no such table: explainTest/.test(String(error)) ? "no such table" : String(error);
+    }
+    return { rowCounts, dropped };
   }
 
   /** Workerd's SQL regulator allows the built-in R*Tree virtual-table module. */

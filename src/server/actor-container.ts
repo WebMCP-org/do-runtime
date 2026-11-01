@@ -1470,13 +1470,17 @@ class ActorContainerImpl implements ActorContainer {
             .run(
               () =>
                 this.#withExternalEntry(async () => {
-                  const result: unknown = await Reflect.apply(value, subject, args);
                   // ← the reply being piped through `waitForOutputLocks()`. This is §1.1's
                   // whole point: a method that returns without awaiting its own write still
                   // must not answer before that write is durable. Draining inside `run()`
                   // keeps the event pending until the reply can leave.
-                  await this.#ctx.waitForOutputLocks();
-                  return result;
+                  // ← workerd 0b348c30b (`worker-rpc.c++:2268`): a throw, sync or async, waits
+                  // too, and a broken gate's exception replaces the method's.
+                  try {
+                    return (await Reflect.apply(value, subject, args)) as unknown;
+                  } finally {
+                    await this.#ctx.waitForOutputLocks();
+                  }
                 }),
               { signal },
             )
@@ -1504,9 +1508,12 @@ class ActorContainerImpl implements ActorContainer {
         if (typeof value !== "function") {
           throw new TypeError(`This RPC callback has no method ${String(property)}.`);
         }
-        const result = await Reflect.apply(value as (...rest: unknown[]) => unknown, target, args);
-        await this.#ctx.waitForOutputLocks();
-        return result;
+        // ← workerd 0b348c30b: an exception waits for the output gate as a result does.
+        try {
+          return await Reflect.apply(value as (...rest: unknown[]) => unknown, target, args);
+        } finally {
+          await this.#ctx.waitForOutputLocks();
+        }
       },
     );
     const bound = new Map<string | symbol, unknown>();

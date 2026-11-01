@@ -522,7 +522,11 @@ export class ActorSqlite implements ActorCacheInterface {
           const nextTime = this.#pendingLaterAlarmTime;
           if (nextTime !== undefined) {
             this.#pendingLaterAlarmTime = undefined;
-            this.#scheduleLaterAlarm(nextTime);
+            // ← workerd 2093b5b1b: a commit may have stored an alarm earlier than the parked time
+            // while this request was in flight; that commit schedules its own time, so drop ours.
+            if (!willFireEarlier(this.#metadata.getAlarm(), nextTime)) {
+              this.#scheduleLaterAlarm(nextTime);
+            }
           }
         })
         .catch(() => {
