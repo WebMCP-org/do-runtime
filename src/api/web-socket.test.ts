@@ -526,6 +526,24 @@ describe("hibernatable close settlement", () => {
     expect(observe(() => registry, socket)).toEqual({ tags: ["t"], listed: false });
   });
 
+  test("a pair coupled to the host closes like a network transport: own close then echo keeps the tags", async () => {
+    const { ctx } = newFixture();
+    const { registry, seen } = recordingRegistry(ctx);
+    const { 0: client, 1: server } = new registry.WebSocketPair();
+    await ctx.run(() => registry.acceptWebSocket(server, ["t"]));
+    // What returning the client half in a 101 response does: its peer is now the network.
+    const host = (client as AcceptedWebSocket).coupleToHost();
+    host.accept();
+    const echoes: number[] = [];
+    host.addEventListener("close", (event) => echoes.push((event as CloseEvent).code));
+    await ctx.run(() => server.close(4002, "server out"));
+    await quiesce();
+    expect(echoes).toEqual([4002]);
+    const during = { tags: ["t"], listed: true };
+    expect(seen).toEqual([{ event: "close:4002", sync: during, microtask: during }]);
+    expect(observe(() => registry, server)).toEqual({ tags: ["t"], listed: false });
+  });
+
   test("a message ahead of a pair's echo takes the completion, so nothing releases", async () => {
     const { ctx } = newFixture();
     const { registry, seen } = recordingRegistry(ctx);

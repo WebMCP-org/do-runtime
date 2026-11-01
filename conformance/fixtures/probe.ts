@@ -1506,6 +1506,13 @@ export class Probe extends DurableObject<ProbeEnv> {
     this.#requireServer(id).close(code, reason);
   }
 
+  /** Closes every accepted socket with `tag`, whichever transport its peer is on. */
+  closeTagged(tag: string, code: number, reason: string): number {
+    const sockets = this.ctx.getWebSockets(tag);
+    for (const socket of sockets) socket.close(code, reason);
+    return sockets.length;
+  }
+
   /** The client's frame leaves after the server's own close, ahead of the client's echo. */
   closeSelfServerThenSendSelf(id: string, message: string): void {
     this.#requireServer(id).close(4002, "server out");

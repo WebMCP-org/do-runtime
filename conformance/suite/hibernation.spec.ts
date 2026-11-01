@@ -366,6 +366,23 @@ describe("handler dispatch and close state", () => {
     ]);
   });
 
+  it("D6 a network client's echo of own close keeps the tags", async () => {
+    const actor = await host.spawn("ws-own-close-network");
+    const client = await host.connect(actor, ["connection-id"]);
+    expect(await actor.call("closeTagged", "connection-id", 4002, "server out")).toBe(1);
+    expect(await client.nextClose()).toMatchObject({ code: 4002, reason: "server out" });
+    const result = await eventually(
+      () => journal(actor),
+      (value) => value.afterTurn.some((event) => event.event === "close"),
+    );
+    // Unlike a pair, a network write completes without waiting for the peer to read it, so
+    // the own close is complete before the echo's close event and nothing releases the
+    // socket (raw workerd 1.20261031.1: net:own, net:closeFromFetch).
+    expect(result.afterTurn).toEqual([
+      { id: "connection-id", event: "close", listed: false, tags: ["connection-id"] },
+    ]);
+  });
+
   it("D7 exposes ready states on the constructor and prototype", async () => {
     const actor = await host.spawn("ws-ready-state");
     expect(await actor.call("readyStateConstants")).toEqual({

@@ -9,6 +9,7 @@ before it reaches the caller, and a broken gate's error replaces it; and a
 hibernatable socket that sent its own close is released, so `getTags()` throws,
 once that close completes after the close event was dispatched. A message
 received after the own close keeps the tags readable. A closed socket stays in
-`getWebSockets()` and keeps its tags until its close handler's synchronous part
-returns. `SqlStorageCursor.next()` is typed `IteratorResult<T, undefined>`. Pin
-the conformance oracle and Workers types to the October 31 release.
+`getWebSockets()` until its close handler's synchronous part returns, and its
+tags stay readable unless the socket is released. `SqlStorageCursor.next()` is
+typed `IteratorResult<T, undefined>`. Pin the conformance oracle and Workers
+types to the October 31 release.

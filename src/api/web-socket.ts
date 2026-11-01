@@ -111,6 +111,8 @@ type SocketEvent = (typeof SOCKET_EVENTS)[number];
 type PairState = {
   used: boolean;
   hibernationAccepted: boolean;
+  /** One half went out in a Response, so the other half's peer is the network. */
+  coupled?: true;
 };
 
 type SocketAcceptance =
@@ -149,16 +151,21 @@ type SocketMetadata = {
  * ← the pump continuation (`web-socket.c++:1202-1233`). It releases a
  * hibernatable socket only when it runs after the close event was dispatched:
  * `closedIncoming` and the release state are both set by
- * `initiateHibernatableRelease()`, and nothing else calls `tryReleaseNative()`
- * for a socket that closed cleanly. A continuation that ran earlier released
- * nothing, and no later one comes, so the socket stays accepted with its tags.
+ * `initiateHibernatableRelease()`. The other `tryReleaseNative()` callers are
+ * not reached by a hibernatable socket that closed cleanly: a disconnect
+ * without a Close frame (`:910`), `send()`/`close()` in the error state
+ * (`:936`, `:1030`), and the `accept()` read loop (`:1553`). A continuation
+ * that ran earlier released nothing, and no later one comes, so the socket
+ * stays accepted with its tags.
  *
  * When the continuation runs is a property of the transport, measured against
  * raw workerd 1.20261031.1 (docs/workerd-sync.md):
  *
  * - A network transport's write completes at once and its continuation is the
  *   next turn. The peer's echo takes longer, so own close then echo leaves the
- *   socket accepted, and a close sent from `webSocketClose` releases it.
+ *   socket accepted, and a close sent from `webSocketClose` releases it. A pair
+ *   whose other half went out in a Response (`coupleToHost()`) is one of these:
+ *   its peer is the network.
  * - A `WebSocketPair` write completes when the other half reads it, inside the
  *   same isolate, and the continuation lands after this socket's next
  *   hibernation event. That event is the echo when nothing is queued ahead of
@@ -424,7 +431,10 @@ export class AcceptedWebSocket extends EventTarget implements RawWebSocket, WebS
     this.#enqueue(() => {
       this.#socket.close(code, reason);
       if (this.#delivery.mode === "hibernatable") {
-        ownCloseWritten(socketMetadata(this), this.#socket instanceof MemoryWebSocketEndpoint);
+        ownCloseWritten(
+          socketMetadata(this),
+          this.#socket instanceof MemoryWebSocketEndpoint && this.#pairState?.coupled !== true,
+        );
       }
     });
   }
@@ -502,6 +512,7 @@ export class AcceptedWebSocket extends EventTarget implements RawWebSocket, WebS
     host.#peerClose = this.#peerClose;
     host.#binaryType = this.#binaryType;
     this.#markPairUsed();
+    if (this.#pairState !== undefined) this.#pairState.coupled = true;
     this.#released = true;
     this.#ctx = undefined;
     this.#pending = [];

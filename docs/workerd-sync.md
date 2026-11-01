@@ -32,7 +32,7 @@ Line citations below are at `v1.20261031.1`.
 | --- | --- |
 | [Parked move-later alarm, `2093b5b1b`](https://github.com/cloudflare/workerd/commit/2093b5b1b) | `actor-sqlite.c++:475`: when a move-later alarm request completes, its parked time is dropped if a commit stored an earlier alarm meanwhile, since that commit schedules its own time. `#scheduleLaterAlarm` now does the same. The ported `actor-sqlite-test.c++` case (1 ms, 3 ms in flight, 10 ms coalesced, 6 ms with the commit held) failed before the fix with a stray `scheduleRun(10ms)` and passes after it. |
 | [RPC exceptions behind the output gate, `0b348c30b`](https://github.com/cloudflare/workerd/commit/0b348c30b) | `worker-rpc.c++:2268` and `:2320`: an actor method's exception, sync or async, waits for the output gate as a result does, and a broken gate's exception replaces the method's. `entry()` and `bindReentryTarget()` now wait in a `finally`. A unit test holding the gate with a pending alarm write failed before the change for both a sync and an async throw. The §1.7.1/§2.6 abort rows now see the broken gate's error, which carries the abort reason, in the Node and browser lanes too, instead of the fixture's sentinel throw. |
-| Hibernatable socket released after its own close | Measured on raw `workerd serve`, not attributed to one commit; see [getTags() and listing during webSocketClose](#gettags-and-listing-during-websocketclose). `tryReleaseNative()` (`web-socket.c++:1430`) runs when the socket's own outgoing close completes, and it releases the socket only if `initiateHibernatableRelease()` (`web-socket.c++:1665`, called from `global-scope.c++:995` just before `webSocketClose()`) has already marked the close dispatched. Through a `WebSocketPair` the own close completes when the socket's next event finishes its synchronous part. When that event is the echoed close, `getTags()` throws one turn after `webSocketClose()` returns. This happens from `v1.20261023.1`; `v1.20260815.1` never released the socket, and the lockfile has no binary in between. A message ahead of the echo takes the completion, so the socket is not released. A network peer's echo arrives after the write has already completed, so its tags also stay readable. A close sent from inside `webSocketClose()` releases the socket. In every case the socket is still listed, with readable tags, during the handler's synchronous part. Locally, `WebSocket.close()` and the hibernation registry now track this release state, and a socket woken from hibernation is accepted again. The D6-D7 row and a new message-after-own-close row pin this behaviour. |
+| Hibernatable socket released after its own close | Measured on raw `workerd serve`, not attributed to one commit; see [getTags() and listing during webSocketClose](#gettags-and-listing-during-websocketclose). `tryReleaseNative()` (`web-socket.c++:1430`) runs when the socket's own outgoing close completes, and it releases the socket only if `initiateHibernatableRelease()` (`web-socket.c++:1665`, called from `global-scope.c++:995` just before `webSocketClose()`) has already marked the close dispatched. Through a `WebSocketPair` the own close completes when the socket's next event finishes its synchronous part. When that event is the echoed close, `getTags()` throws one turn after `webSocketClose()` returns. This happens from `v1.20261023.1`; `v1.20260815.1` never released the socket, and the lockfile has no binary in between. A message ahead of the echo takes the completion, so the socket is not released. A network peer's echo arrives after the write has already completed, so its tags also stay readable; locally, a pair whose other half was returned in a 101 `Response` counts as a network transport. A close sent from inside `webSocketClose()` releases the socket. In every case the socket is still listed, with readable tags, during the handler's synchronous part. Locally, `WebSocket.close()` and the hibernation registry now track this release state, and a socket woken from hibernation is accepted again. The D6-D7 row, a new message-after-own-close row and a new network own-close row pin this behaviour. |
 
 The compatibility date is unchanged. Updating the oracle and ambient Workers
 types does not opt local hosts into newer compatibility-date policy
@@ -103,11 +103,11 @@ handler.
 
 | Row | Binary | Sync: listed / tags | After a turn: listed / tags |
 | --- | --- | --- | --- |
-| D5/B4 peer close (pair) | 0815, 1023, 1031 | yes / `["socket"]` | no / throws |
+| D5/B4 peer close, answered from webSocketClose (pair) | 0815, 1023, 1031 | yes / `["socket"]` | no / throws |
 | D6-D7 own close, then echo (pair) | 1023, 1031 | yes / `["socket"]` | no / throws |
 | D6-D7 own close, then echo (pair) | 0815 | yes / `["socket"]` | no / `["socket"]` |
 | D6 message after own close: message, then close (pair) | 1023, 1031 | yes / `["socket"]` for both | no / `["socket"]` for both |
-| Network peer close (eviction row shape) | 0815, 1023, 1031 | yes / tags | no / throws |
+| Network peer close, answered from webSocketClose (eviction row shape) | 0815, 1023, 1031 | yes / tags | no / throws |
 
 On 0815 the message row's close arrived as 1006, unclean. A second probe on
 1031 drove the same socket over a real network connection. An own close
@@ -115,6 +115,13 @@ followed by the echo kept the tags (`net:own`), and so did an own close with a
 message ahead of the echo (`net:ownThenMsg`). A peer close answered from
 `webSocketClose()` released the socket (`net:peer`). Microtask reads inside the
 handler always matched the sync reads.
+
+Three further differences measured in the same probe are not ported here and
+stay open: `close()` with no code delivers 1000 on a pair or coupled socket
+where workerd delivers 1005; after `webSocketError` the socket stays listed with
+`readyState` 1 and `close()` sends a frame, where workerd unlists it after a
+turn, reports 2 and ignores `close()`; and a message handler that runs after
+the socket's own close sees `readyState` 3 where workerd reports 2.
 
 **Method caveat.** The vitest-pool-workers lane does not show the sync values.
 Its wrapper (`test-internal.mjs`) runs a Durable Object handler only after
