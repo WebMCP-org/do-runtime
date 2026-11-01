@@ -16,6 +16,17 @@ import type {
   Tool
 } from "@modelcontextprotocol/client";
 export type { ElicitRequest, ElicitResult } from "@modelcontextprotocol/client";
+export {
+  RPC_DO_PREFIX,
+  RPCClientTransport,
+  type McpRpcAgent,
+  type RPCClientTransportOptions
+} from "../rpc";
+export type {
+  MCPElicitationHandler,
+  MCPElicitationHandlers
+} from "./connection";
+export type { McpClientOptions } from "../types";
 import { type RetryOptions, tryN } from "../../retries";
 import { z } from "zod";
 import { nanoid } from "nanoid";
@@ -384,8 +395,7 @@ export type MCPServerFilter = {
 
 /**
  * A Durable Object capability that persists and aggregates MCP client
- * connections. Installing it directly on a Lifecycle (outside `agent.mcp`)
- * is experimental: that capability surface may change before stabilizing.
+ * connections. Install it on any Lifecycle, or use `agent.mcp` on an Agent.
  */
 export class MCPClientManager extends LifecycleCapability {
   public mcpConnections: Record<string, MCPClientConnection> = {};

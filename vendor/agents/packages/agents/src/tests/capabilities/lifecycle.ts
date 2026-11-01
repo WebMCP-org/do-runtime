@@ -13,6 +13,7 @@ import {
 } from "../../lifecycle";
 import { State } from "../../state";
 import { WebSockets } from "../../websockets";
+import { LiveInstances } from "../shared/live-instances";
 
 type StartupProps = { label: string };
 
@@ -690,6 +691,124 @@ export class RetryableStartObject extends DurableObject<Cloudflare.Env> {
 
   getHostStarts(): number {
     return this.hostStarts;
+  }
+}
+
+/**
+ * Fails startup while its object's storage holds `fail-start`. When storage
+ * also holds `push-during-start`, a failing startup first pushes a job due at
+ * that time, so a test can check the job still gets a wake.
+ */
+class StoredStartFailureProbe extends LifecycleCapability {
+  constructor() {
+    super("stored-start-failure-probe");
+  }
+
+  async onStart(): Promise<void> {
+    if (!(await this.lifecycle.storage.get<boolean>("fail-start"))) return;
+    const pushTime =
+      await this.lifecycle.storage.get<number>("push-during-start");
+    if (pushTime !== undefined) {
+      await this.push({
+        id: "pushed-during-start",
+        fn: "tick",
+        time: pushTime
+      });
+    }
+    throw new Error("intentional startup failure");
+  }
+
+  async onJob(): Promise<void> {}
+
+  push(options: LifecycleJobPushOptions) {
+    return this.lifecycle.jobs.push(options);
+  }
+}
+
+/** Every {@link EvictableStartObject} instance, by object name. */
+const evictableStartInstances = new LiveInstances();
+
+/**
+ * Starts by storing a promise that never settles but has a reaction, as
+ * pi's Harness does. Every promise reaction keeps the async context it was
+ * created in, so the capability is reachable from its startup context.
+ */
+class PendingReactionProbe extends LifecycleCapability {
+  pending: Promise<void> | undefined;
+
+  constructor() {
+    super("pending-reaction-probe");
+  }
+
+  onStart(): void {
+    const pending = new Promise<void>(() => {});
+    void pending.then(() => {});
+    this.pending = pending;
+  }
+}
+
+/**
+ * Holds a queued job whose alarm runs into a failing startup, so a test can
+ * check the queue still has a wake after that alarm fails.
+ */
+export class AlarmStartFailureObject extends DurableObject<Cloudflare.Env> {
+  readonly #probe = new StoredStartFailureProbe();
+  readonly lifecycle = Lifecycle.install(this).use(this.#probe);
+
+  /** Queue a job due at `time`, then make every later startup fail. */
+  async queueJobThenFailStartup(time: number): Promise<void> {
+    await this.lifecycle.start();
+    await this.#probe.push({ id: "pending", fn: "tick", time });
+    await this.ctx.storage.put("fail-start", true);
+  }
+
+  /**
+   * Make every later startup push a job due at `pushTime` and then fail. When
+   * `queuedTime` is given, first queue a job due then.
+   */
+  async failStartupAfterPushing(
+    pushTime: number,
+    queuedTime?: number
+  ): Promise<void> {
+    await this.lifecycle.start();
+    if (queuedTime !== undefined) {
+      await this.#probe.push({ id: "pending", fn: "tick", time: queuedTime });
+    }
+    await this.ctx.storage.put("push-during-start", pushTime);
+    await this.ctx.storage.put("fail-start", true);
+  }
+
+  /** Start the lifecycle from a request, returning the startup error. */
+  async tryStart(): Promise<string> {
+    try {
+      await this.lifecycle.start();
+      return "started";
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+  }
+}
+
+/**
+ * Proves an evicted object can be garbage collected after a capability
+ * started work that never settles. Tests evict it repeatedly, then count
+ * the instances still alive after a forced GC.
+ */
+export class EvictableStartObject extends DurableObject<Cloudflare.Env> {
+  readonly lifecycle = Lifecycle.install(this).use(new PendingReactionProbe());
+
+  constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
+    super(ctx, env);
+    evictableStartInstances.track(ctx.id.name ?? "", this);
+  }
+
+  async startLifecycle(): Promise<void> {
+    await this.lifecycle.start();
+  }
+
+  /** Count this object's instances still alive after a forced GC. */
+  countLiveInstances(): Promise<number> {
+    return evictableStartInstances.countAfterGC(this.ctx.id.name ?? "");
   }
 }
 

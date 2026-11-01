@@ -12,20 +12,18 @@
  *
  * const ai = createAI({ binding: env.AI, id: "prod" });
  *
- * ai("@cf/zai-org/glm-4.7-flash");                     // Workers AI: ours
+ * ai("@cf/zai-org/glm-5.3-flash");                     // Workers AI: ours
  * ai(getBuiltinModel("anthropic", "claude-opus-4-8")); // theirs, our transport
  * ai("anthropic/claude-opus-4-8");                     // same, via pi's catalog
  * ```
  *
  * Workers AI runs on `env.AI.run` with Cloudflare's own compat layer. Every
- * other model goes to AI Gateway's universal endpoint, which forwards the
- * vendor's own request to the vendor with the key the gateway holds — so no
+ * other model goes to AI Gateway in its own protocol — `/run` for a model
+ * from the gateway's catalog, the provider-native path otherwise — and the
+ * gateway calls the vendor with the key it holds, so no
  * provider key, and no vendor wire format, lives in your Worker. The model's
  * metadata (`api`, `compat`, `thinkingLevelMap`, cost, limits) is whatever its
  * own registry says, and pi-ai's converters and stream processors do the rest.
- *
- * @beta Everything exported here is in beta: the surface may
- * change in a minor release while the design settles.
  *
  * @module
  */
@@ -42,7 +40,11 @@ import {
   createProvider,
   normalizeContext
 } from "@earendil-works/pi-ai";
-import type { WorkersAIModelId } from "../core/catalog";
+import {
+  isRunPathLanguageModelId,
+  type DynamicRouteId,
+  type WorkersAIModelId
+} from "../core/catalog";
 import type { AISettings } from "../core/settings";
 import { createTransport } from "../core/transport";
 import {
@@ -68,6 +70,7 @@ import { createStreams } from "./models/language";
 
 export type {
   CloudflareEmbeddingModelId,
+  DynamicRouteId,
   WorkersAIModelId
 } from "../core/catalog";
 export {
@@ -106,8 +109,6 @@ export { CLOUDFLARE_DIAGNOSTIC } from "./wires/shared";
 
 /**
  * pi-agent-core's `streamFn` shape: what `Agent` calls to run a turn.
- *
- * @beta This surface is in beta and may change.
  */
 export type StreamFn = (
   model: Model<string>,
@@ -120,12 +121,12 @@ export type StreamFn = (
  * pi-ai model to get a model this instance routes; use `stream`/`complete` to
  * run it, `streamFn` with pi-agent-core's `Agent`, and `provider` with a pi-ai
  * `Models` registry.
- *
- * @beta This surface is in beta and may change.
  */
 export interface AI {
   /** A Workers AI model: Cloudflare's own catalog, on the run path. */
   (modelId: WorkersAIModelId, options?: PiModelOptions): CloudflareModel;
+  /** An AI Gateway dynamic route, `dynamic/<route>`, on the Workers AI wire. */
+  (route: DynamicRouteId, options?: PiModelOptions): CloudflareModel;
   /** Any pi-ai model, routed through AI Gateway with its metadata intact. */
   <TApi extends Api>(model: Model<TApi>, options?: PiModelOptions): Model<TApi>;
   /**
@@ -135,6 +136,7 @@ export interface AI {
   (target: string | Model<Api>, options?: PiModelOptions): RoutedModel;
   /** Same as calling the provider directly. */
   model(modelId: WorkersAIModelId, options?: PiModelOptions): CloudflareModel;
+  model(route: DynamicRouteId, options?: PiModelOptions): CloudflareModel;
   model<TApi extends Api>(
     model: Model<TApi>,
     options?: PiModelOptions
@@ -202,7 +204,7 @@ function unroutableString(specifier: string): TypeError {
   const prefix = specifier.split("/")[0] ?? "";
   const hint = VENDOR_HINTS[prefix];
   return new TypeError(
-    `ai("${specifier}") is not a model this provider knows. Workers AI ids start with "@cf/". A third-party model comes from its own pi-ai registry: ai(getBuiltinModel(${
+    `ai("${specifier}") is not a model this provider knows. Workers AI ids start with "@cf/", AI Gateway dynamic routes with "dynamic/". A third-party model comes from its own pi-ai registry: ai(getBuiltinModel(${
       hint === undefined ? '"<provider>"' : `"${hint}"`
     }, "<model id>")) from "@earendil-works/pi-ai/providers/all", or any Model object you built yourself.`
   );
@@ -215,12 +217,16 @@ function buildModel(
   // A string leg follows the same rule as a string target, checked here so
   // the mistake is reported at the line that wrote the chain.
   for (const leg of options?.fallback ?? []) {
-    if (typeof leg !== "string" || leg.startsWith("@cf/")) continue;
+    if (typeof leg !== "string" || isRunPathLanguageModelId(leg)) continue;
     if (!leg.includes("/")) throw unroutableString(leg);
     buildGatewayModel(leg, undefined);
   }
   if (typeof target !== "string") return withOptions(target, options);
-  if (target.startsWith("@cf/")) return buildWorkersAIModel(target, options);
+  // Workers AI ids and AI Gateway dynamic routes both run on `env.AI.run`
+  // and answer in the chat-completions shape.
+  if (isRunPathLanguageModelId(target)) {
+    return buildWorkersAIModel(target, options);
+  }
   if (!target.includes("/")) throw unroutableString(target);
   return buildGatewayModel(target, options);
 }
@@ -228,21 +234,20 @@ function buildModel(
 /**
  * Creates a pi-ai provider over Cloudflare's AI.
  *
- * The Workers AI binding is the only way in — Workers AI models go through
- * `env.AI.run`, vendor models through `env.AI.gateway(id).run`, and there is
- * no HTTP transport and no API token. Gateway options may be given flat
+ * Workers AI and catalog models go through `env.AI.run`, other model objects
+ * through the binding's `fetch` to AI Gateway's provider-native path. With
+ * `{ accountId, apiToken }` instead of `binding`, the same requests go to the
+ * REST API and to `gateway.ai.cloudflare.com`. Gateway options may be given flat
  * (`{ binding, id: "prod", cacheTtl: 60 }`) or nested under `gateway`;
  * per-model options and per-call pi-ai options (`headers`, `metadata`,
  * `sessionId`) override them in that order.
  *
  * ```ts
  * const ai = createAI({ binding: env.AI, id: "prod" });
- * ai("@cf/zai-org/glm-4.7-flash");
- * ai(anthropicModel, { fallback: ["@cf/zai-org/glm-4.7-flash"] });
+ * ai("@cf/zai-org/glm-5.3-flash");
+ * ai(anthropicModel, { fallback: ["@cf/zai-org/glm-5.3-flash"] });
  * new Agent({ streamFn: ai.streamFn, initialState: { model: ai(openaiModel) } });
  * ```
- *
- * @beta This surface is in beta and may change.
  */
 export function createAI(settings: AISettings): AI {
   const transport = createTransport(settings);

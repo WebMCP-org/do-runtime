@@ -10,8 +10,6 @@ export const PROVIDER_OPTIONS_KEY = "cloudflare";
  * AI Gateway settings for a request. The gateway is an option, not a separate
  * product: every call goes through one, and `id` defaults to `"default"`,
  * which Cloudflare creates on first use.
- *
- * @experimental This surface is experimental and may change.
  */
 export interface GatewayOptions {
   /** Gateway id. Defaults to `"default"` (auto-created on first use). */
@@ -36,26 +34,64 @@ export interface GatewayOptions {
     retryDelayMs?: number;
     backoff?: "constant" | "linear" | "exponential";
   };
+  /**
+   * The stored BYOK key to use when the gateway holds more than one for a
+   * provider, by alias. Sent as `cf-aig-byok-alias`, for catalog models and
+   * for model objects reached through the provider-native path.
+   */
+  byokAlias?: string;
+  /**
+   * Zero Data Retention for this request, sent as `cf-aig-zdr`: `true` turns
+   * it on and `false` off, whatever the gateway's own setting. Unified
+   * billing only, and only for model objects reached through the
+   * provider-native path — `/run` does not read it.
+   */
+  zdr?: boolean;
 }
 
 /**
- * How `createAI` reaches Cloudflare: the Workers AI binding, and nothing else.
- * Workers AI models go through `env.AI.run`, vendor models through
- * `env.AI.gateway(id).run` — both are the binding, so there is no HTTP
- * transport, no account id and no API token to hold.
- *
- * @experimental This surface is experimental and may change.
+ * How `createAI` reaches Cloudflare: the `AI` binding, or an account id and
+ * API token. Both take the same routes — a model id to the run path, a
+ * vendor's model object to the provider-native path — and the same gateway
+ * options.
  */
-export type AISettings = {
+export type AISettings = (BindingAccess | AccountAccess) &
+  ProviderGatewaySettings;
+
+/**
+ * Reach Cloudflare through the `AI` binding: no account id or token to hold,
+ * and the gateway is the Worker's own account's.
+ */
+export interface BindingAccess {
   /** The `AI` binding from a Worker's env. */
   binding: Ai;
-} & ProviderGatewaySettings;
+  accountId?: never;
+  apiToken?: never;
+}
+
+/**
+ * Reach Cloudflare over HTTP with an account id and API token, for a gateway
+ * in another account or code that runs outside a Worker. A model id goes to
+ * the REST API (`api.cloudflare.com/client/v4/accounts/{accountId}/ai/...`),
+ * a model object to the provider-native path
+ * (`gateway.ai.cloudflare.com/v1/{accountId}/{gateway}/...`). The token is
+ * only ever sent to those two hosts.
+ */
+export interface AccountAccess {
+  /** The account the gateway belongs to. */
+  accountId: string;
+  /**
+   * A Cloudflare API token for that account, with Workers AI Read (model ids,
+   * on the REST API) and AI Gateway Run (model objects, on the
+   * provider-native path).
+   */
+  apiToken: string;
+  binding?: never;
+}
 
 /**
  * Provider-wide gateway defaults, in either spelling: nested under `gateway`,
  * or flat (`{ id: "prod", cacheTtl: 60 }`). Both merge, the flat key winning.
- *
- * @experimental This surface is experimental and may change.
  */
 export interface ProviderGatewaySettings extends GatewayOptions {
   /** Gateway id or full gateway options. */
@@ -75,8 +111,6 @@ export interface ProviderGatewaySettings extends GatewayOptions {
  * default; a module whose legs may also be model objects says so
  * (`ModelOptions<WorkersAIModelId | LanguageModelV4>`) rather than rebuilding
  * the type.
- *
- * @experimental This surface is experimental and may change.
  */
 export interface ModelOptions<
   Leg = WorkersAIModelId
@@ -166,6 +200,7 @@ function layerGateway(
   return {
     ...normalizeGateway(options.gateway),
     ...defined({
+      byokAlias: options.byokAlias,
       cacheKey: options.cacheKey,
       cacheTtl: options.cacheTtl,
       collectLog: options.collectLog,
@@ -174,13 +209,15 @@ function layerGateway(
       metadata: options.metadata,
       requestTimeoutMs: options.requestTimeoutMs,
       retries: options.retries,
-      skipCache: options.skipCache
+      skipCache: options.skipCache,
+      zdr: options.zdr
     })
   };
 }
 
 /** The flat gateway sugar {@link layerGateway} folds into `gateway`. */
 const FLAT_GATEWAY_KEYS = [
+  "byokAlias",
   "cacheKey",
   "cacheTtl",
   "collectLog",
@@ -190,7 +227,8 @@ const FLAT_GATEWAY_KEYS = [
   "metadata",
   "requestTimeoutMs",
   "retries",
-  "skipCache"
+  "skipCache",
+  "zdr"
 ] as const;
 
 /**
@@ -399,6 +437,7 @@ function asRetries(value: unknown): GatewayOptions["retries"] {
 /** Reads the shared gateway keys out of a loosely-typed record. */
 function parseGatewayFields(raw: Record<string, unknown>): GatewayOptions {
   return defined({
+    byokAlias: asString(raw.byokAlias),
     cacheKey: asString(raw.cacheKey),
     cacheTtl: asNumber(raw.cacheTtl),
     collectLog: asBoolean(raw.collectLog),
@@ -407,7 +446,8 @@ function parseGatewayFields(raw: Record<string, unknown>): GatewayOptions {
     metadata: asMetadata(raw.metadata),
     requestTimeoutMs: asNumber(raw.requestTimeoutMs),
     retries: asRetries(raw.retries),
-    skipCache: asBoolean(raw.skipCache)
+    skipCache: asBoolean(raw.skipCache),
+    zdr: asBoolean(raw.zdr)
   });
 }
 

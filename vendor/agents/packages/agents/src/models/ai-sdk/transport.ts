@@ -1,6 +1,6 @@
 import type { AISettings } from "../core/settings";
 import {
-  type Transport,
+  type Transport as CoreTransport,
   createTransport as createCoreTransport,
   errorFromGatewayEnvelope as coreErrorFromGatewayEnvelope,
   errorFromResponse as coreErrorFromResponse,
@@ -13,14 +13,13 @@ export {
   errorMessageFrom,
   headersToObject,
   isGatewayErrorEnvelope,
-  type Transport,
-  type TransportRequest,
-  type UniversalRequest
+  type NativeRequest,
+  type TransportRequest
 } from "../core/transport";
 
 /**
  * The typed AI SDK error for the gateway's own error envelope — a missing
- * gateway, an unpaid account — on the universal path.
+ * gateway, an unpaid account — on the provider-native path.
  */
 export function errorFromGatewayEnvelope(
   body: unknown,
@@ -30,6 +29,13 @@ export function errorFromGatewayEnvelope(
     coreErrorFromGatewayEnvelope(body, context)
   );
 }
+
+/**
+ * The transport this module uses: the run path for a model id, and the
+ * provider-native path for a vendor's own model object, through the binding
+ * or over HTTP.
+ */
+export type Transport = CoreTransport;
 
 /**
  * Unwraps the Cloudflare `{ success, result }` envelope, throwing an AI SDK
@@ -59,23 +65,21 @@ export async function errorFromResponse(
 /**
  * Builds the transport for a set of provider settings, with every failure
  * lifted into the AI SDK error type.
- *
- * @experimental This surface is experimental and may change.
  */
 export function createTransport(settings: AISettings): Transport {
   const inner = createCoreTransport(settings);
   return {
     logIdFallback: (response) => inner.logIdFallback(response),
-    async run(request) {
+    async native(request) {
       try {
-        return await inner.run(request);
+        return await inner.native(request);
       } catch (error) {
         throw toAISDKError(error);
       }
     },
-    async universal(request) {
+    async run(request) {
       try {
-        return await inner.universal(request);
+        return await inner.run(request);
       } catch (error) {
         throw toAISDKError(error);
       }

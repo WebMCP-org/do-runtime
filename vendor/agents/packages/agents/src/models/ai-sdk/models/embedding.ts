@@ -5,7 +5,7 @@ import {
   type EmbeddingModelV4Result
 } from "@ai-sdk/provider";
 import {
-  parseCallOptions,
+  parseModalityCallOptions,
   resolveOptions,
   type ModelOptions
 } from "../settings";
@@ -32,8 +32,6 @@ const MAX_EMBEDDINGS_PER_CALL = 3000;
  * An `EmbeddingModelV4` over the Workers AI text-embedding catalog. The run
  * path takes `{ text: string[] }` and answers `{ data, shape, usage }`,
  * sometimes inside the Cloudflare envelope.
- *
- * @experimental This surface is experimental and may change.
  */
 export class CloudflareEmbeddingModel implements EmbeddingModelV4 {
   readonly specificationVersion = "v4" as const;
@@ -75,7 +73,7 @@ export class CloudflareEmbeddingModel implements EmbeddingModelV4 {
     const resolved = resolveOptions(
       this.#config.providerGateway,
       this.#options,
-      parseCallOptions(options.providerOptions)
+      parseModalityCallOptions(options.providerOptions)
     );
     const input = { text: options.values };
     const transport: Transport = this.#config.transport;

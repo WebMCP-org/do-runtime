@@ -8,16 +8,12 @@ import {
   type Executor
 } from "@cloudflare/codemode";
 import { ToolSetConnector } from "@cloudflare/codemode/ai";
-import type { StateBackend, WorkspaceFsLike } from "@cloudflare/shell";
-import { createWorkspaceStateBackend } from "@cloudflare/shell";
-import { StateConnector } from "@cloudflare/shell/workers";
 import {
   BrowserConnector,
   DurableBrowserSessionStore,
   type BrowserBinding,
   type BrowserConnectorSessionOptions
 } from "agents/browser";
-import type { WorkspaceLike } from "./workspace";
 
 /**
  * The minimum agent surface for the `createExecuteTool(this)` one-liner.
@@ -28,7 +24,6 @@ import type { WorkspaceLike } from "./workspace";
  * which would break structural assignability of `this`.)
  */
 export interface ExecuteToolAgent {
-  workspace?: WorkspaceLike;
   /** Set by `createExecuteRuntime(agent)` so callables can reach the runtime. */
   codemode?: CodemodeRuntimeHandle;
 }
@@ -53,19 +48,6 @@ export interface CreateExecuteToolOptions {
   tools?: ToolSet;
 
   /**
-   * StateBackend exposed as `state.*` inside the sandbox — the full
-   * filesystem API (readFile, writeFile, glob, searchFiles, replaceInFiles,
-   * planEdits, …). Every method takes a single object argument.
-   *
-   * @example
-   * ```ts
-   * import { createWorkspaceStateBackend } from "@cloudflare/shell";
-   * state: createWorkspaceStateBackend(this.workspace)
-   * ```
-   */
-  state?: StateBackend;
-
-  /**
    * Browser Rendering binding. When provided, the sandbox gets the `cdp.*`
    * connector (cdp.send, cdp.attachToTarget, cdp.spec, …) — a live browser
    * over the Chrome DevTools Protocol.
@@ -81,7 +63,7 @@ export interface CreateExecuteToolOptions {
   session?: BrowserConnectorSessionOptions;
 
   /**
-   * Additional connectors for the sandbox beyond `tools`, `state`, and `cdp`.
+   * Additional connectors for the sandbox beyond `tools` and `cdp`.
    * Each adds its own named namespace.
    */
   connectors?: CodemodeConnector[];
@@ -118,7 +100,7 @@ export interface CreateExecuteToolOptions {
   /**
    * Custom tool description. Replaces the generated default entirely — the
    * default explains the codemode workflow and lists each configured
-   * namespace (`tools.*`, `state.*`, `cdp.*`) with a usage hint.
+   * namespace (`tools.*`, `cdp.*`) with a usage hint.
    */
   description?: string;
 
@@ -153,42 +135,9 @@ function isAgent(
   // An options bag has no `env`, but guard against a hand-built object that
   // happens to carry one (e.g. spread from a worker handler): an explicit
   // `executor`/`loader` key marks it as options — agents never have those.
-  // (Other option keys like `state`/`browser` can legitimately exist on agent
+  // (Other option keys like `tools`/`browser` can legitimately exist on agent
   // subclasses, so they can't discriminate.)
   return "env" in source && !("executor" in source) && !("loader" in source);
-}
-
-// The agent one-liner derives state from the workspace, which requires the
-// full filesystem surface (`WorkspaceFsLike`) — a concrete `Workspace` has
-// it; a minimal custom `WorkspaceLike` may not.
-const WORKSPACE_FS_METHODS = [
-  "readFile",
-  "readFileBytes",
-  "writeFile",
-  "writeFileBytes",
-  "appendFile",
-  "exists",
-  "stat",
-  "lstat",
-  "mkdir",
-  "readDir",
-  "rm",
-  "cp",
-  "mv",
-  "symlink",
-  "readlink",
-  "glob"
-] as const;
-
-function workspaceFs(
-  workspace: WorkspaceLike | undefined
-): WorkspaceFsLike | undefined {
-  if (!workspace) return undefined;
-  const candidate = workspace as unknown as Record<string, unknown>;
-  for (const method of WORKSPACE_FS_METHODS) {
-    if (typeof candidate[method] !== "function") return undefined;
-  }
-  return workspace as unknown as WorkspaceFsLike;
 }
 
 function optionsFromAgent(agent: ExecuteToolAgent): CreateExecuteToolOptions {
@@ -203,11 +152,9 @@ function optionsFromAgent(agent: ExecuteToolAgent): CreateExecuteToolOptions {
         "call createExecuteTool({ ctx, loader, ... }) with explicit options."
     );
   }
-  const fs = workspaceFs(agent.workspace);
   return {
     ctx,
     loader: env.LOADER,
-    state: fs ? createWorkspaceStateBackend(fs) : undefined,
     browser: env.BROWSER
   };
 }
@@ -221,6 +168,12 @@ function optionsFromAgent(agent: ExecuteToolAgent): CreateExecuteToolOptions {
  * When called with an agent, the runtime handle is also assigned to
  * `agent.codemode` so callables (and Think's built-in approval flow) can
  * reach it.
+ *
+ * @deprecated Code execution is moving to the Workspace: give it a
+ * JavaScript backend with a `ws:tools` module
+ * (`createToolBindings(forAISDKTools(() => this.getTools()))` from
+ * `@cloudflare/computer`), so code the model runs with `exec` imports the
+ * agent's tools and reads files through `node:fs`.
  */
 export function createExecuteRuntime(
   source: CreateExecuteToolOptions | ExecuteToolAgent,
@@ -262,9 +215,6 @@ export function createExecuteRuntime(
       new ToolSetConnector(options.ctx, { tools: options.tools })
     );
   }
-  if (options.state) {
-    connectors.push(new StateConnector(options.ctx, options.state));
-  }
   if (options.browser) {
     connectors.push(
       new BrowserConnector(options.ctx, {
@@ -280,7 +230,7 @@ export function createExecuteRuntime(
   if (connectors.length === 0) {
     throw new Error(
       "createExecuteTool has nothing to expose — provide at least one of " +
-        "`tools`, `state`, `browser`, or `connectors`."
+        "`tools`, `browser`, or `connectors`."
     );
   }
 
@@ -329,8 +279,8 @@ export function createExecuteRuntime(
 /**
  * One-line usage hints for the namespaces createExecuteTool itself wires up,
  * rendered into the default tool description. Models otherwise tend to guess
- * a filesystem API (`host.*`, `fs.*`) instead of discovering `state.*` /
- * `tools.*` via `codemode.search`.
+ * a filesystem API (`host.*`, `fs.*`) instead of discovering `tools.*` via
+ * `codemode.search`.
  */
 function connectorHints(
   options: CreateExecuteToolOptions
@@ -345,12 +295,6 @@ function connectorHints(
         `your host tools as async functions — e.g. \`await tools.${names[0]}({ ... })\`. ` +
         `Available: ${names.join(", ")}`;
     }
-  }
-  if (options.state) {
-    hints.state =
-      "the workspace filesystem. Every method takes ONE object argument: " +
-      "`state.readFile({ path })`, `state.writeFile({ path, content })`, " +
-      "`state.readdir({ path })`, `state.glob({ pattern })`, …";
   }
   if (options.browser) {
     hints.cdp =
@@ -392,13 +336,12 @@ export function truncatePausedExecutionOutput(output: unknown): unknown {
 
 /**
  * Create a code execution tool that lets the LLM write and run TypeScript
- * against your tools, the workspace filesystem, and (optionally) a live
- * browser — all inside a sandboxed Worker, recorded on a durable codemode
+ * against your tools and (optionally) a live browser — all inside a sandboxed Worker, recorded on a durable codemode
  * runtime (abort-and-replay, approvals, snippets).
  *
- * The model sees typed namespaces: `tools.*` for your AI SDK tools,
- * `state.*` for the filesystem (object args: `state.readFile({ path })`),
- * and `cdp.*` for the browser.
+ * The model sees typed namespaces: `tools.*` for your AI SDK tools and
+ * `cdp.*` for the browser. To give the sandbox the workspace, pass the
+ * workspace tools: `tools: createAITools({ workspace: this.workspace })`.
  *
  * Setup checklist:
  *
@@ -412,7 +355,7 @@ export function truncatePausedExecutionOutput(output: unknown): unknown {
  * ```ts
  * getTools() {
  *   return {
- *     // state.* from this.workspace, cdp.* if env.BROWSER is bound,
+ *     // cdp.* if env.BROWSER is bound,
  *     // executor from env.LOADER
  *     execute: createExecuteTool(this)
  *   };
@@ -429,7 +372,6 @@ export function truncatePausedExecutionOutput(output: unknown): unknown {
  * execute: createExecuteTool({
  *   ctx: this.ctx,
  *   tools: myDomainTools,                                  // tools.*
- *   state: createWorkspaceStateBackend(this.workspace),    // state.*
  *   browser: this.env.BROWSER,                             // cdp.*
  *   loader: this.env.LOADER
  * })
@@ -437,6 +379,12 @@ export function truncatePausedExecutionOutput(output: unknown): unknown {
  *
  * Use {@link createExecuteRuntime} to also get the runtime handle
  * (approvals, audit, snippets) and the connector set.
+ *
+ * @deprecated Code execution is moving to the Workspace: give it a
+ * JavaScript backend with a `ws:tools` module
+ * (`createToolBindings(forAISDKTools(() => this.getTools()))` from
+ * `@cloudflare/computer`), so code the model runs with `exec` imports the
+ * agent's tools and reads files through `node:fs`.
  */
 export function createExecuteTool(
   source: CreateExecuteToolOptions | ExecuteToolAgent,

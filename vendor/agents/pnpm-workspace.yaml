@@ -20,10 +20,14 @@ peerDependencyRules:
     # declares only Babel 8. The maintained browser suite exercises this pair.
     "@babel/core": "^7.29.0"
     # The maintained fork typechecks against this Workers contract.
-    "@cloudflare/workers-types": "5.20261009.1"
+    "@cloudflare/workers-types": "5.20261031.1"
 patchedDependencies:
   vitest-browser-react@2.3.0: patches/vitest-browser-react+2.3.0.patch
 allowBuilds:
+  # pi-ai 1.4's provider SDKs (@earendil-works/pi-ai); the faux provider path
+  # never invokes these, so their postinstall/native builds are not needed.
+  "@google/genai": false
+  protobufjs: false
   esbuild: true
   workerd: true
   core-js-pure: false
@@ -47,8 +51,8 @@ minimumReleaseAgeExclude:
   - postal-mime@2.7.5
   - cronstrue@3.23.0
   - es-module-lexer@2.2.0
-  - "@modelcontextprotocol/core@2.0.0"
-  - "@modelcontextprotocol/server@2.0.0"
-  - "@modelcontextprotocol/client@2.0.0"
-  - "@modelcontextprotocol/conformance@0.2.0-alpha.10"
-  - "@modelcontextprotocol/sdk@1.30.0"
+  - "@modelcontextprotocol/core@2.4.0"
+  - "@modelcontextprotocol/server@2.4.0"
+  - "@modelcontextprotocol/client@2.4.0"
+  - "@modelcontextprotocol/conformance@0.2.0-alpha.12"
+  - "@modelcontextprotocol/sdk@1.32.2"

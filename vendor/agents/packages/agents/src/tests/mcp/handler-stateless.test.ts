@@ -176,6 +176,42 @@ describe("createMcpHandler SDK v2", () => {
     expect(factoryCalls).toBe(0);
   });
 
+  it.each<KeepaliveLane>(["modern", "legacy"])(
+    "rejects a %s request when the factory returns an instance still serving another request",
+    async (lane) => {
+      const shared = createHangingServer();
+      const onerror = vi.fn();
+      const handler = createMcpHandler(() => shared.server, {
+        onerror,
+        responseMode: "sse"
+      });
+
+      const first = await handler(
+        keepaliveRequest(lane),
+        env,
+        createExecutionContext()
+      );
+      expect(first.status).toBe(200);
+
+      const second = await handler(
+        keepaliveRequest(lane),
+        env,
+        createExecutionContext()
+      );
+      expect(second.status).toBe(500);
+      expect(onerror).toHaveBeenCalledWith(
+        expect.objectContaining({
+          message: expect.stringContaining("still serving another request")
+        })
+      );
+
+      // The rejected request must not tear down the instance the first
+      // request is still using.
+      shared.release();
+      expect(await first.text()).toContain('"text":"done"');
+    }
+  );
+
   it("fails fast when Legacy compatibility code attempts a reverse request", async () => {
     const handler = createMcpHandler(() => {
       const server = createServer();
@@ -608,6 +644,90 @@ describe("createMcpHandler SDK v2", () => {
     expect(seenFactoryContext).toMatchObject({ authInfo: expected });
     expect(seenToolContext).toMatchObject({ http: { authInfo: expected } });
     expect(seenAuthProps).toBe(props);
+  });
+
+  it("maps workers-oauth-provider 1.x ctx.auth to AuthInfo and preserves props", async () => {
+    const props = { userId: "user-1x" };
+    const ctx = createExecutionContext();
+    Object.defineProperty(ctx, "props", { value: props });
+    Object.defineProperty(ctx, "auth", {
+      value: {
+        token: "secret-1x-token",
+        audience: "https://example.com/mcp",
+        expiresAt: 1234567890,
+        scope: ["mcp:read"],
+        userId: "user-1x",
+        clientId: "client-1x"
+      }
+    });
+    let seenFactoryContext: unknown;
+    let seenToolContext: unknown;
+    let seenAuthProps: unknown;
+    const handler = createMcpHandler((factoryContext) => {
+      seenFactoryContext = factoryContext;
+      const server = createServer();
+      server.registerTool(
+        "whoami",
+        { inputSchema: {} },
+        (_args, toolContext) => {
+          seenToolContext = toolContext;
+          seenAuthProps = getMcpAuthContext()?.props;
+          return { content: [{ type: "text", text: "ok" }] };
+        }
+      );
+      return server;
+    });
+
+    const response = await handler(
+      statelessRequest("tools/call", { name: "whoami", arguments: {} }),
+      env,
+      ctx
+    );
+
+    expect(response.status).toBe(200);
+    const expected = {
+      token: "secret-1x-token",
+      clientId: "client-1x",
+      scopes: ["mcp:read"],
+      expiresAt: 1234567890,
+      resource: new URL("https://example.com/mcp"),
+      extra: { props }
+    };
+    expect(seenFactoryContext).toMatchObject({ authInfo: expected });
+    expect(seenToolContext).toMatchObject({ http: { authInfo: expected } });
+    expect(seenAuthProps).toBe(props);
+  });
+
+  it("ignores ctx.auth without a client ID and keeps props", async () => {
+    const props = { userId: "external-1x" };
+    const ctx = createExecutionContext();
+    Object.defineProperty(ctx, "props", { value: props });
+    Object.defineProperty(ctx, "auth", {
+      value: {
+        token: "external-token",
+        audience: "https://example.com/mcp",
+        scope: []
+      }
+    });
+    let seenFactoryContext: unknown;
+    let seenProps: unknown;
+    const handler = createMcpHandler((factoryContext) => {
+      seenFactoryContext = factoryContext;
+      seenProps = getMcpAuthContext()?.props;
+      return createServer();
+    });
+
+    const response = await handler(
+      statelessRequest("server/discover"),
+      env,
+      ctx
+    );
+
+    expect(response.status).toBe(200);
+    expect(
+      (seenFactoryContext as { authInfo?: unknown }).authInfo
+    ).toBeUndefined();
+    expect(seenProps).toBe(props);
   });
 
   it("maps provider metadata through the v2 server's legacy fallback", async () => {

@@ -1,4 +1,4 @@
-# Models for pi-ai (Beta)
+# Models for pi-ai
 
 `agents/models/pi-ai` is the [pi-ai](https://github.com/earendil-works/pi/tree/main/packages/ai)
 twin of [`agents/models/ai-sdk`](./models.md): the same `createAI` factory, the same options,
@@ -21,7 +21,7 @@ import { getBuiltinModel } from "@earendil-works/pi-ai/providers/all";
 
 const ai = createAI({ binding: env.AI, id: "prod", cacheTtl: 60 });
 
-ai("@cf/zai-org/glm-4.7-flash"); // Workers AI: our catalog, our compat layer
+ai("@cf/zai-org/glm-5.3-flash"); // Workers AI: our catalog, our compat layer
 ai(getBuiltinModel("anthropic", "claude-opus-4-8")); // their model, our transport
 ```
 
@@ -43,9 +43,10 @@ design: a model this package cannot name exactly is yours to construct.
    created on first use.
 3. **No provider keys.** AI Gateway holds the credential — unified billing, or a key you
    store on the gateway (BYOK) — so nothing vendor-shaped needs a secret in your Worker.
-4. **The binding is the only way in.** Workers AI goes through `env.AI.run`, vendor models
-   through `env.AI.gateway(id).run`; there is no HTTP transport and no API token to hold.
-5. Everything here is in beta and may change in a minor release.
+4. **The binding, or an account id and token.** Workers AI and catalog models go through
+   `env.AI.run`, other model objects through the binding's `fetch` to AI Gateway's
+   provider-native path. With [an account id and API token](#account-id-and-api-token) the
+   same requests go over HTTP instead.
 
 ## Quick start
 
@@ -64,7 +65,7 @@ import { createAI } from "agents/models/pi-ai";
 export default {
   async fetch(_request: Request, env: { AI: Ai }) {
     const ai = createAI({ binding: env.AI });
-    const reply = await ai.complete(ai("@cf/zai-org/glm-4.7-flash"), {
+    const reply = await ai.complete(ai("@cf/zai-org/glm-5.3-flash"), {
       messages: [{ role: "user", content: "Hello", timestamp: Date.now() }]
     });
     // `content` is an array of parts — text, thinking, tool calls.
@@ -77,14 +78,37 @@ export default {
 };
 ```
 
+### Account id and API token
+
+To use a gateway in another account, or to call from outside a Worker, pass `accountId` and
+`apiToken` instead of `binding`. Everything else is the same, and the gateway still defaults to
+`default`:
+
+```ts
+const ai = createAI({
+  accountId: "27b146402af2103944379f33841b6234",
+  apiToken: env.CLOUDFLARE_API_TOKEN,
+  gateway: "project-gateway"
+});
+```
+
+Workers AI and catalog models go to AI Gateway's
+[REST API](https://developers.cloudflare.com/ai-gateway/usage/rest-api/), which runs them on
+`/run` as `env.AI.run` does. Other model objects go to the provider-native path on
+`gateway.ai.cloudflare.com`, with the token as `cf-aig-authorization`. Create the token with
+**Workers AI Read** and **AI Gateway Run**; it is sent to those two hosts only.
+
 ## Where a model comes from
 
 ```ts
 // 1. Workers AI — ours.
-ai("@cf/zai-org/glm-4.7-flash");
+ai("@cf/zai-org/glm-5.3-flash");
 
 // 2. pi-ai's Cloudflare AI Gateway catalog — a string, resolved by pi, not us.
 ai("anthropic/claude-opus-4.8");
+
+// 2b. An AI Gateway dynamic route — the route on the gateway picks the model.
+ai("dynamic/support");
 
 // 3. Any pi-ai model object, from any registry you imported.
 import { anthropicProvider } from "@earendil-works/pi-ai/providers/anthropic";
@@ -99,6 +123,10 @@ cost, context window, max tokens. That metadata is why Claude Opus gets
 `thinking: { type: "adaptive" }` and GPT-5 gets `reasoning.effort`: the model's author said
 so, and this package does not second-guess it. Form 3 never mutates the object you
 passed; the options ride on a copy.
+
+A `dynamic/<route>` id runs on `env.AI.run` with the Workers AI wire, under the gateway the
+route was created on. It answers in the chat-completions shape whichever model the route
+picked, and takes the same metadata defaults and overrides as a Workers AI id.
 
 ## Running a model
 
@@ -137,6 +165,10 @@ A session stores its model as `{ provider, modelId }`, not as a model object, so
 `@cf/…` and `<provider>/<id>` forms there. Options given to `ai(model, options)` do not reach a
 session; set them on `createAI` instead.
 
+A model stream that is cut off, or that sends nothing for `streamIdleTimeoutMs`, ends in an error
+pi-ai's `isRetryableAssistantError()` treats as transient, so the harness retries the turn under
+its retry settings rather than failing it.
+
 `ai.streamFn` is `streamSimple`, bound, for frameworks that take a stream function, such as
 pi-agent-core's `Agent({ streamFn })`.
 
@@ -148,7 +180,7 @@ import { createModels } from "@earendil-works/pi-ai/models";
 const models = createModels();
 models.setProvider(ai.provider); // provider id: "cloudflare"
 models.getModel("cloudflare", "anthropic/claude-opus-4.8");
-models.streamSimple(ai("@cf/zai-org/glm-4.7-flash"), context);
+models.streamSimple(ai("@cf/zai-org/glm-5.3-flash"), context);
 ```
 
 The provider's static list is every Workers AI id pi-ai knows plus every `<provider>/<id>` in
@@ -172,7 +204,8 @@ ai("anthropic/claude-opus-4.8", {
   eventId: "turn-17",
   requestTimeoutMs: 30_000,
   retries: { maxAttempts: 3, backoff: "exponential", retryDelayMs: 500 },
-  fallback: ["@cf/zai-org/glm-4.7-flash"], // ids or models, in any mix
+  byokAlias: "team-a", // which stored BYOK key, by alias
+  fallback: ["@cf/zai-org/glm-5.3-flash"], // ids or models, in any mix
   headers: { "x-request-source": "docs" },
   sessionAffinity: "chat-42", // Workers AI prefix-cache routing
   reasoningEffort: "low", // "low" | "medium" | "high" | null
@@ -203,20 +236,29 @@ then model, then `createAI` settings.
 
 ## How a request travels
 
-| Model                    | `api`                | Transport                                 |
-| ------------------------ | -------------------- | ----------------------------------------- |
-| `@cf/…`                  | `cloudflare-ai`      | `env.AI.run` + Cloudflare's compat layer  |
-| Anthropic (any registry) | `anthropic-messages` | gateway universal → `v1/messages`         |
-| OpenAI (any registry)    | `openai-responses`   | gateway universal → `v1/responses`        |
-| Groq, DeepSeek, xAI, …   | `openai-completions` | gateway universal → `v1/chat/completions` |
+| Model                                   | `api`                | Through the binding                                       | With an account id and token                           |
+| --------------------------------------- | -------------------- | --------------------------------------------------------- | ------------------------------------------------------ |
+| `@cf/…`, `dynamic/…`                    | `cloudflare-ai`      | `env.AI.run` + Cloudflare's compat layer                  | the REST API + Cloudflare's compat layer               |
+| `anthropic/…` from pi's gateway catalog | `anthropic-messages` | `env.AI.run` → AI Gateway `/run`, Messages in and out     | the REST API's `/ai/v1/messages` → AI Gateway `/run`   |
+| `openai/…` from pi's gateway catalog    | `openai-responses`   | `env.AI.run` → AI Gateway `/run`, Responses in and out    | the REST API's `/ai/v1/responses` → AI Gateway `/run`  |
+| Any other model object                  | its own `api`        | the binding's `fetch` → AI Gateway's provider-native path | `gateway.ai.cloudflare.com` → the provider-native path |
 
-Everything that is not `@cf/` goes through **AI Gateway's universal request**: the vendor's
-own body, built by pi-ai's own converter, posted to the gateway with the provider slug taken
-from the model's `baseUrl` host. The gateway forwards it to the vendor with the credential it
-holds, and streams the vendor's own SSE back untouched — pi-ai's stream processors parse it,
-as they would if you had called the vendor directly, the thinking knobs aside (below). No
-credential header leaves your Worker, and the model's `api`, `provider` and `id` are never
-rewritten, so thinking signatures and encrypted reasoning items replay on the next turn.
+A model from pi's Cloudflare AI Gateway catalog runs on `env.AI.run` under the gateway's
+catalog id (`anthropic/claude-opus-4.8`). pi-ai spells Claude ids as Anthropic does
+(`claude-opus-4-8`), so `agents` lists and resolves them with the catalog's dot instead. The body is pi-ai's own,
+built by pi-ai's converter for the model's `api`, and it is sent in that format: `/run`
+converts nothing, so the answer, streams included, is the shape pi-ai's stream processors
+read. `/run` picks the provider and bills through Unified Billing or a key stored on the
+gateway.
+
+Any other model object — one from pi's Anthropic, OpenAI or Groq registry, with the vendor's
+own id — goes to AI Gateway's **provider-native path** through the binding's `fetch`, with the
+provider slug taken from the model's `baseUrl` host. The gateway forwards it to the vendor with
+the credential it holds and streams the vendor's own SSE back untouched.
+
+Either way no vendor credential leaves your Worker, and the model's `api`, `provider` and
+`id` are never rewritten, so thinking signatures and encrypted reasoning items replay on the
+next turn.
 
 The `api` markers in that table are the only ones this package routes, and the table is the
 whole list: `cloudflare-ai`, `anthropic-messages`, `openai-responses`, `openai-completions`.
@@ -258,6 +300,11 @@ gateway, an unpaid account) become a `CloudflareAIError`, so fallback and retry 
 way they treat Workers AI failures. A model whose `api` is not one of the four routed markers
 never gets that far: the stream ends with an `error` event naming the `api`.
 
+`byokAlias` picks a stored key by alias when the gateway holds several for one provider. It is
+sent as `cf-aig-byok-alias` on a catalog model and on any other model object. `zdr` turns Zero
+Data Retention on or off for a Unified Billing request, and applies to model objects outside
+pi's gateway catalog only: `/run` does not read it.
+
 ## Observability
 
 Every assistant message carries a `cloudflare` diagnostic with the gateway correlation for its
@@ -276,10 +323,19 @@ A failed dispatch ends the stream with an `error` event whose message carries a
 `cloudflare-error` diagnostic (`status`, `code`, `logId`), and `onResponse` fires with the raw
 status and headers for every request.
 
+## Stream resume
+
+Through the binding, a model from pi's AI Gateway catalog streams from `/run`, which names the run in
+`cf-aig-run-id` and keeps its events. If the connection drops, the provider reconnects through
+the binding and replays from the last complete event, so the stream continues with nothing lost
+or repeated. It gives up after five drops or once the gateway no longer holds the run, and an
+abort never resumes. Workers AI streams and models on the provider-native path have no run id
+and are not resumed. The run id is on the `cloudflare` diagnostic as `runId`.
+
 ## Fallback
 
 ```ts
-ai(claude, { fallback: ["@cf/zai-org/glm-4.7-flash"] });
+ai(claude, { fallback: ["@cf/zai-org/glm-5.3-flash"] });
 ```
 
 Legs may be Workers AI ids or models, in any mix. They are tried in order: a leg is abandoned
@@ -311,11 +367,10 @@ Image generation is Workers AI only. The knobs a model takes are the model's:
 in a `cloudflare-compat` diagnostic on the result rather than sent and ignored.
 Every other model in the catalog takes the full set.
 
-## Beta
+## Requirements
 
-This subpath needs `@earendil-works/pi-ai@^1.0.0`, an optional peer of `agents`. `agents`
-takes no vendor package as a dependency, optional or otherwise. The surface is in beta
-and may change in a minor release. An unlisted `@cf/` id resolves with default metadata (a
+This subpath needs `@earendil-works/pi-ai@~1.4.0`, an optional peer of `agents`. `agents`
+takes no vendor package as a dependency, optional or otherwise. An unlisted `@cf/` id resolves with default metadata (a
 128k context window, 8192 output tokens, zero cost); pass overrides when you know better.
 
 ## See also

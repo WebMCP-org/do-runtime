@@ -31,19 +31,43 @@ export {
   DurableBrowserSessionStore,
   type BrowserSessionLock,
   type BrowserSessionStore,
+  type ListableBrowserSessionStore,
   type StoredBrowserSession
 } from "./session-store";
 
 export {
   Browser,
-  browserRun,
+  DEFAULT_BROWSER_SCOPE,
+  MAX_BROWSER_SCOPES,
   type BrowserConnection,
+  type BrowserConnectOptions,
   type BrowserOptions,
+  type BrowserInternalHosts,
   type BrowserProvider,
-  type BrowserRunOptions,
-  type BrowserRunProvider,
   type ResolvedBrowser
 } from "./browser";
+
+export {
+  InternalHostRouter,
+  MAX_INTERNAL_HOSTS,
+  type InternalWorkerHost,
+  type InternalHost,
+  type InternalHostInfo,
+  type InternalHostMessage,
+  type InternalHostRouterLoopback,
+  type InternalHostRouterProps,
+  type InternalHostsOptions,
+  type JsonSchemaObject,
+  type TargetOf,
+  type TargetSchema,
+  type TypedTargetSchema
+} from "./internal-hosts";
+
+export {
+  browserRun,
+  type BrowserRunOptions,
+  type BrowserRunProvider
+} from "./providers/browser-run";
 
 export {
   browserContent,
@@ -77,19 +101,39 @@ export {
 } from "./spec";
 
 export {
+  ACTIVE_PAGE_SESSION,
+  BrowserSession,
+  type BrowserAttachInput,
+  type BrowserDebugLogInput,
+  type BrowserNewTab,
+  type BrowserSendInput,
+  type BrowserSessionOptions,
+  type BrowserSessionReport,
+  type BrowserSource
+} from "./session";
+
+export type {
+  BrowserLiveView,
+  BrowserLiveViewTarget,
+  BrowserLiveViewUrl,
+  LiveViewMode
+} from "./live-view";
+
+export {
   BrowserConnector,
   DEFAULT_EXEC_SWEEP_IDLE_MS,
   type BrowserConnectorOptions,
   type BrowserConnectorSessionOptions,
   type BrowserConnectorSweepOptions,
-  type BrowserConnectorSweepResult,
-  type BrowserLiveView,
-  type BrowserLiveViewTarget,
-  type BrowserLiveViewUrl,
-  type LiveViewMode
+  type BrowserConnectorSweepResult
 } from "./connector";
 
-// Re-exported so browser-tool consumers can satisfy the facet wiring with
-// `export { CodemodeRuntime } from "agents/browser";` in their worker entry
-// without adding a direct @cloudflare/codemode dependency.
+/**
+ * The facet class `createBrowserTools` runs on, re-exported so a Worker entry
+ * can `export { CodemodeRuntime } from "agents/browser"` without a direct
+ * `@cloudflare/codemode` dependency.
+ *
+ * @deprecated Only the deprecated `createBrowserTools` needs it;
+ * `browserTool` doesn't.
+ */
 export { CodemodeRuntime } from "@cloudflare/codemode";

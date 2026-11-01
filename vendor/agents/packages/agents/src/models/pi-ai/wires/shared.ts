@@ -15,9 +15,12 @@ import {
   calculateCost
 } from "@earendil-works/pi-ai";
 import { sseDataStream } from "../../core/sse";
-import type { Transport } from "../../core/transport";
+import { isCatalogModelId } from "../../core/catalog";
 import {
+  type RunRequestFormat,
+  type Transport,
   errorFromGatewayEnvelope,
+  errorFromResponse,
   headersToObject,
   isGatewayErrorEnvelope
 } from "../../core/transport";
@@ -252,9 +255,11 @@ export function withIdleDeadline(
           reader.read(),
           new Promise<never>((_, reject) => {
             timer = setTimeout(() => {
+              // "timed out" matches pi-ai's isRetryableAssistantError(), so
+              // pi retries a stalled stream instead of failing the turn.
               reject(
                 new Error(
-                  `Model stream stalled: no data received for ${Math.round(idleMs / 1000)}s.`
+                  `Model stream timed out: no data received for ${Math.round(idleMs / 1000)}s.`
                 )
               );
             }, idleMs);
@@ -345,39 +350,108 @@ export function anthropicVendorHeaders(betas: readonly string[]): {
   };
 }
 
+/**
+ * The vendor headers `/run` also carries. The rest (`anthropic-version`,
+ * `accept`, `content-type`) belong to the gateway there, but `anthropic-beta`
+ * holds the beta features the body was built for: without it Anthropic refuses
+ * a body that uses one, or quietly drops the feature. The binding sends
+ * `extraHeaders` as request headers, and AI Gateway passes this one on.
+ */
+const RUN_VENDOR_HEADERS: readonly string[] = ["anthropic-beta"];
+
+/**
+ * The headers a `/run` request sends: the vendor headers in
+ * {@link RUN_VENDOR_HEADERS}, then the caller's own, which win. Names compare
+ * case-insensitively, so a caller's `Anthropic-Beta` replaces the wire's
+ * rather than being sent alongside it.
+ */
+function runHeaders(
+  vendorHeaders: Record<string, string>,
+  callerHeaders: Record<string, string>
+): Record<string, string> {
+  const callerNames = new Set(
+    Object.keys(callerHeaders).map((name) => name.toLowerCase())
+  );
+  const headers: Record<string, string> = {};
+  for (const name of RUN_VENDOR_HEADERS) {
+    const value = vendorHeaders[name];
+    if (value !== undefined && !callerNames.has(name)) headers[name] = value;
+  }
+  return { ...headers, ...callerHeaders };
+}
+
 /** The vendor headers an OpenAI-shaped request needs. */
 export function openAIVendorHeaders(): Record<string, string> {
   return { accept: "application/json", "content-type": "application/json" };
 }
 
 /**
- * Sends a vendor's own request body through AI Gateway's universal endpoint.
- *
- * The provider slug comes from the model's base URL and the endpoint from its
- * `api`; the body is what pi-ai's converter built, `model` included, because
- * that is what the universal request carries. The gateway's *own* failures
- * (no such gateway, unified billing unpaid) are lifted into a
- * `CloudflareAIError` so fallback and retry classification behave as they do on
- * the Workers AI run path; a vendor's own error response is left alone for the
- * wire's parser to read.
+ * The AI Gateway catalog id a model runs under on `/run`, when it has one: the
+ * `<author>/<model>` specifier it was resolved from, spelled as the gateway's
+ * catalog spells it (`anthropic/claude-opus-4.8`, not pi's `claude-opus-4-8`).
  */
-export async function sendUniversal(
+function catalogIdOf(model: Model<Api>): string | undefined {
+  const specifier = specifierOf(model);
+  return specifier !== undefined && isCatalogModelId(specifier)
+    ? specifier
+    : undefined;
+}
+
+/**
+ * Sends a vendor-format request body through AI Gateway, by the binding.
+ *
+ * A model from pi's Cloudflare AI Gateway catalog runs on `env.AI.run` under
+ * its catalog id, in its native `format`: `/run` converts nothing, so the
+ * answer — streams included — is the shape this wire parses. Any other model
+ * goes to the gateway's provider-native path with the request unchanged; the
+ * provider slug comes from the model's base URL and the endpoint from its
+ * `api`.
+ *
+ * The gateway's *own* failures (no such gateway, unified billing unpaid, an
+ * unknown catalog model) become a `CloudflareAIError`, so fallback and retry
+ * behave as they do on the Workers AI run path; a vendor's own error response
+ * on the provider-native path is left for the wire's parser to read.
+ */
+export async function sendGateway(
   request: WireRequest,
   transport: Transport,
   body: Record<string, unknown>,
   vendorHeaders: Record<string, string>,
+  format: RunRequestFormat,
   onResponse?: (response: Response) => void
 ): Promise<Response> {
   const { model, options, resolved } = request;
+  const catalogId = catalogIdOf(model);
+  if (catalogId !== undefined) {
+    // `/run` names the model at the top level; the vendor spelling the wire
+    // put in the body is not the catalog's.
+    const { model: _vendorId, ...input } = body;
+    const response = await transport.run({
+      format,
+      gateway: resolved.gateway,
+      headers: runHeaders(vendorHeaders, request.headers),
+      input,
+      model: catalogId,
+      signal: options.signal
+    });
+    onResponse?.(response);
+    if (!response.ok) {
+      throw await errorFromResponse(response, {
+        model: catalogId,
+        requestBodyValues: input,
+        url: transport.url
+      });
+    }
+    return response;
+  }
   const route = routeForModel(model);
-  const response = await transport.universal({
+  const response = await transport.native({
+    body: JSON.stringify(body),
     endpoint: route.endpoint,
-    extraHeaders:
-      Object.keys(request.headers).length > 0 ? request.headers : undefined,
     gateway: resolved.gateway,
-    headers: vendorHeaders,
+    headers: { ...vendorHeaders, ...request.headers },
+    method: "POST",
     provider: route.provider,
-    query: body,
     signal: options.signal
   });
   // The correlation ids are on the raw response, and a gateway envelope is

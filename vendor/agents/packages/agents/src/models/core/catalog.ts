@@ -83,8 +83,6 @@ type RerankingCatalogId = {
  *
  * Third-party models are not ids here — they are model objects built by their
  * own provider package and routed through AI Gateway.
- *
- * @experimental This surface is experimental and may change.
  */
 export type WorkersAIModelId =
   // `Extract` is the runtime guard written as a type: the ambient catalog also
@@ -103,12 +101,76 @@ export type WorkersAIModelId =
   | (`@cf/${string}` & {});
 
 /**
+ * An AI Gateway dynamic route, by name: `dynamic/<route>`.
+ *
+ * A dynamic route is configured on the gateway — which models it tries, in
+ * which order, with what rate limits or budgets — and called through the
+ * Workers AI run path like a model. It answers in the OpenAI chat-completions
+ * shape whatever model served it, so it is a language model only.
+ */
+export type DynamicRouteId = `dynamic/${string}`;
+
+/**
+ * Whether an id names an AI Gateway dynamic route: `dynamic/` and a route
+ * name after it.
+ *
+ * @experimental This surface is experimental and may change.
+ */
+export function isDynamicRouteId(modelId: string): modelId is DynamicRouteId {
+  return modelId.startsWith("dynamic/") && modelId.length > "dynamic/".length;
+}
+
+/**
+ * Whether an id names a Workers AI model, served by Workers AI itself rather
+ * than by AI Gateway's `/run`.
+ *
+ * @experimental This surface is experimental and may change.
+ */
+export function isWorkersAIId(modelId: string): boolean {
+  return modelId.startsWith("@cf/") || modelId.startsWith("@hf/");
+}
+
+/**
+ * A model from the AI Gateway catalog, by its catalog id:
+ * `<author>/<model>`, such as `openai/gpt-5.5`,
+ * `anthropic/claude-opus-4.8` or `cloudflare/auto`.
+ *
+ * The catalog id is the gateway's own spelling, which can differ from the
+ * vendor's (`claude-opus-4.8`, not `claude-opus-4-8`). It runs on
+ * `env.AI.run`, where AI Gateway's `/run` engine picks the provider, converts
+ * the request, and bills through Unified Billing or a key stored on the
+ * gateway.
+ */
+export type CatalogModelId = `${string}/${string}`;
+
+/**
+ * Whether an id names an AI Gateway catalog model: an author and a model,
+ * neither empty, and none of the other id namespaces (`@cf/`, `@hf/`,
+ * `dynamic/`).
+ *
+ * @experimental This surface is experimental and may change.
+ */
+export function isCatalogModelId(modelId: string): modelId is CatalogModelId {
+  if (modelId.startsWith("@") || modelId.startsWith("dynamic/")) return false;
+  const slash = modelId.indexOf("/");
+  return slash > 0 && slash < modelId.length - 1;
+}
+
+/**
+ * Whether a string names a language model that runs on `env.AI.run`: a
+ * Workers AI id or an AI Gateway dynamic route.
+ *
+ * @experimental This surface is experimental and may change.
+ */
+export function isRunPathLanguageModelId(modelId: string): boolean {
+  return modelId.startsWith("@cf/") || isDynamicRouteId(modelId);
+}
+
+/**
  * A text-embedding model id accepted by `ai.embedding()`.
  *
  * The modality methods are Workers AI only — there is no vendor route for them
  * — so, like {@link WorkersAIModelId}, they take `@cf/` ids and nothing else.
- *
- * @experimental This surface is experimental and may change.
  */
 export type CloudflareEmbeddingModelId =
   | Extract<
@@ -130,8 +192,6 @@ export type CloudflareEmbeddingModelId =
  * `prompt`, which the JSON run path cannot carry — live, the run path answers
  * `400 Bad input: required properties at "/" are 'multipart'`. Suggesting an
  * id that always 400s is worse than not suggesting it.
- *
- * @experimental This surface is experimental and may change.
  */
 export type KnownImageModelId =
   | "@cf/black-forest-labs/flux-1-schnell"
@@ -140,8 +200,6 @@ export type KnownImageModelId =
 
 /**
  * An image model id accepted by `ai.image()`.
- *
- * @experimental This surface is experimental and may change.
  */
 export type CloudflareImageModelId =
   | Extract<
@@ -153,8 +211,6 @@ export type CloudflareImageModelId =
 /**
  * Workers AI text-to-speech ids without a {@link BaseAiTextToSpeech} entry.
  * Curated for autocomplete only.
- *
- * @experimental This surface is experimental and may change.
  */
 export type KnownSpeechModelId =
   | "@cf/deepgram/aura-1"
@@ -163,8 +219,6 @@ export type KnownSpeechModelId =
 
 /**
  * A text-to-speech model id accepted by `ai.speech()`.
- *
- * @experimental This surface is experimental and may change.
  */
 export type CloudflareSpeechModelId =
   | Extract<
@@ -174,22 +228,17 @@ export type CloudflareSpeechModelId =
   | (`@cf/${string}` & {});
 
 /**
- * Deepgram's recognition models want the audio as an object body
- * (`audio: { body, contentType }`) rather than as base64, which the JSON run
- * path cannot carry — every documented variant answered `400` live. They stay
- * out of the suggested arm, and the transcription model answers a clear error
- * for them.
+ * Deepgram's Flux takes websocket connections only. It stays out of the
+ * suggested arm, and the transcription model answers a clear error for it.
  */
-type UnsupportedTranscriptionId = "@cf/deepgram/nova-3" | "@cf/deepgram/flux";
+type UnsupportedTranscriptionId = "@cf/deepgram/flux";
 
 /**
  * A speech-recognition model id accepted by `ai.transcription()`.
  *
- * Deepgram's recognition models (`@cf/deepgram/nova-3`, `@cf/deepgram/flux`)
- * are deliberately not suggested: the run path rejects their documented input
- * shape, so this provider answers a clear error for them rather than a 400.
- *
- * @experimental This surface is experimental and may change.
+ * Deepgram's Flux (`@cf/deepgram/flux`) is deliberately not suggested: it
+ * takes websocket connections only, so this provider answers a clear error
+ * for it rather than a 400.
  */
 export type CloudflareTranscriptionModelId =
   | Extract<
@@ -204,8 +253,6 @@ export type CloudflareTranscriptionModelId =
 
 /**
  * A reranking model id accepted by `ai.reranking()`.
- *
- * @experimental This surface is experimental and may change.
  */
 export type CloudflareRerankingModelId =
   | Extract<RerankingCatalogId, `@cf/${string}`>

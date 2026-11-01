@@ -1,6 +1,6 @@
 /**
  * The AI Gateway provider table: which gateway provider slug a vendor's own
- * base URL belongs to, and what the universal request's `endpoint` is for a
+ * base URL belongs to, and what the provider-native `endpoint` is for a
  * given upstream URL.
  *
  * This is platform knowledge, not vendor knowledge — the gateway publishes the
@@ -17,8 +17,6 @@
 /**
  * The gateway provider slugs this table maps onto. A subset of the ambient
  * `AIGatewayProviders` union; {@link GatewayProviderNameCheck} keeps it one.
- *
- * @experimental This surface is experimental and may change.
  */
 export const GATEWAY_PROVIDER_NAMES = [
   "workers-ai",
@@ -44,8 +42,6 @@ export const GATEWAY_PROVIDER_NAMES = [
 
 /**
  * A gateway provider slug.
- *
- * @experimental This surface is experimental and may change.
  */
 export type GatewayProviderName = (typeof GATEWAY_PROVIDER_NAMES)[number];
 
@@ -77,7 +73,7 @@ export interface GatewayProvider {
    */
   readonly authHeaders: readonly string[];
   /**
-   * The universal request's `endpoint` for an upstream URL: everything after
+   * The provider-native `endpoint` for an upstream URL: everything after
    * the host, query string included, with the provider's fixed prefix removed.
    * `undefined` when the URL does not belong to this provider.
    */
@@ -227,7 +223,7 @@ export const GATEWAY_PROVIDERS: readonly GatewayProvider[] =
   SPECS.map(buildProvider);
 
 /**
- * A vendor URL mapped onto the universal gateway request.
+ * A vendor URL mapped onto the provider-native gateway request.
  *
  * @experimental This surface is experimental and may change.
  */

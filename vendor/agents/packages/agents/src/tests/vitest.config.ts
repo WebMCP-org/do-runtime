@@ -2,6 +2,7 @@ import { createRequire } from "node:module";
 import path from "node:path";
 import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
 import agents from "agents/vite";
+import { exposeWorkerdGC } from "../../../../scripts/vitest/expose-workerd-gc";
 import { stripNodeModulesSourceMapReferences } from "../../../../scripts/vitest/strip-node-modules-source-map-references";
 import { defineConfig } from "vitest/config";
 
@@ -9,6 +10,9 @@ const testsDir = import.meta.dirname;
 const workspaceRequire = createRequire(
   path.resolve(testsDir, "../../../..", "package.json")
 );
+
+// Memory tests force a full GC to prove evicted objects are released.
+exposeWorkerdGC();
 
 export default defineConfig({
   resolve: {

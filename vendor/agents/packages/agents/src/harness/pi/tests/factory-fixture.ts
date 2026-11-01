@@ -12,14 +12,14 @@ import { DurableObject } from "cloudflare:workers";
 import { Lifecycle } from "../../../lifecycle";
 import { setWakeTimingForTests } from "../harness";
 import { TEST_TIMING } from "./timing";
-import { fromManifest } from "../../../skills/manifest";
+import { manifest } from "../../../skills/manifest";
 import {
   createRegistry,
   Harness,
   type Extension,
   type ToolRegistration
 } from "@earendil-works/pi-durable";
-import { fauxModels, NO_RETRY } from "./faux";
+import { fauxModels, TEST_SETTINGS } from "./faux";
 import { PiHarness, skills } from "../index";
 
 /** What one request offered the model, folded from its system messages. */
@@ -87,7 +87,7 @@ const Shout = Type.Object({ text: Type.String() });
 const Sum = Type.Object({ values: Type.Array(Type.Number()) });
 
 function text(value: string) {
-  return { content: [{ type: "text" as const, text: value }] };
+  return { output: [{ type: "text" as const, text: value }] };
 }
 
 const shout: ToolRegistration<typeof Shout> = {
@@ -110,20 +110,15 @@ const sum: ToolRegistration<typeof Sum> = {
   }
 };
 
-const notes = fromManifest({
+const notes = manifest({
   id: "test-skills",
-  fingerprint: "v1",
   skills: [
     {
       name: "haiku",
       description: "Write haiku.",
       body: "Five, seven, five syllables.",
       resources: [
-        {
-          path: "examples.md",
-          kind: "reference",
-          content: "An old silent pond"
-        }
+        { path: "references/examples.md", content: "An old silent pond" }
       ]
     }
   ]
@@ -140,7 +135,7 @@ export class PiFactoryTestObject extends DurableObject<Cloudflare.Env> {
 
   readonly registry = createRegistry();
   readonly harness = new PiHarness({
-    harness: async ({ storage, context }) => {
+    harness: async ({ storage, context, onWake }) => {
       for (const extension of await this.#extensions()) {
         this.registry.install(extension);
       }
@@ -149,7 +144,8 @@ export class PiFactoryTestObject extends DurableObject<Cloudflare.Env> {
         {
           models: fauxModels(this.#faux.provider),
           registry: this.registry,
-          settings: { retry: NO_RETRY }
+          settings: TEST_SETTINGS,
+          onWake
         },
         context
       );
@@ -219,13 +215,18 @@ export class PiFlakyFactoryTestObject extends DurableObject<Cloudflare.Env> {
 
   readonly registry = createRegistry();
   readonly harness = new PiHarness({
-    harness: async ({ storage, context }) => {
+    harness: async ({ storage, context, onWake }) => {
       this.#attempts += 1;
       if (this.#attempts === 1) throw new Error("extension failed to load");
       this.registry.install({ name: "flaky", tools: [shout] });
       return Harness.open(
         storage,
-        { models: fauxModels(this.#faux.provider), registry: this.registry },
+        {
+          models: fauxModels(this.#faux.provider),
+          registry: this.registry,
+          settings: TEST_SETTINGS,
+          onWake
+        },
         context
       );
     },

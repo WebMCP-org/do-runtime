@@ -6,7 +6,8 @@
  * The `api` is the model author's declaration, not a guess of ours: Workers AI
  * models carry {@link CLOUDFLARE_AI_API} and run on `env.AI.run`; every other
  * model carries whatever protocol its registry says it speaks, and goes to AI
- * Gateway's universal endpoint.
+ * Gateway in that protocol: `/run` for a catalog model, the provider-native
+ * path otherwise.
  */
 
 import {
@@ -18,6 +19,7 @@ import {
   type SimpleStreamOptions,
   createAssistantMessageEventStream
 } from "@earendil-works/pi-ai";
+import { isRunPathLanguageModelId } from "../../core/catalog";
 import { gatewayLayerOf, mergeModelOptions } from "../../core/settings";
 import type { Transport } from "../../core/transport";
 import {
@@ -110,7 +112,7 @@ function legModel(
   // It resolves exactly as `ai(string)` does: a Workers AI id, or a
   // `<slug>/<id>` pi-ai's gateway registry knows — never a raw vendor id.
   if (typeof leg === "string") {
-    return leg.startsWith("@cf/")
+    return isRunPathLanguageModelId(leg)
       ? buildWorkersAIModel(leg, options)
       : buildGatewayModel(leg, options);
   }

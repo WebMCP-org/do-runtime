@@ -3,54 +3,106 @@ import {
   classifyStatus,
   normalizeThrownError
 } from "./errors";
+import { isCatalogModelId, isWorkersAIId } from "./catalog";
+import { type ResumeFetch, resumableBody } from "./resume";
 import type { GatewayProviderName } from "./gateway-providers";
-import type { AISettings, ResolvedGateway } from "./settings";
+import type { AccountAccess, AISettings, ResolvedGateway } from "./settings";
 
-/** The reported `url` for a universal call made through the binding. */
-const UNIVERSAL_BINDING_URL = "ai-gateway-binding";
+/** The reported `url` for a provider-native call made through the binding. */
+const NATIVE_BINDING_URL = "ai-gateway-binding-native";
+
+/** The origin the binding's own `fetch` answers on. */
+const BINDING_ORIGIN = "https://workers-binding.ai";
+
+/** The REST API's run path, for a model id reached with an account and token. */
+const REST_API_ORIGIN = "https://api.cloudflare.com/client/v4/accounts";
+
+/** The provider-native path, for a model object reached with a token. */
+const GATEWAY_ORIGIN = "https://gateway.ai.cloudflare.com/v1";
+
+/**
+ * The `Ai` binding's `fetch`. The binding has one at runtime (workerd's
+ * `ai-api.ts`), and aig-entry routes it, but `@cloudflare/workers-types` does
+ * not declare it.
+ */
+interface FetchingBinding {
+  fetch(input: string, init?: RequestInit): Promise<Response>;
+}
+
+/**
+ * The shape of a run-path request body, and of its answer, for a model AI
+ * Gateway's `/run` serves. A request in a model's native format is not
+ * converted, streams included.
+ *
+ * @experimental This surface is experimental and may change.
+ */
+export type RunRequestFormat = "chat-completions" | "messages" | "responses";
 
 /** One request on the Cloudflare run path. */
 export interface TransportRequest {
-  /** Model id — Workers AI slug or catalog `<author>/<model>`. */
+  /**
+   * Model id — a Workers AI id, an AI Gateway catalog id
+   * (`<author>/<model>`), or a dynamic route (`dynamic/<route>`).
+   */
   model: string;
   /** The provider-shaped request body (`input` on the run path). */
   input: Record<string, unknown>;
+  /**
+   * The format `input` is in, and that the answer comes back in, for a model
+   * AI Gateway's `/run` serves. Defaults to chat completions. A Workers AI
+   * model's input is its own, so this is ignored for one.
+   */
+  format?: RunRequestFormat;
   /** Gateway options for this request. */
   gateway: ResolvedGateway;
   /** Extra request headers, merged last. */
   headers: Record<string, string>;
   /** Abort signal, forwarded to the binding or to `fetch`. */
   signal?: AbortSignal;
+  /**
+   * Audio for a Workers AI model that takes it as a raw body
+   * (`audio: { body, contentType }`, as Deepgram's Nova-3 does). `input`
+   * carries the model's other fields. The request goes to Workers AI
+   * directly: AI Gateway does not accept the body.
+   */
+  audio?: RawAudio;
+}
+
+/** Audio bytes and their media type, sent as a request body of their own. */
+export interface RawAudio {
+  bytes: Uint8Array;
+  contentType: string;
 }
 
 /**
- * One request on the universal AI Gateway path: a vendor's own request, routed
- * by the gateway to that vendor. The body is the vendor's, untouched — nothing
- * here knows the vendor's wire format.
+ * A vendor's own request, sent to AI Gateway's provider-native path:
+ * `{gateway}/{provider}/{endpoint}`. Nothing is converted on the way — the
+ * method, headers and body are the vendor's — so the answer is the vendor's
+ * own response, streams included.
  *
  * @experimental This surface is experimental and may change.
  */
-export interface UniversalRequest {
-  /** The gateway provider slug the request is routed to. */
+export interface NativeRequest {
+  /** The gateway provider slug, e.g. `anthropic`. */
   provider: GatewayProviderName | string;
-  /** The vendor path the gateway appends to that provider's base URL. */
+  /** The vendor path after the provider slug, query string included. */
   endpoint: string;
-  /** The vendor's own request headers, minus its credential header. */
+  /** The HTTP method the vendor used. */
+  method: string;
+  /** The vendor's own request headers. */
   headers: Record<string, string>;
-  /** The vendor's request body, verbatim. */
-  query: unknown;
-  /** Gateway options for this request. */
+  /** The vendor's request body, untouched: JSON, multipart, or none. */
+  body: BodyInit | null | undefined;
+  /** Gateway options, sent as `cf-aig-*` headers. */
   gateway: ResolvedGateway;
-  /** Extra headers merged last, outside the vendor's own set. */
-  extraHeaders?: Record<string, string>;
-  /** Abort signal, forwarded to the binding or to `fetch`. */
+  /** Abort signal, forwarded to the binding. */
   signal?: AbortSignal;
 }
 
 /**
- * The single code path both backends implement. Always resolves to a raw
- * `Response`, so streaming and non-streaming calls share one path and nothing
- * is buffered on the caller's behalf.
+ * The single code path both backends, the binding and HTTP, implement. Always
+ * resolves to a raw `Response`, so streaming and non-streaming calls share one
+ * path and nothing is buffered on the caller's behalf.
  *
  * @experimental This surface is experimental and may change.
  */
@@ -59,13 +111,13 @@ export interface Transport {
   readonly url: string;
   run(request: TransportRequest): Promise<Response>;
   /**
-   * Sends a vendor's own request through the gateway's universal endpoint.
-   * Always resolves to the vendor's raw `Response`, error responses included:
-   * only the gateway's own failures (a missing gateway, an unpaid account) are
-   * lifted into a {@link CloudflareAIError}, because the vendor's provider
-   * knows how to read its own errors and we do not.
+   * Sends a vendor's own request to AI Gateway's provider-native path. It
+   * resolves to the vendor's raw `Response`, error responses included: only
+   * the gateway's own failures (a missing gateway, an unpaid account) are
+   * lifted, by the caller, because the vendor's own code knows how to read
+   * its errors and we do not.
    */
-  universal(request: UniversalRequest): Promise<Response>;
+  native(request: NativeRequest): Promise<Response>;
   /**
    * A log id read off the backend itself when the response carried none. The
    * Workers AI binding exposes the last gateway log id as a mutable property,
@@ -214,28 +266,135 @@ export async function errorFromResponse(
 }
 
 /**
- * The gateway's own options for the universal call. The id is not among them:
- * it selects the gateway (`env.AI.gateway(id)`), and the binding's own `id`
- * field is deprecated.
+ * The gateway options as the `cf-aig-*` request headers AI Gateway reads.
+ * The provider-native path has no options object, so every option travels
+ * this way; the names are the gateway's own.
  */
-function universalGatewayOptions(
-  gateway: ResolvedGateway
-): UniversalGatewayOptions {
-  // `id` is deprecated on this type but still required by it; the gateway is
-  // already selected by `env.AI.gateway(id)`, so it repeats that id.
-  const options: UniversalGatewayOptions = { id: gateway.id };
-  if (gateway.skipCache !== undefined) options.skipCache = gateway.skipCache;
-  if (gateway.cacheTtl !== undefined) options.cacheTtl = gateway.cacheTtl;
-  if (gateway.cacheKey !== undefined) options.cacheKey = gateway.cacheKey;
-  if (gateway.metadata !== undefined) options.metadata = gateway.metadata;
-  if (gateway.collectLog !== undefined) options.collectLog = gateway.collectLog;
-  if (gateway.eventId !== undefined) options.eventId = gateway.eventId;
-  if (gateway.requestTimeoutMs !== undefined) {
-    options.requestTimeoutMs = gateway.requestTimeoutMs;
+function gatewayHeaders(gateway: ResolvedGateway): Record<string, string> {
+  const headers: Record<string, string> = {};
+  if (gateway.cacheTtl !== undefined) {
+    headers["cf-aig-cache-ttl"] = String(gateway.cacheTtl);
   }
-  if (gateway.retries !== undefined) options.retries = gateway.retries;
-  return options;
+  if (gateway.skipCache !== undefined) {
+    headers["cf-aig-skip-cache"] = String(gateway.skipCache);
+  }
+  if (gateway.cacheKey !== undefined) {
+    headers["cf-aig-cache-key"] = gateway.cacheKey;
+  }
+  if (gateway.metadata !== undefined) {
+    headers["cf-aig-metadata"] = JSON.stringify(gateway.metadata);
+  }
+  if (gateway.collectLog !== undefined) {
+    headers["cf-aig-collect-log"] = String(gateway.collectLog);
+  }
+  if (gateway.eventId !== undefined) {
+    headers["cf-aig-event-id"] = gateway.eventId;
+  }
+  if (gateway.requestTimeoutMs !== undefined) {
+    headers["cf-aig-request-timeout"] = String(gateway.requestTimeoutMs);
+  }
+  const retries = gateway.retries;
+  if (retries?.maxAttempts !== undefined) {
+    headers["cf-aig-max-attempts"] = String(retries.maxAttempts);
+  }
+  if (retries?.retryDelayMs !== undefined) {
+    headers["cf-aig-retry-delay"] = String(retries.retryDelayMs);
+  }
+  if (retries?.backoff !== undefined) {
+    headers["cf-aig-backoff"] = retries.backoff;
+  }
+  if (gateway.byokAlias !== undefined) {
+    headers["cf-aig-byok-alias"] = gateway.byokAlias;
+  }
+  if (gateway.zdr !== undefined) headers["cf-aig-zdr"] = String(gateway.zdr);
+  return headers;
 }
+
+/**
+ * The run path's gateway options, and the headers for the ones the binding's
+ * `GatewayOptions` type does not define. Both transports use it: the binding
+ * takes `gateway` as an options object, HTTP as `cf-aig-*` headers.
+ *
+ * `byokAlias` reaches `/run` as `cf-aig-byok-alias`, which `/run` reads for a
+ * catalog model's stored key. `zdr` is left off: `/run` does not read it, so it
+ * applies to provider-native requests only.
+ */
+function runOptions(request: TransportRequest): {
+  gateway: Omit<ResolvedGateway, "byokAlias" | "zdr">;
+  headers: Record<string, string>;
+} {
+  const { byokAlias, zdr: _zdr, ...gateway } = request.gateway;
+  return {
+    gateway,
+    headers: {
+      ...request.headers,
+      ...(byokAlias !== undefined && isCatalogModelId(request.model)
+        ? { "cf-aig-byok-alias": byokAlias }
+        : {})
+    }
+  };
+}
+
+/**
+ * The binding's resume route for the run a response names. Only called for a
+ * response {@link withResume} has checked carries `cf-aig-run-id`.
+ */
+function resumeUrl(
+  gatewayId: string,
+  response: Response,
+  from: number
+): string {
+  const runId = response.headers.get("cf-aig-run-id") ?? "";
+  return `${BINDING_ORIGIN}/ai-gateway/gateways/${encodeURIComponent(
+    gatewayId
+  )}/run/${encodeURIComponent(runId)}/resume?from=${from}`;
+}
+
+/**
+ * A streamed `/run` answer that names its run (`cf-aig-run-id`) resumes from
+ * the last complete event if the connection drops; see `resume.ts`. Anything
+ * else — a JSON answer, an error, a Workers AI stream with no run id — is
+ * returned as it is.
+ */
+function withResume(
+  response: Response,
+  request: TransportRequest,
+  resume: ResumeFetch
+): Response {
+  const contentType = response.headers.get("content-type") ?? "";
+  if (
+    !response.ok ||
+    response.body === null ||
+    !contentType.includes("text/event-stream") ||
+    response.headers.get("cf-aig-run-id") === null
+  ) {
+    return response;
+  }
+  return new Response(
+    resumableBody({
+      initial: response.body,
+      model: request.model,
+      resume,
+      signal: request.signal,
+      url: "workers-ai-binding"
+    }),
+    {
+      headers: response.headers,
+      status: response.status,
+      statusText: response.statusText
+    }
+  );
+}
+
+/**
+ * What `/run` calls each request format in the binding's `openaiEndpoint`
+ * option, which `aig-entry` turns into `/run`'s `requestFormat`.
+ */
+const OPENAI_ENDPOINTS: Record<RunRequestFormat, string> = {
+  "chat-completions": "/v1/chat/completions",
+  messages: "/v1/messages",
+  responses: "/v1/responses"
+};
 
 /**
  * Whether a parsed body is the gateway's own error envelope rather than a
@@ -267,7 +426,7 @@ export function isGatewayErrorEnvelope(json: unknown): boolean {
 
 /**
  * Builds a {@link CloudflareAIError} from the gateway's own error envelope, so
- * a gateway failure on the universal path classifies and retries exactly as
+ * a gateway failure on the provider-native path classifies and retries exactly as
  * one on the Workers AI run path.
  *
  * @experimental This surface is experimental and may change.
@@ -305,19 +464,6 @@ export function errorFromGatewayEnvelope(
 }
 
 /**
- * The model id a universal request is about, for error reporting. Every vendor
- * body carries `model`; the endpoint is the fallback.
- */
-function universalModel(request: UniversalRequest): string {
-  const query = request.query;
-  if (query !== null && typeof query === "object" && !Array.isArray(query)) {
-    const model = (query as Record<string, unknown>).model;
-    if (typeof model === "string") return model;
-  }
-  return `${request.provider}/${request.endpoint}`;
-}
-
-/**
  * The `Ai` binding narrowed to the raw-response overload. The ambient
  * overloads pick their return type from the model id, and every catalog slug
  * lands on the `Record<string, unknown>` fallback, so the run-path signature
@@ -327,7 +473,14 @@ interface RawResponseBinding {
   run(
     model: string,
     inputs: Record<string, unknown>,
-    options: AiOptions & { returnRawResponse: true }
+    options: AiOptions & {
+      returnRawResponse: true;
+      /**
+       * Not in `AiOptions`: the binding forwards every option, and
+       * `aig-entry` maps this one onto `/run`'s `requestFormat`.
+       */
+      openaiEndpoint?: string;
+    }
   ): Promise<Response>;
 }
 
@@ -346,21 +499,60 @@ function bindingTransport(binding: Ai): Transport {
     },
     async run(request) {
       try {
+        if (request.audio !== undefined) {
+          // TODO: send this through the gateway once AI Gateway takes a stream
+          // body; today the binding refuses one when `gateway` is set.
+          return await raw.run(
+            request.model,
+            {
+              ...request.input,
+              audio: {
+                body: new Response(new Uint8Array(request.audio.bytes)).body,
+                contentType: request.audio.contentType
+              }
+            },
+            {
+              ...(Object.keys(request.headers).length > 0
+                ? { extraHeaders: request.headers }
+                : {}),
+              returnRawResponse: true,
+              signal: request.signal
+            }
+          );
+        }
         // Called as a method, never detached: the binding reads private
         // fields and throws on a detached reference.
+        const run = runOptions(request);
         const response = await raw.run(request.model, request.input, {
-          ...(Object.keys(request.headers).length > 0
-            ? { extraHeaders: request.headers }
+          ...(Object.keys(run.headers).length > 0
+            ? { extraHeaders: run.headers }
             : {}),
-          gateway: request.gateway,
+          gateway: run.gateway,
+          // A Workers AI id goes to Workers AI itself; any other id is served
+          // by AI Gateway's `/run`, which reads the body and answers in the
+          // format named here. Without it `/run` guesses the format from the
+          // body and wraps an answer it cannot place in `{ state, result }`.
+          ...(isWorkersAIId(request.model)
+            ? {}
+            : {
+                openaiEndpoint:
+                  OPENAI_ENDPOINTS[request.format ?? "chat-completions"]
+              }),
           returnRawResponse: true,
           signal: request.signal
         });
+        const resumable = withResume(response, request, (from, signal) =>
+          // The binding's own `fetch`; aig-entry serves the resume route for it.
+          (binding as unknown as FetchingBinding).fetch(
+            resumeUrl(run.gateway.id, response, from),
+            { method: "GET", signal }
+          )
+        );
         const logId = binding.aiGatewayLogId;
         if (logId !== null && logId !== undefined) {
-          logIds.set(response, logId);
+          logIds.set(resumable, logId);
         }
-        return response;
+        return resumable;
       } catch (error) {
         // `returnRawResponse` resolves with a `Response` for upstream errors,
         // so a throw here means the binding itself failed (e.g. code 3040,
@@ -372,34 +564,208 @@ function bindingTransport(binding: Ai): Transport {
         });
       }
     },
-    async universal(request) {
+    async native(request) {
       try {
-        // Called as a method on the binding, and on the `AiGateway` it
-        // returns: both read private fields.
-        return await binding.gateway(request.gateway.id).run(
+        // `fetch` is the binding's own and is called as a method: aig-entry
+        // serves `/ai-gateway/gateways/{gateway}/{provider}/*` for it and
+        // forwards the request to the provider-native path unchanged.
+        return await (binding as unknown as FetchingBinding).fetch(
+          `${BINDING_ORIGIN}/ai-gateway/gateways/${encodeURIComponent(
+            request.gateway.id
+          )}/${request.provider}/${request.endpoint}`,
           {
-            endpoint: request.endpoint,
-            headers: request.headers,
-            provider: request.provider,
-            query: request.query
-          },
-          {
-            ...(request.extraHeaders === undefined
-              ? {}
-              : { extraHeaders: request.extraHeaders }),
-            gateway: universalGatewayOptions(request.gateway),
+            body: request.body ?? null,
+            headers: { ...request.headers, ...gatewayHeaders(request.gateway) },
+            method: request.method,
             signal: request.signal
           }
         );
       } catch (error) {
         throw normalizeThrownError(error, {
-          model: universalModel(request),
-          requestBodyValues: request.query,
-          url: UNIVERSAL_BINDING_URL
+          model: `${request.provider}/${request.endpoint}`,
+          requestBodyValues: undefined,
+          url: NATIVE_BINDING_URL
         });
       }
     },
     url: "workers-ai-binding"
+  };
+}
+
+/**
+ * Request headers with the credential set last. `Headers` matches names
+ * case-insensitively, so a caller's `Authorization` is replaced rather than
+ * sent alongside the token.
+ */
+function withCredential(
+  headers: Record<string, string>,
+  name: "authorization" | "cf-aig-authorization",
+  token: string
+): Headers {
+  const result = new Headers(headers);
+  result.set(name, `Bearer ${token}`);
+  return result;
+}
+
+/**
+ * A Workers AI answer as the binding returns it. The REST API wraps a JSON
+ * answer in the `{ success, result }` envelope where the binding returns the
+ * bare result, so a successful envelope is unwrapped; anything else is left
+ * for the caller, as it is on the binding.
+ */
+async function bareWorkersAIAnswer(response: Response): Promise<Response> {
+  const contentType = response.headers.get("content-type") ?? "";
+  if (!response.ok || !contentType.includes("application/json")) {
+    return response;
+  }
+  const text = await response.text();
+  let body: unknown;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    body = undefined;
+  }
+  const record =
+    body !== null && typeof body === "object" && !Array.isArray(body)
+      ? (body as Record<string, unknown>)
+      : undefined;
+  const unwrapped =
+    record?.success === true && "result" in record ? record.result : undefined;
+  const headers = new Headers(response.headers);
+  headers.delete("content-length");
+  return new Response(
+    unwrapped === undefined ? text : JSON.stringify(unwrapped),
+    { headers, status: response.status, statusText: response.statusText }
+  );
+}
+
+/**
+ * The HTTP backend, for an account id and API token. A model id goes to the
+ * REST API, which serves it with the same `/run` call the binding makes: a
+ * Workers AI id on `/ai/run/{model}` with its own input, any other id on the
+ * endpoint for its request format with the model in the body. A model object
+ * goes to the provider-native path on `gateway.ai.cloudflare.com`, exactly as
+ * the binding's `fetch` forwards it.
+ *
+ * A dropped stream is not resumed: the binding has a resume route, but the
+ * public one is not open to every gateway yet.
+ */
+function httpTransport({ accountId, apiToken }: AccountAccess): Transport {
+  const account = encodeURIComponent(accountId);
+  const runBase = `${REST_API_ORIGIN}/${account}/ai`;
+  /**
+   * A raw audio body goes to Workers AI's own run route, with the model's
+   * other fields as query parameters. TODO: send it through the gateway once
+   * AI Gateway accepts the body; today the REST API answers `500` when
+   * `cf-aig-gateway-id` is set.
+   */
+  async function runRawAudio(
+    request: TransportRequest,
+    audio: RawAudio
+  ): Promise<Response> {
+    const query = new URLSearchParams();
+    for (const [key, value] of Object.entries(request.input)) {
+      if (
+        typeof value === "string" ||
+        typeof value === "number" ||
+        typeof value === "boolean"
+      ) {
+        query.set(key, String(value));
+      }
+    }
+    const search = query.size > 0 ? `?${query}` : "";
+    const url = `${runBase}/run/${request.model}${search}`;
+    try {
+      const response = await fetch(url, {
+        body: new Uint8Array(audio.bytes),
+        headers: withCredential(
+          { ...request.headers, "content-type": audio.contentType },
+          "authorization",
+          apiToken
+        ),
+        method: "POST",
+        signal: request.signal
+      });
+      return await bareWorkersAIAnswer(response);
+    } catch (error) {
+      throw normalizeThrownError(error, {
+        model: request.model,
+        requestBodyValues: request.input,
+        url
+      });
+    }
+  }
+
+  return {
+    logIdFallback() {
+      return undefined;
+    },
+    async run(request) {
+      if (request.audio !== undefined)
+        return runRawAudio(request, request.audio);
+      const workersAI = isWorkersAIId(request.model);
+      const run = runOptions(request);
+      const url = workersAI
+        ? `${runBase}/run/${request.model}`
+        : `${runBase}${OPENAI_ENDPOINTS[request.format ?? "chat-completions"]}`;
+      try {
+        const response = await fetch(url, {
+          body: JSON.stringify(
+            workersAI
+              ? request.input
+              : { ...request.input, model: request.model }
+          ),
+          headers: withCredential(
+            {
+              "content-type": "application/json",
+              ...gatewayHeaders(run.gateway),
+              "cf-aig-gateway-id": run.gateway.id,
+              ...run.headers
+            },
+            "authorization",
+            apiToken
+          ),
+          method: "POST",
+          signal: request.signal
+        });
+        return workersAI ? await bareWorkersAIAnswer(response) : response;
+      } catch (error) {
+        throw normalizeThrownError(error, {
+          model: request.model,
+          requestBodyValues: request.input,
+          url
+        });
+      }
+    },
+    async native(request) {
+      const url = `${GATEWAY_ORIGIN}/${account}/${encodeURIComponent(
+        request.gateway.id
+      )}/${request.provider}/${request.endpoint}`;
+      try {
+        return await fetch(url, {
+          body: request.body ?? null,
+          // A stream body needs `duplex: "half"` in Node's fetch, which
+          // rejects the request without it. workerd accepts it too.
+          ...(request.body instanceof ReadableStream
+            ? ({ duplex: "half" } as RequestInit)
+            : {}),
+          headers: withCredential(
+            { ...request.headers, ...gatewayHeaders(request.gateway) },
+            "cf-aig-authorization",
+            apiToken
+          ),
+          method: request.method,
+          signal: request.signal
+        });
+      } catch (error) {
+        throw normalizeThrownError(error, {
+          model: `${request.provider}/${request.endpoint}`,
+          requestBodyValues: undefined,
+          url
+        });
+      }
+    },
+    url: runBase
   };
 }
 
@@ -411,8 +777,9 @@ function bindingTransport(binding: Ai): Transport {
  * @experimental This surface is experimental and may change.
  */
 export function createTransport(settings: AISettings): Transport {
-  if (settings.binding === undefined) {
-    throw new Error("createAI requires { binding }: the Workers AI binding.");
-  }
-  return bindingTransport(settings.binding);
+  if (settings.binding !== undefined) return bindingTransport(settings.binding);
+  if (settings.accountId && settings.apiToken) return httpTransport(settings);
+  throw new Error(
+    "createAI requires { binding } (the AI binding) or { accountId, apiToken }."
+  );
 }

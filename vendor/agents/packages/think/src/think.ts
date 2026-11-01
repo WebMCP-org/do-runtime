@@ -12,7 +12,7 @@
  * Configuration overrides:
  *   - getModel()            — return a model id string (resolved via the
  *                             built-in workers-ai-provider) or a LanguageModel
- *   - getSystemPrompt()     — return the legacy fallback system prompt
+ *   - getSystemPrompt()     — instructions at the top of the system prompt
  *   - getTools()            — return the ToolSet for the agentic loop
  *   - maxSteps              — max tool-call rounds per turn (default: 10)
  *   - configureSession()    — compaction and search policy
@@ -128,13 +128,15 @@ import { wrapAISDK } from "agents/observability/ai";
 import { createWorkersAI } from "workers-ai-provider";
 import { anthropic } from "workers-ai-provider/anthropic";
 import { openai } from "workers-ai-provider/openai";
-import * as skills from "agents/skills";
-import { SkillRegistry } from "agents/skills";
-// Vendor divergence: `SkillScriptRunner` is not imported. The fork removed
-// `getSkillScriptRunner()` and upstream's Codemode-backed `run_skill_script`
-// injection (2026-08-16 "Active Think and skill barrels no longer reach
-// Codemode"), so the type has no referent here.
-import type { SkillSource, SkillWorkspaceSeedOptions } from "agents/skills";
+import * as skills from "./skills";
+import { formatSkillDiagnostic, loadSkillCatalog } from "agents/skills";
+import { createSkillTools } from "agents/skills/tools/ai-sdk";
+// Vendor divergence: `SkillScriptRunner` is not imported. The fork ships no
+// skill script runner (fork-diff "Deliberate product omissions"): no
+// `getSkillScriptRunner()`, no `agents/skills/runner` entry, and
+// `createSkillTools()` takes no `scriptRunner`, so `run_skill_script` never
+// reaches the model.
+import type { SkillCatalog, SkillSource } from "agents/skills";
 
 // Re-export AI SDK types that appear on Think's public lifecycle hooks
 // so users can import them from a single place.
@@ -148,11 +150,9 @@ export type {
   TypedToolResult
 } from "ai";
 export { skills };
-export type {
-  SkillRunContext,
-  SkillSource,
-  SkillWorkspaceSeedOptions
-} from "agents/skills";
+// Vendor divergence: no `SkillRunContext` (the runner's script `ctx` type);
+// `agents/skills` does not export it because the fork ships no runner.
+export type { Skill, SkillCatalog, SkillSource } from "agents/skills";
 import {
   AGENT_TOOL_MILESTONE_PART,
   AGENT_TOOL_PROGRESS_PART,
@@ -398,13 +398,6 @@ function mediaEvictionCutoff(
 }
 const DEFAULT_ACTION_TIMEOUT_MS = 30_000;
 
-/** Whether a workspace can receive raw bytes, which skills projection needs. */
-function hasWriteFileBytes(
-  workspace: WorkspaceLike
-): workspace is WorkspaceLike &
-  Required<Pick<WorkspaceLike, "writeFileBytes">> {
-  return typeof workspace.writeFileBytes === "function";
-}
 const ACTION_OUTPUT_MAX_CHARS = 20_000;
 const MAX_REPLY_ATTACHMENTS_PER_TURN = 32;
 const ACTION_LEDGER_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
@@ -615,12 +608,42 @@ function keepResolvedPauses(
     return { ...message, parts };
   });
 }
+/**
+ * Whether a workspace is a Computer `Workspace` this agent owns, as opposed
+ * to a client for one another Durable Object owns. Checked by shape so a
+ * second copy of `@cloudflare/computer` in the bundle still matches.
+ */
+function isLocalWorkspace(
+  workspace: ThinkWorkspace
+): workspace is ThinkWorkspace & Pick<Workspace, "ready" | "stub"> {
+  return (
+    "ready" in workspace &&
+    typeof workspace.ready === "function" &&
+    "stub" in workspace &&
+    typeof workspace.stub === "function"
+  );
+}
+
+/** Context block label for the skills catalog. */
+const SKILLS_CONTEXT_LABEL = "think_skills";
+
 const ACTION_PENDING_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
 const ACTION_PENDING_LAST_SWEPT_KEY =
   "cf_think_action_pending_approvals:last_swept_at";
 /** Prefix for durable-pause action execution ids (vs codemode execution ids). */
 const ACTION_PAUSE_ID_PREFIX = "actpause_";
-import { Workspace } from "@cloudflare/shell";
+import { Workspace, type WorkspaceStub } from "@cloudflare/computer";
+import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
+import {
+  WorkspaceFiles,
+  resolveWorkspacePath,
+  type ThinkWorkspace
+} from "./workspace-files";
+import {
+  withWorkspaceReadMedia,
+  type WorkspaceMediaCapability,
+  type WorkspacePdfText
+} from "./workspace-read";
 import {
   evictMediaFromMessage,
   evictedFilePath,
@@ -628,7 +651,6 @@ import {
   type MediaEvictionConfig,
   hasEvictableMedia
 } from "./media-eviction";
-import { createWorkspaceTools } from "./tools/workspace";
 import { createFetchTools } from "./tools/fetch";
 import type { CreateFetchToolsOptions, FetchToolEvent } from "./tools/fetch";
 import { ExtensionManager, sanitizeName } from "./extensions/manager";
@@ -672,10 +694,22 @@ export type {
   SessionContextOptions
 } from "./session";
 export type { SessionMessage } from "agents/sessions";
-export { Workspace } from "@cloudflare/shell";
 export type { FiberContext, FiberRecoveryContext } from "agents";
-export type { WorkspaceLike } from "./tools/workspace";
-import type { WorkspaceLike } from "./tools/workspace";
+export type {
+  ThinkWorkspace,
+  ThinkWorkspaceFilesystem
+} from "./workspace-files";
+// Vendor divergence (fork-diff.md "Early model preparation and media").
+export {
+  createWorkspaceReadTool,
+  withWorkspaceReadMedia
+} from "./workspace-read";
+export type {
+  CreateWorkspaceReadToolOptions,
+  WorkspaceMediaCapability,
+  WorkspacePdfText,
+  WorkspaceReadMediaOptions
+} from "./workspace-read";
 
 export type {
   CreateFetchToolsOptions,
@@ -1412,20 +1446,36 @@ function parseDeclaredTaskScheduleUnchecked(
   throw new Error(`Unsupported schedule DSL "${rawSchedule}"`);
 }
 
+// findZonedInstant calls getZonedParts once per minute across a 28-hour
+// window, so building a formatter per call dominated the CPU cost of resolving
+// a wall-clock occurrence. Formatters are stateless, so keep one per timezone.
+// The map holds at most one entry per distinct timezone, and an invalid
+// timezone throws before anything is cached.
+const zonedPartsFormatters = new Map<string, Intl.DateTimeFormat>();
+
+function getZonedPartsFormatter(timezone: string): Intl.DateTimeFormat {
+  let formatter = zonedPartsFormatters.get(timezone);
+  if (!formatter) {
+    formatter = new Intl.DateTimeFormat("en-US", {
+      timeZone: timezone,
+      calendar: "iso8601",
+      numberingSystem: "latn",
+      weekday: "short",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hourCycle: "h23"
+    });
+    zonedPartsFormatters.set(timezone, formatter);
+  }
+  return formatter;
+}
+
 function getZonedParts(date: Date, timezone: string): ZonedParts {
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone: timezone,
-    calendar: "iso8601",
-    numberingSystem: "latn",
-    weekday: "short",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hourCycle: "h23"
-  }).formatToParts(date);
+  const parts = getZonedPartsFormatter(timezone).formatToParts(date);
   const part = (type: Intl.DateTimeFormatPartTypes) =>
     parts.find((entry) => entry.type === type)?.value ?? "";
   return {
@@ -2953,7 +3003,7 @@ export interface TurnInput {
  * Contains everything Think assembled — the hook can inspect and override.
  */
 export interface TurnContext {
-  /** Assembled system prompt (from context blocks or getSystemPrompt fallback). */
+  /** Assembled system prompt: an overridden `getSystemPrompt()`, then context blocks. */
   system: string;
   /**
    * Assembled model messages (truncated, pruned). When a `whenChanged:
@@ -3719,17 +3769,8 @@ export class Think<
   /** Store tool input/output on `execute_tool` spans. */
   storeTools = false;
 
-  /**
-   * Project `getSkills()` into the active workspace so the agent can read
-   * and edit skills as files. Computer workspaces use
-   * `/workspace/.agents/skills`; legacy Shell uses `/.agents/skills`.
-   * Existing edits are preserved. Off by default: skills load from their
-   * sources and nothing is written to the Workspace, as before. Set `{}` to
-   * project with the defaults.
-   */
-  skillWorkspace: false | SkillWorkspaceSeedOptions = false;
-
-  private _skillRegistry: SkillRegistry | null = null;
+  private _skillSources: readonly SkillSource[] = [];
+  private _skillCatalog: SkillCatalog | null = null;
   private _loggedSkillWarnings = new Set<string>();
   private _loggedProtocolWarnings = new Set<string>();
 
@@ -3938,64 +3979,62 @@ export class Think<
   extensionManager?: import("./extensions/manager").ExtensionManager;
 
   /**
-   * Workspace filesystem available in `getTools()` and lifecycle hooks.
-   * Defaults to a full `Workspace` backed by the DO's SQLite storage.
+   * The agent's Workspace, available in `getTools()` and lifecycle hooks.
+   * Defaults to a `Workspace` from `@cloudflare/computer` on this Durable
+   * Object's storage, with no execution backends.
    *
-   * Typed as `WorkspaceLike` rather than `Workspace` so subclasses can
-   * replace it with anything that satisfies the interface — e.g. a proxy
-   * that forwards to a shared workspace owned by a parent DO. Override as
-   * a class field to skip the default init entirely:
+   * Override it as a class field to add backends, mounts, or git, or to
+   * work in a Workspace another Durable Object owns:
    *
    * ```typescript
-   * // Default init with R2 spillover for large files.
+   * import { Workspace, type WorkspaceStub } from "@cloudflare/computer";
+import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
+   *
    * override workspace = new Workspace({
-   *   sql: this.ctx.storage.sql,
-   *   r2: this.env.R2,
-   *   name: () => this.name
+   *   storage: this.ctx.storage,
+   *   backends: [...]
    * });
    *
-   * // Or a custom WorkspaceLike — e.g. a parent-owned shared workspace.
-   * override workspace: WorkspaceLike = new SharedWorkspace(this);
+   * // A Workspace owned by a parent Durable Object.
+   * override workspace = await getWorkspace(parentStub);
    * ```
    */
-  workspace!: WorkspaceLike;
+  workspace!: ThinkWorkspace;
 
   /**
-   * Include the default workspace Bash tool. Enabled by default so models can
-   * run shell-style multi-file workflows against the workspace. Set to `false`
-   * to omit it from the built-in workspace tools.
+   * The codemode runtime behind the execute tool, when one has been created
+   * via `createExecuteRuntime(this)` / `createExecuteTool(this)` (from
+   * `@cloudflare/think/tools/execute`). Gives callables and lifecycle hooks
+   * access to approvals (`approve`/`reject`/`pending`), the audit trail
+   * (`executions`), `expirePaused`, and snippets.
    */
-  workspaceBash:
-    | boolean
-    | NonNullable<Parameters<typeof createWorkspaceTools>[1]>["bash"] = true;
+  codemode?: import("@cloudflare/codemode").CodemodeRuntimeHandle;
+
+  // Vendor divergence (fork-diff.md "Early model preparation and media"):
+  // the built-in `read` renders images and PDFs for the prepared model.
 
   /**
    * Whether the configured model reads image parts. Enabled by default. Set to
    * `false`, or to a thunk for a host whose model can change between requests,
    * and a workspace `read` of an image renders as a note naming the file
-   * instead of the picture.
+   * instead of the picture. Consulted each time a read is rendered, so a
+   * model swap changes the next request without rewriting history.
    */
-  workspaceAcceptsImages: NonNullable<
-    Parameters<typeof createWorkspaceTools>[1]
-  >["acceptsImages"] = true;
+  workspaceAcceptsImages: WorkspaceMediaCapability = true;
 
   /**
    * Whether the configured model reads PDF file parts. Enabled by default. Set
-   * to `false`, or to a thunk, and a workspace `read` of a PDF renders as a
-   * note naming the file instead of the document.
+   * to `false`, or to a thunk, and a workspace `read` of a PDF renders as
+   * {@link workspacePdfText}'s output, or as a note naming the file.
    */
-  workspaceAcceptsPdfs: NonNullable<
-    Parameters<typeof createWorkspaceTools>[1]
-  >["acceptsPdfs"] = true;
+  workspaceAcceptsPdfs: WorkspaceMediaCapability = true;
 
   /**
    * Extracts a PDF's text, one string per page. Unset by default. When set,
    * a workspace `read` of a PDF renders as that text for a model without PDF
    * input (see {@link workspaceAcceptsPdfs}) instead of a note naming the file.
    */
-  workspacePdfText: NonNullable<
-    Parameters<typeof createWorkspaceTools>[1]
-  >["pdfText"] = undefined;
+  workspacePdfText: WorkspacePdfText | undefined = undefined;
 
   /**
    * Opt-in HTTP fetch tools. Disabled by default — set to a config object to
@@ -4038,10 +4077,7 @@ export class Think<
         async () => {
           // 1. Workspace initialization
           if (!this.workspace) {
-            this.workspace = new Workspace({
-              sql: this.ctx.storage.sql,
-              name: () => this.name
-            });
+            this.workspace = new Workspace({ storage: this.ctx.storage });
           }
 
           // 2. Session configuration (builder phase: compaction, and the
@@ -4515,7 +4551,6 @@ export class Think<
    * since — not zero — and the request they left pending can pass the gate.
    */
   private _mediaEvictionAppendsDuringPass = 0;
-  private _warnedEvictionUnsupported = false;
   /**
    * The last pass that found nothing to evict while aged rows were hidden
    * from the cache: the stored size it saw, and how many linear appends have
@@ -4654,23 +4689,7 @@ export class Think<
       backlogRemains: false
     };
     try {
-      // A custom `WorkspaceLike` may predate `writeFileBytes`. Eviction needs
-      // it to preserve the bytes, so without it the pass is a no-op rather
-      // than a lossy one.
-      const writeFileBytes = this.workspace.writeFileBytes?.bind(
-        this.workspace
-      );
-      if (!writeFileBytes) {
-        if (!this._warnedEvictionUnsupported) {
-          this._warnedEvictionUnsupported = true;
-          console.warn(
-            "[Think] mediaEviction is enabled but the configured workspace " +
-              "does not implement writeFileBytes; media eviction is a no-op " +
-              "for this agent."
-          );
-        }
-        return null;
-      }
+      const files = new WorkspaceFiles(this.workspace);
       const stats = await this.session.getHistoryRowStats();
       const aged = stats.slice(
         0,
@@ -4702,11 +4721,7 @@ export class Think<
           minPartBytes: config.minPartBytes,
           write: async (index, bytes, mediaType) => {
             const path = evictedFilePath(message.id, index, mediaType);
-            await writeFileBytes(
-              path,
-              bytes,
-              mediaType ?? "application/octet-stream"
-            );
+            await files.write(path, bytes);
             return path;
           }
         });
@@ -5639,9 +5654,11 @@ export class Think<
   }
 
   /**
-   * Return the fallback system prompt for the assistant.
-   * Ignored when context blocks are configured. Use `configureContext()` for
-   * always-on instructions that should coexist with context blocks or skills.
+   * Return the instructions at the top of the system prompt.
+   *
+   * An override always comes first, followed by the context blocks from
+   * `configureContext()`, skills, and extensions. Think's default text is
+   * used only when the agent overrides nothing and has no context blocks.
    */
   getSystemPrompt(): string {
     return [
@@ -5651,6 +5668,23 @@ export class Think<
       "When the task is complex, briefly state your approach and keep the user informed with concise progress updates. If you modify code, verify with the smallest relevant test, build, typecheck, lint, or runtime check available, and report any checks you could not run.",
       "Be direct and useful in your final response: summarize the outcome, mention important files or commands, and call out real blockers or risks."
     ].join("\n\n");
+  }
+
+  /**
+   * The base system prompt for a turn: an overridden `getSystemPrompt()`,
+   * then the frozen context blocks. Think's default `getSystemPrompt()` is
+   * only a fallback for an agent with no context blocks.
+   *
+   * @internal Exposed to subclasses for tests.
+   */
+  protected async _buildBaseSystemPrompt(): Promise<string> {
+    const blocks = await this.context.freezeSystemPrompt();
+    if (!isMethodOverridden(this, "getSystemPrompt")) {
+      return blocks || this.getSystemPrompt();
+    }
+    return [this.getSystemPrompt(), blocks]
+      .filter((part) => part.trim().length > 0)
+      .join("\n\n");
   }
 
   /** Return the tools available to the assistant. */
@@ -6226,7 +6260,42 @@ export class Think<
     detached: (onTurnStarted: () => void) => Promise<void>
   ): Promise<void> {
     return dispatchChatRecoveryToHandoff({
-      detached,
+      // Each run is one attempt under the interruption budget: it counts an
+      // earlier attempt that died and records itself before any heavy work.
+      // Stop and cancel are decided before the attempt is admitted, so a
+      // stopped or cancelled turn is never sealed or reported to
+      // `onExhausted`. The checks inside `detached` stay: they also guard its
+      // stable-wait windows. A sealed incident stays sealed: its callback
+      // goes straight to the engine, whose guard makes it a no-op.
+      detached: async (onTurnStarted) => {
+        const payload = data as
+          | ChatRecoveryContinueData
+          | ChatRecoveryRetryData
+          | undefined;
+        const sealed =
+          payload?.incidentId !== undefined &&
+          (
+            await this.ctx.storage.get<ChatRecoveryIncident>(
+              CHAT_RECOVERY_INCIDENT_KEY_PREFIX +
+                encodeURIComponent(payload.incidentId)
+            )
+          )?.status === "exhausted";
+        if (!sealed) {
+          if (
+            await this._cancelRecoveryIfStopped(
+              payload?.stopEpoch ?? 0,
+              payload?.incidentId
+            )
+          )
+            return;
+          if (await this._recoveryCancelled(payload)) return;
+        }
+        return this._chatRecoveryEngine().runRecoveryAttempt({
+          callback,
+          data,
+          run: () => detached(onTurnStarted)
+        });
+      },
       track: (turn) => this.lifecycle.trackAlarmWork(turn),
       redefer: (dedupeKey) =>
         this._enqueueChatRecovery(
@@ -6496,7 +6565,7 @@ export class Think<
       "read",
       "write",
       "edit",
-      "list",
+      "ls",
       "find",
       "grep",
       "delete"
@@ -6812,14 +6881,20 @@ export class Think<
   /**
    * Return Agent Skills sources for this Think agent.
    *
-   * Bundled skills are typically imported with the Agents Vite plugin:
+   * A skill is a directory with a `SKILL.md` file, as defined by
+   * https://agentskills.io. Keep skills as files in the agent's Workspace
+   * and they become available as soon as they are written:
    *
    * ```typescript
-   * import productSkills from "agents:skills"; // -> ./skills next to this file
+   * getSkills() {
+   *   return [skills.workspace(this.workspace)]; // /workspace/.agents/skills
+   * }
    * ```
    *
-   * Sources are applied in order; the first source to register a skill name
-   * wins, and later collisions are skipped with a logged warning.
+   * `skills.r2()` reads skills from an R2 bucket and `skills.manifest()`
+   * defines them in code. Sources are applied in order; the first source to
+   * provide a skill name wins, and later collisions are skipped with a
+   * logged warning. Sources are listed again before every turn.
    */
   getSkills(): SkillSource[] | Promise<SkillSource[]> {
     return [];
@@ -6832,37 +6907,23 @@ export class Think<
       const sources = await this.getSkills();
       if (sources.length === 0) return;
 
-      if (isMethodOverridden(this, "getSystemPrompt")) {
-        const warning =
-          "getSystemPrompt() is only used as a fallback when no context blocks are configured. getSkills() registers a skills context block, so move always-on instructions into configureContext() instead.";
-        if (!this._loggedSkillWarnings.has(warning)) {
-          this._loggedSkillWarnings.add(warning);
-          console.warn(`[think] ${warning}`);
-        }
-      }
+      this._skillSources = sources;
+      await this._loadSkillCatalog();
 
-      const registry = new SkillRegistry(sources);
-      await registry.load();
-      this._logSkillWarnings(registry);
-      this._skillRegistry = registry;
-
-      await this._configureSkillWorkspace(registry);
-
+      // `whenChanged: "remind"` keeps the frozen system prompt (and the
+      // provider's prefix cache) stable when skills change mid-conversation.
+      // The new catalog goes out as a reminder after the cached prefix, and
+      // is folded into the system prompt at the next rebuild (compaction or
+      // clearing history).
       await this.context.addBlock({
-        label: registry.contextLabel,
+        label: SKILLS_CONTEXT_LABEL,
         description: "Think skills: available skill catalog",
+        whenChanged: "remind",
         provider: {
-          get: () => registry.systemPrompt()
+          get: async () =>
+            this._skillCatalog?.prompt() ?? "No skills are available."
         }
       });
-
-      const previous = (this._skillsFingerprint ??=
-        this._configGet("skillsFingerprint") ?? null);
-      if (previous !== registry.fingerprint) {
-        await this.context.refreshSystemPrompt();
-        this._configSet("skillsFingerprint", registry.fingerprint);
-        this._skillsFingerprint = registry.fingerprint;
-      }
     } catch (error) {
       console.warn(
         `[think] Failed to initialize skills; continuing without them: ${error instanceof Error ? error.message : String(error)}`
@@ -6870,84 +6931,44 @@ export class Think<
     }
   }
 
-  private async _configureSkillWorkspace(
-    registry: SkillRegistry
-  ): Promise<void> {
-    if (this.skillWorkspace === false) return;
-    const workspace = this.workspace;
-    if (!hasWriteFileBytes(workspace)) {
-      const warning =
-        "skillWorkspace is enabled but the configured workspace does not implement writeFileBytes; skills stay source-backed.";
-      if (!this._loggedSkillWarnings.has(warning)) {
-        this._loggedSkillWarnings.add(warning);
-        console.warn(`[think] ${warning}`);
-      }
-      return;
+  /** Load the catalog from every source and log new diagnostics. */
+  private async _loadSkillCatalog(): Promise<SkillCatalog> {
+    // `previous` keeps a source's last skills when it fails to list, so a
+    // transient outage (an R2 blip) does not drop them for a turn.
+    const catalog = await loadSkillCatalog(this._skillSources, {
+      previous: this._skillCatalog ?? undefined
+    });
+    for (const diagnostic of catalog.diagnostics) {
+      this._warnSkillsOnce(formatSkillDiagnostic(diagnostic));
     }
-    try {
-      const key = "skillsWorkspaceFingerprint";
-      if (this._configGet(key) === registry.fingerprint) {
-        await registry.useWorkspace(workspace, this.skillWorkspace);
-        return;
-      }
-      const seeded = await registry.seedWorkspace(
-        workspace,
-        this.skillWorkspace
-      );
-      for (const warning of seeded.warnings) {
-        if (this._loggedSkillWarnings.has(warning)) continue;
-        this._loggedSkillWarnings.add(warning);
-        console.warn(`[think] ${warning}`);
-      }
-      if (seeded.skipped === 0) {
-        this._configSet(key, registry.fingerprint);
-      }
-    } catch (error) {
-      console.warn(
-        `[think] Failed to seed skills into the workspace; source-backed skill tools remain available: ${error instanceof Error ? error.message : String(error)}`
-      );
-    }
+    this._skillCatalog = catalog;
+    return catalog;
   }
 
   /**
-   * Log registry diagnostics (duplicate names, sources that failed to list),
-   * deduped by message so a new collision after a deploy still surfaces while
-   * the same warning is not repeated on every turn.
+   * Log a skills warning once per object lifetime, so a new problem after a
+   * deploy still surfaces while the same warning is not repeated every turn.
    */
-  private _logSkillWarnings(registry: SkillRegistry): void {
-    for (const warning of registry.warnings) {
-      if (this._loggedSkillWarnings.has(warning)) continue;
-      this._loggedSkillWarnings.add(warning);
-      console.warn(`[think] ${warning}`);
-    }
+  private _warnSkillsOnce(warning: string): void {
+    if (this._loggedSkillWarnings.has(warning)) return;
+    this._loggedSkillWarnings.add(warning);
+    console.warn(`[think] ${warning}`);
   }
 
   // Vendor divergence: upstream's `getSkillScriptRunner()` hook is removed
-  // with the Codemode-backed `run_skill_script` tool it feeds (2026-08-16
-  // "Active Think and skill barrels no longer reach Codemode").
-
-  /**
-   * The persisted skills fingerprint, read from `think_config` once per
-   * object lifetime; `null` once read and absent. Saves the per-turn probe.
-   */
-  private _skillsFingerprint: string | null | undefined;
+  // with the `run_skill_script` tool it feeds. Upstream's runner
+  // (`agents/skills/runner`) runs scripts in a Dynamic Worker through
+  // Codemode, which needs a Worker Loader the fork's browser host lacks.
 
   private async _refreshSkillsIfChanged(): Promise<void> {
-    if (!this._skillRegistry) return;
+    if (!this._skillCatalog) return;
 
-    // Refreshing pulls from live sources (e.g. R2); a transient failure must
-    // not break the turn. Keep the last good catalog on error.
+    // Sources are live (a Workspace, R2); a transient failure must not break
+    // the turn. Keep the last good catalog on error. The skills block is a
+    // reminder block, so a changed catalog reaches the model without
+    // rebuilding the frozen system prompt.
     try {
-      await this._skillRegistry.refresh();
-      this._logSkillWarnings(this._skillRegistry);
-      await this._configureSkillWorkspace(this._skillRegistry);
-      const previous = (this._skillsFingerprint ??=
-        this._configGet("skillsFingerprint") ?? null);
-      if (previous !== this._skillRegistry.fingerprint) {
-        await this.context.refreshSystemPrompt();
-        this._configSet("skillsFingerprint", this._skillRegistry.fingerprint);
-        this._skillsFingerprint = this._skillRegistry.fingerprint;
-      }
+      await this._loadSkillCatalog();
     } catch (error) {
       console.warn(
         `[think] Failed to refresh skills; using last known catalog: ${error instanceof Error ? error.message : String(error)}`
@@ -7822,12 +7843,17 @@ export class Think<
     }
 
     const preparedModel = await this.prepareModel();
-    const workspaceTools = createWorkspaceTools(this.workspace, {
-      bash: this.workspaceBash,
-      acceptsImages: this.workspaceAcceptsImages,
-      acceptsPdfs: this.workspaceAcceptsPdfs,
-      pdfText: this.workspacePdfText
-    });
+    // Computer's tools: exec offers every backend the Workspace has.
+    // Vendor divergence: `read` renders media for the prepared model.
+    const workspaceTools: ToolSet = withWorkspaceReadMedia(
+      createAITools({ workspace: this.workspace }),
+      this.workspace,
+      {
+        acceptsImages: this.workspaceAcceptsImages,
+        acceptsPdfs: this.workspaceAcceptsPdfs,
+        pdfText: this.workspacePdfText
+      }
+    );
     const fetchToolSet: ToolSet = this.fetchTools
       ? createFetchTools({
           ...this.fetchTools,
@@ -7847,7 +7873,11 @@ export class Think<
     const extensionTools = this.extensionManager?.getTools() ?? {};
     await this._refreshSkillsIfChanged();
     const contextTools = await this.context.tools();
-    const skillTools = this._skillRegistry?.tools() ?? {};
+    // Vendor divergence: no `scriptRunner` (fork omits `getSkillScriptRunner()`).
+    // The skill tools are exactly `activate_skill` and `read_skill_resource`.
+    const skillTools = this._skillCatalog
+      ? createSkillTools(this._skillCatalog)
+      : {};
     const clientToolSet = createToolsFromClientSchemas(
       input.clientTools,
       input.clientToolExecutor
@@ -7884,8 +7914,7 @@ export class Think<
           : channelDefinition.instructions
         : undefined;
 
-    const frozenPrompt = await this.context.freezeSystemPrompt();
-    const rawBaseSystem = frozenPrompt || this.getSystemPrompt();
+    const rawBaseSystem = await this._buildBaseSystemPrompt();
     const baseSystem = channelInstructions
       ? `${channelInstructions}\n\n${rawBaseSystem}`
       : rawBaseSystem;
@@ -9363,22 +9392,51 @@ export class Think<
     );
   }
 
+  /**
+   * Hand out an RPC stub to this agent's Workspace. `getWorkspace(stub)`
+   * from `@cloudflare/computer` calls it to reach the Workspace from
+   * another Worker or Durable Object, and the Worker shell backend calls it
+   * so its isolate can reach back into the Workspace.
+   *
+   * Only a Workspace this agent owns can hand out a stub; a client for
+   * another object's Workspace cannot.
+   */
+  async __getWorkspaceStub(): Promise<WorkspaceStub> {
+    await this.__unsafe_ensureInitialized();
+    const workspace = this.workspace;
+    if (!isLocalWorkspace(workspace)) {
+      throw new Error(
+        "[Think] This agent's workspace belongs to another Durable Object, " +
+          "so it cannot hand out a Workspace stub."
+      );
+    }
+    await workspace.ready();
+    return workspace.stub();
+  }
+
   // ── Host bridge methods (called by HostBridgeLoopback via DO RPC) ──
 
   async _hostReadFile(path: string): Promise<string | null> {
     await this.__unsafe_ensureInitialized();
-    return (await this.workspace.readFile(path)) ?? null;
+    return new WorkspaceFiles(this.workspace).readText(
+      resolveWorkspacePath(path)
+    );
   }
 
   async _hostWriteFile(path: string, content: string): Promise<void> {
     await this.__unsafe_ensureInitialized();
-    await this.workspace.writeFile(path, content);
+    await new WorkspaceFiles(this.workspace).write(
+      resolveWorkspacePath(path),
+      content
+    );
   }
 
   async _hostDeleteFile(path: string): Promise<boolean> {
     await this.__unsafe_ensureInitialized();
     try {
-      await this.workspace.rm(path);
+      await new WorkspaceFiles(this.workspace).remove(
+        resolveWorkspacePath(path)
+      );
       return true;
     } catch {
       return false;
@@ -9391,12 +9449,14 @@ export class Think<
     Array<{ name: string; type: string; size: number; path: string }>
   > {
     await this.__unsafe_ensureInitialized();
-    const entries = await this.workspace.readDir(dir);
+    const entries = await new WorkspaceFiles(this.workspace).list(
+      resolveWorkspacePath(dir)
+    );
     return entries.map((e) => ({
       name: e.name,
       type: e.type,
-      size: e.size ?? 0,
-      path: e.path ?? `${dir}/${e.name}`
+      size: e.size,
+      path: e.path
     }));
   }
 
@@ -13492,7 +13552,8 @@ export class Think<
    * Request identities still awaiting native execution, recovery, or a
    * persisted terminal-response hook. Safe in `onStart`, before the alarm
    * resumes interrupted chat Tasks. Settled model-step journals are excluded
-   * even when their Task run has not finished its queue cleanup.
+   * even when their Task run has not finished its queue cleanup, and so is a
+   * queued recovery whose incident was sealed as exhausted.
    */
   async listRecoverableChatRequests(): Promise<RecoverableChatRequest[]> {
     // One recovery root has one current handoff owner. A successor's Task or
@@ -13511,7 +13572,15 @@ export class Think<
         )) ||
         (data.recoveredRequestId &&
           !this._readRunningSubmissionForRecovery(data.recoveredRequestId)) ||
-        this._chatRecoveryTargetMismatch(callback, data, leaf)
+        this._chatRecoveryTargetMismatch(callback, data, leaf) ||
+        // The engine no-ops a callback whose incident was sealed (#2615).
+        (data.incidentId &&
+          (
+            await this.ctx.storage.get<ChatRecoveryIncident>(
+              CHAT_RECOVERY_INCIDENT_KEY_PREFIX +
+                encodeURIComponent(data.incidentId)
+            )
+          )?.status === "exhausted")
       )
         return;
       const incident = incidents.find(
@@ -17886,6 +17955,7 @@ export class Think<
     recoveryRootRequestId?: string | null;
     latestUserMessageId?: string | null;
     recoveryKind: ChatRecoveryKind;
+    trigger: "interrupted" | "stalled";
     /** Test-only clock injection for deterministic debounce/window timing. */
     nowMs?: number;
   }): Promise<{
@@ -17945,11 +18015,18 @@ export class Think<
       // not stuck, so the engine keeps it budget-free. SERVER-tool orphans are
       // excluded by `hasPendingInteraction` and still recover normally.
       isAwaitingClientInteraction: () => this.hasPendingInteraction(),
+      // A Stop that lands while an at-budget admission syncs still wins over
+      // the seal; `_dispatchChatRecovery` covers a Stop before admission.
+      isRecoveryAttemptCancelled: (data) =>
+        this._isStoppedRecovery(
+          (data as ChatRecoveryContinueData | undefined)?.stopEpoch ?? 0
+        ),
       listActiveIncidents: async () =>
         (await listActiveChatRecoveryIncidents(this.ctx.storage)).map(
           ({ incident }) => incident
         ),
       putIncident: (key, incident) => this.ctx.storage.put(key, incident),
+      syncStorage: () => this.ctx.storage.sync(),
       deleteIncident: async (key) => {
         await this.ctx.storage.delete(key);
       },
@@ -18177,7 +18254,8 @@ export class Think<
         requestId: input.requestId,
         recoveryRootRequestId,
         latestUserMessageId,
-        recoveryKind
+        recoveryKind,
+        trigger: "stalled"
       });
     const partialText = input.partialParts
       .filter(
@@ -18978,62 +19056,15 @@ export class Think<
   }
 
   /**
-   * Apply the tight OOM-retry budget to a recovery error (#1825). Invoked from
-   * `_handleRecoveryCallbackError`, i.e. for an OOM that is *thrown* out of a
-   * recovery turn (typically from recovery bookkeeping or storage/SQL ops that
-   * reject with the memory-limit-reset message after an isolate reset). An OOM
-   * that surfaces as a returned `error` result means `continueLastTurn` already
-   * terminalized the turn (client error frame + `onError`), so it is NOT routed
-   * here — re-driving a terminalized turn would be wasteful and risk a second
-   * terminal signal. `error` may be an Error or a wrapper with a `cause` chain.
-   *
-   * The reliable terminator is the begin-path (`evaluateChatRecoveryIncident`),
-   * which seals once `oomAttempts` exceeds the budget; that runs before the
-   * memory-heavy turn, in the low-memory window where writes succeed. This
-   * method's job is to persist `oomAttempts` (small writes) so the begin path
-   * can act on it, and to schedule a delayed re-run while under budget.
-   *
-   * Returns `true` when the error was an OOM and this method owns the outcome:
-   *  - under budget → a delayed re-run was scheduled (best-effort: a transient
-   *    spike may clear);
-   *  - over budget (or untrackable, or the bookkeeping itself OOMed) →
-   *    terminalized via the give-up path with `reason="out_of_memory"`.
-   * Returns `false` for non-OOM errors so the caller proceeds normally.
-   */
-  private async _handleRecoveryOom(
-    callback: ChatRecoveryScheduleCallback,
-    data: ChatRecoveryContinueData | ChatRecoveryRetryData | undefined,
-    error: unknown
-  ): Promise<boolean> {
-    if (!isDurableObjectMemoryLimitReset(error)) return false;
-    let decision: "rescheduled" | "exhausted" = "exhausted";
-    try {
-      decision = await this._chatRecoveryEngine().recordOomAndDecide({
-        incidentId: data?.incidentId,
-        callback,
-        data,
-        maxOomRetries: this._resolveChatRecoveryConfig().maxOomRetries
-      });
-    } catch (bookkeepingError) {
-      // The bump/reschedule writes can themselves reject in the degraded isolate
-      // that just OOMed. Fail closed (seal) rather than risk a silent wedge; the
-      // finite `maxRecoveryWork` backstop covers anything that slips past.
-      console.error(
-        "[Think] failed to record OOM recovery attempt; terminalizing",
-        bookkeepingError
-      );
-      decision = "exhausted";
-    }
-    if (decision === "exhausted") {
-      await this._exhaustRecoveryGiveUp(callback, data, "out_of_memory");
-    }
-    return true;
-  }
-
-  /**
    * Handle an error thrown by `_chatRecoveryContinue` / `_chatRecoveryRetry`
    * after the incident was opened.
    *
+   * - A Durable Object memory-limit reset is re-thrown with no bookkeeping.
+   *   The isolate is condemned: its storage calls reject and unconfirmed
+   *   writes are discarded, so nothing written here would survive (#2613).
+   *   The attempt's `attemptsInFlight` entry stays behind, and the next
+   *   attempt counts it against `maxInterruptedAttempts` before running
+   *   anything heavy.
    * - A platform transient (`isPlatformTransientError` from `agents` — a
    *   deploy code-update reset / script supersede, a `retryable`-flagged
    *   platform error, or "Network connection lost.", looking through wrappers
@@ -19065,13 +19096,10 @@ export class Think<
     data: ChatRecoveryContinueData | ChatRecoveryRetryData | undefined,
     error: unknown
   ): Promise<void> {
-    // A memory-limit reset is NOT a platform transient (re-running the same
-    // memory-heavy turn re-OOMs deterministically), so it must be classified
-    // BEFORE the transient check and routed through the tight OOM-retry budget
-    // instead of either deferring forever or terminalizing on the first hit
-    // (#1825). Returns true once it has owned the outcome (rescheduled or
-    // sealed); only fall through to the generic handling for non-OOM errors.
-    if (await this._handleRecoveryOom(callback, data, error)) return;
+    // Classified before the transient check: a memory-limit reset is not a
+    // transient, and the generic path below would try to terminalize through
+    // storage that is already gone.
+    if (isDurableObjectMemoryLimitReset(error)) throw error;
     if (isPlatformTransientError(error)) {
       const message = error instanceof Error ? error.message : String(error);
       const incidentId = data?.incidentId;

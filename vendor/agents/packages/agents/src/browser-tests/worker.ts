@@ -9,15 +9,11 @@ import {
   type ProxyToolOutput
 } from "@cloudflare/codemode";
 import { BrowserConnector } from "../browser/connector";
-import {
-  BrowserSessionConnector,
-  type BrowserExecutionReport
-} from "../browser/session-connector";
-import {
-  Browser,
-  browserRun,
-  namedBrowserSessionKey
-} from "../browser/browser";
+import { browserFunctions } from "../browser/browser-functions";
+import { runBrowserCode } from "../browser/sandbox";
+import type { BrowserSessionReport } from "../browser/session";
+import { Browser, namedBrowserSessionKey } from "../browser/browser";
+import { browserRun } from "../browser/providers/browser-run";
 import {
   DurableBrowserSessionStore,
   type StoredBrowserSession
@@ -102,7 +98,7 @@ export class BrowserTestAgent extends Agent<Env> {
     )) as ProxyToolOutput;
   }
 
-  // ── Persistent named browser (BrowserSessionConnector) ──
+  // ── Persistent named browser (BrowserSession + runBrowserCode) ──
 
   #namedBrowser(): Browser {
     return new Browser({
@@ -112,38 +108,37 @@ export class BrowserTestAgent extends Agent<Env> {
     });
   }
 
-  #namedConnector(): BrowserSessionConnector {
-    return new BrowserSessionConnector(this.ctx, {
-      browser: this.#namedBrowser()
-    });
-  }
-
-  #namedRuntime(connector: BrowserSessionConnector): CodemodeRuntimeHandle {
-    return createCodemodeRuntime({
-      ctx: this.ctx,
-      executor: new DynamicWorkerExecutor({ loader: this.env.LOADER }),
-      connectors: [connector, new GateConnector(this.ctx, this.env)],
-      name: "browser-named"
-    });
-  }
-
-  /** Run code against the persistent browser; include the browser report. */
+  /**
+   * Run code against the persistent browser the way `browserTool`
+   * does: one session per run, the code in a Dynamic Worker. Includes the
+   * session's report.
+   */
   @callable()
   async runNamed(
-    code: string
-  ): Promise<ProxyToolOutput & { report: BrowserExecutionReport | null }> {
-    const connector = this.#namedConnector();
-    const output = await this.#execute(this.#namedRuntime(connector), code);
-    return {
-      ...output,
-      report: connector.takeReport(output.executionId) ?? null
-    };
-  }
-
-  @callable()
-  async approveNamed(executionId: string) {
-    const connector = this.#namedConnector();
-    return this.#namedRuntime(connector).approve({ executionId });
+    code: string,
+    scope?: string
+  ): Promise<
+    (
+      | { status: "completed"; result: unknown }
+      | { status: "error"; error: string }
+    ) & { logs: string[]; report: BrowserSessionReport | null }
+  > {
+    const session = this.#namedBrowser().session({ scope });
+    try {
+      const ran = await runBrowserCode({
+        loader: this.env.LOADER,
+        code,
+        functions: browserFunctions(session),
+        timeoutMs: 60_000
+      });
+      const report = (await session.close()) ?? null;
+      return "error" in ran
+        ? { status: "error", error: ran.error, logs: ran.logs, report }
+        : { status: "completed", result: ran.result, logs: ran.logs, report };
+    } finally {
+      // Already closed unless the run threw; a second close does nothing.
+      await session.close();
+    }
   }
 
   /** Close the persistent browser so it doesn't outlive the suite. */

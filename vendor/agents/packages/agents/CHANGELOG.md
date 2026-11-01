@@ -1,5 +1,213 @@
 # @cloudflare/agents
 
+## 0.32.0
+
+### Minor Changes
+
+- [#2752](https://github.com/cloudflare/agents/pull/2752) [`34cbd30`](https://github.com/cloudflare/agents/commit/34cbd305c6d55d2c38f4063c58ddbe97785fb8c8) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Add `experimental_registerOpenTelemetry()` to `agents/observability`, which records spans from OpenTelemetry-instrumented libraries as Workers trace spans. Experimental and subject to change.
+
+- [#2771](https://github.com/cloudflare/agents/pull/2771) [`54ae3e8`](https://github.com/cloudflare/agents/commit/54ae3e86987be92ae20bc6a8b06c26ec1884d01c) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Breaking: `agents/skills` now loads Agent Skills from Computer Workspace files (`workspace()`), R2 (`r2()`), or code (`manifest()`), checks `SKILL.md` against the Agent Skills spec, and replaces `SkillRegistry` with `loadSkillCatalog()` and `createSkillTools()` (from `agents/skills/tools/ai-sdk`); `parseSkill()` follows the spec's guide for agents, loading skills that break a rule with warnings; `runner()` moved to `agents/skills/runner`; the `agents:skills` Vite import and `agents/skills/compile` are removed. See [Agent Skills](https://developers.cloudflare.com/agents/skills/).
+
+### Patch Changes
+
+- [#2763](https://github.com/cloudflare/agents/pull/2763) [`df85805`](https://github.com/cloudflare/agents/commit/df85805ed79b4287f35f59efdbf2e947854bc14a) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Agents SDK spans (agent lifecycle, `wrapAISDK`, Think) now set span status `error` on failure, where the Workers runtime supports `Span.setStatus()`; attributes are unchanged. See [Observability](https://github.com/cloudflare/agents/blob/main/docs/agents/observability.md#ai-sdk-tracing).
+
+- [#2737](https://github.com/cloudflare/agents/pull/2737) [`08747d9`](https://github.com/cloudflare/agents/commit/08747d9aa7a11f284dbd85e3b024ef1ce1ddaa41) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Mark the package side-effect free (apart from the CLI), so bundlers drop the modules a Worker doesn't use. `import { routeAgentRequest } from "agents"` no longer bundles the MCP client.
+
+- [#2744](https://github.com/cloudflare/agents/pull/2744) [`a2d371e`](https://github.com/cloudflare/agents/commit/a2d371ec333198855f4ac2aa4dadbe2696e73c75) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Update `@modelcontextprotocol/client` and `@modelcontextprotocol/server` to 2.4.0 and `@modelcontextprotocol/sdk` to 1.32.2, and add a `clientMetadataUrl` option to `DurableObjectOAuthClientProvider` for OAuth Client ID Metadata Documents. See [MCP client](https://developers.cloudflare.com/agents/model-context-protocol/apis/client-api/).
+
+- [#2740](https://github.com/cloudflare/agents/pull/2740) [`8cf6da1`](https://github.com/cloudflare/agents/commit/8cf6da190aa4212c83dd11089413f390a9f510ac) Thanks [@mattzcarey](https://github.com/mattzcarey)! - `agents/models/pi-ai` parses streamed chat-completions tool-call arguments incrementally, instead of re-parsing the whole argument text on every delta.
+
+- [#2766](https://github.com/cloudflare/agents/pull/2766) [`b372289`](https://github.com/cloudflare/agents/commit/b372289fdee424366b6bd8a8ae9923afb3ac803f) Thanks [@github-actions](https://github.com/apps/github-actions)! - Allow `@tanstack/ai` 1.x in the optional peer dependency ranges, and type the TanStack AI tools so they compile against both 0.x and 1.x. See [TanStack AI](https://github.com/cloudflare/agents/blob/main/packages/codemode/README.md#tanstack-ai).
+
+## 0.31.0
+
+This release adds internal hostnames to the browser. Give a Browser Run browser hostnames such as `preview.internal`, and its requests to them go to your agent instead of the internet, so the model can open a dev server, a workspace folder or another Worker in the same browser it uses for the web.
+
+### Highlights
+
+- **Internal hostnames:** pass up to 8 hostnames to `browserRun()` as `internalHosts`. Serve each one from a `fetch` function on your agent or from another Worker. See [Internal hostnames](https://github.com/cloudflare/agents/blob/main/docs/agents/browse-the-web.md#internal-hostnames).
+- **Hosts the model points:** give a host a `target` schema, and the model chooses what it serves with `browser.assignHost()`, such as a container port or a folder in its workspace. Without a target, a host always serves the same thing.
+- **Lighter installs without MCP servers:** `@modelcontextprotocol/sdk` and `@modelcontextprotocol/server` are now optional peer dependencies, so apps that don't serve MCP no longer install them.
+- **Stable models:** `agents/models/ai-sdk` and `agents/models/pi-ai` are no longer experimental. See [Models](https://github.com/cloudflare/agents/blob/main/docs/agents/models.md).
+- **Other changes:** `createMcpHandler` passes the verified token from `@cloudflare/workers-oauth-provider` 1.x to tool callbacks as `context.http.authInfo`. `createAI` from `agents/models/pi-ai` sends pi-ai's Anthropic betas for catalog Claude models. `PiWhenBusy` accepts `"reject"`.
+- **`browserTool` improvements:** the model's code runs in its own Dynamic Worker instead of on codemode, and is stopped from outside that Worker if it overruns its timeout. It can no longer close the browser or create a Live View link. `this.browser.session()` lets your own code drive the same browser. `createBrowserTools`, `createBrowserRuntime`, `BrowserConnector` and the Quick Action helpers are deprecated in favour of `browserTool`.
+
+### Upgrading
+
+You only need to make changes if you serve MCP or use `browserTool`.
+
+If you serve MCP or use `agents/x402` or `agents/experimental/webmcp`:
+
+1. **Add the MCP packages to your `package.json`** at the versions this release expects, since your package manager no longer installs them. Until you do, builds fail with an unresolved import.
+
+   - `agents/mcp` (`McpAgent`, `WorkerTransport`, `createLegacyMcpHandler`) and `agents/x402`: `@modelcontextprotocol/sdk@1.32.1` and `@modelcontextprotocol/server@2.3.1`
+   - `agents/mcp/server` (`createMcpHandler`): `@modelcontextprotocol/server@2.3.1`
+   - `agents/experimental/webmcp`: `@modelcontextprotocol/sdk@1.32.1`
+
+   See [Upgrading an existing `McpAgent` server](https://github.com/cloudflare/agents/blob/main/docs/agents/mcp-servers.md#upgrading-an-existing-mcpagent-server).
+
+2. **Import client helpers such as `RPCClientTransport` from `agents/mcp/client`** instead of `agents/mcp`. MCP client code needs neither package.
+
+If you use `browserTool`:
+
+1. **Remove the `CodemodeRuntime` export** from your Worker unless `createBrowserTools` still uses it, and remove `ctx` from `browserTool`'s options. Keep the `LOADER` binding and keep `@cloudflare/codemode` installed for now.
+2. **Update instructions of your own that mention `cdp.send`**, such as a system prompt. The tool's description already teaches the new call:
+
+   ```diff
+   - await cdp.send({ method: "Page.navigate", params: { url }, sessionId: "active" });
+   + await browser.cdp({ method: "Page.navigate", params: { url }, sessionId: "active" });
+   ```
+
+3. **Read `notice` instead of `restarted`, `newTabs` and `calls`** if your code inspects results. `notice` says in sentences whether the browser restarted, the page opened tabs, or another chat closed or shares the tab. `PiBrowserToolDetails` now has only `executionId` and `status`.
+
+### Minor Changes
+
+- [#2673](https://github.com/cloudflare/agents/pull/2673) [`865a57e`](https://github.com/cloudflare/agents/commit/865a57e5222cf34d6eb8bf6383e3af1358690aa5) Thanks [@ben-reitz](https://github.com/ben-reitz)! - Add `internalHosts` to `browserRun()` provider: set internal hostnames the browser can reach through your agent. Allow the model to point these hostnames at specific targets like container ports or workspace folders with `browser.assignHost()`. See [Internal hostnames](https://developers.cloudflare.com/agents/tools/browser/).
+
+- [#2667](https://github.com/cloudflare/agents/pull/2667) [`03b4609`](https://github.com/cloudflare/agents/commit/03b46094ff6625569bd1799e0f02f30fef9d6257) Thanks [@ben-reitz](https://github.com/ben-reitz)! - `browserTool` now runs the model's code in its own Dynamic Worker instead of on codemode, so it needs no `ctx` or `CodemodeRuntime` export (keep `@cloudflare/codemode` installed for now) and its output has no `calls` log; `browser.session()` gives your own code the same connection to the browser. See [Persistent browser](https://github.com/cloudflare/agents/blob/main/docs/agents/browse-the-web.md#persistent-browser).
+
+- [#2634](https://github.com/cloudflare/agents/pull/2634) [`565e37c`](https://github.com/cloudflare/agents/commit/565e37c666d8df74268a78108c5e1551541a87bf) Thanks [@mattzcarey](https://github.com/mattzcarey)! - `@modelcontextprotocol/sdk` and `@modelcontextprotocol/server` are now optional peer dependencies, so add them to your `package.json` if you use `agents/mcp`, `agents/mcp/server`, `agents/x402` or `agents/experimental/webmcp`. See [Upgrading an existing `McpAgent` server](https://github.com/cloudflare/agents/blob/main/docs/agents/mcp-servers.md#upgrading-an-existing-mcpagent-server).
+
+### Patch Changes
+
+- [#2668](https://github.com/cloudflare/agents/pull/2668) [`183c141`](https://github.com/cloudflare/agents/commit/183c1416c064924d6d2353f7e2a9decc988568dd) Thanks [@ben-reitz](https://github.com/ben-reitz)! - `browserTool`'s model code now calls a `browser` global (`browser.cdp(...)`, `browser.spec({ domain })`) instead of `cdp.send(...)`, and the result's `notice` replaces the `restarted` and `newTabs` fields. See [Persistent browser](https://github.com/cloudflare/agents/blob/main/docs/agents/browse-the-web.md#persistent-browser).
+
+- [#2666](https://github.com/cloudflare/agents/pull/2666) [`57c7813`](https://github.com/cloudflare/agents/commit/57c78139793a65940171a9b80653721c972de4fb) Thanks [@ben-reitz](https://github.com/ben-reitz)! - `createBrowserTools`, `createBrowserRuntime` and `BrowserConnector` are deprecated; use `browserTool`. See [Persistent browser](https://github.com/cloudflare/agents/blob/main/docs/agents/browse-the-web.md#persistent-browser). The Quick Action helpers (`createQuickActionTools`, `runQuickAction`, `browserMarkdown` and the rest) are deprecated too and will not change.
+
+- [#2743](https://github.com/cloudflare/agents/pull/2743) [`f049ee1`](https://github.com/cloudflare/agents/commit/f049ee11cc70584681b58753c122d3fd60b69b31) Thanks [@mattzcarey](https://github.com/mattzcarey)! - `agents/models/ai-sdk` and `agents/models/pi-ai` are no longer experimental. See [Models](https://github.com/cloudflare/agents/blob/main/docs/agents/models.md).
+
+- [#2718](https://github.com/cloudflare/agents/pull/2718) [`916c0e3`](https://github.com/cloudflare/agents/commit/916c0e33d80cb7b34fb96a2b1f447dac274a7efb) Thanks [@ben-reitz](https://github.com/ben-reitz)! - `createAI` from `agents/models/pi-ai` now sends pi-ai's `betas` as the `anthropic-beta` header for catalog Claude models on `/run`, as it already did on the provider-native path. See [#2714](https://github.com/cloudflare/agents/issues/2714).
+
+- [#2717](https://github.com/cloudflare/agents/pull/2717) [`4d7734a`](https://github.com/cloudflare/agents/commit/4d7734a09a0eabb0f5e9df40000801303cd8c528) Thanks [@ben-reitz](https://github.com/ben-reitz)! - `PiWhenBusy` accepts `"reject"`, which `PiHarness.submit()` already passed through to pi-durable. See [Pi harness](https://developers.cloudflare.com/agents/harnesses/pi/).
+
+- [#2680](https://github.com/cloudflare/agents/pull/2680) [`2a25d88`](https://github.com/cloudflare/agents/commit/2a25d8890686b106758f4a127c6165ea63a05ab5) Thanks [@mattzcarey](https://github.com/mattzcarey)! - `createMcpHandler` now reads the verified token that `@cloudflare/workers-oauth-provider` 1.x sets as `ctx.auth`, so tool callbacks receive `context.http.authInfo` (token, client ID, scopes, expiry and resource) behind `OAuthProvider` and `OAuthResourceServer`. `getMcpAuthContext().props` is unchanged.
+
+## 0.30.1
+
+### Patch Changes
+
+- [#2684](https://github.com/cloudflare/agents/pull/2684) [`9c79ba1`](https://github.com/cloudflare/agents/commit/9c79ba12778cbb53b6c50db79282d780466c9897) Thanks [@ben-reitz](https://github.com/ben-reitz)! - Fix `PiHarness` with `onWake` not resuming a sleeping Pi task, such as a compaction retry, while another task is running ([#2683](https://github.com/cloudflare/agents/issues/2683)). See [How recovery works](https://developers.cloudflare.com/agents/harnesses/pi/#how-recovery-works).
+
+## 0.30.0
+
+This release adds support for [Pi 1.4](https://github.com/earendil-works/pi/blob/v1.4.0/packages/durable/CHANGELOG.md#140---2026-10-21) and makes `PiHarness` recover more reliably from evictions, crashes and storage errors.
+
+### Highlights
+
+- **Pi 1.4 support:** `agents/harness/pi` now runs on Pi 1.4.
+- **Hibernation while Pi's tasks sleep:** `PiHarness` passes Pi's `onWake` through your harness factory, so a Durable Object sleeps until Pi's next task is due instead of staying in memory.
+- **One wake job per object:** `PiHarness` wakes from Pi's `wake()`, so a task stopped by Pi's restart limit no longer keeps the object awake.
+- **Parked tasks:** tasks stopped by Pi's restart limit show as `parked` in `pending()`, and `retry()` runs them again.
+- **Recovery:** Pi reopens after a storage error instead of failing every call until the object restarts, and the wake job survives failed steps with backoff.
+- **Fixes:** Lifecycle no longer keeps evicted Durable Objects in memory, and it arms a fallback alarm when startup fails. pi-ai now reports cut-off model streams with wording Pi treats as transient, so Pi retries them.
+
+### Upgrading
+
+1. **Update Pi to `~1.4.0`** (`@earendil-works/pi-durable`, `pi-ai`, `pi-agent-core`) and install `@earendil-works/chord` alongside them. Pi 1.4 migrates session storage to a schema Pi 1.3 cannot open, so a deployment cannot roll back past this release.
+2. **Check [pi-durable's 1.4.0 changelog](https://github.com/earendil-works/pi/blob/v1.4.0/packages/durable/CHANGELOG.md#140---2026-10-21)** for its breaking changes, such as the removal of `TaskRuntime.sleep()`, the new `sleeping` task status, and the restart limit that parks a crash-looping task after 5 restarts.
+3. **Pass `onWake` to `Harness.open`**, as in the diff below. Without it, the harness still works but logs a warning, and the object stays in memory while Pi's tasks sleep.
+4. **If you create Pi's registry at module scope, move it into your class**, as a field or in the factory. Our tool examples showed module scope before this release. Pi keeps every `Harness` subscribed to its registry until it closes, and an evicted object never closes it, so a module-level registry keeps every evicted object's harness in memory.
+
+   ```diff
+   - const registry = createRegistry();
+     export class Assistant extends Agent<Env> {
+   +   registry = createRegistry();
+       harness = new PiHarness({
+         harness: ({ storage, context, onWake }) =>
+   -       Harness.open(storage, { models, registry }, context)
+   +       Harness.open(storage, { models, registry: this.registry, onWake }, context)
+       });
+     }
+   ```
+
+5. **Keep the harness factory safe to run more than once.** It now runs again when Pi reopens after a storage error.
+6. **Handle the new `parked` status** if you switch on `PiPendingOperation.status`.
+
+Existing objects need no migration step. Wake jobs left by earlier releases are handed over to the new wake job on first start.
+
+### Minor Changes
+
+- [#2617](https://github.com/cloudflare/agents/pull/2617) [`cfe9d0f`](https://github.com/cloudflare/agents/commit/cfe9d0f3d5de5e07fc77e5edc320d423e6634295) Thanks [@ben-reitz](https://github.com/ben-reitz)! - Support Pi 1.4: the Pi peer range is now `~1.4.0`. Pi 1.4 migrates SQLite session storage to a schema that Pi 1.3 cannot open, so a deployment cannot roll back past this release. See [Pi harness](https://developers.cloudflare.com/agents/harnesses/pi/).
+
+- [#2619](https://github.com/cloudflare/agents/pull/2619) [`4b535dc`](https://github.com/cloudflare/agents/commit/4b535dc9f30f85a295261e545bc18cf58dfa012f) Thanks [@ben-reitz](https://github.com/ben-reitz)! - `PiHarness` hands its factory an `onWake` to pass to `Harness.open`, so the Durable Object can hibernate while Pi's tasks sleep. Add it to your factory: `harness: ({ storage, context, onWake }) => Harness.open(storage, { ...options, onWake }, context)`. Without it the harness still works and logs a warning. See [Pi harness](https://developers.cloudflare.com/agents/harnesses/pi/).
+
+- [#2624](https://github.com/cloudflare/agents/pull/2624) [`3954859`](https://github.com/cloudflare/agents/commit/3954859b3d2b56bcf8e0425bda39608de7744dfe) Thanks [@ben-reitz](https://github.com/ben-reitz)! - `PiHarness` shows operations stopped by Pi's restart limit as `parked` in `pending()`, and `retry()` runs them again. See [Pi harness](https://developers.cloudflare.com/agents/harnesses/pi/#how-recovery-works).
+
+### Patch Changes
+
+- [#2644](https://github.com/cloudflare/agents/pull/2644) [`f404547`](https://github.com/cloudflare/agents/commit/f404547453d412d04aafedff7d624d384c6e70d8) Thanks [@ben-reitz](https://github.com/ben-reitz)! - Lifecycle arms a fallback alarm while its job queue holds jobs, before startup runs in an alarm and after a startup that queued jobs throws, so a failed startup cannot leave queued jobs without a wake. See [Lifecycle](https://github.com/cloudflare/agents/blob/main/docs/agents/lifecycle.md).
+
+- [#2653](https://github.com/cloudflare/agents/pull/2653) [`fc4cd24`](https://github.com/cloudflare/agents/commit/fc4cd249b962f481fa8d6c1692e9bf10db2878cf) Thanks [@ben-reitz](https://github.com/ben-reitz)! - Stop Lifecycle startup keeping an evicted Durable Object in memory when a capability's startup leaves a promise pending, as `PiHarness` does when it opens Pi. See [Pi harness](https://github.com/cloudflare/agents/blob/main/docs/agents/harnesses/pi.md#create-the-harness).
+
+- [#2643](https://github.com/cloudflare/agents/pull/2643) [`e117121`](https://github.com/cloudflare/agents/commit/e117121fff687a0320b96cb22da63cb089855a04) Thanks [@ben-reitz](https://github.com/ben-reitz)! - `agents/models/pi-ai` reports a cut-off or idle model stream with wording pi's retry policy treats as transient, so pi retries the turn instead of failing it. See [Models with pi-ai](https://github.com/cloudflare/agents/blob/main/docs/agents/models-pi-ai.md).
+
+- [#2617](https://github.com/cloudflare/agents/pull/2617) [`cfe9d0f`](https://github.com/cloudflare/agents/commit/cfe9d0f3d5de5e07fc77e5edc320d423e6634295) Thanks [@ben-reitz](https://github.com/ben-reitz)! - `agents/harness/pi` now uses chord's own context helpers, so install `@earendil-works/chord` alongside pi-durable and pi-ai. See [Pi harness](https://developers.cloudflare.com/agents/harnesses/pi/).
+
+- [#2648](https://github.com/cloudflare/agents/pull/2648) [`000fcaf`](https://github.com/cloudflare/agents/commit/000fcaf67670cfedfc0923726f7400cf2524ca76) Thanks [@ben-reitz](https://github.com/ben-reitz)! - `PiHarness` opens pi again after a storage error closes it, instead of failing every call until the object restarts. See [How recovery works](https://developers.cloudflare.com/agents/harnesses/pi/#how-recovery-works).
+
+- [#2618](https://github.com/cloudflare/agents/pull/2618) [`3e91ded`](https://github.com/cloudflare/agents/commit/3e91ded5295aef63bd40e34cb5f3396d0be11992) Thanks [@ben-reitz](https://github.com/ben-reitz)! - `PiHarness` wakes from Pi's `wake()` with one job per object, so a task parked by Pi's restart limit no longer keeps the Durable Object awake. See [Pi harness](https://developers.cloudflare.com/agents/harnesses/pi/).
+
+- [#2649](https://github.com/cloudflare/agents/pull/2649) [`91a8f61`](https://github.com/cloudflare/agents/commit/91a8f611ac4cb205e6a8efd3481af851022a8958) Thanks [@ben-reitz](https://github.com/ben-reitz)! - `PiHarness` keeps its wake job when a step fails, retrying with a backoff up to 10 minutes, and counts a memory-limit reset during the job's wait against the alarm memory-limit breaker. See [How recovery works](https://developers.cloudflare.com/agents/harnesses/pi/#how-recovery-works).
+
+## 0.29.0
+
+### Minor Changes
+
+- [#2560](https://github.com/cloudflare/agents/pull/2560) [`8c720d3`](https://github.com/cloudflare/agents/commit/8c720d3b0d7703741bf0f6e47b571d3e21c50742) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Agent Skills read and write a `@cloudflare/computer` Workspace, for both projection and `skills.runner()`. See [Upgrading to a Computer workspace](https://github.com/cloudflare/agents/blob/main/docs/think/index.md#upgrading-to-a-computer-workspace).
+
+### Patch Changes
+
+- [#2584](https://github.com/cloudflare/agents/pull/2584) [`3b3a88e`](https://github.com/cloudflare/agents/commit/3b3a88e487398f4120023f1c75830bc703b14216) Thanks [@ben-reitz](https://github.com/ben-reitz)! - `Browser` creates and closes its Browser Run sessions with the binding's typed `acquire()` and `closeSession()`, falling back to the HTTP API in fully local dev. See [Browser](https://developers.cloudflare.com/agents/tools/browser/).
+
+- [#2615](https://github.com/cloudflare/agents/pull/2615) [`05843e4`](https://github.com/cloudflare/agents/commit/05843e428be0d8b43a5bf1923d8e40adce6f213d) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Chat recovery now seals a turn after `chatRecovery.maxInterruptedAttempts` interrupted attempts (default 5), so a turn that exceeds the Durable Object memory limit on every run no longer retries forever; `maxOomRetries` is deprecated. See [Stream Recovery](https://github.com/cloudflare/agents/blob/main/docs/agents/chat-agents.md#stream-recovery).
+
+- [#2604](https://github.com/cloudflare/agents/pull/2604) [`5d6f5d6`](https://github.com/cloudflare/agents/commit/5d6f5d66c9095b4871e810b6f72dd0c3206c7087) Thanks [@mattzcarey](https://github.com/mattzcarey)! - `createAI` takes `{ accountId, apiToken }` in place of `binding`, to use a gateway in another account or to run outside a Worker. See [the models docs](https://github.com/cloudflare/agents/blob/main/docs/agents/models.md#account-id-and-api-token).
+
+- [#2622](https://github.com/cloudflare/agents/pull/2622) [`2c68a71`](https://github.com/cloudflare/agents/commit/2c68a718334cb7bac102afc16a067f8ff19973ee) Thanks [@mattzcarey](https://github.com/mattzcarey)! - `createAI` transcribes with `@cf/deepgram/nova-3`. See [the models docs](https://github.com/cloudflare/agents/blob/main/docs/agents/models.md#other-modalities).
+
+- [#2576](https://github.com/cloudflare/agents/pull/2576) [`b048873`](https://github.com/cloudflare/agents/commit/b04887397fa99fd785f8323076e61a2b76e6ca5f) Thanks [@mattzcarey](https://github.com/mattzcarey)! - `createAI` no longer uses AI Gateway's deprecated Universal Endpoint. Model ids, now including catalog ids like `anthropic/claude-opus-4.8`, run on `env.AI.run`; model objects go to the provider-native path. Adds `byokAlias`, fixes pi-ai catalog models and dynamic routes, and lets `agents/models/opencode` take catalog ids. See [the models docs](https://github.com/cloudflare/agents/blob/main/docs/agents/models.md).
+
+- [#2589](https://github.com/cloudflare/agents/pull/2589) [`841cc18`](https://github.com/cloudflare/agents/commit/841cc1813b21de3ca3228a08185e4ce1568eb972) Thanks [@mattzcarey](https://github.com/mattzcarey)! - `createAI` resumes a catalog or dynamic route stream that drops mid-answer, with nothing lost or repeated. See [the models docs](https://github.com/cloudflare/agents/blob/main/docs/agents/models.md#stream-resume).
+
+- [#2594](https://github.com/cloudflare/agents/pull/2594) [`cc34652`](https://github.com/cloudflare/agents/commit/cc34652df94ed583120cddc0412660dda3515e42) Thanks [@ben-reitz](https://github.com/ben-reitz)! - `agents/models/pi-ai` resolves Claude ids from pi-ai 1.2's gateway catalog under AI Gateway's spelling, `anthropic/claude-opus-4.8`. See [Models for pi-ai](https://developers.cloudflare.com/agents/models/pi-ai/).
+
+- [#2594](https://github.com/cloudflare/agents/pull/2594) [`cc34652`](https://github.com/cloudflare/agents/commit/cc34652df94ed583120cddc0412660dda3515e42) Thanks [@ben-reitz](https://github.com/ben-reitz)! - Support Pi 1.3: the Pi web search, web fetch, browser, and skills tools return `output`, and the Pi peer range is now `~1.3.0`. See [Pi harness](https://developers.cloudflare.com/agents/harnesses/pi/).
+
+- [#2621](https://github.com/cloudflare/agents/pull/2621) [`e80a201`](https://github.com/cloudflare/agents/commit/e80a2013af633d76439d7fd67b909dee5e80b62d) Thanks [@ben-reitz](https://github.com/ben-reitz)! - `PiHarness` `submit()` and `steer()` now accept pi-durable's `entry` option, which labels an input with a transcript kind of your own (for example `app.approval`) instead of `pi.user`. Before, the harness had no way to pass it. See [Label input the user did not type](https://developers.cloudflare.com/agents/harnesses/pi/#label-input-the-user-did-not-type).
+
+- [#2616](https://github.com/cloudflare/agents/pull/2616) [`65ddec8`](https://github.com/cloudflare/agents/commit/65ddec801904f0150acbecbac81f910f06f79a97) Thanks [@ben-reitz](https://github.com/ben-reitz)! - `openPiSessionStore` now uses pi-durable's own Durable Object SQLite adapter, so several Pi storages in one object share its operation queue. See [Pi harness](https://developers.cloudflare.com/agents/harnesses/pi/).
+
+## 0.28.1
+
+### Patch Changes
+
+- [#2571](https://github.com/cloudflare/agents/pull/2571) [`1bd2bc5`](https://github.com/cloudflare/agents/commit/1bd2bc5d5e90e963c4d7db52cb9ef1a95153b99e) Thanks [@mattzcarey](https://github.com/mattzcarey)! - `createAI` (`agents/models/ai-sdk`, `agents/models/pi-ai`) adds the `zdr` gateway option, and `vendorKey: "request"` for AI SDK models routed with your own vendor key. See [docs/agents/models.md](https://github.com/cloudflare/agents/blob/main/docs/agents/models.md#unified-billing-and-byok).
+
+- [#2572](https://github.com/cloudflare/agents/pull/2572) [`b7c6ab9`](https://github.com/cloudflare/agents/commit/b7c6ab94dbe7b998ae9d85cb528eb1c39f02e00a) Thanks [@mattzcarey](https://github.com/mattzcarey)! - `createAI` (`agents/models/ai-sdk`, `agents/models/pi-ai`) takes AI Gateway dynamic routes as `ai("dynamic/<route>")`. See [docs/agents/models.md](https://github.com/cloudflare/agents/blob/main/docs/agents/models.md#dynamic-routes).
+
+- [#2573](https://github.com/cloudflare/agents/pull/2573) [`80719a5`](https://github.com/cloudflare/agents/commit/80719a5943a4a5ee63e11acd719091a70d388119) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Update `@modelcontextprotocol/client` and `@modelcontextprotocol/server` to 2.2.0 and `@modelcontextprotocol/sdk` to 1.31.0. See [Model Context Protocol](https://developers.cloudflare.com/agents/model-context-protocol/).
+
+- [#2574](https://github.com/cloudflare/agents/pull/2574) [`131af4b`](https://github.com/cloudflare/agents/commit/131af4b0d9d54b465051f3209b9a41a1d6ddc1c1) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Update `@modelcontextprotocol/client` and `@modelcontextprotocol/server` to 2.3.1 and `@modelcontextprotocol/sdk` to 1.32.1. The MCP client transports now follow redirects only within the same origin. See [Model Context Protocol](https://developers.cloudflare.com/agents/model-context-protocol/).
+
+- [#2574](https://github.com/cloudflare/agents/pull/2574) [`131af4b`](https://github.com/cloudflare/agents/commit/131af4b0d9d54b465051f3209b9a41a1d6ddc1c1) Thanks [@mattzcarey](https://github.com/mattzcarey)! - `McpAgent` now answers requests for a session ended with `DELETE` with 404 straight away, instead of serving it until deferred teardown runs, and `createMcpHandler` rejects a Legacy request whose factory returns an instance still serving another request without closing that instance. See [Transport](https://developers.cloudflare.com/agents/model-context-protocol/transport/).
+
+- [#2568](https://github.com/cloudflare/agents/pull/2568) [`46570f5`](https://github.com/cloudflare/agents/commit/46570f5309626d65f7111c9bda84c2de5412db16) Thanks [@mattzcarey](https://github.com/mattzcarey)! - `OpenCodeHarness`: `session.events()` now returns a stream with a snapshot of the session and then its events, translated into the same kinds `PiHarness` reports: `run_start`/`run_end`, `operation_start`/`operation_end` (with the result `wait()` returns), `message_start`/`message_end`, `text_delta`, `reasoning_delta`, `tool_start`/`tool_end`, permissions and compaction. It replaces the async iterable of OpenCode's raw events; those are still available, durable and resumable, from `session.log()`. The OpenCode example now gives the model Workspace tools from `@cloudflare/computer` in place of OpenCode's local file and shell tools.
+
+## 0.28.0
+
+### Minor Changes
+
+- [#2484](https://github.com/cloudflare/agents/pull/2484) [`dedbee4`](https://github.com/cloudflare/agents/commit/dedbee41bad3986ffc45fe295502e9740bde31ca) Thanks [@ben-reitz](https://github.com/ben-reitz)! - Add `browserTool()` to `agents/browser/pi`. See [Persistent browser](https://github.com/cloudflare/agents/blob/main/docs/agents/browse-the-web.md#persistent-browser).
+
+- [#2473](https://github.com/cloudflare/agents/pull/2473) [`6614955`](https://github.com/cloudflare/agents/commit/661495532b69e64affad5e7bcd6373b4ee6ad3c5) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Make `agents/lifecycle` stable along with the `Scheduler` (`agents/schedules`), `State` (`agents/state`), `WebSockets` (`agents/websockets`) and `MCPClientManager` (`agents/mcp/client`) capabilities. See [Lifecycle](https://github.com/cloudflare/agents/blob/main/docs/agents/lifecycle.md).
+
+### Patch Changes
+
+- [#2540](https://github.com/cloudflare/agents/pull/2540) [`b65956e`](https://github.com/cloudflare/agents/commit/b65956e8a40501fc241c223aba0d6177077268d1) Thanks [@mattzcarey](https://github.com/mattzcarey)! - `ThinkHarness` now keeps its sessions and operations in the shared `agents/harness/store`. Migrations are performed on first run. See [ThinkHarness: Recovery](https://github.com/cloudflare/agents/blob/main/docs/agents/harnesses/think.md#recovery).
+
+- [#2522](https://github.com/cloudflare/agents/pull/2522) [`bcf5d20`](https://github.com/cloudflare/agents/commit/bcf5d2057aa477da9f464af8496a21811416a7c4) Thanks [@ben-reitz](https://github.com/ben-reitz)! - Add `agents/webfetch`, a `web_fetch` tool that reads a URL as Markdown, JSON, or text (HTML, PDF, and Office documents via Worker AI). See [Fetch the Web](https://github.com/cloudflare/agents/blob/main/docs/agents/fetch-the-web.md).
+
 ## 0.27.0
 
 This release adds four new experimental harnesses and a `web_search` tool, and reorganizes the experimental Channels API.

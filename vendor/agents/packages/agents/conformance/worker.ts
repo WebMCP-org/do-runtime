@@ -1,6 +1,8 @@
 import {
   Agent,
+  type AgentMcpOAuthProvider,
   type AgentNamespace,
+  DurableObjectOAuthClientProvider,
   getAgentByName,
   routeAgentRequest
 } from "../src/index.ts";
@@ -47,6 +49,10 @@ type Env = {
 
 const SERVER_NAME = "conformance";
 
+// Fixed client_id the referee's auth/basic-cimd scenario expects.
+const CIMD_CLIENT_METADATA_URL =
+  "https://conformance-test.local/client-metadata.json";
+
 type RunRequest = { scenario: string; serverUrl: string; context?: string };
 
 type RunResult =
@@ -58,6 +64,19 @@ export class ConformanceHost extends Agent<Env> {
   private _serverId: string | undefined;
   private _scenario: string | undefined;
   private _mrtrIsolationCallMade = false;
+
+  // Offer a Client ID Metadata Document URL. Authorization servers that
+  // advertise CIMD support receive it as the client_id; the rest still use
+  // dynamic client registration. The referee accepts this fixed URL without
+  // fetching it.
+  createMcpOAuthProvider(callbackUrl: string): AgentMcpOAuthProvider {
+    return new DurableObjectOAuthClientProvider(
+      this.ctx.storage,
+      this.name,
+      callbackUrl,
+      { clientMetadataUrl: CIMD_CLIENT_METADATA_URL }
+    );
+  }
 
   onStart() {
     // Accept elicitation requests. Form-mode defaults are applied by the SDK
@@ -337,6 +356,20 @@ export class ConformanceHost extends Agent<Env> {
             call.arguments as Record<string, unknown>
           );
         }
+        return;
+      }
+      case "json-schema-2020-12-preservation": {
+        // Echo the schema exactly as MCPClientManager exposes it to
+        // applications, so the referee sees whatever our catalog kept.
+        const focal = this.mcp
+          .listTools({ serverId })
+          .find((tool) => tool.name === "json_schema_2020_12_tool");
+        if (!focal) {
+          throw new Error("json_schema_2020_12_tool was not discovered");
+        }
+        await this.callTool(serverId, "json_schema_echo", {
+          schema: focal.inputSchema
+        });
         return;
       }
       case "http-invalid-tool-headers":

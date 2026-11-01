@@ -9,7 +9,7 @@ import type {
   SharedV4ProviderMetadata,
   SharedV4Warning
 } from "@ai-sdk/provider";
-import { CloudflareAIError, requireWorkersAIId } from "../errors";
+import { CloudflareAIError, requireLanguageModelId } from "../errors";
 import {
   fallbackLegs,
   rememberOptions,
@@ -47,17 +47,15 @@ import {
  * Typed observability attached to every result under
  * `providerMetadata.cloudflare`, so consumers never have to walk response
  * objects looking for a gateway log id.
- *
- * @experimental This surface is experimental and may change.
  */
 export interface CloudflareMetadata {
   /** The model that actually answered — the fallback leg, when one was used. */
   model: string;
-  /** The gateway id the request went through. */
-  gateway: string;
+  /** The gateway id the request went through. Absent when none handled it. */
+  gateway?: string;
   /**
-   * The gateway provider slug the request was routed to, for a model reached
-   * through the universal gateway path. Absent for Workers AI.
+   * The gateway provider slug, for a vendor's model object sent to the
+   * provider-native path. Absent for a model id.
    */
   provider?: string;
   /** `cf-aig-log-id`, or the binding's last log id. */
@@ -106,7 +104,7 @@ function callHeaders(
  */
 export function cloudflareMetadata(
   model: string,
-  resolved: ResolvedOptions,
+  gateway: string | undefined,
   response: Response,
   transport: Transport,
   provider?: string
@@ -115,7 +113,7 @@ export function cloudflareMetadata(
   const rawStep = headers.get("cf-aig-step");
   const step = rawStep === null ? Number.NaN : Number(rawStep);
   const metadata: CloudflareMetadata = {
-    gateway: resolved.gateway.id,
+    ...(gateway === undefined ? {} : { gateway }),
     model,
     ...(provider === undefined ? {} : { provider }),
     ...(Number.isNaN(step) ? {} : { step })
@@ -276,8 +274,6 @@ function emitContent(
 /**
  * A `LanguageModelV4` backed by the Cloudflare run path. The model id decides
  * the wire format; nothing about transport or wire format reaches user land.
- *
- * @experimental This surface is experimental and may change.
  */
 export class CloudflareLanguageModel implements LanguageModelV4 {
   readonly specificationVersion = "v4" as const;
@@ -320,7 +316,7 @@ export class CloudflareLanguageModel implements LanguageModelV4 {
           finishReason: generation.finishReason,
           providerMetadata: cloudflareMetadata(
             modelId,
-            resolved,
+            resolved.gateway.id,
             response,
             this.#config.transport
           ),
@@ -352,7 +348,7 @@ export class CloudflareLanguageModel implements LanguageModelV4 {
         const response = await this.#send(modelId, request, options, resolved);
         const providerMetadata = cloudflareMetadata(
           modelId,
-          resolved,
+          resolved.gateway.id,
           response,
           this.#config.transport
         );
@@ -429,6 +425,7 @@ export class CloudflareLanguageModel implements LanguageModelV4 {
     resolved: ResolvedOptions
   ): Promise<Response> {
     const response = await this.#config.transport.run({
+      format: "chat-completions",
       gateway: resolved.gateway,
       headers: callHeaders(options, resolved),
       input: request.body,
@@ -473,7 +470,7 @@ export class CloudflareLanguageModel implements LanguageModelV4 {
             // legs, and a vendor id must never reach `env.AI.run`. Checked
             // as the chain is built, so the throw is not swallowed as one
             // more failed leg.
-            { model: requireWorkersAIId(leg), run: () => runSelf(leg) }
+            { model: requireLanguageModelId(leg), run: () => runSelf(leg) }
           : { model: leg.modelId, run: () => runLeg(leg) }
       )
     ]);

@@ -11,12 +11,18 @@ export interface StoredBrowserSession {
    */
   closedAt?: number;
   /**
-   * Named browsers only: the tab (CDP `targetId`) the agent last worked in,
-   * so `sessionId: "active"` in a later execution lands on the same page.
-   * CDP session ids die with each connection; target ids live as long as
-   * the tab.
+   * Browser scope records only: the tab (CDP `targetId`) the scope last
+   * worked in, so `sessionId: "active"` in a later execution lands on the
+   * same page. CDP session ids die with each connection; target ids live as
+   * long as the tab.
    */
   activeTargetId?: string;
+  /**
+   * Named browser records only: the internal hostnames the session was
+   * started with (see `internalHostsSignature`). Routes are fixed at launch,
+   * so a record made with different hostnames is replaced.
+   */
+  internalHosts?: string;
 }
 
 export interface BrowserSessionLock {
@@ -40,6 +46,14 @@ export interface BrowserSessionStore {
    */
   list?(prefix: string): MaybePromise<Map<string, StoredBrowserSession>>;
 }
+
+/**
+ * A {@link BrowserSessionStore} that can list by prefix, as `Browser` needs:
+ * it lists a browser's scope records to cap them and to see which tabs
+ * other scopes are working in.
+ */
+export type ListableBrowserSessionStore = BrowserSessionStore &
+  Required<Pick<BrowserSessionStore, "list">>;
 
 export class DurableBrowserSessionStore implements BrowserSessionStore {
   static #queues = new WeakMap<
