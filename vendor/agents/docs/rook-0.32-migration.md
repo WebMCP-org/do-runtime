@@ -1,6 +1,6 @@
 # Rook: consuming the 0.32 fork
 
-Status: written against the uncommitted `alex/october-31-refresh` tree. Rook
+Status: written against the `alex/october-31-refresh` branch (PR #111). Rook
 facts come from Rook `origin/main` at `b9467a95991e` (2026-10-31). Nothing in
 Rook has changed yet.
 
@@ -118,7 +118,7 @@ browser, together with `manifest()` and the catalog.
 Other effects of the skills change:
 
 - **Re-listing.** Think 0.23 re-lists every skill source on every turn
-  (`_refreshSkillsIfChanged`, `think/src/think.ts:6963`, called at 7874).
+  (`_refreshSkillsIfChanged`, `think/src/think.ts:6954`, called at 7865).
   Rook's fingerprint plumbing no longer does anything.
 - **Catalog delivery.** See below. This one breaks Rook's prefix cache.
 
@@ -126,17 +126,17 @@ Other effects of the skills change:
 Only a changed catalog travels as a reminder.
 
 - **First catalog.** `_initializeSkills` adds the `think_skills` block with
-  `whenChanged: "remind"` (`think.ts:6918-6927`). `freezeSystemPrompt` renders
+  `whenChanged: "remind"` (`think.ts:6904-6916`). `freezeSystemPrompt` renders
   it into the stored prompt (`agents/src/context/blocks.ts:415-431`). Rook
   appends to `system` in `beforeTurn` (`worker-agent.ts:664`) and has no
   `getSystemPrompt` override, so ordering there is unaffected.
 - **Changed catalog.** After a mid-conversation `/skills` edit, `reminder()`
   returns the new section on every call until `refreshSystemPrompt()` runs
   (`blocks.ts:446-475`). Compaction, clearing history and extension unload
-  call it (`think.ts:4142, 5034, 7472`). Think appends the reminder,
+  call it (`think.ts:4142, 5034, 7463`). Think appends the reminder,
   unpersisted, as an extra text part on the last user message
-  (`withContextReminder`, `think.ts:1745-1765`, applied at 7923-7927). That happens before
-  `beforeTurn` runs (7963).
+  (`withContextReminder`, `think.ts:1745-1765`, applied at 7916). That happens before
+  `beforeTurn` runs (7954).
 - **What 0.20.1 did.** It called `context.refreshSystemPrompt()` once, when
   the registry fingerprint changed (`think.ts:6946-6949` at `abba5d67`).
 - **Rook impact.** `BrowserThinkConversation.beforeTurn` replays only its own
@@ -193,11 +193,11 @@ selected skill's `rawContent` to `system`. The changes:
   (`agents/src/skills/source.ts:58`). `workspace()` sets it to
   `<root>/<dir>` (`workspace.ts:103`); `manifest()` never does.
 - **Duplicate listing.** A Rook-side `loadSkillCatalog` in `beforeTurn`
-  repeats Think's own per-turn listing (`think.ts:7874`), which is two `/skills`
+  repeats Think's own per-turn listing (`think.ts:7865`), which is two `/skills`
   OPFS scans per turn. Load the catalog once per task and cache it; the
   selection is fixed once `#task` is set.
 - **No skills selected.** The system prompt now contains
-  "No skills are available." (`think.ts:6924`). 0.20.1 rendered nothing,
+  "No skills are available." (`think.ts:6915`). 0.20.1 rendered nothing,
   because `registry.systemPrompt()` returned null (`registry.ts:296-314` at
   `abba5d67`).
 
@@ -331,12 +331,15 @@ and `async_hooks`. Rook's bundles therefore need their own aliases.
   without `node:`) to node-stdlib-browser. For the Think probe it maps
   `node:zlib` and `node:stream/promises` to unenv. `browserHost` supplies
   `cloudflare:workers`.
-- **`node:fs`.** The example has no explicit `node:fs` alias; it resolves
-  through the node-stdlib-browser spread (`vite.config.ts:139-140`), whose
-  `fs` entry is `cjs/mock/empty.js`. Computer's main entry imports `node:fs`
+- **`node:fs`.** The example has no `node:fs` alias, and the
+  node-stdlib-browser spread (`vite.config.ts:137-142`) covers only `crypto`,
+  `buffer`, `stream` and `events`. Vite externalizes the import for the browser
+  build, so `fs` resolves to a stub that warns and throws on first property
+  access (`dist/think-probe.js` carries the `vite-browser-external` marker).
+  Computer's main entry imports `node:fs`
   twice, `node:crypto` three times, `node:events` twice and `node:zlib` once
   (grep of `@cloudflare/computer@0.8.0/dist`); the browser code path never
-  calls into `fs`, so the empty mock is enough. Rook already maps `node:fs`
+  calls into `fs`, so the stub is never touched. Rook already maps `node:fs`
   to `shims/node-fs.ts`, `node:crypto` to crypto-browserify and `events` to
   node-stdlib-browser.
 - **`node:zlib` (closed).** Rook covers it. `node:zlib` and `node:events` map to

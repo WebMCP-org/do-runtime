@@ -31,11 +31,11 @@ Five releases lie between the two pins:
 
 | Disposition                | Commits |
 | -------------------------- | ------: |
-| taken as-is                |      54 |
+| taken as-is                |      55 |
 | taken with fork adaptation |      28 |
 | fork-overridden            |       3 |
 | deferred                   |       2 |
-| not applicable to the fork |      34 |
+| not applicable to the fork |      33 |
 
 - **Not applicable to the fork:** the commit touches no retained package or
   docs path. These are examples, Gardener, triage, CI and root dependency
@@ -159,11 +159,19 @@ untransformed wrapper loses the lock on either shape, and the fix does not help
 it. Rook wraps no storage today (Rook `origin/main` `b9467a95`).
 
 **Test.** A new lane, `agents/src/do-runtime-tests/`, runs the real
-`createActorContainer` in Node with a transformed Lifecycle and holds each
-alarm write for 10 ms. Its two cases are:
+`createActorContainer` in Node with a transformed Lifecycle. Its three cases
+are:
 
-- re-arming jobs queued with no `await` between them;
-- arming the startup fallback behind an in-flight re-arm.
+- re-arming jobs queued with no `await` between them (each alarm write held for
+  10 ms);
+- arming the startup fallback behind an in-flight re-arm (same hold);
+- a memory-limit strike recorded by `trackAlarmWork` for work handed off by
+  `onJob`, which rejects later from a bare timer
+  (`lifecycle-alarm-handoff.test.ts`, third pass). Holding the strike write
+  does not expose upstream's shape: a rejection from an awaited actor
+  continuation still holds the lock, so the rejection source is what matters.
+  On upstream's shape the strike write fails, the strike path swallows the
+  error and the counter is never written.
 
 The lane is appended to `test:agents` and excluded from the package
 `tsconfig.json`; [VENDOR.md](../../VENDOR.md) says when to add to it.
@@ -173,6 +181,13 @@ The lane is appended to `test:agents` and excluded from the package
 | Upstream shape           | Fails 10/10 runs        |
 | Fork shape               | Passes 10/10 runs       |
 | Mutant runs after review | Fail on assertions only |
+| Handoff case, upstream   | Fails (`strikes` unset) |
+| Handoff case, fork       | Passes                  |
+
+The lane also logs an ungated-await warning at `#runStartup`'s
+`blockConcurrencyWhile` in `durable-object-lifecycle.ts`, from `lifecycle.start()`
+rather than the handoff. Not addressed here. The vendor workerd lanes resolve
+workerd `1.20260911.1`, older than the root pin; pre-existing.
 
 The Chromium lane was not run. The direct `setAlarm` in `job-driver.ts` `runAlarm` is
 unchanged.
@@ -194,23 +209,47 @@ the callbacks remain.
 **Sealed stays sealed.** This was review finding M1. The first version of the
 hoist let a stale callback after Stop rewrite an `exhausted` incident to
 `skipped`. The fork had done the same before the refresh, and it undoes
-upstream's 0.29 guarantee. The guard now lives at the engine's writers, behind
-the opt-in adapter flag `sealedIncidentsAreFinal` (Think sets it, AI Chat does
-not):
+upstream's 0.29 guarantee. The guard now lives at every engine writer that
+changes an incident's status, behind the opt-in adapter flag
+`sealedIncidentsAreFinal` (Think sets it, AI Chat does not). `#finishAttempt`
+and `recordTransientRetry` also write an `exhausted` record, but only counters,
+and keep its status.
 
-- `updateIncident` is a no-op on an `exhausted` record (post-review fix);
-- `beginIncident` returns an `exhausted` record as `sealed` instead of
-  re-evaluating the budget, so a replayed fiber or a later stall writes
-  nothing, emits nothing and does not terminalize again; the replay only closes
-  the orphaned stream and clears the recovering flag, and Think's stall path
-  keeps the partial and skips the second banner (second-pass fix);
+- `updateIncident` is a no-op on an `exhausted` record (post-review fix).
+- `beginIncident` never re-evaluates an `exhausted` record's budget. It checks
+  after its first read, and again on a fresh read immediately before its put
+  with no await in between, so a seal that lands while `readProgress` or
+  `shouldKeepRecovering` runs survives (second- and third-pass fixes).
+- `scheduleRecovery` reads the record first and, on an `exhausted` one, returns
+  without the transition, the `chat:recovery:scheduled` event or the enqueue
+  (third-pass fix).
 - `rescheduleAfterStableTimeout` declines on an `exhausted` record (second-pass
-  fix);
+  fix).
 - `runRecoveryAttempt`'s entry guard (`recovery-engine.ts`, upstream) already
   returned on one.
 
+**Delivered stamp.** A budget evaluation writes `exhausted` before its caller
+delivers the terminal UX, so an `exhausted` record alone does not prove the
+banner, `onExhausted` and the terminal record went out. The record now carries
+an optional `terminalDelivered: true`, written only for opted-in hosts and only
+after the delivery returns: `markTerminalDelivered` runs after the fiber
+replay's `exhaustChatRecovery` and after Think's stall-path
+`_exhaustChatRecovery`, and `exhaustRecoveryGiveUp`'s seal, which already
+follows its delivery, carries the stamp in the same put. `beginIncident`
+returns a stamped record `sealed`: a replayed fiber or a later stall writes
+nothing, emits nothing and does not terminalize again, and the replay keeps the
+settled partial and clears the recovering flag while leaving the stream row as
+the exhausted path leaves it. An unstamped record comes back `exhausted` but not
+`sealed`, still without a write, an event or a re-evaluation; the caller
+delivers it and stamps it. Think's stall path skips the second banner only when
+the sealer's request id is its own. A continuation under the same root that
+stalls after a concurrent seal is terminalized under its own request id, so its
+clients get a done frame and a terminal record; the second `onExhausted` for the
+chain is the same at-least-once edge as a give-up re-run.
+
 Without the flag every writer behaves as upstream does, including the budget
-re-evaluation that reopens an `exhausted` record as `attempting`.
+re-evaluation that reopens an `exhausted` record as `attempting`, and nothing
+writes the stamp.
 
 **Engine hook.** `recovery-engine.ts` has a new optional adapter method,
 `isRecoveryAttemptCancelled?(data)` (`:170`).
@@ -468,7 +507,7 @@ These counts are from the refresh's final gate run.
 | `test:react`                                    |     10 |                                                                  108 |
 | `test:chat`                                     |     34 |                                                                  668 |
 | `test:agents` (workerd lane)                    |     73 |                                                        1675 + 2 todo |
-| `test:agents` (do-runtime lane)                 |      1 |                                                                    2 |
+| `test:agents` (do-runtime lane)                 |      2 |                                                                    3 |
 | `test:ai-chat` (plus React)                     | 12 + 1 |                                                            194 + 106 |
 | `test:think`                                    |     56 |                                                                 1340 |
 | `test:voice`                                    |      1 |                                                                   21 |
@@ -498,8 +537,8 @@ makes both forms exit 0 with a clean tree.
 A merge-fidelity review after `d4d7bead` found no lost upstream change but
 several ledger gaps. The follow-up commits:
 
-- harden the recovery seal, so a sealed incident stays sealed, and gate AI
-  Chat's matching parity hook the same way;
+- harden the recovery seal, so a sealed incident stays sealed, and keep AI
+  Chat on upstream's admission and transition paths;
 - gate workspace media by the file's bytes and read a PDF's header within a
   bounded window;
 - revert the workerd `getTags` change in do-runtime;
@@ -532,6 +571,46 @@ A second review pass, two fresh reviewers on the three code fix commits only
   `upgradeWebSocket`) was still released after its own close and the client's
   echo, where workerd keeps the tags. Fixed in do-runtime with a conformance
   row (see `docs/workerd-sync.md` in the repository root).
+
+A third review pass on the seal commit (`1d5f2767`) found its premise unsound:
+it treated an `exhausted` record as proof of delivery. Four findings, all fixed
+as described under "Sealed stays sealed":
+
+- the seal-before-delivery window (High): `beginIncident`'s evaluation writes
+  `exhausted` before the replay or the stall path delivers the terminal UX, so a
+  transient terminal-write failure or a memory-limit reset in between left a
+  record whose banner never went out, and the `sealed` shortcut then suppressed
+  the redelivery upstream's retry performs. Fixed by the `terminalDelivered`
+  stamp and the unstamped handback;
+- a stale-read race (Medium): `beginIncident` checked the seal on its first
+  read, then awaited `readProgress` and `shouldKeepRecovering`, so a seal that
+  landed in between was overwritten with `attempting`. Fixed by the re-read
+  before the put;
+- a `scheduleRecovery` leak (Low): on a sealed record its transition no-oped
+  but it still emitted `chat:recovery:scheduled` and enqueued the callback.
+  Fixed by the read-first guard;
+- a request-id mismatch in Think's stall shortcut (Medium): it told the stream
+  consumers a done frame had gone out for the stalled request, but the seal's
+  banner went to the sealer's request id. Fixed by the request-id condition.
+
+The sealed replay also no longer completes the orphaned stream, which the
+exhausted path never did. Eleven new `recovery-engine.test.ts` cases cover the
+fixes. Eight fail against the engine at `1d5f2767`; the other three are
+flag-off parity guards that pass there by design (a re-terminalized replay,
+`scheduleRecovery` over an `exhausted` record, and the give-up seal without the
+stamp). The adjusted sealed-replay case, which now asserts the stream row is
+left alone, fails there too: nine failures in all.
+No Think test reaches the stall path's request-id fall-through: it needs a seal
+that lands under a running continuation, and no test agent helper provides one.
+
+The same pass added the job-driver handoff case above, corrected the
+disposition counts (55 taken as-is, 33 not applicable), rewrote the notes for
+`131af4b0` and `a2d371ec` in the dispositions CSV, named `SkillToolsOptions` as
+the omitted 0.32 export in `fork-diff.md`, and fixed line references and the
+`node:fs` paragraph in the Rook 0.32 guide. On the do-runtime side it found two
+socket divergences against raw workerd, both fixed with conformance rows: a pair
+half's own close written before the 101 `Response` is returned completes at
+coupling, and `accept()` on a pair half answers a close that arrived before it.
 
 Outside the curated `test:ai-chat` list, `src/tests/ai-chat-eviction.test.ts`
 (one case: the fork's `createdAt` on rebuilt messages) and the fork-only
