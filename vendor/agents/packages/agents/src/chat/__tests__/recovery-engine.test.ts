@@ -187,6 +187,68 @@ describe("ChatRecoveryEngine.beginIncident (fake adapter)", () => {
     nowMs: 5_000
   };
 
+  it("leaves an exhausted record untouched and reports it sealed when sealed incidents are final", async () => {
+    const fake = makeFakeAdapter();
+    fake.adapter.sealedIncidentsAreFinal = true;
+    const key = chatRecoveryIncidentKey(chatRecoveryIncidentId(input));
+    const sealed: ChatRecoveryIncident = {
+      incidentId: chatRecoveryIncidentId(input),
+      requestId: "req-1",
+      recoveryRootRequestId: "req-1",
+      recoveryKind: "continue",
+      attempt: 6,
+      maxAttempts: 6,
+      status: "exhausted",
+      reason: "interrupted_attempts_exceeded",
+      firstSeenAt: 1_000,
+      lastAttemptAt: 1_000
+    };
+    fake.storage.set(key, sealed);
+
+    for (const trigger of ["interrupted", "stalled"] as const) {
+      const result = await new ChatRecoveryEngine(fake.adapter).beginIncident({
+        ...input,
+        trigger
+      });
+      expect(result).toMatchObject({
+        incident: sealed,
+        exhausted: true,
+        sealed: true,
+        attempt: null
+      });
+    }
+    expect(fake.storage.get(key)).toEqual(sealed);
+    expect(fake.events).toHaveLength(0);
+    expect(fake.calls).not.toContain("put");
+  });
+
+  it("re-evaluates an exhausted record, as upstream does, for a host that does not opt in", async () => {
+    const fake = makeFakeAdapter();
+    const key = chatRecoveryIncidentKey(chatRecoveryIncidentId(input));
+    fake.storage.set(key, {
+      incidentId: chatRecoveryIncidentId(input),
+      requestId: "req-1",
+      recoveryRootRequestId: "req-1",
+      recoveryKind: "continue",
+      attempt: 6,
+      maxAttempts: 6,
+      status: "exhausted",
+      reason: "interrupted_attempts_exceeded",
+      firstSeenAt: 1_000,
+      lastAttemptAt: 1_000
+    });
+
+    const result = await new ChatRecoveryEngine(fake.adapter).beginIncident(
+      input
+    );
+
+    expect(result.sealed).toBe(false);
+    expect(fake.calls).toContain("put");
+    expect(fake.events.map(({ type }) => type)).toEqual([
+      "chat:recovery:attempt"
+    ]);
+  });
+
   it("persists the incident under the pure-derived key and returns it", async () => {
     const fake = makeFakeAdapter();
     const engine = new ChatRecoveryEngine(fake.adapter);
@@ -1098,6 +1160,30 @@ describe("ChatRecoveryEngine.rescheduleAfterStableTimeout (fake adapter)", () =>
     return incident;
   }
 
+  it("declines to reschedule an exhausted record when sealed incidents are final", async () => {
+    const fake = makeFakeAdapter();
+    fake.adapter.sealedIncidentsAreFinal = true;
+    const engine = new ChatRecoveryEngine(fake.adapter);
+    const incident = seed(fake.storage, {
+      attempt: 2,
+      status: "exhausted",
+      reason: "interrupted_attempts_exceeded"
+    });
+
+    const rescheduled = await engine.rescheduleAfterStableTimeout({
+      incidentId: incident.incidentId,
+      callback: "_chatRecoveryContinue",
+      data: { incidentId: incident.incidentId, originalRequestId: "root-1" },
+      fallbackMaxAttempts: 6
+    });
+
+    expect(rescheduled).toBe(false);
+    expect(
+      fake.storage.get(chatRecoveryIncidentKey(incident.incidentId))
+    ).toEqual(incident);
+    expect(fake.schedules).toHaveLength(0);
+  });
+
   it("bumps the attempt, persists scheduled/stable_timeout_retry, and enqueues a delayed non-idempotent retry", async () => {
     const fake = makeFakeAdapter();
     const engine = new ChatRecoveryEngine(fake.adapter);
@@ -1886,6 +1972,8 @@ describe("ChatRecoveryEngine.handleChatFiberRecovery (fake adapter + wake hooks)
     basePersist?: boolean;
     dispatchThrows?: boolean;
     seedExhausted?: boolean;
+    /** Seed an already-sealed (`exhausted`) record with the adapter opted in. */
+    seedSealed?: boolean;
     /**
      * Drop the engine-defaulted optional hooks (`isAwaitingClientInteraction`,
      * `onShouldKeepRecoveringError`, `invokeOnChatRecovery`) so a MINIMAL adapter
@@ -2024,9 +2112,11 @@ describe("ChatRecoveryEngine.handleChatFiberRecovery (fake adapter + wake hooks)
       delete wake.invokeOnChatRecovery;
     }
 
-    if (options.seedExhausted) {
+    if (options.seedExhausted || options.seedSealed) {
       // Seed an at-cap, long-stale incident so `beginIncident` evaluates as
-      // exhausted (both the no-progress and attempt-cap bounds trip at NOW).
+      // exhausted (both the no-progress and attempt-cap bounds trip at NOW),
+      // or the record that evaluation already sealed.
+      if (options.seedSealed) adapter.sealedIncidentsAreFinal = true;
       const incidentId = chatRecoveryIncidentId({
         requestId: "req-1",
         recoveryRootRequestId:
@@ -2041,7 +2131,10 @@ describe("ChatRecoveryEngine.handleChatFiberRecovery (fake adapter + wake hooks)
         recoveryKind: options.recoveryKind ?? "continue",
         attempt: config.maxAttempts,
         maxAttempts: config.maxAttempts,
-        status: "attempting",
+        status: options.seedSealed ? "exhausted" : "attempting",
+        ...(options.seedSealed
+          ? { reason: "interrupted_attempts_exceeded" }
+          : {}),
         firstSeenAt: 0,
         lastAttemptAt: 0,
         lastProgressAt: 0,
@@ -2183,6 +2276,21 @@ describe("ChatRecoveryEngine.handleChatFiberRecovery (fake adapter + wake hooks)
     expect(h.exhausted[0]?.createdAt).toBe(4242);
     expect(h.calls).not.toContain("invokeOnChatRecovery");
     expect(h.calls).not.toContain("dispatch");
+  });
+
+  it("replaying a sealed incident terminalizes nothing and leaves the record alone", async () => {
+    const h = makeHarness({ seedSealed: true });
+
+    expect(await h.engine.handleChatFiberRecovery(h.ctx, h.wake)).toBe(true);
+
+    // No second banner / onExhausted, no budget re-evaluation write, no
+    // dispatch; the orphaned stream is still closed.
+    expect(h.calls).not.toContain("exhaust");
+    expect(h.calls).not.toContain("put");
+    expect(h.calls).not.toContain("invokeOnChatRecovery");
+    expect(h.calls).not.toContain("dispatch");
+    expect(h.completed).toEqual(["s1"]);
+    expect(h.events).toHaveLength(0);
   });
 
   it("flips the incident to failed and rethrows when dispatch throws", async () => {

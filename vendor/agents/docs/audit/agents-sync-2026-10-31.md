@@ -194,13 +194,23 @@ the callbacks remain.
 **Sealed stays sealed.** This was review finding M1. The first version of the
 hoist let a stale callback after Stop rewrite an `exhausted` incident to
 `skipped`. The fork had done the same before the refresh, and it undoes
-upstream's 0.29 guarantee.
+upstream's 0.29 guarantee. The guard now lives at the engine's writers, behind
+the opt-in adapter flag `sealedIncidentsAreFinal` (Think sets it, AI Chat does
+not):
 
-- The lambda now reads the incident first.
-- An `exhausted` incident skips the Stop and cancel checks and goes straight to
-  `runRecoveryAttempt`.
-- The engine's guard (`agents/src/chat/recovery-engine.ts:483`) then makes the
-  attempt a no-op.
+- `updateIncident` is a no-op on an `exhausted` record (post-review fix);
+- `beginIncident` returns an `exhausted` record as `sealed` instead of
+  re-evaluating the budget, so a replayed fiber or a later stall writes
+  nothing, emits nothing and does not terminalize again; the replay only closes
+  the orphaned stream and clears the recovering flag, and Think's stall path
+  keeps the partial and skips the second banner (second-pass fix);
+- `rescheduleAfterStableTimeout` declines on an `exhausted` record (second-pass
+  fix);
+- `runRecoveryAttempt`'s entry guard (`recovery-engine.ts`, upstream) already
+  returned on one.
+
+Without the flag every writer behaves as upstream does, including the budget
+re-evaluation that reopens an `exhausted` record as `attempting`.
 
 **Engine hook.** `recovery-engine.ts` has a new optional adapter method,
 `isRecoveryAttemptCancelled?(data)` (`:170`).
@@ -456,7 +466,7 @@ These counts are from the refresh's final gate run.
 | Suite                                           |  Files |                                                                Tests |
 | ----------------------------------------------- | -----: | -------------------------------------------------------------------: |
 | `test:react`                                    |     10 |                                                                  108 |
-| `test:chat`                                     |     34 |                                                                  664 |
+| `test:chat`                                     |     34 |                                                                  668 |
 | `test:agents` (workerd lane)                    |     73 |                                                        1675 + 2 todo |
 | `test:agents` (do-runtime lane)                 |      1 |                                                                    2 |
 | `test:ai-chat` (plus React)                     | 12 + 1 |                                                            194 + 106 |
@@ -503,6 +513,32 @@ several ledger gaps. The follow-up commits:
 - add `@mongodb-js/zstd` and `node-liblzma` to the vendor `allowBuilds` (both
   `false`, as the root workspace has them) and drop the unused
   `nanoid@5.1.16` and `postal-mime@2.7.5` release-age exclusions.
+
+A second review pass, two fresh reviewers on the three code fix commits only
+(the workerd socket release; the recovery seal and workspace media), found:
+
+- two more engine writers that could reopen a sealed incident with
+  `sealedIncidentsAreFinal` set: `beginIncident` re-evaluated the budget on a
+  replayed fiber, which turns an `exhausted` record back into `attempting`, and
+  `rescheduleAfterStableTimeout` wrote `scheduled` over it. Both are guarded at
+  the writer (see "Sealed stays sealed"); the replay and Think's stall path no
+  longer terminalize a sealed incident a second time. Engine tests cover
+  `beginIncident`, the reschedule and the fiber replay, with and without the
+  flag;
+- a false parity claim: AI Chat does not set the two engine fields, but the
+  owner-scoped recovering clear in `recovery-incident.ts` applies to both
+  packages. The recovery row in `../fork-diff.md` says so now;
+- the coupled WebSocket pair (the production network shape through
+  `upgradeWebSocket`) was still released after its own close and the client's
+  echo, where workerd keeps the tags. Fixed in do-runtime with a conformance
+  row (see `docs/workerd-sync.md` in the repository root).
+
+Outside the curated `test:ai-chat` list, `src/tests/ai-chat-eviction.test.ts`
+(one case: the fork's `createdAt` on rebuilt messages) and the fork-only
+`src/tests/agent-tools.test.ts` (four cases: a leading `snapshot` event and a
+duplicated stored chunk) fail on this branch before and after the second-pass
+fixes, and fail the same way on `main` (abba5d67) before the refresh. Not
+touched here.
 
 Known dead references, left in code:
 

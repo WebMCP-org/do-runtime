@@ -17953,6 +17953,7 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
     incident: ChatRecoveryIncident;
     config: ResolvedChatRecoveryConfig;
     exhausted: boolean;
+    sealed: boolean;
   }> {
     // Incident orchestration (sweep -> read -> rehydrate interaction state ->
     // budget eval -> persist -> emit, with its ordering invariants) lives in the
@@ -18244,7 +18245,7 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
     const recoveryKind: ChatRecoveryKind = retryTargetUserId
       ? "retry"
       : "continue";
-    const { incident, config, exhausted } =
+    const { incident, config, exhausted, sealed } =
       await this._beginChatRecoveryIncident({
         requestId: input.requestId,
         recoveryRootRequestId,
@@ -18264,7 +18265,10 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
       // exhaustion (terminalMessage + onExhausted + chat:recovery:exhausted +
       // submission interrupted) instead of letting the raw stall error leak
       // out. `firstSeenAt` is the closest available turn-start proxy here.
+      // A sealed incident already delivered that UX: keep the partial, skip
+      // the second banner and `onExhausted`.
       await input.persistPartial();
+      if (sealed) return "exhausted";
       await this._exhaustChatRecovery(
         incident,
         config,

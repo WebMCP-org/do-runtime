@@ -106,6 +106,13 @@ export interface BeginChatRecoveryIncidentResult {
   config: ResolvedChatRecoveryConfig;
   exhausted: boolean;
   /**
+   * The record was already `exhausted` and the adapter sets
+   * {@link ChatRecoveryAdapter.sealedIncidentsAreFinal}: nothing was written
+   * or emitted, and the seal's terminal delivery already happened, so the
+   * caller must not terminalize again. Implies `exhausted`.
+   */
+  sealed: boolean;
+  /**
    * The attempt this opening recorded as in flight (an `interrupted` trigger
    * on an incident that is not sealed), for the caller to finish. `null`
    * when nothing was recorded.
@@ -175,7 +182,10 @@ export interface ChatRecoveryAdapter {
   /**
    * Optional: `true` makes an `exhausted` incident final. Every later
    * {@link ChatRecoveryEngine.updateIncident} on it is a no-op: no write, no
-   * lifecycle event and no recovering-flag change. A host that lets a callback
+   * lifecycle event and no recovering-flag change;
+   * {@link ChatRecoveryEngine.beginIncident} returns it `sealed` instead of
+   * re-evaluating the budget, and
+   * {@link ChatRecoveryEngine.rescheduleAfterStableTimeout} declines. A host that lets a callback
    * run past an at-budget admission (see {@link isRecoveryAttemptCancelled})
    * sets it, so that callback's own skip or completion cannot reopen an
    * incident a concurrent delivery sealed during the sync.
@@ -633,19 +643,21 @@ export class ChatRecoveryEngine {
     // replay is itself an attempt: it counts the death and records itself so
     // that its own death, if it dies too, is counted by the next isolate
     // (#2613).
-    const { incident, config, exhausted, attempt } = await this.beginIncident({
-      requestId,
-      recoveryRootRequestId,
-      latestUserMessageId: snapshot?.latestUserMessageId,
-      recoveryKind,
-      trigger: "interrupted"
-    });
+    const { incident, config, exhausted, sealed, attempt } =
+      await this.beginIncident({
+        requestId,
+        recoveryRootRequestId,
+        latestUserMessageId: snapshot?.latestUserMessageId,
+        recoveryKind,
+        trigger: "interrupted"
+      });
     try {
       return await this.#replayRecoveredTurn(wake, {
         ctx,
         incident,
         config,
         exhausted,
+        sealed,
         recoveryKind,
         detail,
         requestId,
@@ -670,6 +682,7 @@ export class ChatRecoveryEngine {
       incident: ChatRecoveryIncident;
       config: ResolvedChatRecoveryConfig;
       exhausted: boolean;
+      sealed: boolean;
       recoveryKind: ChatRecoveryKind;
       detail: TClassify;
       requestId: string;
@@ -688,6 +701,7 @@ export class ChatRecoveryEngine {
       incident,
       config,
       exhausted,
+      sealed,
       recoveryKind,
       detail,
       requestId,
@@ -699,6 +713,27 @@ export class ChatRecoveryEngine {
       streamStatus,
       partial
     } = input;
+
+    if (sealed) {
+      // The attempt that sealed the incident already delivered the terminal
+      // UX. Settle only what this replay found, as the cancelled branch does:
+      // keep settled work, close the orphaned stream, clear the flag.
+      if (
+        await this._shouldPersistOrphanedPartial(wake, {
+          streamId,
+          streamStillActive,
+          streamStatus,
+          snapshot,
+          options: undefined,
+          partial
+        })
+      ) {
+        await wake.persistOrphanedStream(streamId);
+      }
+      if (streamStillActive) await wake.completeRecoveredStream(streamId);
+      await adapter.setRecovering(false, recoveryRootRequestId);
+      return true;
+    }
 
     if (exhausted) {
       // Preserve the settled partial before sealing. Exhaustion is decided BEFORE
@@ -830,6 +865,18 @@ export class ChatRecoveryEngine {
     // resuming a dead budget.
     await adapter.sweepStaleIncidents(now);
     const existing = await adapter.getIncident(key);
+    if (adapter.sealedIncidentsAreFinal && existing?.status === "exhausted") {
+      // Sealed stays sealed: a replayed fiber or a later stall on an exhausted
+      // incident neither re-evaluates the budget (which would reopen the
+      // record as `attempting`) nor terminalizes it a second time.
+      return {
+        incident: existing,
+        config,
+        exhausted: true,
+        sealed: true,
+        attempt: null
+      };
+    }
     // Ordering invariant: rehydrate interaction state BEFORE the budget reads
     // `isAwaitingClientInteraction()` (see the adapter hook's contract).
     adapter.ensureInteractionStateLoaded?.();
@@ -862,7 +909,7 @@ export class ChatRecoveryEngine {
     }
     const attempt =
       trigger.kind === "interrupted" && !exhausted ? trigger.attempt : null;
-    return { incident, config, exhausted, attempt };
+    return { incident, config, exhausted, sealed: false, attempt };
   }
 
   /**
@@ -938,6 +985,8 @@ export class ChatRecoveryEngine {
     const key = chatRecoveryIncidentKey(input.incidentId);
     const incident = await adapter.getIncident(key);
     if (!incident) return false;
+    if (adapter.sealedIncidentsAreFinal && incident.status === "exhausted")
+      return false;
     const attempt = incident.attempt ?? 0;
     if (attempt >= (incident.maxAttempts ?? input.fallbackMaxAttempts)) {
       return false;
