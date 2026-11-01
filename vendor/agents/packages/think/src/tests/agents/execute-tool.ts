@@ -6,8 +6,7 @@
 import { tool } from "ai";
 import type { LanguageModel } from "ai";
 import { z } from "zod";
-import type { WorkspaceFsLike } from "@cloudflare/shell";
-import { createWorkspaceStateBackend } from "@cloudflare/shell";
+import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
 import { Think } from "../../think";
 import {
   createExecuteRuntime,
@@ -49,6 +48,7 @@ export class ThinkExecuteToolAgent extends Think {
           inputSchema: z.object({ a: z.number(), b: z.number() }),
           execute: async ({ a, b }) => ({ sum: a + b })
         }),
+        ...createAITools({ workspace: this.workspace }),
         launchMissiles: tool({
           description: "Approval-gated — must be stripped from the sandbox",
           inputSchema: z.object({}),
@@ -56,21 +56,29 @@ export class ThinkExecuteToolAgent extends Think {
           execute: async () => "boom"
         })
       },
-      state: createWorkspaceStateBackend(
-        this.workspace as unknown as WorkspaceFsLike
-      ),
       loader: this.env.LOADER
     });
   }
 
-  /** Run code on the explicit-options runtime (tools.* + state.*). */
+  /** Run code on the explicit-options runtime (tools.*, including the workspace tools). */
   async runExecute(code: string): Promise<ExecuteOutput> {
     return invoke(this.#runtime().tool, code);
   }
 
   /** Run code through the `createExecuteTool(this)` one-liner. */
   async runOneLiner(code: string): Promise<ExecuteOutput> {
-    return invoke(createExecuteTool(this), code);
+    return invoke(
+      createExecuteTool(this, {
+        tools: {
+          echo: tool({
+            description: "Echo a value",
+            inputSchema: z.object({ value: z.string() }),
+            execute: async ({ value }) => value
+          })
+        }
+      }),
+      code
+    );
   }
 
   /** The sandbox type surface advertised by the `tools` connector. */

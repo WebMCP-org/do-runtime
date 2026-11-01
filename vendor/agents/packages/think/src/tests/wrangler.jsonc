@@ -20,8 +20,8 @@
         "name": "ConnectionStateThink"
       },
       {
-        "class_name": "TestAssistantToolsAgent",
-        "name": "TestAssistantToolsAgent"
+        "class_name": "ThinkWorkspaceToolsAgent",
+        "name": "ThinkWorkspaceToolsAgent"
       },
       {
         "class_name": "TestAssistantAgentAgent",
@@ -86,6 +86,10 @@
       {
         "class_name": "ThinkSystemPromptFieldSkillsAgent",
         "name": "ThinkSystemPromptFieldSkillsAgent"
+      },
+      {
+        "class_name": "ThinkWorkspaceSkillsAgent",
+        "name": "ThinkWorkspaceSkillsAgent"
       },
       {
         "class_name": "ThinkMissingClassifierWarningAgent",
@@ -235,7 +239,7 @@
       "new_sqlite_classes": [
         "ConnectionStateParent",
         "ConnectionStateThink",
-        "TestAssistantToolsAgent",
+        "ThinkWorkspaceToolsAgent",
         "TestAssistantAgentAgent",
         "BareAssistantAgent",
         "LoopTestAgent",
@@ -252,6 +256,7 @@
         "ThinkDefaultSystemPromptSkillsAgent",
         "ThinkInheritedSystemPromptSkillsAgent",
         "ThinkSystemPromptFieldSkillsAgent",
+        "ThinkWorkspaceSkillsAgent",
         "ThinkMissingClassifierWarningAgent",
         "ThinkClassifierMethodAgent",
         "ThinkInheritedClassifierAgent",

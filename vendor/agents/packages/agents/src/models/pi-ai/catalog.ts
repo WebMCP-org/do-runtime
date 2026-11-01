@@ -18,8 +18,6 @@
  * options do not, so a model stored in Agent state and read back comes home
  * with this provider's defaults. Re-apply them with `ai(model, options)`
  * after loading if the model carried any.
- *
- * @beta This surface is in beta and may change.
  */
 
 import type { Api, Model } from "@earendil-works/pi-ai";
@@ -32,38 +30,28 @@ import type { ModelOptions } from "../core/settings";
  * The `api` marker Workers AI models from this provider carry. It is not a
  * wire format: Workers AI runs on `env.AI.run`, and the compat layer maps that
  * onto strict OpenAI chat completions.
- *
- * @beta This surface is in beta and may change.
  */
 export const CLOUDFLARE_AI_API = "cloudflare-ai";
 
-/** @beta This surface is in beta and may change. */
 export type CloudflareAIApi = typeof CLOUDFLARE_AI_API;
 
 /**
  * The pi-ai provider id. A `Models` registry resolves specifiers as
- * `cloudflare/<id>`, e.g. `cloudflare/anthropic/claude-opus-4-8`.
- *
- * @beta This surface is in beta and may change.
+ * `cloudflare/<id>`, e.g. `cloudflare/anthropic/claude-opus-4.8`.
  */
 export const CLOUDFLARE_PROVIDER_ID = "cloudflare";
 
 /**
  * A Workers AI model produced by this provider. `id` is the `@cf/` id exactly
  * as given; `api` is {@link CLOUDFLARE_AI_API}.
- *
- * @beta This surface is in beta and may change.
  */
 export type CloudflareModel = Model<CloudflareAIApi>;
 
-/** @beta This surface is in beta and may change. */
 export type ModelCost = Model<Api>["cost"];
 
 /**
  * A model this provider routes: a Workers AI model or any pi-ai model the
  * caller handed to `ai(model)`.
- *
- * @beta This surface is in beta and may change.
  */
 export type RoutedModel = Model<Api>;
 
@@ -72,8 +60,6 @@ export type RoutedModel = Model<Api>;
  * session affinity, plus pi-ai model metadata overrides and the stream idle
  * deadline. Metadata overrides only apply to the `@cf/` form — a model object
  * brings its own metadata, and this module never second-guesses it.
- *
- * @beta This surface is in beta and may change.
  */
 /**
  * A fallback leg: a Workers AI id, a `<slug>/<id>` pi-ai's gateway registry
@@ -252,10 +238,26 @@ function slugOf(entry: Model<Api>): string | undefined {
   return segments.at(-1);
 }
 
+/**
+ * The id AI Gateway's model catalog — `env.AI.run` — knows a registry entry
+ * by. pi-ai spells Claude ids as Anthropic does (`claude-opus-4-8`), because pi
+ * sends them through the gateway's Anthropic passthrough, while the catalog
+ * puts a dot between version numbers (`anthropic/claude-opus-4.8`) and answers
+ * `Model not found` to the dashed spelling. Checked against the live catalog
+ * for every entry in pi-ai 1.2: that dot is the only difference, and only
+ * Anthropic ids have it.
+ */
+function gatewayCatalogId(slug: string, id: string): string {
+  const catalogId =
+    slug === "anthropic" ? id.replace(/(\d)-(\d)(?!\d)/g, "$1.$2") : id;
+  return `${slug}/${catalogId}`;
+}
+
 let gatewayRegistry: Map<string, Model<Api>> | undefined;
 
 /**
- * pi-ai's generated Cloudflare AI Gateway registry, keyed by `<slug>/<id>`.
+ * pi-ai's generated Cloudflare AI Gateway registry, keyed by the id AI
+ * Gateway's catalog runs each entry under (see {@link gatewayCatalogId}).
  * `/compat` entries are skipped: they alias `@cf/` ids the Workers AI registry
  * already declares, and those belong on the run path.
  */
@@ -266,7 +268,7 @@ function buildGatewayRegistry(): Map<string, Model<Api>> {
   ) as Model<Api>[]) {
     const slug = slugOf(entry);
     if (slug === undefined || slug === "compat") continue;
-    map.set(`${slug}/${entry.id}`, entry);
+    map.set(gatewayCatalogId(slug, entry.id), entry);
   }
   return map;
 }

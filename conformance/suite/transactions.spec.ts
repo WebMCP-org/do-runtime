@@ -16,9 +16,12 @@ const expectAbort = async (
 ): Promise<void> => {
   // workerd terminates the JavaScript slice at abort(); this runtime has no
   // isolate to terminate, so the fixture reaches its explicit sentinel throw.
-  // Both are named expected outcomes; any earlier storage/runtime failure now
-  // fails here instead of being mistaken for a successful rollback.
-  const expected = host.lane === "workerd" ? reason : `unreachable after ${reason}`;
+  // That throw waits for the output gate the abort broke, and the gate's
+  // exception replaces it (workerd 0b348c30b, `worker-rpc.c++:2268`). Both are
+  // named expected outcomes; any earlier storage/runtime failure now fails here
+  // instead of being mistaken for a successful rollback.
+  const expected =
+    host.lane === "workerd" ? reason : `broken.outputGateBroken; jsg.Error: ${reason}`;
   const outcome = await probe.call(method).then(
     (value) => ({ status: "fulfilled", value }) as const,
     (error: unknown) => ({ status: "rejected", error }) as const,

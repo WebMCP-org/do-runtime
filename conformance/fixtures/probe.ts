@@ -125,6 +125,8 @@ export class Probe extends DurableObject<ProbeEnv> {
     { code: number; reason: string; wasClean: boolean }[]
   >();
   #handlerEvents: Record<string, unknown>[] = [];
+  /** What a handler sees after one awaited timer turn: see `#recordAfterTurn`. */
+  #afterTurn: Record<string, unknown>[] = [];
   #handlerTrace: string[] = [];
   #listenerMessages = 0;
   #latePair: [WebSocket, WebSocket] | undefined;
@@ -361,6 +363,24 @@ export class Probe extends DurableObject<ProbeEnv> {
       log.push("section-end");
     });
     return log;
+  }
+
+  /**
+   * ← workerd 1fa562228 (`actor-block-concurrency-timer-test.js`). A timer armed
+   * outside `blockConcurrencyWhile` whose deadline passes while the section holds
+   * the input gate waits for the gate, and must not hold back a later timer the
+   * section itself is waiting on. Before that commit workerd's single ordered
+   * timer queue deadlocked here.
+   */
+  async outsideTimerBehindCriticalSection(): Promise<string[]> {
+    const events: string[] = [];
+    const outer = scheduler.wait(10).then(() => events.push("outer"));
+    await this.ctx.blockConcurrencyWhile(async () => {
+      await scheduler.wait(200);
+      events.push("critical section");
+    });
+    await outer;
+    return events;
   }
 
   /** `setInterval` repeats, each tick is gated, and `clearInterval` stops it. */
@@ -982,6 +1002,40 @@ export class Probe extends DurableObject<ProbeEnv> {
     }
   }
 
+  /**
+   * ← workerd 35780cd85 (`sql-test.js`). An EXPLAIN reused by `exec` keeps
+   * describing the current schema after its table is dropped and recreated, or
+   * rebuilt and renamed back, and fails with "no such table" once it is gone.
+   */
+  sqlExplainAfterSchemaChange(): Record<string, unknown> {
+    const sql = this.ctx.storage.sql;
+    const explain = "EXPLAIN INSERT INTO explainTest VALUES (?, ?)";
+    const rowCounts: boolean[] = [];
+    sql.exec("DROP TABLE IF EXISTS explainTest");
+    sql.exec("DROP TABLE IF EXISTS explainTest2");
+    sql.exec("CREATE TABLE explainTest (id TEXT PRIMARY KEY, name TEXT)");
+    for (let i = 0; i < 3; i++) {
+      rowCounts.push(sql.exec(explain, null, null).toArray().length > 0);
+      sql.exec("DROP TABLE explainTest");
+      sql.exec("CREATE TABLE explainTest (id TEXT PRIMARY KEY, name TEXT)");
+    }
+    for (let i = 0; i < 3; i++) {
+      rowCounts.push(sql.exec(explain, null, null).toArray().length > 0);
+      sql.exec("CREATE TABLE explainTest2 (id TEXT PRIMARY KEY, name TEXT)");
+      sql.exec("DROP TABLE explainTest");
+      sql.exec("ALTER TABLE explainTest2 RENAME TO explainTest");
+    }
+    rowCounts.push(sql.exec(explain, null, null).toArray().length > 0);
+    sql.exec("DROP TABLE explainTest");
+    let dropped = "no error";
+    try {
+      sql.exec(explain, null, null);
+    } catch (error) {
+      dropped = /no such table: explainTest/.test(String(error)) ? "no such table" : String(error);
+    }
+    return { rowCounts, dropped };
+  }
+
   /** Workerd's SQL regulator allows the built-in R*Tree virtual-table module. */
   sqliteRtree(): Record<string, unknown> {
     const sql = this.ctx.storage.sql;
@@ -1232,7 +1286,20 @@ export class Probe extends DurableObject<ProbeEnv> {
     });
     const connects = ((await this.ctx.storage.get<number>("wsConnects")) ?? 0) + 1;
     await this.ctx.storage.put("wsConnects", connects);
+    const closeOnConnect = await this.ctx.storage.get<{ code: number; reason: string }>(
+      "wsCloseOnConnect",
+    );
+    if (closeOnConnect !== undefined) {
+      // A handler that rejects the socket it just accepted: own close before the 101 goes out.
+      await this.ctx.storage.delete("wsCloseOnConnect");
+      server.close(closeOnConnect.code, closeOnConnect.reason);
+    }
     return new Response(null, { status: 101, webSocket: client });
+  }
+
+  /** The next upgrade accepts its socket, closes it, and only then returns the 101. */
+  async closeNextConnect(code: number, reason: string): Promise<void> {
+    await this.ctx.storage.put("wsCloseOnConnect", { code, reason });
   }
 
   acceptanceSemantics(): Record<string, unknown> {
@@ -1452,6 +1519,19 @@ export class Probe extends DurableObject<ProbeEnv> {
     this.#requireServer(id).close(code, reason);
   }
 
+  /** Closes every accepted socket with `tag`, whichever transport its peer is on. */
+  closeTagged(tag: string, code: number, reason: string): number {
+    const sockets = this.ctx.getWebSockets(tag);
+    for (const socket of sockets) socket.close(code, reason);
+    return sockets.length;
+  }
+
+  /** The client's frame leaves after the server's own close, ahead of the client's echo. */
+  closeSelfServerThenSendSelf(id: string, message: string): void {
+    this.#requireServer(id).close(4002, "server out");
+    this.#requireClient(id).send(message);
+  }
+
   throwOnNextSocketMessage(): void {
     this.#throwNextMessage = true;
   }
@@ -1473,6 +1553,7 @@ export class Probe extends DurableObject<ProbeEnv> {
   socketJournal(): Record<string, unknown> {
     return {
       events: this.#handlerEvents,
+      afterTurn: this.#afterTurn,
       trace: this.#handlerTrace,
       listenerMessages: this.#listenerMessages,
       clients: Object.fromEntries(
@@ -1702,6 +1783,11 @@ export class Probe extends DurableObject<ProbeEnv> {
       typeof message === "string"
         ? { kind: "string", value: message }
         : { kind: "ArrayBuffer", value: [...new Uint8Array(message)] };
+    if (typeof message === "string" && message.startsWith("tags:")) {
+      this.#handlerEvents.push({ id, message: description, ...this.#handlerState(ws) });
+      await this.#recordAfterTurn(ws, "message");
+      return;
+    }
     this.#handlerEvents.push({ id, message: description });
 
     if (typeof message === "string" && message.startsWith("slow:")) {
@@ -1740,19 +1826,44 @@ export class Probe extends DurableObject<ProbeEnv> {
     });
   }
 
-  webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean): void {
-    let tags: string[] = [];
-    const tagsError = captureError(() => { tags = this.ctx.getTags(ws); });
+  async webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean): Promise<void> {
     const event: Record<string, unknown> = {
       id: this.#socketId(ws),
       close: { code, reason, wasClean },
       readyState: ws.readyState,
-      listedDuringHandler: this.ctx.getWebSockets().includes(ws),
-      tagsDuringHandler: tagsError ?? tags,
+      ...this.#handlerState(ws),
     };
     event.sendAfterPeerClose = captureError(() => ws.send("after-peer-close"));
     event.reciprocalClose = captureError(() => ws.close(code, reason));
     this.#handlerEvents.push(event);
+    await this.#recordAfterTurn(ws, "close");
+  }
+
+  /** Read in the handler's synchronous part, which the workerd lane cannot observe (see the spec). */
+  #handlerState(ws: WebSocket): Record<string, unknown> {
+    let tags: string[] = [];
+    const tagsError = captureError(() => { tags = this.ctx.getTags(ws); });
+    return {
+      listedDuringHandler: this.ctx.getWebSockets().includes(ws),
+      tagsDuringHandler: tagsError ?? tags,
+    };
+  }
+
+  /**
+   * The same reads after a timer turn. workerd settles a closed hibernatable socket on a later
+   * turn than the handler's synchronous part — it leaves `getWebSockets()` and may be released —
+   * so this is the state every lane, the delayed one included, reaches.
+   */
+  async #recordAfterTurn(ws: WebSocket, event: "message" | "close"): Promise<void> {
+    await scheduler.wait(10);
+    let tags: string[] = [];
+    const tagsError = captureError(() => { tags = this.ctx.getTags(ws); });
+    this.#afterTurn.push({
+      id: this.#socketId(ws),
+      event,
+      listed: this.ctx.getWebSockets().includes(ws),
+      tags: tagsError ?? tags,
+    });
   }
 
   webSocketError(ws: WebSocket, error: unknown): void {

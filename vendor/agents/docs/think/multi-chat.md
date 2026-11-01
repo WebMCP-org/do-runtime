@@ -19,10 +19,11 @@ one Durable Object would serialize all of a user's turns on one single-threaded
 object, so each chat gets its own.
 
 This guide walks through the pattern as implemented in
-[`examples/assistant`](https://github.com/cloudflare/agents/tree/main/examples/assistant),
-the reference Think app. The code below is taken from that example.
+the assistant example, a reference Think app that has since been removed from
+the repository ([last version](https://github.com/cloudflare/agents/tree/786d30e305baebc5fbf5ad5ed80461f88a728468/examples/assistant)). The code below is taken from that
+example.
 
-> **Topology note.** `examples/assistant` hosts each chat as a facet (a
+> **Topology note.** The assistant example hosts each chat as a facet (a
 > [dynamic agent](https://github.com/cloudflare/agents/blob/main/docs/agents/sub-agents.md))
 > of the directory, using `subAgent()`, `hasSubAgent()`, `listSubAgents()`,
 > and `deleteSubAgent()`. Those methods are aliases for `this.dynamicAgents`.
@@ -46,7 +47,7 @@ Browser tab
                     - messages and branches
                     - memory and other context blocks
                     - extensions, config, skills
-                    - SharedWorkspace / SharedMCPClient proxies → directory
+                    - workspace client / SharedMCPClient proxy → directory
 ```
 
 The browser keeps two connections open: one to the directory for the sidebar,
@@ -56,7 +57,7 @@ conversation itself.
 | Resource                                        | Owner     | How chats reach it                              |
 | ----------------------------------------------- | --------- | ----------------------------------------------- |
 | Chat list, titles, previews                     | Directory | Chats push updates over Durable Object RPC      |
-| Workspace files                                 | Directory | `SharedWorkspace` proxy, one RPC per file call  |
+| Workspace files                                 | Directory | `getWorkspace()` client, one RPC per file call  |
 | MCP registry, OAuth tokens, live connections    | Directory | `SharedMCPClient` proxy, merged in `beforeTurn` |
 | Cross-chat scheduled work                       | Directory | Directory RPCs into the selected chat           |
 | Messages, branches, compaction                  | Chat      | Local Session                                   |
@@ -280,7 +281,7 @@ export class AssistantDirectory extends Think<Env, DirectoryState> {
 ### Connect from React
 
 The client opens one connection to the directory for the sidebar and one to the
-active chat. `examples/assistant` wraps the directory connection in a local
+active chat. The assistant example wraps the directory connection in a local
 `useChats()` hook (`src/use-chats.ts`):
 
 ```typescript
@@ -335,78 +336,39 @@ deleted from another tab, the app selects the most recently active chat.
 
 ## Share the workspace
 
-The directory owns one `Workspace` backed by its own SQLite, so a file written in
-one chat is visible in every other chat for that user:
+The directory owns one `@cloudflare/computer` `Workspace` backed by its own
+SQLite, so a file written in one chat is visible in every other chat for that
+user:
 
 ```typescript
+import { Workspace } from "@cloudflare/computer";
+
 export class AssistantDirectory extends Think<Env, DirectoryState> {
-  workspace = new Workspace({
-    sql: this.ctx.storage.sql,
-    name: () => this.name,
-    onChange: (event) =>
-      this.broadcast(JSON.stringify({ type: "workspace-change", event }))
-  });
-
-  // One-line delegates, called by child chats over Durable Object RPC.
-  // Not @callable(): browsers must not write files through the sidebar socket.
-  async readFile(path: string): Promise<string | null> {
-    return this.workspace.readFile(path);
-  }
-
-  async writeFile(
-    path: string,
-    content: string,
-    mimeType?: Parameters<Workspace["writeFile"]>[2]
-  ): Promise<void> {
-    return this.workspace.writeFile(path, content, mimeType);
-  }
-
-  // ...readFileBytes, writeFileBytes, appendFile, exists, readDir, rm, glob,
-  // mkdir, stat, lstat, cp, mv, symlink, readlink
+  override workspace = new Workspace({ storage: this.ctx.storage });
 }
 ```
 
-Each chat replaces Think's default workspace with a `SharedWorkspace` proxy that
-forwards every call to the directory. Assigning it as a class field means Think
-never creates a per-chat `Workspace`:
+Every Think agent has a `__getWorkspaceStub()` method, which `getWorkspace()`
+from `@cloudflare/computer` calls over Durable Object RPC. Each chat replaces
+Think's default workspace with a client for the directory's:
 
 ```typescript
-import type { WorkspaceFsLike } from "@cloudflare/shell";
+import { getWorkspace } from "@cloudflare/computer";
 
 export class MyAssistant extends Think<Env> {
-  override workspace: WorkspaceFsLike = new SharedWorkspace(() =>
-    this.parentAgent(AssistantDirectory)
-  );
-}
-
-export class SharedWorkspace implements WorkspaceFsLike {
-  #stubPromise?: Promise<DurableObjectStub<AssistantDirectory>>;
-
-  constructor(
-    private getParent: () => Promise<DurableObjectStub<AssistantDirectory>>
-  ) {}
-
-  private parent() {
-    this.#stubPromise ??= this.getParent();
-    return this.#stubPromise;
-  }
-
-  async readFile(path: string) {
-    return (await this.parent()).readFile(path);
-  }
-
-  // ...every other WorkspaceFsLike method forwards the same way
+  override workspace = getWorkspace(() => this.parentAgent(AssistantDirectory));
 }
 ```
 
-The proxy implements `WorkspaceFsLike` from `@cloudflare/shell`, which is wider
-than the `WorkspaceLike` type Think requires. That lets the same object drive
-Think's built-in workspace tools, `createWorkspaceTools(this.workspace)`, the
-`state.*` API inside `createExecuteTool(this, ...)`, `fetchTools` workspace
-spill, and skill script runners.
+The client reaches the directory on the first file call, so a chat that never
+touches a file never contacts it.
 
-To keep file browsers live across chats and tabs, `useChats()` listens for the
-directory's `workspace-change` broadcasts and exposes a `workspaceRevision`
+Think's workspace tools, the fetch tool's saved responses, and skill script
+runners all go through it.
+
+To keep file browsers fresh across chats and tabs, each chat calls a
+`workspaceChanged()` method on the directory after every turn, which broadcasts
+`{ type: "workspace-change" }`. `useChats()` listens for those broadcasts and exposes a `workspaceRevision`
 counter that chat panes use as a `useEffect` dependency:
 
 ```typescript
@@ -602,7 +564,7 @@ See [Scheduled Tasks](./index.md#scheduled-tasks) for the schedule syntax.
   The example has no directory-level search index.
 - **No packaged helpers.** There is no `Chats` base class and `useChats()` is not
   exported from any package. The pattern is documented through
-  `examples/assistant` until the shape settles.
+  the assistant example until the shape settles.
 
 ## Related
 
@@ -611,4 +573,4 @@ See [Scheduled Tasks](./index.md#scheduled-tasks) for the schedule syntax.
 - [Lifecycle Hooks](./lifecycle-hooks.md) — `beforeTurn` and `onChatResponse`
 - [Dynamic agents](https://github.com/cloudflare/agents/blob/main/docs/agents/sub-agents.md) — `onBeforeSubAgent`, `parentAgent()`, `useAgent({ sub })`, and routing
 - [Routing to independent Agents](https://github.com/cloudflare/agents/blob/main/docs/agents/routing.md#routing-to-independent-agents) — `RoutedAgents` for top-level chat Durable Objects
-- [`examples/assistant`](https://github.com/cloudflare/agents/tree/main/examples/assistant) — the full reference app
+- [Assistant example (last version)](https://github.com/cloudflare/agents/tree/786d30e305baebc5fbf5ad5ed80461f88a728468/examples/assistant) — the full reference app

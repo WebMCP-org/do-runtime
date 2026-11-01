@@ -1,10 +1,140 @@
-# workerd sync: October 9, 2026
+# workerd sync: October 31, 2026
 
-The oracle is now pinned to `v1.20261009.1`
-([`a3985499a5f7`](https://github.com/cloudflare/workerd/tree/a3985499a5f7820cf72f39aba486120383e6580c)),
-with Workers types `5.20261009.1`. The October 9 audit covers
-[`v1.20261002.1...v1.20261009.1`](https://github.com/cloudflare/workerd/compare/v1.20261002.1...v1.20261009.1);
-the October 2 and September audits below record the earlier baselines.
+The oracle is now pinned to `v1.20261031.1`
+([`8119fd824c29`](https://github.com/cloudflare/workerd/tree/8119fd824c29ba4a877824b01ebb0b5dbefe444c)),
+with Workers types `5.20261031.1`. The October 31 audit covers
+[`v1.20261009.1...v1.20261031.1`](https://github.com/cloudflare/workerd/compare/v1.20261009.1...v1.20261031.1);
+the October 9, October 2 and September audits below record the earlier baselines.
+
+## October 31 audit
+
+The [official release](https://github.com/cloudflare/workerd/releases/tag/v1.20261031.1)
+and [npm latest metadata](https://registry.npmjs.org/workerd/latest) agreed on
+`1.20261031.1`, commit `8119fd824c29ba4a877824b01ebb0b5dbefe444c`, when checked
+on October 31 (UTC); `@cloudflare/workers-types` latest was `5.20261031.1`. The
+range contains **794 commits: 607 non-merge commits and 187 merges**. The
+endpoint diff changes 1,535 files, with 166,732 insertions and 31,143 deletions.
+Most of it is the experimental TypeScript streams implementation, Rust JSG,
+async-trace instrumentation, the Rust server and the `workerd bench` tooling.
+`compatibility-date.capnp` adds flags `@192` through `@201`; the maximum
+compatibility date advances to November 7.
+
+The [commit ledger](workerd-sync-2026-10-31.csv) records every SHA, its parents,
+subject, changed paths, and disposition, using the same method as the October 9
+audit. Commits touching Durable Objects, alarms, gates, SQLite storage, facets,
+Worker Loader, hibernatable WebSockets and `ctx.exports` were read at their
+patches and regression tests; the rest were dispositioned by path and subject.
+Line citations below are at `v1.20261031.1`.
+
+### Behavioral ports
+
+| Upstream change | Local result and evidence |
+| --- | --- |
+| [Parked move-later alarm, `2093b5b1b`](https://github.com/cloudflare/workerd/commit/2093b5b1b) | `actor-sqlite.c++:475`: when a move-later alarm request completes, its parked time is dropped if a commit stored an earlier alarm meanwhile, since that commit schedules its own time. `#scheduleLaterAlarm` now does the same. The ported `actor-sqlite-test.c++` case (1 ms, 3 ms in flight, 10 ms coalesced, 6 ms with the commit held) failed before the fix with a stray `scheduleRun(10ms)` and passes after it. |
+| [RPC exceptions behind the output gate, `0b348c30b`](https://github.com/cloudflare/workerd/commit/0b348c30b) | `worker-rpc.c++:2268` and `:2320`: an actor method's exception, sync or async, waits for the output gate as a result does, and a broken gate's exception replaces the method's. `entry()` and `bindReentryTarget()` now wait in a `finally`. A unit test holding the gate with a pending alarm write failed before the change for both a sync and an async throw. The §1.7.1/§2.6 abort rows now see the broken gate's error, which carries the abort reason, in the Node and browser lanes too, instead of the fixture's sentinel throw. |
+| Hibernatable socket released after its own close | Measured on raw `workerd serve`, not attributed to one commit; see [getTags() and listing during webSocketClose](#gettags-and-listing-during-websocketclose). `tryReleaseNative()` (`web-socket.c++:1430`) runs when the socket's own outgoing close completes, and it releases the socket only if `initiateHibernatableRelease()` (`web-socket.c++:1665`, called from `global-scope.c++:995` just before `webSocketClose()`) has already marked the close dispatched. Through a `WebSocketPair` the own close completes when the socket's next event finishes its synchronous part. When that event is the echoed close, `getTags()` throws one turn after `webSocketClose()` returns. This happens from `v1.20261023.1`; `v1.20260815.1` never released the socket, and the lockfile has no binary in between. A message ahead of the echo takes the completion, so the socket is not released. A network peer's echo arrives after the write has already completed, so its tags also stay readable; locally, a pair whose other half was returned in a 101 `Response` counts as a network transport, and a close the handler sent before returning that `Response` completes when the half is coupled, as workerd's coupling pump reads it then. A close sent from inside `webSocketClose()` releases the socket. In every case the socket is still listed, with readable tags, during the handler's synchronous part. Locally, `WebSocket.close()` and the hibernation registry now track this release state, and a socket woken from hibernation is accepted again. Separately, a pair half's `accept()` now answers a close that was queued before it, as workerd's read loop does, so `webSocketClose` fires on the other half after a late `accept()`. The D6-D7 row, a new message-after-own-close row and two new network own-close rows (echo after `connect()`, and own close before the 101 is returned) pin this behaviour. |
+
+The compatibility date is unchanged. Updating the oracle and ambient Workers
+types does not opt local hosts into newer compatibility-date policy
+(`pipe_to_backward_propagation` and `cache_option_preserves_cache_control` on
+2026-11-17; `wasm_source_url_support` and `temporal` on 2026-12-01).
+
+### Measured, no runtime change
+
+| Upstream change | Disposition |
+| --- | --- |
+| [Input-gate timer scopes, `1fa562228`](https://github.com/cloudflare/workerd/commit/1fa562228) | Upstream kept one ordered timer queue, so an earlier outside timer waiting on the gate could hold back a critical section's own timer. Local timers are independent `Timer.afterDelay` calls, so the deadlock never existed. The `actor-block-concurrency-timer-test.js` case is now the §1.5 "outside timer" row and passes in every lane. The clock-clamping half has no local counterpart. |
+| [EXPLAIN recompilation, `35780cd85`](https://github.com/cloudflare/workerd/commit/35780cd85) | `sqlite.c++:1519` `Statement::prepareForExecution()` recompiles a cached EXPLAIN across schema changes. The local SQL layer has no statement cache. The `sql-test.js` block is now the §1.4 "reused EXPLAIN" row and passes in every lane. |
+
+### Reviewed host and protocol changes
+
+| Surface | Disposition |
+| --- | --- |
+| Durable Object retries | [`01bb2e6de`](https://github.com/cloudflare/workerd/commit/01bb2e6de) adds an experimental per-stub `retry` option to `get()`. The oracle validates it: `TypeError` for non-numbers, `RangeError` for `maxRetries` outside 0–10 or `timeoutMs` outside 500–60000. Local `get()` ignores the option, so invalid values are accepted locally. Not ported, following the October 2 decision to make no retry claims. [`4be0c0167`](https://github.com/cloudflare/workerd/commit/4be0c0167) turns `@retryable` into `retryable()` in `cloudflare:durable-objects`, which has no local alias. The claim, replay and delivery-marking commits (`d834a15b0`, `f0105d9ef`, `2cc73f4ab`, `95daf1fed`, `2162c1af9`, `8da930c60`, `aa6b35682`, `1a7db17df`) need a retry service that is absent locally. |
+| `onHibernate` | [`a6eaed5c8`](https://github.com/cloudflare/workerd/commit/a6eaed5c8), [`744706ac8`](https://github.com/cloudflare/workerd/commit/744706ac8) and [`5e395fc45`](https://github.com/cloudflare/workerd/commit/5e395fc45) add an experimental `onHibernate` symbol and its embedder dispatch. Local hosts never dispatch it. |
+| Idle-actor cross-context actions | [`f24ceb77d`](https://github.com/cloudflare/workerd/commit/f24ceb77d) defers them instead of aborting, behind the `DEFER_CROSS_CONTEXT_ACTIONS` autogate. There is no local DeleteQueue. |
+| Snapshots and location hints | [`d4969086a`](https://github.com/cloudflare/workerd/commit/d4969086a) gates `storage.snapshot()` behind `durable_object_snapshots`, and [`8e5c9b6ee`](https://github.com/cloudflare/workerd/commit/8e5c9b6ee) refuses it in facets. Locally both methods are absent. [`ec3982b2a`](https://github.com/cloudflare/workerd/commit/ec3982b2a) accepts `locationHint: "offpeak"` only with `offpeak_location_hint` or `experimental`; local hosts pass hints through, which matches the experimental oracle lane. |
+| SQLite | [`9426fffe7`](https://github.com/cloudflare/workerd/commit/9426fffe7) raises `SQLITE_LIMIT_VDBE_OP` from 25,000 to 250,000. Local backends set only `SQLITE_LIMIT_LENGTH` (`node:sqlite` has no limit API), so the engine default applies, and upstream moved toward it. [`9eac3b2d6`](https://github.com/cloudflare/workerd/commit/9eac3b2d6) refreshes workerd's SQLite patches; the local engines do not carry them. [`2c8abc502`](https://github.com/cloudflare/workerd/commit/2c8abc502) forwards internal query ids, with no observable change. |
+| Cluster storage | [`aa494794c`](https://github.com/cloudflare/workerd/commit/aa494794c) and [`2992f3f89`](https://github.com/cloudflare/workerd/commit/2992f3f89) cluster workerd processes and their alarms over a shared bucket, including `close(CloseReason)` notifications on the SQLite KV and metadata. Local `SqliteDatabase.close()` notifies no listeners; after teardown the aborted IoContext refuses further use. |
+| Worker Loader and Wasm | [`169bd4afe`](https://github.com/cloudflare/workerd/commit/169bd4afe), [`6e8675b13`](https://github.com/cloudflare/workerd/commit/6e8675b13) and [`bc8e6bc99`](https://github.com/cloudflare/workerd/commit/bc8e6bc99) add `wasm_source_url_support`, enabled from 2026-12-01. [`fd1d71fac`](https://github.com/cloudflare/workerd/commit/fd1d71fac) adds the opt-in `wasm_esm_integration_builtins`. Compiling modules is the host's job here. |
+| WebSockets | [`299cc29c6`](https://github.com/cloudflare/workerd/commit/299cc29c6) and [`9b2168f86`](https://github.com/cloudflare/workerd/commit/9b2168f86) change how locally coupled pumps fail and report. Only invocation outcomes change; WebSocket events are unchanged. |
+| RPC | [`f7f0a918b`](https://github.com/cloudflare/workerd/commit/f7f0a918b) and [`e0f971b6c`](https://github.com/cloudflare/workerd/commit/e0f971b6c) concern RPC `AbortSignal` transport behind an experimental flag, and [`1efc2db24`](https://github.com/cloudflare/workerd/commit/1efc2db24) releases the pipeline on rejected promises. Cap'n Web owns both locally. [`ec9f0e9f9`](https://github.com/cloudflare/workerd/commit/ec9f0e9f9) stops a legacy callee's stack leaking to an enhanced caller under `enhanced_error_serialization`; local errors do not travel as V8 serializer host objects. [`0ddf04f33`](https://github.com/cloudflare/workerd/commit/0ddf04f33) types the failure of `IoContext::run()` without a request. Local runs always come from a host event. |
+| Types | [`d7356c821`](https://github.com/cloudflare/workerd/commit/d7356c821) ungates `ctx.mapVirtualHost()`. [`81ba6e861`](https://github.com/cloudflare/workerd/commit/81ba6e861) types `SqlStorageCursor.next()` as `IteratorResult<T, undefined>`, which the local cursor already returns. Both arrive with the types pin. |
+
+### Security review
+
+[`1f18c628f`](https://github.com/cloudflare/workerd/commit/1f18c628f) cages
+Blob payload pointers relative to the V8 heap, and
+[`b1fa66610`](https://github.com/cloudflare/workerd/commit/b1fa66610) and
+[`dbe8f821b`](https://github.com/cloudflare/workerd/commit/dbe8f821b) replace
+bare references captured by continuations with weak handles.
+[`66a64f3a9`](https://github.com/cloudflare/workerd/commit/66a64f3a9) fixes
+destructors that throw during unwinding. All four are native memory-safety
+work with no JavaScript analogue, because local objects are owned by the
+JavaScript GC.
+
+### Toolchain
+
+`wrangler` was refreshed to 4.156.0, the latest release, published October 29
+and outside the release-age gate. The lockfile moved only the intended graph:
+workerd and its platform packages, Workers types, wrangler, and wrangler's
+miniflare `5.20261023.3-beta` (with its nested workerd `1.20261023.1`), plus
+sharp `0.35.5` and undici `7.30.1`. rolldown, vite and babel are unchanged.
+
+### Focused validation
+
+The alarm regression failed before the `2093b5b1b` port, and the sync and async
+RPC-exception tests failed before the `0b348c30b` port; all pass afterward. On
+the new oracle the D6-D7 hibernation row failed in the workerd lane until the
+expectation and the local release were updated. The two measured rows passed in
+every lane without runtime changes. Typechecking against Workers types
+`5.20261031.1` required `Cursor.next()` to declare `IteratorResult<T, undefined>`.
+Integrated runtime validation then passed: 1,086 unit tests; 86 workerd, 86 Node,
+and 101 browser conformance/smoke tests; 86 tests in each transformed Node and
+browser lane; `pnpm typecheck`; and `pnpm check:oracle`.
+
+### getTags() and listing during webSocketClose
+
+These rows ran the real `conformance/fixtures/probe.ts`, bundled, under raw
+`workerd serve` with a front worker. Each binary ran 8 times, and every run of
+every row produced the same output. "Sync" is read inside the handler before it
+awaits; "after a turn" is read after `scheduler.wait(10)` inside the same
+handler.
+
+| Row | Binary | Sync: listed / tags | After a turn: listed / tags |
+| --- | --- | --- | --- |
+| D5/B4 peer close, answered from webSocketClose (pair) | 0815, 1023, 1031 | yes / `["socket"]` | no / throws |
+| D6-D7 own close, then echo (pair) | 1023, 1031 | yes / `["socket"]` | no / throws |
+| D6-D7 own close, then echo (pair) | 0815 | yes / `["socket"]` | no / `["socket"]` |
+| D6 message after own close: message, then close (pair) | 1023, 1031 | yes / `["socket"]` for both | no / `["socket"]` for both |
+| Network peer close, answered from webSocketClose (eviction row shape) | 0815, 1023, 1031 | yes / tags | no / throws |
+
+On 0815 the message row's close arrived as 1006, unclean. A second probe on
+1031 drove the same socket over a real network connection. An own close
+followed by the echo kept the tags (`net:own`), and so did an own close with a
+message ahead of the echo (`net:ownThenMsg`). A peer close answered from
+`webSocketClose()` released the socket (`net:peer`). Microtask reads inside the
+handler always matched the sync reads. A third probe on 1031 closed the accepted
+half before returning the 101 (`netCloseBeforeReturn`): the tags were kept
+through the echo, so the own close completes when the Response couples the
+pair, and a late `accept()` on an in-actor pair auto-replied to a queued close
+(`lateaccept`), firing `webSocketClose` with 4002. Both are ported; a reversed
+pair (accepted `pair[0]`, returned `pair[1]`) behaves the same.
+
+Three further differences measured in the same probe are not ported here and
+stay open: `close()` with no code delivers 1000 on a pair or coupled socket
+where workerd delivers 1005; after `webSocketError` the socket stays listed with
+`readyState` 1 and `close()` sends a frame, where workerd unlists it after a
+turn, reports 2 and ignores `close()`; and a message handler that runs after
+the socket's own close sees `readyState` 3 where workerd reports 2.
+
+**Method caveat.** The vitest-pool-workers lane does not show the sync values.
+Its wrapper (`test-internal.mjs`) runs a Durable Object handler only after
+`enqueueInvocation` and `await this[kEnsureInstance]()`, so the handler starts
+at least one I/O turn late. By then a pair socket has already left the list
+and may already be released. `conformance/suite/hibernation.spec.ts` therefore
+asserts sync-handler values only outside the workerd lane, and asserts
+after-a-turn values in every lane.
 
 ## October 9 audit
 

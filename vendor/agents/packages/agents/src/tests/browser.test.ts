@@ -1,13 +1,16 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
-  BROWSER_SESSION_KEEP_ALIVE_MAX_MS,
   Browser,
   type BrowserOptions,
-  type BrowserRunOptions,
-  browserRun,
   DEFAULT_BROWSER_NAME,
+  DEFAULT_BROWSER_SCOPE,
   namedBrowserSessionKey
 } from "../browser/browser";
+import {
+  BROWSER_SESSION_KEEP_ALIVE_DEFAULT_MS,
+  type BrowserRunOptions,
+  browserRun
+} from "../browser/providers/browser-run";
 import {
   type BrowserBinding,
   openOneShotBrowserSession,
@@ -16,6 +19,7 @@ import {
 import type {
   BrowserSessionLock,
   BrowserSessionStore,
+  ListableBrowserSessionStore,
   StoredBrowserSession
 } from "../browser/session-store";
 
@@ -186,7 +190,7 @@ async function waitUntil(condition: () => boolean): Promise<void> {
 /** A standalone `Browser` over `binding` — a custom store needs no Lifecycle. */
 function createBrowser(
   binding: BrowserBinding,
-  store: BrowserSessionStore,
+  store: ListableBrowserSessionStore,
   options: Omit<BrowserOptions, "provider" | "store"> & {
     run?: BrowserRunOptions;
   } = {}
@@ -214,7 +218,7 @@ describe("new Browser", () => {
 });
 
 describe("Browser.resolve", () => {
-  it("creates on first use, pins keep_alive to the platform max, restarted: false", async () => {
+  it("creates on first use, pins keep_alive to the 10-minute default, restarted: false", async () => {
     const { browser, requests } = createFakeBrowser();
     const store = new MemorySessionStore();
     const named = createBrowser(browser, store);
@@ -228,7 +232,7 @@ describe("Browser.resolve", () => {
 
     const [create] = creates(requests);
     expect(create.url).toContain(
-      `keep_alive=${BROWSER_SESSION_KEEP_ALIVE_MAX_MS}`
+      `keep_alive=${BROWSER_SESSION_KEEP_ALIVE_DEFAULT_MS}`
     );
 
     // The record lives under the named keyspace; sessionId stays internal.
@@ -263,6 +267,22 @@ describe("Browser.resolve", () => {
     expect(second.sessionId).not.toBe(first.sessionId);
     expect(second.restarted).toBe(true);
     expect(creates(requests)).toHaveLength(2);
+  });
+
+  it("keeps the browser when the liveness probe fails for another reason", async () => {
+    // A 500 says nothing about whether the browser is gone, so the record
+    // must survive and the error reach the caller.
+    const { browser, requests } = createFakeBrowser({ listStatuses: [500] });
+    const store = new MemorySessionStore();
+    const named = createBrowser(browser, store);
+
+    const first = await named.resolve();
+    await expect(named.resolve()).rejects.toThrow(/500/);
+
+    const again = await named.resolve();
+    expect(again.sessionId).toBe(first.sessionId);
+    expect(again.restarted).toBe(false);
+    expect(creates(requests)).toHaveLength(1);
   });
 
   it("keeps sessions separate per name", async () => {
@@ -306,6 +326,23 @@ describe("Browser.resolve", () => {
         guardrails: { allowedDomains: ["example.com", "*.example.com"] }
       });
     }
+  });
+
+  it("reads the provider's options at each create", async () => {
+    const { browser, requests } = createFakeBrowser({ listStatuses: [404] });
+    const options: BrowserRunOptions = { keepAliveMs: 600_000 };
+    const named = new Browser({
+      provider: browserRun(browser, options),
+      store: new MemorySessionStore()
+    });
+
+    await named.resolve();
+    options.keepAliveMs = 30_000;
+    await named.resolve(); // dead — recreated
+
+    const [first, second] = creates(requests);
+    expect(first.url).toContain("keep_alive=600000");
+    expect(second.url).toContain("keep_alive=30000");
   });
 
   it("never holds the store lock across Browser Run calls", async () => {
@@ -394,6 +431,99 @@ describe("Browser.resolve", () => {
   });
 });
 
+describe("Browser Run typed binding methods", () => {
+  function notImplemented(method: string) {
+    return new TypeError(
+      `The RPC receiver does not implement the method "${method}".`
+    );
+  }
+
+  it("creates and closes through acquire() and closeSession()", async () => {
+    const fake = createFakeBrowser();
+    const acquired: unknown[] = [];
+    const closed: string[] = [];
+    const binding: BrowserBinding = {
+      fetch: fake.browser.fetch,
+      async acquire(options) {
+        acquired.push(options);
+        return { sessionId: "session-typed" };
+      },
+      async closeSession(sessionId) {
+        closed.push(sessionId);
+        return { status: "closed" };
+      }
+    };
+    const named = createBrowser(binding, new MemorySessionStore(), {
+      run: {
+        recording: true,
+        guardrails: { allowedDomains: ["example.com"] }
+      }
+    });
+
+    expect((await named.resolve()).sessionId).toBe("session-typed");
+    expect(await named.close()).toBe(true);
+
+    expect(acquired).toEqual([
+      {
+        keepAlive: BROWSER_SESSION_KEEP_ALIVE_DEFAULT_MS,
+        recording: true,
+        guardrails: { allowedDomains: ["example.com"] }
+      }
+    ]);
+    expect(closed).toEqual(["session-typed"]);
+    // Nothing went through the HTTP create and delete routes.
+    expect(creates(fake.requests)).toHaveLength(0);
+    expect(deletes(fake.requests)).toHaveLength(0);
+  });
+
+  it("falls back to HTTP when the binding doesn't have the typed methods", async () => {
+    // Fully local dev: the methods look like functions but throw when called.
+    const fake = createFakeBrowser();
+    const binding: BrowserBinding = {
+      fetch: fake.browser.fetch,
+      acquire: () => Promise.reject(notImplemented("acquire")),
+      closeSession: () => Promise.reject(notImplemented("closeSession"))
+    };
+    const named = createBrowser(binding, new MemorySessionStore());
+
+    expect((await named.resolve()).sessionId).toBe("session-1");
+    expect(await named.close()).toBe(true);
+
+    expect(creates(fake.requests)).toHaveLength(1);
+    expect(deletes(fake.requests, "session-1")).toHaveLength(1);
+  });
+
+  it("counts a session closeSession() doesn't know as closed", async () => {
+    // What Browser Run's binding throws for an unknown session id.
+    const fake = createFakeBrowser();
+    const binding: BrowserBinding = {
+      fetch: fake.browser.fetch,
+      acquire: async () => ({ sessionId: "session-typed" }),
+      closeSession: () => Promise.reject(new Error("Not Found (status=404)"))
+    };
+    const named = createBrowser(binding, new MemorySessionStore());
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await named.resolve();
+    expect(await named.close()).toBe(true);
+    expect(warn).not.toHaveBeenCalled();
+    expect(deletes(fake.requests)).toHaveLength(0);
+    warn.mockRestore();
+  });
+
+  it("doesn't fall back to HTTP when acquire() fails for another reason", async () => {
+    const fake = createFakeBrowser();
+    const binding: BrowserBinding = {
+      fetch: fake.browser.fetch,
+      acquire: () => Promise.reject(new Error("Browser time limit exceeded"))
+    };
+    const named = createBrowser(binding, new MemorySessionStore());
+
+    await expect(named.resolve()).rejects.toThrow("Browser time limit");
+    expect(creates(fake.requests)).toHaveLength(0);
+  });
+});
+
 describe("Browser.close", () => {
   it("retires the record and deletes the Browser Run session", async () => {
     const { browser, requests } = createFakeBrowser();
@@ -446,6 +576,18 @@ describe("Browser.close", () => {
     expect(await named.close()).toBe(false);
   });
 
+  it("closes quietly when the platform session already expired", async () => {
+    const { browser } = createFakeBrowser({ deleteStatuses: [410] });
+    const store = new MemorySessionStore();
+    const named = createBrowser(browser, store);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await named.resolve();
+    expect(await named.close()).toBe(true);
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
   it("returns false when there is nothing to close", async () => {
     const { browser } = createFakeBrowser();
     const named = createBrowser(browser, new MemorySessionStore(), {
@@ -491,10 +633,13 @@ describe("Browser.connect", () => {
   });
 
   it("replaces a browser that expires between the probe and the upgrade", async () => {
-    // The first upgrade finds the just-resolved browser gone (410).
-    const { browser, requests } = createFakeBrowser({ upgradeStatuses: [410] });
+    // The second connection's upgrade finds the browser gone (410).
+    const { browser, requests } = createFakeBrowser({
+      upgradeStatuses: [0, 410]
+    });
     const store = new MemorySessionStore();
     const named = createBrowser(browser, store, { name: "checkout" });
+    (await named.connect()).cdp.close();
 
     const connected = await named.connect();
 
@@ -513,7 +658,16 @@ describe("Browser.connect", () => {
     await expect(named.connect()).rejects.toThrow(/\(502\)/);
   });
 
-  it("records the active tab on the browser's record", async () => {
+  it("doesn't report a restart to a scope's first connection", async () => {
+    const { browser } = createFakeBrowser({ upgradeStatuses: [410] });
+    const named = createBrowser(browser, new MemorySessionStore());
+
+    const connected = await named.connect();
+    expect(connected.sessionId).toBe("session-2");
+    expect(connected.restarted).toBe(false);
+  });
+
+  it("records the active tab per scope", async () => {
     const { browser } = createFakeBrowser();
     const store = new MemorySessionStore();
     const named = createBrowser(browser, store, { name: "work" });
@@ -524,10 +678,27 @@ describe("Browser.connect", () => {
 
     const second = await named.connect();
     expect(second.activeTargetId).toBe("target-7");
+    expect(second.scope).toBe(DEFAULT_BROWSER_SCOPE);
+
+    const other = await named.connect({ scope: "other" });
+    expect(other.activeTargetId).toBeUndefined();
+    expect(await other.targetsInOtherScopes()).toEqual(new Set(["target-7"]));
+    expect(await other.setActiveTarget("target-8")).toBe(true);
+
     expect(await second.setActiveTarget(undefined)).toBe(true);
     expect(
-      store.sessions.get(namedBrowserSessionKey("work"))?.activeTargetId
+      store.sessions.get(`browser:scope:4:work:${DEFAULT_BROWSER_SCOPE}`)
+        ?.activeTargetId
     ).toBeUndefined();
+    expect(
+      store.sessions.get(`browser:scope:4:work:other`)?.activeTargetId
+    ).toBe("target-8");
+  });
+
+  it("rejects an empty scope", async () => {
+    const { browser } = createFakeBrowser();
+    const named = createBrowser(browser, new MemorySessionStore());
+    await expect(named.connect({ scope: " " })).rejects.toThrow(/non-empty/);
   });
 
   it("never resurrects a closed browser when recording the active tab", async () => {
@@ -561,7 +732,7 @@ describe("Browser.connect", () => {
     const key = namedBrowserSessionKey("work");
     const stale = {
       ...store.sessions.get(key)!,
-      updatedAt: Date.now() - BROWSER_SESSION_KEEP_ALIVE_MAX_MS * 2
+      updatedAt: Date.now() - BROWSER_SESSION_KEEP_ALIVE_DEFAULT_MS * 2
     };
     store.sessions.set(key, stale);
 

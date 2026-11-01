@@ -446,3 +446,212 @@ describe("accept", () => {
     expect(targets).toEqual([accepted, accepted]);
   });
 });
+
+/**
+ * When a closed hibernatable socket leaves `getWebSockets()` and when `getTags()`
+ * stops answering. Each expectation was measured against raw `workerd serve`
+ * 1.20261031.1 (docs/workerd-sync.md, "getTags() and listing during
+ * webSocketClose"); the conformance suite's D5-D7 rows replay the pair cases.
+ */
+describe("hibernatable close settlement", () => {
+  const NOT_ACCEPTED =
+    "you must call 'acceptWebSocket()' before attempting to access the tags of a WebSocket.";
+
+  function observe(registry: () => HibernatableWebSocketRegistry, socket: unknown) {
+    const target = socket as RawWebSocket;
+    let tags: unknown;
+    try {
+      tags = registry().getTags(target);
+    } catch (error) {
+      tags = (error as Error).message;
+    }
+    return { tags, listed: registry().getWebSockets().includes(target as WebSocket) };
+  }
+
+  function recordingRegistry(ctx: IoContext, onClose?: (socket: RawWebSocket) => void) {
+    const seen: { event: string; sync: unknown; microtask?: unknown }[] = [];
+    const registry: HibernatableWebSocketRegistry = new HibernatableWebSocketRegistry(ctx, {
+      message: (socket, message) => {
+        seen.push({ event: `message:${String(message)}`, sync: observe(() => registry, socket) });
+      },
+      close: async (socket, code) => {
+        const entry: (typeof seen)[number] = {
+          event: `close:${code}`,
+          sync: observe(() => registry, socket),
+        };
+        seen.push(entry);
+        onClose?.(socket);
+        await Promise.resolve();
+        entry.microtask = observe(() => registry, socket);
+      },
+      error: () => {},
+    });
+    return { registry, seen };
+  }
+
+  test("a pair's own close then echo: listed with tags in the handler, released a turn later", async () => {
+    const { ctx } = newFixture();
+    const { registry, seen } = recordingRegistry(ctx);
+    const { 0: client, 1: server } = new registry.WebSocketPair();
+    await ctx.run(() => {
+      registry.acceptWebSocket(server, ["t"]);
+      client.accept();
+      server.close(4002, "server out");
+    });
+    await quiesce();
+    const during = { tags: ["t"], listed: true };
+    expect(seen).toEqual([{ event: "close:4002", sync: during, microtask: during }]);
+    expect(observe(() => registry, server)).toEqual({ tags: NOT_ACCEPTED, listed: false });
+  });
+
+  test("a network transport's own close then echo never releases: the write completed first", async () => {
+    const { ctx, socket } = newFixture();
+    const { registry, seen } = recordingRegistry(ctx);
+    await ctx.run(() => registry.acceptWebSocket(socket, ["t"]));
+    const wrapper = registry.getWebSockets()[0]!;
+    await ctx.run(() => wrapper.close(4002, "server out"));
+    await quiesce();
+    expect(socket.closed).toEqual([4002]);
+
+    socket.dispatchEvent(new CloseEvent("close", { code: 4002, reason: "server out", wasClean: true }));
+    await quiesce();
+    expect(seen).toEqual([
+      {
+        event: "close:4002",
+        sync: { tags: ["t"], listed: true },
+        microtask: { tags: ["t"], listed: true },
+      },
+    ]);
+    expect(observe(() => registry, wrapper)).toEqual({ tags: ["t"], listed: false });
+    expect(observe(() => registry, socket)).toEqual({ tags: ["t"], listed: false });
+  });
+
+  test("a pair coupled to the host closes like a network transport: own close then echo keeps the tags", async () => {
+    const { ctx } = newFixture();
+    const { registry, seen } = recordingRegistry(ctx);
+    const { 0: client, 1: server } = new registry.WebSocketPair();
+    await ctx.run(() => registry.acceptWebSocket(server, ["t"]));
+    // What returning the client half in a 101 response does: its peer is now the network.
+    const host = (client as AcceptedWebSocket).coupleToHost();
+    host.accept();
+    const echoes: number[] = [];
+    host.addEventListener("close", (event) => echoes.push((event as CloseEvent).code));
+    await ctx.run(() => server.close(4002, "server out"));
+    await quiesce();
+    expect(echoes).toEqual([4002]);
+    const during = { tags: ["t"], listed: true };
+    expect(seen).toEqual([{ event: "close:4002", sync: during, microtask: during }]);
+    expect(observe(() => registry, server)).toEqual({ tags: ["t"], listed: false });
+  });
+
+  test("an own close written before the pair is coupled completes at coupling, so the echo keeps the tags", async () => {
+    const { ctx } = newFixture();
+    const { registry, seen } = recordingRegistry(ctx);
+    const { 0: client, 1: server } = new registry.WebSocketPair();
+    // `acceptWebSocket(server); server.close(); return 101`: the write lands before
+    // the host couples the client half (raw workerd 1.20261031.1 keeps the tags).
+    await ctx.run(() => {
+      registry.acceptWebSocket(server, ["t"]);
+      server.close(4002, "server out");
+    });
+    await quiesce();
+    const host = (client as AcceptedWebSocket).coupleToHost();
+    const echoes: number[] = [];
+    host.addEventListener("close", (event) => echoes.push((event as CloseEvent).code));
+    host.accept();
+    await quiesce();
+    expect(echoes).toEqual([4002]);
+    const during = { tags: ["t"], listed: true };
+    expect(seen).toEqual([{ event: "close:4002", sync: during, microtask: during }]);
+    expect(observe(() => registry, server)).toEqual({ tags: ["t"], listed: false });
+  });
+
+  test("a close queued before accept() is answered when accept() delivers it", async () => {
+    const { ctx } = newFixture();
+    const { registry, seen } = recordingRegistry(ctx);
+    const { 0: client, 1: server } = new registry.WebSocketPair();
+    await ctx.run(() => {
+      registry.acceptWebSocket(server, ["t"]);
+      server.close(4002, "server out");
+    });
+    await quiesce();
+    expect(seen).toEqual([]);
+    // ← a late `accept()` on raw workerd auto-replies, and `webSocketClose` fires.
+    const clientSeen: number[] = [];
+    client.addEventListener("close", (event) => clientSeen.push((event as CloseEvent).code));
+    await ctx.run(() => client.accept());
+    await quiesce();
+    expect(clientSeen).toEqual([4002]);
+    expect(seen.map((entry) => entry.event)).toEqual(["close:4002"]);
+    expect(client.readyState).toBe(3);
+  });
+
+  test("a message ahead of a pair's echo takes the completion, so nothing releases", async () => {
+    const { ctx } = newFixture();
+    const { registry, seen } = recordingRegistry(ctx);
+    const { 0: client, 1: server } = new registry.WebSocketPair();
+    await ctx.run(() => {
+      registry.acceptWebSocket(server, ["t"]);
+      client.accept();
+      server.close(4002, "server out");
+      client.send("late");
+    });
+    await quiesce();
+    expect(seen).toEqual([
+      { event: "message:late", sync: { tags: ["t"], listed: true } },
+      {
+        event: "close:4002",
+        sync: { tags: ["t"], listed: true },
+        microtask: { tags: ["t"], listed: true },
+      },
+    ]);
+    expect(observe(() => registry, server)).toEqual({ tags: ["t"], listed: false });
+  });
+
+  test("a close sent from webSocketClose completes after the dispatch and releases", async () => {
+    const { ctx } = newFixture();
+    const { registry, seen } = recordingRegistry(ctx, (socket) => socket.close(4001, "bye"));
+    const { 0: client, 1: server } = new registry.WebSocketPair();
+    await ctx.run(() => {
+      registry.acceptWebSocket(server, ["t"]);
+      client.accept();
+      client.close(4001, "bye");
+    });
+    await quiesce();
+    const during = { tags: ["t"], listed: true };
+    expect(seen).toEqual([{ event: "close:4001", sync: during, microtask: during }]);
+    expect(observe(() => registry, server)).toEqual({ tags: NOT_ACCEPTED, listed: false });
+  });
+
+  test("a released socket woken from hibernation is accepted again", async () => {
+    const { ctx } = newFixture();
+    const { registry } = recordingRegistry(ctx);
+    const { 0: client, 1: server } = new registry.WebSocketPair();
+    await ctx.run(() => {
+      registry.acceptWebSocket(server, ["t"]);
+      client.accept();
+      server.close(4002, "server out");
+    });
+    await quiesce();
+    expect(observe(() => registry, server).tags).toBe(NOT_ACCEPTED);
+
+    const woken = new HibernatableWebSocketRegistry(
+      ctx,
+      { message: () => {}, close: () => {}, error: () => {} },
+      undefined,
+      [{ socket: server, tags: ["t"] }],
+    );
+    expect(woken.getTags(server)).toEqual(["t"]);
+  });
+
+  test("a close that never reaches a handler still leaves the list", async () => {
+    const { ctx, socket } = newFixture();
+    const { registry, seen } = recordingRegistry(ctx);
+    await ctx.run(() => registry.acceptWebSocket(socket, ["t"]));
+    ctx.abort(new Error("actor stopped"));
+    socket.dispatchEvent(new CloseEvent("close", { code: 1000, wasClean: true }));
+    await quiesce();
+    expect(seen).toEqual([]);
+    expect(registry.getWebSockets()).toEqual([]);
+  });
+});

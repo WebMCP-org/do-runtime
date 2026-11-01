@@ -1,5 +1,25 @@
 # @cloudflare/codemode
 
+## 0.5.6
+
+### Patch Changes
+
+- [#2766](https://github.com/cloudflare/agents/pull/2766) [`b372289`](https://github.com/cloudflare/agents/commit/b372289fdee424366b6bd8a8ae9923afb3ac803f) Thanks [@github-actions](https://github.com/apps/github-actions)! - Allow `@tanstack/ai` 1.x in the optional peer dependency ranges, and type the TanStack AI tools so they compile against both 0.x and 1.x. See [TanStack AI](https://github.com/cloudflare/agents/blob/main/packages/codemode/README.md#tanstack-ai).
+
+## 0.5.5
+
+### Patch Changes
+
+- [#2614](https://github.com/cloudflare/agents/pull/2614) [`d6606fd`](https://github.com/cloudflare/agents/commit/d6606fd549d70e8b8c4abe8ec47476c90b17e8c7) Thanks [@aron-cf](https://github.com/aron-cf)! - Release tool calls left pending when an execution settles, so unawaited calls no longer leak Dynamic Worker concurrency slots. See [Unawaited tool calls](https://github.com/cloudflare/agents/blob/main/docs/codemode/runtime.md#unawaited-tool-calls).
+
+## 0.5.4
+
+### Patch Changes
+
+- [#2472](https://github.com/cloudflare/agents/pull/2472) [`7945da9`](https://github.com/cloudflare/agents/commit/7945da9c6e142119e296984fc9caadec41e182a5) Thanks [@mattzcarey](https://github.com/mattzcarey)! - `ToolSetConnector` now forwards each AI SDK tool's `outputSchema` into its connector descriptors, so durable `codemode.describe()` shows the output type instead of `unknown`, as `McpConnector` already does. Input and output schemas that convert asynchronously (`jsonSchema(promise)`) are now awaited instead of being dropped.
+
+  Output types, in both `generateTypes` and connector descriptors, now describe the value a tool returns rather than the input side of its schema. A `.default()` field is now required and a `.pipe()` field has the piped type. A `.transform()`, which JSON Schema can't express, shows as `unknown` instead of the pre-transform type.
+
 ## 0.5.3
 
 ### Patch Changes

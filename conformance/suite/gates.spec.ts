@@ -153,6 +153,16 @@ it("§1.5 a setTimeout armed inside blockConcurrencyWhile runs inside that secti
   expect(await probe.call("timerInsideCriticalSection")).toEqual(["timer", "section-end"]);
 });
 
+/**
+ * Each input-gate scope keeps its own timers (workerd 1fa562228). An earlier
+ * timer armed outside the section waits for the gate without blocking the
+ * section's own later timer, so the section finishes first.
+ */
+it("§1.5 an outside timer waiting on the gate does not hold back a critical section's timer", async () => {
+  const probe = await host.spawn("gate-timer-outside-cs");
+  expect(await probe.call("outsideTimerBehindCriticalSection")).toEqual(["critical section", "outer"]);
+});
+
 it("§1.2 setInterval repeats under the gate and clearInterval stops it", async () => {
   const probe = await host.spawn("gate-interval");
   expect(await probe.call("armInterval")).toBe("armed");

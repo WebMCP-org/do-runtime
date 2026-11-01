@@ -16,6 +16,7 @@ import { describe, expect, expectTypeOf, test, vi } from "vitest";
 import { createNodeSqlProvider } from "../../backends/node-sqlite";
 import { __gateAwait, __resumeAwait } from "../gate";
 import { DurableObjectClass } from "../api/actor";
+import { RpcTarget } from "../api/cloudflare-workers";
 import { FACET_TREE_MAX_DEPTH } from "../api/actor-state";
 import type { AlarmInvocationInfo } from "../api/global-scope";
 import { markWebSocketUsed } from "../api/web-socket";
@@ -93,6 +94,8 @@ class RecordingFacetHost implements FacetHost {
    * recorder and disagree on the only thing that matters.
    */
   readonly trace: string[] = [];
+  /** What each `reenter` call's callback into the caller returned, unawaited. */
+  readonly reentries: Promise<unknown>[] = [];
   /** Placements held open by `deferStart`, by name. */
   readonly #deferred = new Map<string, { begun: () => void; landing: Promise<void> }>();
 
@@ -134,6 +137,13 @@ class RecordingFacetHost implements FacetHost {
       ping: () => {
         this.invoked.push(request.id);
         return Promise.resolve(`pong:${request.id}`);
+      },
+      /** Call back into the caller's `RpcTarget` and answer without waiting for it. */
+      reenter: (target: { armThenThrow(at: number, mode: string): Promise<never> }, at: number, mode: string) => {
+        const callback = target.armThenThrow(at, mode);
+        callback.catch(() => {});
+        this.reentries.push(callback);
+        return Promise.resolve("reentered");
       },
     };
     const held = this.#deferred.get(request.name);
@@ -272,6 +282,30 @@ class Counter {
       ping(): Promise<string>;
     };
     return child.ping();
+  }
+
+  armThenThrow(at: number, mode: "sync" | "async"): Promise<never> {
+    void this.ctx.storage.setAlarm(at);
+    const error = new Error(`thrown ${mode}`);
+    if (mode === "sync") throw error;
+    return Promise.reject(error);
+  }
+
+  /** The facet calls back into a target whose method is `armThenThrow`, re-entering this actor. */
+  reenterThroughFacet(name: string, at: number, mode: "sync" | "async"): Promise<unknown> {
+    const ctx = this.ctx;
+    const target = new (class extends RpcTarget {
+      armThenThrow(armAt: number, throwMode: "sync" | "async"): Promise<never> {
+        void ctx.storage.setAlarm(armAt);
+        const error = new Error(`thrown ${throwMode}`);
+        if (throwMode === "sync") throw error;
+        return Promise.reject(error);
+      }
+    })();
+    const child = this.ctx.facets.get(name, () => ({ class: actorClass("Child") })) as unknown as {
+      reenter(target: RpcTarget, at: number, mode: string): Promise<string>;
+    };
+    return child.reenter(target, at, mode);
   }
 
   async alarm(info?: AlarmInvocationInfo): Promise<void> {
@@ -847,6 +881,65 @@ describe("the composition", () => {
     expect(await stub.bump()).toBe(1);
     expect(await stub.bump()).toBe(2);
   });
+
+  // ← workerd 0b348c30b: an error can carry unconfirmed state as easily as a return value.
+  test.each(["sync", "async"] as const)(
+    "entry holds a %s exception behind the output gate too",
+    async (mode) => {
+      const projection = Promise.withResolvers<void>();
+      const scheduleRun = vi.fn(() => projection.promise);
+      const { stub } = await counterContainer({
+        ports: {
+          sql: createNodeSqlProvider(),
+          alarms: { scheduleRun },
+          facets: new RecordingFacetHost(),
+          timer,
+        },
+      });
+
+      let settled = false;
+      const answer = stub.armThenThrow(Date.now() + 1_000, mode).finally(() => {
+        settled = true;
+      });
+      answer.catch(() => {});
+      await vi.waitFor(() => expect(scheduleRun).toHaveBeenCalledOnce());
+      await portHop();
+      expect(settled).toBe(false);
+
+      projection.resolve();
+      await expect(answer).rejects.toThrow(`thrown ${mode}`);
+    },
+  );
+
+  // ← workerd 0b348c30b (`worker-rpc.c++:2261-2283`), which gates an `RpcTarget`'s methods
+  // (`JsRpcTargetBase::callImpl`) exactly as it gates the entrypoint's.
+  test.each(["sync", "async"] as const)(
+    "a re-entry callback holds a %s exception behind the output gate too",
+    async (mode) => {
+      const projection = Promise.withResolvers<void>();
+      const scheduleRun = vi.fn(() => projection.promise);
+      const facets = new RecordingFacetHost();
+      const { stub } = await counterContainer({
+        ports: { sql: createNodeSqlProvider(), alarms: { scheduleRun }, facets, timer },
+      });
+
+      const outer = stub.reenterThroughFacet("callback", Date.now() + 1_000, mode);
+      outer.catch(() => {});
+      await vi.waitFor(() => expect(facets.reentries).toHaveLength(1));
+      let settled = false;
+      const callback = facets.reentries[0]!.finally(() => {
+        settled = true;
+      });
+      callback.catch(() => {});
+      await vi.waitFor(() => expect(scheduleRun).toHaveBeenCalledOnce());
+      await portHop();
+      expect(settled).toBe(false);
+
+      projection.resolve();
+      await expect(callback).rejects.toThrow(`thrown ${mode}`);
+      expect(await outer).toBe("reentered");
+    },
+  );
 
   test("ctx.id is derived from the name under the host's unique key", async () => {
     const a = await createActorContainer(options({ id: "alice" }));

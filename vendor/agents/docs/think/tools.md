@@ -6,11 +6,11 @@ Think provides built-in workspace file tools on every turn, plus integration poi
 
 On every turn, Think merges tools from multiple sources. Later sources override earlier ones if names collide:
 
-1. **Workspace tools** — `read`, `write`, `edit`, `list`, `find`, `grep`, `delete`, `bash` (built-in)
+1. **Workspace tools** — `read`, `ls`, `find`, `grep`, `write`, `edit`, `delete`, plus `exec` and `publish` when configured (built-in)
 2. **`getTools()`** — your custom server-side tools
 3. **Extension tools** — tools from loaded extensions (prefixed by extension name)
 4. **Context tools** — `set_context`, `search_context` (from `configureContext`)
-5. **Skill tools** — `activate_skill`, `read_skill_resource`, `run_skill_script` (from `getSkills()`)
+5. **Skill tools** — `activate_skill`, `read_skill_resource`, `run_skill_script` (from `getSkills()`; the fork omits `run_skill_script`)
 6. **MCP tools** — from connected MCP servers (when `includeMcpTools` is enabled)
 7. **Client tools** — from the browser (see [Client Tools](./client-tools.md))
 
@@ -20,57 +20,45 @@ use [Agent Tools](https://github.com/cloudflare/agents/blob/main/docs/agents/age
 
 ## Built-in Workspace Tools
 
-Every Think agent gets `this.workspace` — a virtual filesystem backed by the Durable Object's SQLite storage. Workspace tools are automatically available to the model with no configuration.
+Every Think agent gets `this.workspace`: a `Workspace` from [`@cloudflare/computer`](https://github.com/cloudflare/computer), stored in the Durable Object's SQLite. Think adds Computer's AI SDK tools to every turn with no configuration.
 
-| Tool     | Description                                                                 |
-| -------- | --------------------------------------------------------------------------- |
-| `read`   | Read text with line numbers; pass images and PDFs to multimodal models      |
-| `write`  | Write content to a file (creates parent directories)                        |
-| `edit`   | Apply a find-and-replace edit to an existing file (supports fuzzy matching) |
-| `list`   | List files and directories in a path                                        |
-| `find`   | Find files matching a glob pattern                                          |
-| `grep`   | Search file contents by regex or fixed string                               |
-| `delete` | Delete a file or directory                                                  |
-| `bash`   | Run a sandboxed Bash script against workspace files                         |
+| Tool      | Description                                                                         |
+| --------- | ----------------------------------------------------------------------------------- |
+| `read`    | Read text with line and byte paging; pass images and PDFs to multimodal models      |
+| `ls`      | List files and directories in a path, with pagination                               |
+| `find`    | Find files matching a glob pattern                                                  |
+| `grep`    | Search file contents by regex or fixed string                                       |
+| `write`   | Write content to a file (creates parent directories)                                |
+| `edit`    | Apply exact text replacements to a file, falling back to whitespace-tolerant search |
+| `delete`  | Delete a file or directory                                                          |
+| `exec`    | Run a command or module on one of the Workspace's execution backends                |
+| `publish` | Share a workspace file through a presigned URL, when the Workspace has assets       |
 
-The `bash` tool is enabled by default. It mounts workspace files into a
-`just-bash` virtual filesystem, runs with network access disabled, and writes
-created, updated, and deleted files and empty directories back to the workspace.
-Use it for shell-style workflows that combine multiple file operations; use the
-narrower tools for simple reads, writes, and edits.
+Paths are absolute. Computer's tools and backends treat `/workspace` as the working root, and Think writes its own files there too.
 
-To keep tool calls bounded, the Bash tool snapshots up to 1,000 workspace files
-by default and skips files larger than 1 MB. Skipped files are reported in the
-tool result and are treated as protected during write-back so the script cannot
-accidentally overwrite or delete content that was not mounted. You can tune
-`maxWorkspaceFiles`, `maxWorkspaceFileBytes`, `maxOutputBytes`, `timeout`, and
-`network` through `workspaceBash`.
+### Running code with `exec`
 
-Disable the default Bash tool for conservative deployments:
-
-```typescript
-export class MyAgent extends Think<Env> {
-  workspaceBash = false;
-
-  getModel() {
-    /* ... */
-  }
-}
-```
-
-### R2 Spillover
-
-By default, the workspace stores everything in SQLite. For large files, override `workspace` to add R2 spillover:
+The default Workspace has no execution backends, so there is no `exec` tool until you add one. Configure the backends, and the modules they offer, on the Workspace:
 
 ```typescript
 import { Think } from "@cloudflare/think";
-import { Workspace } from "@cloudflare/shell";
+import { Workspace } from "@cloudflare/computer";
+import { WorkerJavaScriptBackend } from "@cloudflare/computer/backends/worker-javascript";
+import { createGitClient } from "@cloudflare/computer/git";
+import { createGitModule } from "@cloudflare/computer/modules/git";
 
 export class MyAgent extends Think<Env> {
   override workspace = new Workspace({
-    sql: this.ctx.storage.sql,
-    r2: this.env.R2,
-    name: () => this.name
+    storage: this.ctx.storage,
+    git: createGitClient(),
+    backends: [
+      new WorkerJavaScriptBackend({
+        id: "js",
+        loader: this.env.LOADER,
+        access: "read-write",
+        modules: { "ws:git": createGitModule() }
+      })
+    ]
   });
 
   getModel() {
@@ -79,13 +67,42 @@ export class MyAgent extends Think<Env> {
 }
 ```
 
-This requires an R2 bucket binding in `wrangler.jsonc`:
+Computer ships a JavaScript backend and a just-bash shell backend that run in Dynamic Workers, and a container backend with a full Linux userland. See the [Computer README](https://github.com/cloudflare/computer/tree/main/packages/computer#choosing-a-backend) for each backend's bindings.
 
-```jsonc
-{
-  "r2_buckets": [{ "binding": "R2", "bucket_name": "agent-files" }]
+### Calling the agent's tools from code
+
+Give a JavaScript backend a `ws:tools` module, and code the model runs with `exec` can import the agent's tools. Files come from `node:fs/promises`, so serve `getTools()` rather than the workspace tools:
+
+```typescript
+import { createToolBindings } from "@cloudflare/computer/modules/tools";
+import { forAISDKTools } from "@cloudflare/computer/tools/ai-sdk";
+
+new WorkerJavaScriptBackend({
+  id: "js",
+  loader: this.env.LOADER,
+  modules: {
+    "ws:tools": createToolBindings(forAISDKTools(() => this.getTools()))
+  }
+});
+```
+
+```ts
+import { readFile } from "node:fs/promises";
+import { getWeather } from "ws:tools";
+
+export default async function () {
+  const cities = JSON.parse(await readFile("/workspace/cities.json", "utf8"));
+  const reports = [];
+  for (const city of cities) reports.push((await getWeather({ city })).text);
+  return reports;
 }
 ```
+
+Tools that need approval, and tools that run in the browser, are not exported: nothing can approve or run them from code. Calls from code do not go through `beforeToolCall`. See [`ws:tools`](https://github.com/cloudflare/computer/blob/main/docs/17_isolate_javascript.md#wstools) for how calls and results work.
+
+### Changing the tools
+
+`exec` offers every backend the Workspace has, and each backend describes itself to the model. To change a built-in tool, return a tool with the same name from `getTools()`; it replaces the built-in. To hide tools for a turn, return `activeTools` from `beforeTurn`.
 
 ## Custom Tools
 
@@ -153,7 +170,7 @@ getTools(): ToolSet {
       inputSchema: z.object({ path: z.string() }),
       needsApproval: async ({ path }) => path.startsWith("/important/"),
       execute: async ({ path }) => {
-        await this.workspace.rm(path);
+        await this.workspace.fs.rm(path);
         return { deleted: path };
       }
     })
@@ -240,16 +257,19 @@ See [Connecting to MCP Servers](https://github.com/cloudflare/agents/blob/main/d
 
 ## Code Execution Tool
 
+> **Deprecated.** Use `exec` on a JavaScript backend with `ws:tools` instead; see [Calling the agent's tools from code](#calling-the-agents-tools-from-code). `createExecuteTool` will be removed along with `@cloudflare/codemode`.
+
 Let the LLM write and run TypeScript in a sandboxed Worker, recorded on a durable codemode runtime (abort-and-replay, human approvals, audit trail, reusable snippets). Requires `@cloudflare/codemode` and a `worker_loaders` binding.
 
 ```sh
 npm install @cloudflare/codemode
 ```
 
-The one-liner infers everything from the agent — `state.*` from `this.workspace`, the executor from `env.LOADER`, and a live browser (`cdp.*`) from `env.BROWSER` if bound:
+The one-liner infers the executor from `env.LOADER` and a live browser (`cdp.*`) from `env.BROWSER` if bound. Pass tools for `tools.*`, including the workspace tools if the sandbox should reach the workspace:
 
 ```typescript
 import { Think } from "@cloudflare/think";
+import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
 import { createExecuteTool } from "@cloudflare/think/tools/execute";
 
 export class MyAgent extends Think<Env> {
@@ -259,7 +279,9 @@ export class MyAgent extends Think<Env> {
 
   getTools() {
     return {
-      execute: createExecuteTool(this)
+      execute: createExecuteTool(this, {
+        tools: createAITools({ workspace: this.workspace })
+      })
     };
   }
 }
@@ -287,25 +309,15 @@ Each missing piece fails with an error naming the step.
 Inside the sandbox the model sees typed namespaces plus the platform SDK:
 
 - `tools.*` — your AI SDK tools (object args, validated against their schemas). Only tools with an `execute` function are exposed — client-side tools can't run in the sandbox.
-- `state.*` — the workspace filesystem (`state.readFile({ path })`, `state.glob({ pattern })`, `state.planEdits(...)`, …)
 - `cdp.*` — the browser, when a Browser Rendering binding is configured. The execute tool defaults to `session: { mode: "dynamic" }`: sessions are per-execution unless the model promotes one with `cdp.startSession()`.
 - `codemode.search` / `codemode.describe` / `codemode.step` / `codemode.run` — discovery, side-effect boundaries, and saved snippets
 
-Pass overrides for anything beyond the defaults — e.g. custom `tools.*` alongside the agent-derived state:
+Or pass fully explicit options (no agent inference):
 
 ```typescript
-execute: createExecuteTool(this, { tools: myDomainTools });
-```
-
-Or fully explicit options (no agent inference):
-
-```typescript
-import { createWorkspaceStateBackend } from "@cloudflare/shell";
-
 createExecuteTool({
   ctx: this.ctx,
   tools: myDomainTools,
-  state: createWorkspaceStateBackend(this.workspace),
   browser: this.env.BROWSER,
   loader: this.env.LOADER
 });
@@ -322,9 +334,9 @@ Either way, the text and reasoning the model wrote after the paused output (its 
 
 - `pendingExecutions()` — pending actions (with full args) for rendering approval UI.
 
-> **Render approval cards from `pendingExecutions()`, not the transcript.** The `pending` array in the paused tool output is a _truncated preview_ — args are bounded (~2 KB each) so they don't blow up model context, but the full args (up to 1 MB) are what actually execute on approve. A human approving a gated call must see the authoritative args, so fetch them via `pendingExecutions(executionId)` before enabling the Approve button. `examples/assistant`'s `PausedExecutionCard` shows the pattern.
+> **Render approval cards from `pendingExecutions()`, not the transcript.** The `pending` array in the paused tool output is a _truncated preview_ — args are bounded (~2 KB each) so they don't blow up model context, but the full args (up to 1 MB) are what actually execute on approve. A human approving a gated call must see the authoritative args, so fetch them via `pendingExecutions(executionId)` before enabling the Approve button. The `PausedExecutionCard` in the [assistant example](https://github.com/cloudflare/agents/tree/786d30e305baebc5fbf5ad5ed80461f88a728468/examples/assistant/src) shows the pattern.
 
-See `examples/assistant` for a working approval card, and `design/think-execute-hitl.md` for the design.
+See `design/think-execute-hitl.md` for the design.
 
 ### The runtime handle
 
@@ -393,7 +405,7 @@ Pass `quickActions: false` to keep only `browser_execute`, or `quickActions: { a
 
 By default each execution gets a fresh browser session (`one-shot`), torn down when the run ends. Pass `session: { mode: "dynamic" }` to let the model promote a session with `cdp.startSession()` so later executions continue in the same browser, or `session: { mode: "reuse", key }` for a named long-lived session. Stale sessions are reclaimed by the connector's `sweep()` — call it from a scheduled task (see `createBrowserRuntime` in `agents/browser` for the connector handle).
 
-> The simplest setup is the unified execute tool above: `createExecuteTool(this)` already includes `cdp.*` alongside `state.*` and `tools.*` when `env.BROWSER` is bound — one tool, one durable history. Use `createBrowserTools` when you want a separate, browser-only tool.
+> The simplest setup is the unified execute tool above: `createExecuteTool(this)` already includes `cdp.*` alongside `tools.*` when `env.BROWSER` is bound — one tool, one durable history. Use `createBrowserTools` when you want a separate, browser-only tool.
 
 ### Combining with Other Tools
 
@@ -552,51 +564,3 @@ getExtensions() {
 ```
 
 The context block is registered as `notes_scratchpad` (namespaced by extension name).
-
-## Workspace Tools for Custom Backends
-
-The individual tool factories are exported for use with custom storage backends that implement the operations interfaces:
-
-```typescript
-import {
-  createReadTool,
-  createWriteTool,
-  createEditTool,
-  createListTool,
-  createFindTool,
-  createGrepTool,
-  createDeleteTool
-} from "@cloudflare/think/tools/workspace";
-import type {
-  ReadOperations,
-  WriteOperations,
-  EditOperations,
-  ListOperations,
-  FindOperations,
-  GrepOperations,
-  DeleteOperations
-} from "@cloudflare/think/tools/workspace";
-```
-
-Implement the operations interface for your storage backend:
-
-```typescript
-const myReadOps: ReadOperations = {
-  readFile: async (path) => fetchFromMyStorage(path),
-  readFileBytes: async (path) => fetchBytesFromMyStorage(path),
-  stat: async (path) => getFileInfo(path)
-};
-
-const readTool = createReadTool({ ops: myReadOps });
-```
-
-Or create the full set from a Workspace:
-
-```typescript
-import { createWorkspaceTools } from "@cloudflare/think/tools/workspace";
-
-const tools = createWorkspaceTools(myCustomWorkspace);
-const toolsWithoutBash = createWorkspaceTools(myCustomWorkspace, {
-  bash: false
-});
-```

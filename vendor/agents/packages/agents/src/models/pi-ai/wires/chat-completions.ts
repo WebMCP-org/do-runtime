@@ -1,6 +1,6 @@
 /**
  * Chat-completions wire: Workers AI on the run path, and any pi-ai model whose
- * `api` is `openai-completions` on AI Gateway's universal endpoint.
+ * `api` is `openai-completions`, through AI Gateway.
  *
  * The request is shaped with pi-ai's own message converter so replay rules
  * (tool-call id normalization, reasoning replay, role bridging) match pi's
@@ -39,13 +39,14 @@ import {
   correlationDetails,
   openAIVendorHeaders,
   responseInfo,
-  sendUniversal,
+  sendGateway,
   startMessage,
   usageFromOpenAI,
   withIdleDeadline,
   recordWarnings
 } from "./shared";
 import type { WireRequest } from "../settings";
+import { PartialArguments } from "./partial-arguments";
 
 type Compat = Parameters<typeof convertMessages>[2];
 
@@ -118,7 +119,8 @@ interface Chunk {
   id?: string;
   model?: string;
   choices?: Choice[];
-  usage?: OpenAIUsage;
+  /** OpenAI sends `null` on every chunk but the last. */
+  usage?: OpenAIUsage | null;
   error?: { message?: string; type?: string };
 }
 
@@ -175,6 +177,7 @@ class CompletionAssembler {
   private thinkingBlock: ThinkingContent | undefined;
   private readonly openToolCalls = new Map<number, ToolCallBlock>();
   private readonly closedToolCalls = new Set<number>();
+  private readonly toolArguments = new Map<number, PartialArguments>();
   private lastToolIndex: number | undefined;
   private readonly blocks: Block[];
 
@@ -274,6 +277,7 @@ class CompletionAssembler {
     this.closedToolCalls.add(index);
     block.arguments = parseStreamingJson(block.partialArguments ?? "");
     delete block.partialArguments;
+    this.toolArguments.delete(index);
     this.stream.push({
       contentIndex: this.indexOf(block),
       partial: this.output,
@@ -323,8 +327,13 @@ class CompletionAssembler {
       }
       this.lastToolIndex = index;
       if (args.length > 0) {
-        block.partialArguments = (block.partialArguments ?? "") + args;
-        block.arguments = parseStreamingJson(block.partialArguments);
+        let parser = this.toolArguments.get(index);
+        if (parser === undefined) {
+          parser = new PartialArguments();
+          this.toolArguments.set(index, parser);
+        }
+        block.arguments = parser.push(args);
+        block.partialArguments = parser.text;
         this.stream.push({
           contentIndex: this.indexOf(block),
           delta: args,
@@ -361,7 +370,7 @@ class CompletionAssembler {
     ) {
       this.output.responseModel ??= chunk.model;
     }
-    if (chunk.usage !== undefined) {
+    if (chunk.usage !== undefined && chunk.usage !== null) {
       this.output.usage = usageFromOpenAI(this.model, chunk.usage);
     }
     const finished = this.applyFinishReason(choice?.finish_reason);
@@ -409,10 +418,12 @@ class CompletionAssembler {
         this.output.stopReason = hasToolCalls ? "toolUse" : "stop";
       } else {
         this.output.stopReason = "error";
+        // "ended without" matches pi-ai's isRetryableAssistantError(), so
+        // pi retries a cut-off stream instead of failing the turn.
         this.output.errorMessage =
           this.blocks.length > 0
-            ? "The stream ended before the model finished its answer."
-            : "The stream ended before the model produced any output.";
+            ? "The stream ended without the model finishing its answer."
+            : "The stream ended without any output from the model.";
       }
     } else if (this.output.stopReason === "stop" && hasToolCalls) {
       this.output.stopReason = "toolUse";
@@ -529,8 +540,8 @@ export function streamCompletions(
         stream: true,
         stream_options: { include_usage: true }
       };
-      // The run path names the model in the call; the universal request names
-      // it in the body, in the vendor's own spelling.
+      // The run path names the model in the call; a provider-native request
+      // names it in the body, in the vendor's own spelling.
       if (!workersAI) strict.model = wireModelId(model);
       const tools = getCurrentTools(context.messages);
       if (tools.length > 0) strict.tools = convertTools(tools);
@@ -566,17 +577,19 @@ export function streamCompletions(
 
       response = workersAI
         ? await transport.run({
+            format: "chat-completions",
             gateway: resolved.gateway,
             headers: request.headers,
             input: payload,
             model: model.id,
             signal: options.signal
           })
-        : await sendUniversal(
+        : await sendGateway(
             request,
             transport,
             payload,
-            openAIVendorHeaders()
+            openAIVendorHeaders(),
+            "chat-completions"
           );
       await options.onResponse?.(responseInfo(response), model);
       attachCorrelation(

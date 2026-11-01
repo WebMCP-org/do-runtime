@@ -1,13 +1,13 @@
 /**
- * Routing a vendor's own AI SDK model through AI Gateway.
+ * Routing a vendor's own AI SDK model through AI Gateway's provider-native
+ * path.
  *
  * Nothing here knows a vendor's wire format, ids, or capabilities. The user
  * builds the model with the vendor's own provider package; this module swaps
- * the `fetch` that model would have used for one that hands the very same
- * request to the gateway's universal endpoint, and hands the gateway's answer
- * straight back to the vendor's own parser.
- *
- * @experimental This surface is experimental and may change.
+ * the `fetch` that model would have used for one that sends the very same
+ * request — method, headers, body — to
+ * `env.AI.fetch(".../ai-gateway/gateways/{gateway}/{provider}/{endpoint}")`,
+ * and hands the vendor's answer straight back to the vendor's own parser.
  */
 
 import type {
@@ -26,7 +26,7 @@ import {
   type ResolvedGatewayProvider,
   requireGatewayProvider
 } from "../../core/gateway-providers";
-import { requireWorkersAIId } from "../errors";
+import { requireLanguageModelId } from "../errors";
 import {
   fallbackLegs,
   rememberOptions,
@@ -35,9 +35,11 @@ import {
   resolveOptions,
   withoutCallFallback,
   type FallbackLeg,
+  type GatewayModelOptions,
   type ModelOptions,
   type ResolvedOptions,
-  type RoutedModelOptions
+  type RoutedModelOptions,
+  type VendorKeyOptions
 } from "../settings";
 import {
   errorFromGatewayEnvelope,
@@ -58,10 +60,11 @@ import {
 /**
  * The options accepted beside a vendor model. Re-exported under the name the
  * module's public surface uses.
- *
- * @experimental This surface is experimental and may change.
  */
 export type { GatewayModelOptions } from "../settings";
+
+/** Which key a routed request authenticates with; see {@link VendorKeyOptions}. */
+type VendorKey = NonNullable<VendorKeyOptions["vendorKey"]>;
 
 /** A model whose provider exposes the standard `config.fetch` setting. */
 interface RoutableModel {
@@ -123,58 +126,58 @@ function requestUrl(input: RequestInfo | URL): string {
 
 /**
  * The body of either `fetch` call form: the `RequestInit`'s when one was
- * given, else the `Request`'s own, read from a clone so the caller's object
- * is neither consumed nor mutated.
+ * given, else the `Request`'s own, from a clone so the caller's object is
+ * neither consumed nor mutated.
  */
-async function requestBody(
+function requestBody(
   input: RequestInfo | URL,
   init: RequestInit | undefined
-): Promise<BodyInit | null | undefined> {
+): BodyInit | null | undefined {
   if (init?.body !== undefined) return init.body;
+  // A clone's body streams through to the binding rather than being read
+  // into memory first, so a large upload costs nothing extra here.
   if (input instanceof Request && input.body !== null) {
-    return await input.clone().text();
+    return input.clone().body;
   }
   return undefined;
 }
 
-/**
- * The vendor's body as the universal request's `query`. Only JSON travels:
- * the gateway's universal request has one JSON field for the whole upstream
- * body, so a multipart upload or a streamed body cannot be expressed.
- */
-function universalQuery(body: BodyInit | null | undefined): unknown {
-  if (typeof body !== "string") {
-    const kind =
-      body === null || body === undefined
-        ? "an empty"
-        : body instanceof FormData
-          ? "a FormData"
-          : `a ${body.constructor?.name ?? typeof body}`;
-    throw new TypeError(
-      `AI Gateway's universal request carries a JSON body only, and this model sent ${kind} body. File uploads and other multipart requests cannot be routed through the gateway; call the vendor directly for those.`
-    );
-  }
+/** The method of either `fetch` call form. */
+function requestMethod(
+  input: RequestInfo | URL,
+  init: RequestInit | undefined
+): string {
+  return init?.method ?? (input instanceof Request ? input.method : "POST");
+}
+
+/** The vendor model id out of a JSON body, for error reporting. */
+function modelOfBody(body: BodyInit | null | undefined): string | undefined {
+  if (typeof body !== "string") return undefined;
   try {
-    return JSON.parse(body) as unknown;
-  } catch (error) {
-    throw new TypeError(
-      `AI Gateway's universal request carries a JSON body only, and this model sent a body that is not JSON: ${String(error)}`
-    );
+    const parsed = JSON.parse(body) as unknown;
+    return modelOf(parsed);
+  } catch {
+    return undefined;
   }
 }
 
 /**
- * The vendor's own request headers, minus the credential the gateway supplies
- * itself and the length of a body we are about to re-serialize.
+ * The vendor's own request headers, minus the length of a body we are about
+ * to re-serialize, and minus the vendor's credential unless the model asked
+ * for it to be forwarded.
  */
 function forwardedHeaders(
   init: RequestInit | undefined,
   input: RequestInfo | URL,
-  route: ResolvedGatewayProvider
+  route: ResolvedGatewayProvider,
+  vendorKey: VendorKey
 ): Record<string, string> {
   const source =
     init?.headers ?? (input instanceof Request ? input.headers : undefined);
-  const dropped = new Set([...route.authHeaders, "content-length"]);
+  const dropped = new Set([
+    ...(vendorKey === "request" ? [] : route.authHeaders),
+    "content-length"
+  ]);
   const headers: Record<string, string> = {};
   new Headers(source).forEach((value, key) => {
     if (!dropped.has(key.toLowerCase())) headers[key] = value;
@@ -196,15 +199,16 @@ function replayed(response: Response, text: string): Response {
 }
 
 /**
- * The `fetch` a routed model is given. It never reaches the vendor: it maps
- * the vendor's URL onto a gateway provider slug and endpoint, hands the body
- * over untouched, and returns the gateway's answer as the vendor's own.
+ * The `fetch` a routed model is given. It maps the vendor's URL onto a gateway
+ * provider slug and endpoint and sends the request there unchanged, through
+ * the binding; the answer is the vendor's own.
  */
 function routedFetch(context: {
   config: LanguageModelConfig;
   resolved: ResolvedOptions;
   capture: RouteCapture;
   signal: AbortSignal | undefined;
+  vendorKey: VendorKey;
 }): typeof globalThis.fetch {
   const routed = async (
     input: RequestInfo | URL,
@@ -212,21 +216,21 @@ function routedFetch(context: {
   ): Promise<Response> => {
     const url = requestUrl(input);
     const route = requireGatewayProvider(url);
-    const query = universalQuery(await requestBody(input, init));
+    const body = requestBody(input, init);
     const { resolved } = context;
-    const extraHeaders = {
-      ...resolved.headers,
-      ...(resolved.sessionAffinity === undefined
-        ? {}
-        : { "x-session-affinity": resolved.sessionAffinity })
-    };
-    const response = await context.config.transport.universal({
+    const response = await context.config.transport.native({
+      body,
       endpoint: route.endpoint,
-      ...(Object.keys(extraHeaders).length > 0 ? { extraHeaders } : {}),
       gateway: resolved.gateway,
-      headers: forwardedHeaders(init, input, route),
+      headers: {
+        ...forwardedHeaders(init, input, route, context.vendorKey),
+        ...resolved.headers,
+        ...(resolved.sessionAffinity === undefined
+          ? {}
+          : { "x-session-affinity": resolved.sessionAffinity })
+      },
+      method: requestMethod(input, init),
       provider: route.provider,
-      query,
       // The vendor puts the call's abort signal on the request it builds; the
       // call's own is the fallback for a provider that forgets to.
       signal:
@@ -240,16 +244,16 @@ function routedFetch(context: {
     // how; only the gateway's own failures are lifted here.
     if (response.ok) return response;
     const text = await response.text();
-    let body: unknown;
+    let envelope: unknown;
     try {
-      body = JSON.parse(text) as unknown;
+      envelope = JSON.parse(text) as unknown;
     } catch {
       return replayed(response, text);
     }
-    if (!isGatewayErrorEnvelope(body)) return replayed(response, text);
-    throw errorFromGatewayEnvelope(body, {
-      model: modelOf(query) ?? route.provider,
-      requestBodyValues: query,
+    if (!isGatewayErrorEnvelope(envelope)) return replayed(response, text);
+    throw errorFromGatewayEnvelope(envelope, {
+      model: modelOfBody(body) ?? route.provider,
+      requestBodyValues: undefined,
       responseBody: text,
       responseHeaders: headersToObject(response.headers),
       status: response.status,
@@ -389,19 +393,17 @@ function stampStream(
  * A `LanguageModelV4` that is the user's own vendor model, routed through AI
  * Gateway. Generation, parsing, tool handling and error shapes stay the
  * vendor's; only the transport is Cloudflare's.
- *
- * @experimental This surface is experimental and may change.
  */
 export class GatewayLanguageModel implements LanguageModelV4 {
   readonly specificationVersion = "v4" as const;
 
   readonly #model: LanguageModelV4;
-  readonly #options: ModelOptions | undefined;
+  readonly #options: GatewayModelOptions | undefined;
   readonly #config: LanguageModelConfig;
 
   constructor(
     model: LanguageModelV4,
-    options: ModelOptions | undefined,
+    options: GatewayModelOptions | undefined,
     config: LanguageModelConfig
   ) {
     // Fail where the mistake was made, not one call later.
@@ -498,7 +500,13 @@ export class GatewayLanguageModel implements LanguageModelV4 {
   ): LanguageModelV4 {
     return cloneWithFetch(
       this.#model,
-      routedFetch({ capture, config: this.#config, resolved, signal })
+      routedFetch({
+        capture,
+        config: this.#config,
+        resolved,
+        signal,
+        vendorKey: this.#options?.vendorKey ?? "gateway"
+      })
     );
   }
 
@@ -513,7 +521,7 @@ export class GatewayLanguageModel implements LanguageModelV4 {
     const response = capture.response ?? new Response(null);
     return cloudflareMetadata(
       this.modelId,
-      resolved,
+      resolved.gateway.id,
       response,
       this.#config.transport,
       capture.provider
@@ -562,9 +570,9 @@ export class GatewayLanguageModel implements LanguageModelV4 {
   #workersAI(modelId: string): LanguageModelV4 {
     return new CloudflareLanguageModel(
       // Belt and braces: `ai()` and the per-call bag both gate their legs, so
-      // a non-`@cf/` id can only arrive from a caller that built the model
+      // any other id can only arrive from a caller that built the model
       // some other way — and it must not reach `env.AI.run` either.
-      requireWorkersAIId(modelId),
+      requireLanguageModelId(modelId),
       { ...this.#options, fallback: undefined },
       this.#config
     );
@@ -579,12 +587,10 @@ interface RoutedCall {
 
 /**
  * Routes any other AI SDK v4 model the vendor built — embedding, image,
- * speech, transcription — through the same universal gateway request. Only
+ * speech, transcription — through the same provider-native request. Only
  * `fetch` is swapped; every `do…` method stays the vendor's, and its result
  * gains `providerMetadata.cloudflare` when the result is an object that can
  * carry one.
- *
- * @experimental This surface is experimental and may change.
  */
 export function routed<T extends object>(
   model: T,
@@ -622,7 +628,13 @@ export function routed<T extends object>(
         const capture: RouteCapture = {};
         const clone = cloneWithFetch(
           target as LanguageModelV4,
-          routedFetch({ capture, config, resolved, signal: call?.abortSignal })
+          routedFetch({
+            capture,
+            config,
+            resolved,
+            signal: call?.abortSignal,
+            vendorKey: options?.vendorKey ?? "gateway"
+          })
         );
         const method = Reflect.get(clone, property) as (
           argument: RoutedCall
@@ -640,7 +652,7 @@ export function routed<T extends object>(
               result,
               cloudflareMetadata(
                 String((target as RoutableModel).modelId ?? ""),
-                resolved,
+                resolved.gateway.id,
                 capture.response ?? new Response(null),
                 config.transport,
                 capture.provider

@@ -24,21 +24,20 @@ describe("execute tool on the codemode runtime", () => {
     expect(out.result).toBe(5);
   });
 
-  it("runs sandbox code against state.* with object args", async () => {
+  it("runs sandbox code against the workspace tools", async () => {
     const agent = await freshAgent();
     const out = await agent.runExecute(
       `async () => {
-        await state.writeFile({ path: "/notes.txt", content: "hello" });
-        await state.replaceInFile({
-          path: "/notes.txt",
-          search: "hello",
-          replacement: "bye"
+        await tools.write({ path: "/workspace/notes.txt", content: "hello" });
+        await tools.edit({
+          path: "/workspace/notes.txt",
+          edits: [{ oldText: "hello", newText: "bye" }]
         });
-        return await state.readFile({ path: "/notes.txt" });
+        return JSON.stringify(await tools.read({ path: "/workspace/notes.txt" }));
       }`
     );
     expect(out.status).toBe("completed");
-    expect(out.result).toBe("bye");
+    expect(String(out.result)).toContain("bye");
   });
 
   it("maps needsApproval AI SDK tools to requiresApproval — the call pauses durably", async () => {
@@ -69,16 +68,13 @@ describe("execute tool on the codemode runtime", () => {
     expect(out.executionId).toBeTruthy();
   });
 
-  it("one-liner: createExecuteTool(agent) defaults state from the workspace and records on this.codemode", async () => {
+  it("one-liner: createExecuteTool(agent) runs without state.* and records on this.codemode", async () => {
     const agent = await freshAgent();
     const out = await agent.runOneLiner(
-      `async () => {
-        await state.writeFile({ path: "/one-liner.txt", content: "default state" });
-        return await state.readFile({ path: "/one-liner.txt" });
-      }`
+      `async () => typeof globalThis.state === "undefined" ? "no state" : "state"`
     );
     expect(out.status).toBe("completed");
-    expect(out.result).toBe("default state");
+    expect(out.result).toBe("no state");
 
     // createExecuteRuntime(agent) assigned the handle to agent.codemode —
     // the audit trail is reachable from agent code (callables, hooks).

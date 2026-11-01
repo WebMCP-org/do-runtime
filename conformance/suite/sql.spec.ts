@@ -172,6 +172,14 @@ it("§1.4 SQLite R*Tree virtual tables are available", async () => {
   expect(await probe.call("sqliteRtree")).toEqual({ ids: [{ id: 1 }], check: "ok" });
 });
 
+it("§1.4 a reused EXPLAIN follows schema changes and fails once its table is gone", async () => {
+  const probe = await host.spawn("sql-explain-schema-change");
+  expect(await probe.call("sqlExplainAfterSchemaChange")).toEqual({
+    rowCounts: [true, true, true, true, true, true, true],
+    dropped: "no such table",
+  });
+});
+
 it("§1.4 the authorizer-only forms are refused, with workerd's own messages", async () => {
   // ATTACH, DETACH, the temp-schema creations and the virtual-table modules reach action codes
   // or the authorizer's `dbName == temp` rule, not regulator callbacks, so porting

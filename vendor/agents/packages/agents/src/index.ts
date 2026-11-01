@@ -92,6 +92,8 @@ import {
   type WSMessage
 } from "./lifecycle/durable-object-lifecycle";
 import { abortWithoutAlarmRetry } from "./lifecycle/abort";
+import type { InternalHostMessage } from "./browser/internal-hosts";
+import { browserCapabilityId } from "./browser/capability-id";
 import type { LifecycleRouteAddress } from "./lifecycle/capability";
 import {
   getCurrentAgent as getCurrentLifecycleAgent,
@@ -152,7 +154,7 @@ import {
   genericObservability,
   type Observability,
   type ObservabilityEvent
-} from "./observability";
+} from "./observability/emitter";
 import { agentSpanAttributes } from "./observability/agent-span-attributes";
 import { tracer } from "./observability/tracing/cloudflare";
 import {
@@ -163,10 +165,9 @@ import {
 } from "./observability/tracing/tracer";
 import { DisposableStore } from "./core/events";
 import { MessageType } from "./types";
-import { RPC_DO_PREFIX } from "./mcp/rpc";
+import { RPC_DO_PREFIX, type McpRpcAgent } from "./mcp/rpc";
 import { raceWithSignal } from "./mcp/abort";
 import { ensureMcpServerTable } from "./mcp/client/storage";
-import type { McpAgent } from "./mcp";
 import { Scheduler, setSchedulerCallbackResolver } from "./schedules/scheduler";
 import { Queue, setQueueCallbackResolver } from "./queue/queue";
 import type { QueueItem } from "./queue/types";
@@ -1006,13 +1007,12 @@ export interface AgentStaticOptions {
    * reset (the isolate exceeded its 128 MB limit) before the alarm-boundary
    * circuit breaker stops the platform's auto-retry loop and seals the looping
    * recovery work (#1825). Default: 3. Set to `0` to seal on the first such
-   * reset. This is the universal backstop for the case where the in-DO recovery
-   * budgets (`chatRecovery.maxOomRetries` / `maxRecoveryWork`) can't engage
-   * because the OOM bypasses them — e.g. it is thrown before the budget code
-   * runs, or its own writes also OOM. The boundary handler runs at the outermost
-   * alarm frame, after the heavy turn has unwound and GC has reclaimed its
-   * footprint, so its small seal/purge writes can land where mid-turn writes
-   * could not.
+   * reset. The strike counter is written after the reset, so it only advances
+   * when that isolate's storage still accepts writes, for example when the
+   * reset error came from another isolate such as D1. A Durable Object's own
+   * memory-limit reset rejects every later storage call in that invocation, so
+   * chat recovery does not rely on this counter: it counts each interrupted
+   * attempt in the next isolate (`chatRecovery.maxInterruptedAttempts`, #2613).
    */
   maxAlarmMemoryLimitStrikes?: number;
 }
@@ -1122,8 +1122,6 @@ export class Agent<
 > extends DurableObject<Env> {
   /**
    * Runtime lifecycle and reusable durable capabilities for this Agent.
-   *
-   * @experimental The API surface may change before stabilizing.
    */
   readonly lifecycle = Lifecycle.install<Env, Props>(this, {
     maxAlarmMemoryLimitStrikes: this._resolvedOptions.maxAlarmMemoryLimitStrikes
@@ -1337,10 +1335,8 @@ export class Agent<
 
   /**
    * Durable scheduling capability installed into this Agent's Lifecycle.
-   *
-   * @experimental The API surface may change before stabilizing. Agent's
-   * schedule()/scheduleEvery()/getScheduleById()/listSchedules()/
-   * cancelSchedule() methods are the stable surface.
+   * Agent's schedule()/scheduleEvery()/getScheduleById()/listSchedules()/
+   * cancelSchedule() methods delegate to it.
    */
   readonly scheduler: Scheduler;
 
@@ -3228,6 +3224,24 @@ export class Agent<
     envelope: LifecycleRouteEnvelope
   ): Promise<unknown> {
     return this._dynamicAgents.routeLifecycleToTarget(target, envelope);
+  }
+
+  /**
+   * Serves a browser's request to one of its internal hostnames. Browser
+   * Run's `InternalHostRouter` calls this over RPC; it passes the message to
+   * the `Browser` it names, which runs the host's `fetch`. Built in, so an
+   * Agent needs nothing extra for internal hostnames. Not `@callable`, so
+   * clients can't reach it.
+   */
+  async fetchInternalHost(message: InternalHostMessage): Promise<Response> {
+    await this.__unsafe_ensureInitialized();
+    // Routed by capability id rather than through the Browser itself, so
+    // Agent doesn't bundle the browser code.
+    return (await this.lifecycle.route({
+      capability: browserCapabilityId(message.browser),
+      source: undefined,
+      payload: message
+    })) as Response;
   }
 
   /** Single native-RPC aperture for routed Lifecycle capabilities. */
@@ -9983,7 +9997,7 @@ export class Agent<
   }
 
   private _findBindingNameForNamespace(
-    namespace: DurableObjectNamespace<McpAgent>
+    namespace: DurableObjectNamespace<McpRpcAgent>
   ): string | undefined {
     for (const [key, value] of Object.entries(
       this.env as Record<string, unknown>
@@ -10199,7 +10213,7 @@ export class Agent<
    * await this.addMcpServer("counter", env.MY_MCP);
    * await this.addMcpServer("counter", env.MY_MCP, { props: { userId: "123" } });
    */
-  async addMcpServer<T extends McpAgent>(
+  async addMcpServer<T extends McpRpcAgent>(
     serverName: string,
     binding: DurableObjectNamespace<T>,
     options?: AddRpcMcpServerOptions
@@ -10228,7 +10242,7 @@ export class Agent<
     | { id: string; state: typeof MCPConnectionState.READY }
   >;
 
-  async addMcpServer<T extends McpAgent>(
+  async addMcpServer<T extends McpRpcAgent>(
     serverName: string,
     urlOrBinding: string | DurableObjectNamespace<T>,
     callbackHostOrOptions?:
@@ -10390,7 +10404,7 @@ export class Agent<
           transport: {
             type: "rpc" as TransportType,
             namespace:
-              urlOrBinding as unknown as DurableObjectNamespace<McpAgent>,
+              urlOrBinding as unknown as DurableObjectNamespace<McpRpcAgent>,
             name: normalizedName,
             props: rpcOpts?.props
           }
@@ -10412,7 +10426,7 @@ export class Agent<
       }
 
       const bindingName = this._findBindingNameForNamespace(
-        urlOrBinding as unknown as DurableObjectNamespace<McpAgent>
+        urlOrBinding as unknown as DurableObjectNamespace<McpRpcAgent>
       );
       if (bindingName) {
         this.mcp.saveRpcServerToStorage(

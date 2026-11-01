@@ -7,7 +7,7 @@
  * per container and can be mirrored through `HibernationHost` for reconstruction.
  */
 
-import type { IoContext } from "../io/io-context";
+import { atCheckpointEnd, type IoContext } from "../io/io-context";
 import type { CriticalSection } from "../io/io-gate";
 import { deserializeValue, serializeValue } from "./actor-state";
 
@@ -111,6 +111,10 @@ type SocketEvent = (typeof SOCKET_EVENTS)[number];
 type PairState = {
   used: boolean;
   hibernationAccepted: boolean;
+  /** One half went out in a Response, so the other half's peer is the network. */
+  coupled?: true;
+  /** Both halves, so coupling one can settle what the other already wrote. */
+  halves?: readonly [AcceptedWebSocket, AcceptedWebSocket];
 };
 
 type SocketAcceptance =
@@ -127,7 +131,63 @@ type SocketMetadata = {
   attachment?: Uint8Array;
   /** The actor's gated side of a host transport, kept across registries. */
   wrapper?: AcceptedWebSocket;
+  /**
+   * ← `HibernatableReleaseState` set by `initiateHibernatableRelease()`
+   * (`web-socket.c++:1665`), which `sendHibernatableWebSocketClose` calls right
+   * before the JS `webSocketClose` handler (`global-scope.c++:995-1000`).
+   */
+  closeDispatched?: true;
+  /**
+   * A pair half's own close is written and its completion not yet observed.
+   * See `ownCloseWritten()`.
+   */
+  ownCloseCompletion?: "pending";
+  /**
+   * ← `native.state.init<Released>()` in `tryReleaseNative()` (`web-socket.c++:1430-1438`).
+   * After this `getTags()` no longer finds an accepted socket.
+   */
+  released?: true;
 };
+
+/**
+ * ← the pump continuation (`web-socket.c++:1202-1233`). It releases a
+ * hibernatable socket only when it runs after the close event was dispatched:
+ * `closedIncoming` and the release state are both set by
+ * `initiateHibernatableRelease()`. The other `tryReleaseNative()` callers are
+ * not reached by a hibernatable socket that closed cleanly: a disconnect
+ * without a Close frame (`:910`), `send()`/`close()` in the error state
+ * (`:936`, `:1030`), and the `accept()` read loop (`:1553`). A continuation
+ * that ran earlier released nothing, and no later one comes, so the socket
+ * stays accepted with its tags.
+ *
+ * When the continuation runs is a property of the transport, measured against
+ * raw workerd 1.20261031.1 (docs/workerd-sync.md):
+ *
+ * - A network transport's write completes at once and its continuation is the
+ *   next turn. The peer's echo takes longer, so own close then echo leaves the
+ *   socket accepted, and a close sent from `webSocketClose` releases it. A pair
+ *   whose other half went out in a Response (`coupleToHost()`) is one of these:
+ *   its peer is the network.
+ * - A `WebSocketPair` write completes when the other half reads it, inside the
+ *   same isolate, and the continuation lands after this socket's next
+ *   hibernation event. That event is the echo when nothing is queued ahead of
+ *   it, which releases the socket; a message ahead of the echo takes it, and
+ *   the socket stays accepted.
+ */
+function ownCloseWritten(state: SocketMetadata, pair: boolean): void {
+  if (pair && state.closeDispatched === undefined) {
+    state.ownCloseCompletion = "pending";
+    return;
+  }
+  atCheckpointEnd(() => {
+    completeOwnClose(state);
+  });
+}
+
+function completeOwnClose(state: SocketMetadata): void {
+  delete state.ownCloseCompletion;
+  if (state.closeDispatched !== undefined) state.released = true;
+}
 
 /** Raw listeners follow transport ownership without retaining a released actor wrapper. */
 type SocketReceiver = { socket: AcceptedWebSocket };
@@ -370,7 +430,15 @@ export class AcceptedWebSocket extends EventTarget implements RawWebSocket, WebS
     this.#markPairUsed();
     this.#ownClose = true;
     this.#readyState = this.#peerClose ? AcceptedWebSocket.CLOSED : AcceptedWebSocket.CLOSING;
-    this.#enqueue(() => this.#socket.close(code, reason));
+    this.#enqueue(() => {
+      this.#socket.close(code, reason);
+      if (this.#delivery.mode === "hibernatable") {
+        ownCloseWritten(
+          socketMetadata(this),
+          this.#socket instanceof MemoryWebSocketEndpoint && this.#pairState?.coupled !== true,
+        );
+      }
+    });
   }
 
   /**
@@ -446,6 +514,17 @@ export class AcceptedWebSocket extends EventTarget implements RawWebSocket, WebS
     host.#peerClose = this.#peerClose;
     host.#binaryType = this.#binaryType;
     this.#markPairUsed();
+    if (this.#pairState !== undefined) {
+      this.#pairState.coupled = true;
+      // ← the coupling pump starts reading as the Response goes out, so a close
+      // the other half wrote before this point completes now, ahead of the echo
+      // the host sends once it accepts, not when its next event arrives. Raw
+      // workerd keeps the tags through the echo of such a close
+      // (docs/workerd-sync.md, close before the Response is returned).
+      const other = this.#pairState.halves?.find((half) => half !== this);
+      const state = other === undefined ? undefined : socketMetadata(other);
+      if (state?.ownCloseCompletion !== undefined) completeOwnClose(state);
+    }
     this.#released = true;
     this.#ctx = undefined;
     this.#pending = [];
@@ -471,7 +550,25 @@ export class AcceptedWebSocket extends EventTarget implements RawWebSocket, WebS
     const pending = this.#pending;
     this.#pending = [];
     for (const item of pending) {
+      // ← the `accept()` read loop answers a close it finds queued, as it would
+      // one that arrives later; raw workerd fires `webSocketClose` on the other
+      // half after a late `accept()` with no echo from the handler.
+      if (item.type === "close") this.#answerPeerClose(item.event as CloseEvent);
       this.#deliverClassic(item.type, item.event, delivery.criticalSection);
+    }
+  }
+
+  /**
+   * Pair halves perform the WebSocket close handshake in-memory. An
+   * embedder-supplied raw socket owns its own protocol and only reports.
+   * A dropped connection leaves nobody to answer.
+   */
+  #answerPeerClose(event: CloseEvent): void {
+    if (this.#pairState === undefined || this.#ownClose) return;
+    if (!event.wasClean || event.code === 1005 || event.code === 1006 || event.code === 1015) {
+      this.#readyState = AcceptedWebSocket.CLOSED;
+    } else {
+      this.close(event.code, event.reason);
     }
   }
 
@@ -510,16 +607,7 @@ export class AcceptedWebSocket extends EventTarget implements RawWebSocket, WebS
     } else {
       this.#peerClose = true;
       this.#readyState = AcceptedWebSocket.CLOSING;
-      if (this.#delivery.mode === "classic" && this.#pairState !== undefined) {
-        // Pair halves perform the WebSocket close handshake in-memory. An
-        // embedder-supplied raw socket owns its own protocol and only reports.
-        // A dropped connection leaves nobody to answer.
-        if (!event.wasClean || event.code === 1005 || event.code === 1006 || event.code === 1015) {
-          this.#readyState = AcceptedWebSocket.CLOSED;
-        } else {
-          this.close(event.code, event.reason);
-        }
-      }
+      if (this.#delivery.mode === "classic") this.#answerPeerClose(event);
     }
     const delivery = this.#delivery;
     if (delivery.mode === "pending") this.#pending.push({ type: "close", event });
@@ -650,7 +738,7 @@ export class HibernatableWebSocketRegistry {
 
   getTags(socket: RawWebSocket): string[] {
     const state = isRawWebSocket(socket) ? metadata.get(socket) : undefined;
-    if (state?.accepted === undefined) {
+    if (state?.accepted === undefined || state.released !== undefined) {
       throw new Error(
         "you must call 'acceptWebSocket()' before attempting to access the tags of a WebSocket.",
       );
@@ -749,27 +837,68 @@ export class HibernatableWebSocketRegistry {
       if (message instanceof Blob) {
         this.#ctx.addWaitUntil(
           message.arrayBuffer().then((buffer) => {
-            this.#schedule(() => this.#dispatch.message(socket, buffer));
+            this.#schedule(entry, () => this.#dispatch.message(socket, buffer));
           }),
         );
         return;
       }
-      this.#schedule(() => this.#dispatch.message(socket, message));
+      this.#schedule(entry, () => this.#dispatch.message(socket, message));
       return;
     }
     if (type === "close") {
-      this.#remove(entry);
       const close = event as CloseEvent;
-      this.#schedule(() =>
-        this.#dispatch.close(socket, close.code, close.reason, close.wasClean),
+      this.#schedule(
+        entry,
+        () => this.#dispatch.close(socket, close.code, close.reason, close.wasClean),
+        true,
       );
       return;
     }
-    if (type === "error") this.#schedule(() => this.#dispatch.error(socket, event));
+    if (type === "error") this.#schedule(entry, () => this.#dispatch.error(socket, event));
   }
 
-  #schedule(handler: () => unknown): void {
-    this.#ctx.addWaitUntil(this.#ctx.run(handler).then(() => {}));
+  /**
+   * One hibernatable event. workerd's bookkeeping for it lands a turn after the
+   * handler's synchronous part, which is what `atCheckpointEnd` is:
+   *
+   * - A close event leaves `getWebSockets()` there. ← `readLoop` returns once the
+   *   custom event does, and `handleSocketTermination` drops the socket
+   *   (`legacy-hibernation-manager.c++:470-478,654-660`); the event finishes with
+   *   the handler's synchronous part, its promise being a `waitUntil`
+   *   (`global-scope.c++:999`). So the handler itself still lists the socket.
+   * - A pair half's pending own-close completion is observed there (see
+   *   `ownCloseWritten()`).
+   *
+   * A close that never reaches a handler (an aborted context) still leaves the list.
+   */
+  #schedule(entry: RegistryEntry, handler: () => unknown, isClose = false): void {
+    const state = socketMetadata(entry.raw);
+    let settled = false;
+    const settle = (): void => {
+      if (settled) return;
+      settled = true;
+      if (isClose) this.#remove(entry);
+      if (state.ownCloseCompletion !== undefined) completeOwnClose(state);
+    };
+    let entered = false;
+    const run = this.#ctx.run(() => {
+      entered = true;
+      if (isClose) state.closeDispatched = true;
+      try {
+        return handler();
+      } finally {
+        if (isClose || state.ownCloseCompletion !== undefined) atCheckpointEnd(settle);
+      }
+    });
+    this.#ctx.addWaitUntil(
+      run.then(
+        () => {},
+        (error: unknown) => {
+          if (!entered && isClose) settle();
+          throw error;
+        },
+      ),
+    );
   }
 
   #remove(entry: RegistryEntry): void {
@@ -804,6 +933,11 @@ export class HibernatableWebSocketRegistry {
     const tags = normalizeTags(value.tags);
     const state = socketMetadata(socket);
     state.accepted = { mode: "hibernatable", registry: this, tags };
+    // ← `initNative()` (`web-socket.c++:283-293`): a socket woken from hibernation
+    // is Accepted again, its tags readable, whatever its own close did before.
+    delete state.closeDispatched;
+    delete state.ownCloseCompletion;
+    delete state.released;
     if (value.attachment !== undefined) {
       state.attachment = value.attachment.slice();
     }
@@ -822,10 +956,12 @@ export class HibernatableWebSocketRegistry {
     const right = new MemoryWebSocketEndpoint();
     left.peer = right;
     right.peer = left;
-    return {
-      0: new AcceptedWebSocket(this.#ctx, left, pairState),
-      1: new AcceptedWebSocket(this.#ctx, right, pairState),
-    };
+    const halves = [
+      new AcceptedWebSocket(this.#ctx, left, pairState),
+      new AcceptedWebSocket(this.#ctx, right, pairState),
+    ] as const;
+    pairState.halves = halves;
+    return { 0: halves[0], 1: halves[1] };
   }
 }
 

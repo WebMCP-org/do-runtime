@@ -1,5 +1,45 @@
 # @cloudflare/think
 
+## 0.23.0
+
+### Minor Changes
+
+- [#2771](https://github.com/cloudflare/agents/pull/2771) [`54ae3e8`](https://github.com/cloudflare/agents/commit/54ae3e86987be92ae20bc6a8b06c26ec1884d01c) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Breaking: Think reloads `getSkills()` sources every turn, so `skills.workspace(this.workspace)` picks up skills written to `/workspace/.agents/skills`; an overridden `getSystemPrompt()` now always renders above context blocks instead of being dropped once any block exists; skill catalog changes reach the model as a context reminder rather than rebuilding the cached system prompt; `skillWorkspace` and the extension `"skill"` context block type are removed. See [Agent Skills](https://developers.cloudflare.com/agents/skills/).
+
+## 0.22.0
+
+### Minor Changes
+
+- [#2632](https://github.com/cloudflare/agents/pull/2632) [`361046e`](https://github.com/cloudflare/agents/commit/361046e4f5f528540783d9078c438cb3cbe2d470) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Remove `lazyWorkspace`, exported by mistake in 0.21.0. Use `getWorkspace(() => stub)` from `@cloudflare/computer` instead. Think's `@cloudflare/computer` peer is now `^0.8.0`, so upgrade Computer to 0.8 alongside Think. See [Multi-session chat](https://github.com/cloudflare/agents/blob/main/docs/think/multi-chat.md#share-the-workspace).
+
+### Patch Changes
+
+- [#2678](https://github.com/cloudflare/agents/pull/2678) [`325c6ca`](https://github.com/cloudflare/agents/commit/325c6ca1c9c28f056aa14df6c611c165062151f5) Thanks [@github-actions](https://github.com/apps/github-actions)! - Fix the `ai` peer dependency version in the Think README; see [Think dependencies](https://github.com/cloudflare/agents/blob/main/docs/think/index.md#dependencies).
+
+## 0.21.0
+
+### Minor Changes
+
+- [#2561](https://github.com/cloudflare/agents/pull/2561) [`998ae40`](https://github.com/cloudflare/agents/commit/998ae40e999b5d5acc5bd0f64f538732457fc613) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Think's workspace tools are now `@cloudflare/computer`'s `createAITools`, and `exec` offers every backend the Workspace has; `createWorkspaceTools`, `workspaceBash`, and `@cloudflare/think/tools/workspace` are removed. See [Built-in workspace tools](https://github.com/cloudflare/agents/blob/main/docs/think/tools.md#built-in-workspace-tools).
+
+- [#2560](https://github.com/cloudflare/agents/pull/2560) [`8c720d3`](https://github.com/cloudflare/agents/commit/8c720d3b0d7703741bf0f6e47b571d3e21c50742) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Think's `workspace` is now a `Workspace` from `@cloudflare/computer`, a new peer dependency. See [Upgrading to a Computer workspace](https://github.com/cloudflare/agents/blob/main/docs/think/index.md#upgrading-to-a-computer-workspace).
+
+- [#2562](https://github.com/cloudflare/agents/pull/2562) [`db4303c`](https://github.com/cloudflare/agents/commit/db4303c924c8fe33f25afbc42c70f72d82f6dc28) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Think no longer depends on `@cloudflare/shell`, and the execute tool's `state` option is removed. See [Code Execution Tool](https://github.com/cloudflare/agents/blob/main/docs/think/tools.md#code-execution-tool).
+
+- [#2565](https://github.com/cloudflare/agents/pull/2565) [`f56cd20`](https://github.com/cloudflare/agents/commit/f56cd20dd58dc88f4b76a601bcd94b9eabcd6661) Thanks [@mattzcarey](https://github.com/mattzcarey)! - `createExecuteTool` and `createExecuteRuntime` are deprecated in favour of `exec` with a `ws:tools` module. See [Calling the agent's tools from code](https://github.com/cloudflare/agents/blob/main/docs/think/tools.md#calling-the-agents-tools-from-code).
+
+### Patch Changes
+
+- [#2615](https://github.com/cloudflare/agents/pull/2615) [`05843e4`](https://github.com/cloudflare/agents/commit/05843e428be0d8b43a5bf1923d8e40adce6f213d) Thanks [@mattzcarey](https://github.com/mattzcarey)! - Chat recovery now seals a turn after `chatRecovery.maxInterruptedAttempts` interrupted attempts (default 5), so a turn that exceeds the Durable Object memory limit on every run no longer retries forever; `maxOomRetries` is deprecated. See [Stream Recovery](https://github.com/cloudflare/agents/blob/main/docs/agents/chat-agents.md#stream-recovery).
+
+- [#2593](https://github.com/cloudflare/agents/pull/2593) [`b905483`](https://github.com/cloudflare/agents/commit/b905483d9cfd37e20f323d24bbc0344b289b4ea6) Thanks [@ben-reitz](https://github.com/ben-reitz)! - Reuse one `Intl.DateTimeFormat` per timezone when computing wall-clock scheduled task occurrences, cutting the CPU cost of each occurrence substantially. See [#2583](https://github.com/cloudflare/agents/issues/2583); thanks @Bowiemb.
+
+## 0.20.2
+
+### Patch Changes
+
+- [#2522](https://github.com/cloudflare/agents/pull/2522) [`bcf5d20`](https://github.com/cloudflare/agents/commit/bcf5d2057aa477da9f464af8496a21811416a7c4) Thanks [@ben-reitz](https://github.com/ben-reitz)! - `fetch_url` now blocks private and local hosts using the shared policy from `agents/webfetch`. See [Fetch the Web: URL policy](https://github.com/cloudflare/agents/blob/main/docs/agents/fetch-the-web.md#url-policy).
+
 ## 0.20.1
 
 ### Patch Changes

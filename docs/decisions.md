@@ -8,8 +8,8 @@ the index the citations resolve to, not a second specification.
 Workerd line citations throughout the source use release `v1.20260713.1`, commit
 `03c396e9b14ea5644dfcfb696086d8df040a4efc` of
 [cloudflare/workerd](https://github.com/cloudflare/workerd). The conformance
-oracle is pinned separately to release `v1.20261009.1`, commit
-`a3985499a5f7820cf72f39aba486120383e6580c`.
+oracle is pinned separately to release `v1.20261031.1`, commit
+`8119fd824c29ba4a877824b01ebb0b5dbefe444c`.
 The [workerd sync audit](workerd-sync.md) records the reviewed changes and
 remaining host-engine differences. New source comments name their upstream
 commit when the July line baseline no longer applies.
@@ -93,8 +93,11 @@ and the live per-container registry. A host that may evict a container mirrors
 accepted sockets through `ports.hibernation` and passes them back through
 `options.webSockets`; they are registered before the next constructor runs.
 Pair construction is not tied to one event—using either half via `accept()` or
-a 101 Response is the boundary. A closed socket leaves `getWebSockets()` before
-its close handler runs, but retains its tags for that handler. Host extraction
+a 101 Response is the boundary. A closed socket stays in `getWebSockets()`, with
+its tags, while its close handler's synchronous part runs, and leaves the list
+one turn later. A socket that sent its own close is released, and `getTags()`
+throws, only when that close completes after the close was dispatched. A
+socket woken from hibernation is accepted again. Host extraction
 with `upgradeWebSocket(response)` transfers the endpoint into a distinct host
 socket that outlives actor eviction; the actor's retained reference becomes
 inert. Host event delivery stays asynchronous. Application sends snapshot binary data before waiting for output

@@ -21,7 +21,6 @@ async function main() {
       "src/messengers/browser/slack-socket-mode.ts",
       "src/messengers/browser/discord-js.ts",
 
-      "src/tools/workspace.ts",
       "src/tools/fetch.ts",
       "src/tools/execute.ts",
       "src/tools/extensions.ts",
