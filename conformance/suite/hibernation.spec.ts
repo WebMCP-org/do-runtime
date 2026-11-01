@@ -22,6 +22,7 @@ async function eventually<T>(read: () => Promise<T>, ready: (value: T) => boolea
 
 async function journal(actor: ProbeActor): Promise<{
   events: Record<string, unknown>[];
+  afterTurn: Record<string, unknown>[];
   trace: string[];
   listenerMessages: number;
   clients: Record<string, unknown[]>;
@@ -30,6 +31,34 @@ async function journal(actor: ProbeActor): Promise<{
 }> {
   return await actor.call("socketJournal");
 }
+
+/**
+ * A value read in a hibernation handler's synchronous part, asserted only where
+ * that part runs on time.
+ *
+ * vitest-pool-workers wraps every Durable Object method. Its wrapper queues the
+ * call and awaits the instance before calling the user's handler
+ * (`@cloudflare/vitest-pool-workers/dist/worker/lib/cloudflare/test-internal.mjs`,
+ * `enqueueInvocation` then `await this[kEnsureInstance]()`), so on the workerd
+ * lane `webSocketClose` and `webSocketMessage` start at least one I/O turn
+ * late. workerd settles a closed socket on exactly that turn: it leaves
+ * `getWebSockets()` and may be released (no tags). The oracle lane therefore
+ * only ever sees the state after that turn, and its sync-handler reading is the
+ * wrapper's delay rather than workerd. The sync values asserted here were
+ * measured against raw `workerd serve` 1.20261031.1 with no wrapper
+ * (docs/workerd-sync.md, "getTags() and listing during webSocketClose").
+ * Each row also asserts the reads after an awaited timer (`afterTurn`), which
+ * every lane, the oracle included, reaches undistorted.
+ */
+const handlerEntryDelayed = host.lane === "workerd";
+function onTime<T>(value: T): unknown {
+  return handlerEntryDelayed ? expect.anything() : value;
+}
+
+const NOT_ACCEPTED: CapturedError = {
+  name: "Error",
+  message: "you must call 'acceptWebSocket()' before attempting to access the tags of a WebSocket.",
+};
 
 describe("acceptWebSocket and getWebSockets", () => {
   it("A1-A4 refuses cross-accepts, enforces pair use, and permits the client half", async () => {
@@ -224,17 +253,22 @@ describe("handler dispatch and close state", () => {
     await actor.call("closeSelfClient", "socket", 4001, "bye");
     const result = await eventually(
       () => journal(actor),
-      (value) => value.events.some((event) => "close" in event),
+      (value) => value.afterTurn.some((event) => event.event === "close"),
     );
     expect(result.events.at(-1)).toEqual({
       id: "socket",
       close: { code: 4001, reason: "bye", wasClean: true },
       readyState: 2,
-      listedDuringHandler: false,
+      listedDuringHandler: onTime(true),
       tagsDuringHandler: ["socket"],
       sendAfterPeerClose: null,
       reciprocalClose: null,
     });
+    // The close the handler sent completes after the close event was dispatched,
+    // which releases the socket (`web-socket.c++:1216-1229`).
+    expect(result.afterTurn).toEqual([
+      { id: "socket", event: "close", listed: false, tags: NOT_ACCEPTED },
+    ]);
     expect((await journal(actor)).listed).toEqual([]);
   });
 
@@ -247,26 +281,27 @@ describe("handler dispatch and close state", () => {
     });
     const result = await eventually(
       () => journal(actor),
-      (value) => value.events.some((event) => "close" in event),
+      (value) => value.afterTurn.some((event) => event.event === "close"),
     );
     expect(result.events.at(-1)).toEqual({
       id: "socket",
       close: { code: 4002, reason: "server out", wasClean: true },
       readyState: 3,
-      listedDuringHandler: false,
-      // The own close was written before the echo arrived, so the socket is released
-      // (`web-socket.c++:1430`); oracle 1.20261023.1 onward answers this way.
-      tagsDuringHandler: {
-        name: "Error",
-        message:
-          "you must call 'acceptWebSocket()' before attempting to access the tags of a WebSocket.",
-      },
+      listedDuringHandler: onTime(true),
+      // Still accepted while the handler runs: the release needs the close event dispatched.
+      tagsDuringHandler: onTime(["socket"]),
       sendAfterPeerClose: {
         name: "TypeError",
         message: "Can't call WebSocket send() after close().",
       },
       reciprocalClose: null,
     });
+    // A pair's own close completes when the other half reads it. With nothing queued
+    // ahead of the echo that lands after the close event, which releases the socket
+    // (1.20261023.1 onward; 1.20260815.1 never released it).
+    expect(result.afterTurn).toEqual([
+      { id: "socket", event: "close", listed: false, tags: NOT_ACCEPTED },
+    ]);
 
     const invalidCode = (code: number): CapturedError => ({
       name: "InvalidAccessError",
@@ -291,6 +326,44 @@ describe("handler dispatch and close state", () => {
       code3000: null,
       code4999: null,
     });
+  });
+
+  it("D6 a message after own close keeps the tags, and so does the close that follows it", async () => {
+    const actor = await host.spawn("ws-message-after-own-close");
+    await actor.call("openSelfSocket", "socket", ["socket"]);
+    await actor.call("closeSelfServerThenSendSelf", "socket", "tags:after-own-close");
+    const result = await eventually(
+      () => journal(actor),
+      (value) =>
+        value.afterTurn.some((event) => event.event === "message") &&
+        value.afterTurn.some((event) => event.event === "close"),
+    );
+    expect(result.events).toEqual([
+      {
+        id: "socket",
+        message: { kind: "string", value: "tags:after-own-close" },
+        listedDuringHandler: onTime(true),
+        tagsDuringHandler: ["socket"],
+      },
+      {
+        id: "socket",
+        close: { code: 4002, reason: "server out", wasClean: true },
+        readyState: 3,
+        listedDuringHandler: onTime(true),
+        tagsDuringHandler: ["socket"],
+        sendAfterPeerClose: {
+          name: "TypeError",
+          message: "Can't call WebSocket send() after close().",
+        },
+        reciprocalClose: null,
+      },
+    ]);
+    // The message took the turn the echo would have had, so the own close completed
+    // before the close event was dispatched and nothing ever releases the socket.
+    expect(result.afterTurn).toEqual([
+      { id: "socket", event: "message", listed: false, tags: ["socket"] },
+      { id: "socket", event: "close", listed: false, tags: ["socket"] },
+    ]);
   });
 
   it("D7 exposes ready states on the constructor and prototype", async () => {
@@ -496,15 +569,19 @@ it("a socket rehydrated after eviction can send to its client and delivers the c
   await client.close(4000, "bye");
   const result = await eventually(
     () => journal(actor),
-    (value) => value.events.some((event) => "close" in event),
+    (value) => value.afterTurn.some((event) => event.event === "close"),
   );
   expect(result.events.at(-1)).toEqual({
     id: "connection-id",
     close: { code: 4000, reason: "bye", wasClean: true },
     readyState: 2,
-    listedDuringHandler: false,
+    listedDuringHandler: onTime(true),
     tagsDuringHandler: ["connection-id"],
     sendAfterPeerClose: null,
     reciprocalClose: null,
   });
+  // A woken socket is accepted again, and the close its handler sends releases it.
+  expect(result.afterTurn).toEqual([
+    { id: "connection-id", event: "close", listed: false, tags: NOT_ACCEPTED },
+  ]);
 });

@@ -32,7 +32,7 @@ Line citations below are at `v1.20261031.1`.
 | --- | --- |
 | [Parked move-later alarm, `2093b5b1b`](https://github.com/cloudflare/workerd/commit/2093b5b1b) | `actor-sqlite.c++:475`: when a move-later alarm request completes, its parked time is dropped if a commit stored an earlier alarm meanwhile, since that commit schedules its own time. `#scheduleLaterAlarm` now does the same. The ported `actor-sqlite-test.c++` case (1 ms, 3 ms in flight, 10 ms coalesced, 6 ms with the commit held) failed before the fix with a stray `scheduleRun(10ms)` and passes after it. |
 | [RPC exceptions behind the output gate, `0b348c30b`](https://github.com/cloudflare/workerd/commit/0b348c30b) | `worker-rpc.c++:2268` and `:2320`: an actor method's exception, sync or async, waits for the output gate as a result does, and a broken gate's exception replaces the method's. `entry()` and `bindReentryTarget()` now wait in a `finally`. A unit test holding the gate with a pending alarm write failed before the change for both a sync and an async throw. The §1.7.1/§2.6 abort rows now see the broken gate's error, which carries the abort reason, in the Node and browser lanes too, instead of the fixture's sentinel throw. |
-| Hibernatable socket released after its own close | Measured, not attributed to one commit: the oracle answered `getTags()` with `["socket"]` inside `webSocketClose()` after the socket's own close up to `v1.20261009.1`. From `v1.20261023.1` (bisected against the two binaries in the lockfile) it throws "you must call 'acceptWebSocket()' before attempting to access the tags of a WebSocket.", because `tryReleaseNative()` (`web-socket.c++:1430`) releases the native socket once the outgoing close is pumped, before the peer's echo is dispatched. `web-socket.c++` has no release-logic change in range; the ordering moved underneath it. This is also what a real network peer sees, since the echo arrives well after the close is written. Local `getTags()` now throws once the socket's own close has been written, and the D6-D7 row pins it in every lane. |
+| Hibernatable socket released after its own close | Measured on raw `workerd serve`, not attributed to one commit; see [getTags() and listing during webSocketClose](#gettags-and-listing-during-websocketclose). `tryReleaseNative()` (`web-socket.c++:1430`) runs when the socket's own outgoing close completes, and it releases the socket only if `initiateHibernatableRelease()` (`web-socket.c++:1665`, called from `global-scope.c++:995` just before `webSocketClose()`) has already marked the close dispatched. Through a `WebSocketPair` the own close completes when the socket's next event finishes its synchronous part. When that event is the echoed close, `getTags()` throws one turn after `webSocketClose()` returns. This happens from `v1.20261023.1`; `v1.20260815.1` never released the socket, and the lockfile has no binary in between. A message ahead of the echo takes the completion, so the socket is not released. A network peer's echo arrives after the write has already completed, so its tags also stay readable. A close sent from inside `webSocketClose()` releases the socket. In every case the socket is still listed, with readable tags, during the handler's synchronous part. Locally, `WebSocket.close()` and the hibernation registry now track this release state, and a socket woken from hibernation is accepted again. The D6-D7 row and a new message-after-own-close row pin this behaviour. |
 
 The compatibility date is unchanged. Updating the oracle and ambient Workers
 types does not opt local hosts into newer compatibility-date policy
@@ -89,9 +89,40 @@ the new oracle the D6-D7 hibernation row failed in the workerd lane until the
 expectation and the local release were updated. The two measured rows passed in
 every lane without runtime changes. Typechecking against Workers types
 `5.20261031.1` required `Cursor.next()` to declare `IteratorResult<T, undefined>`.
-Integrated runtime validation then passed: 1,078 unit tests; 85 workerd, 85 Node,
-and 100 browser conformance/smoke tests; 85 tests in each transformed Node and
+Integrated runtime validation then passed: 1,086 unit tests; 86 workerd, 86 Node,
+and 101 browser conformance/smoke tests; 86 tests in each transformed Node and
 browser lane; `pnpm typecheck`; and `pnpm check:oracle`.
+
+### getTags() and listing during webSocketClose
+
+These rows ran the real `conformance/fixtures/probe.ts`, bundled, under raw
+`workerd serve` with a front worker. Each binary ran 8 times, and every run of
+every row produced the same output. "Sync" is read inside the handler before it
+awaits; "after a turn" is read after `scheduler.wait(10)` inside the same
+handler.
+
+| Row | Binary | Sync: listed / tags | After a turn: listed / tags |
+| --- | --- | --- | --- |
+| D5/B4 peer close (pair) | 0815, 1023, 1031 | yes / `["socket"]` | no / throws |
+| D6-D7 own close, then echo (pair) | 1023, 1031 | yes / `["socket"]` | no / throws |
+| D6-D7 own close, then echo (pair) | 0815 | yes / `["socket"]` | no / `["socket"]` |
+| D6 message after own close: message, then close (pair) | 1023, 1031 | yes / `["socket"]` for both | no / `["socket"]` for both |
+| Network peer close (eviction row shape) | 0815, 1023, 1031 | yes / tags | no / throws |
+
+On 0815 the message row's close arrived as 1006, unclean. A second probe on
+1031 drove the same socket over a real network connection. An own close
+followed by the echo kept the tags (`net:own`), and so did an own close with a
+message ahead of the echo (`net:ownThenMsg`). A peer close answered from
+`webSocketClose()` released the socket (`net:peer`). Microtask reads inside the
+handler always matched the sync reads.
+
+**Method caveat.** The vitest-pool-workers lane does not show the sync values.
+Its wrapper (`test-internal.mjs`) runs a Durable Object handler only after
+`enqueueInvocation` and `await this[kEnsureInstance]()`, so the handler starts
+at least one I/O turn late. By then a pair socket has already left the list
+and may already be released. `conformance/suite/hibernation.spec.ts` therefore
+asserts sync-handler values only outside the workerd lane, and asserts
+after-a-turn values in every lane.
 
 ## October 9 audit
 

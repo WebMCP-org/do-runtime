@@ -125,6 +125,8 @@ export class Probe extends DurableObject<ProbeEnv> {
     { code: number; reason: string; wasClean: boolean }[]
   >();
   #handlerEvents: Record<string, unknown>[] = [];
+  /** What a handler sees after one awaited timer turn: see `#recordAfterTurn`. */
+  #afterTurn: Record<string, unknown>[] = [];
   #handlerTrace: string[] = [];
   #listenerMessages = 0;
   #latePair: [WebSocket, WebSocket] | undefined;
@@ -1504,6 +1506,12 @@ export class Probe extends DurableObject<ProbeEnv> {
     this.#requireServer(id).close(code, reason);
   }
 
+  /** The client's frame leaves after the server's own close, ahead of the client's echo. */
+  closeSelfServerThenSendSelf(id: string, message: string): void {
+    this.#requireServer(id).close(4002, "server out");
+    this.#requireClient(id).send(message);
+  }
+
   throwOnNextSocketMessage(): void {
     this.#throwNextMessage = true;
   }
@@ -1525,6 +1533,7 @@ export class Probe extends DurableObject<ProbeEnv> {
   socketJournal(): Record<string, unknown> {
     return {
       events: this.#handlerEvents,
+      afterTurn: this.#afterTurn,
       trace: this.#handlerTrace,
       listenerMessages: this.#listenerMessages,
       clients: Object.fromEntries(
@@ -1754,6 +1763,11 @@ export class Probe extends DurableObject<ProbeEnv> {
       typeof message === "string"
         ? { kind: "string", value: message }
         : { kind: "ArrayBuffer", value: [...new Uint8Array(message)] };
+    if (typeof message === "string" && message.startsWith("tags:")) {
+      this.#handlerEvents.push({ id, message: description, ...this.#handlerState(ws) });
+      await this.#recordAfterTurn(ws, "message");
+      return;
+    }
     this.#handlerEvents.push({ id, message: description });
 
     if (typeof message === "string" && message.startsWith("slow:")) {
@@ -1792,19 +1806,44 @@ export class Probe extends DurableObject<ProbeEnv> {
     });
   }
 
-  webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean): void {
-    let tags: string[] = [];
-    const tagsError = captureError(() => { tags = this.ctx.getTags(ws); });
+  async webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean): Promise<void> {
     const event: Record<string, unknown> = {
       id: this.#socketId(ws),
       close: { code, reason, wasClean },
       readyState: ws.readyState,
-      listedDuringHandler: this.ctx.getWebSockets().includes(ws),
-      tagsDuringHandler: tagsError ?? tags,
+      ...this.#handlerState(ws),
     };
     event.sendAfterPeerClose = captureError(() => ws.send("after-peer-close"));
     event.reciprocalClose = captureError(() => ws.close(code, reason));
     this.#handlerEvents.push(event);
+    await this.#recordAfterTurn(ws, "close");
+  }
+
+  /** Read in the handler's synchronous part, which the workerd lane cannot observe (see the spec). */
+  #handlerState(ws: WebSocket): Record<string, unknown> {
+    let tags: string[] = [];
+    const tagsError = captureError(() => { tags = this.ctx.getTags(ws); });
+    return {
+      listedDuringHandler: this.ctx.getWebSockets().includes(ws),
+      tagsDuringHandler: tagsError ?? tags,
+    };
+  }
+
+  /**
+   * The same reads after a timer turn. workerd settles a closed hibernatable socket on a later
+   * turn than the handler's synchronous part — it leaves `getWebSockets()` and may be released —
+   * so this is the state every lane, the delayed one included, reaches.
+   */
+  async #recordAfterTurn(ws: WebSocket, event: "message" | "close"): Promise<void> {
+    await scheduler.wait(10);
+    let tags: string[] = [];
+    const tagsError = captureError(() => { tags = this.ctx.getTags(ws); });
+    this.#afterTurn.push({
+      id: this.#socketId(ws),
+      event,
+      listed: this.ctx.getWebSockets().includes(ws),
+      tags: tagsError ?? tags,
+    });
   }
 
   webSocketError(ws: WebSocket, error: unknown): void {

@@ -93,8 +93,11 @@ and the live per-container registry. A host that may evict a container mirrors
 accepted sockets through `ports.hibernation` and passes them back through
 `options.webSockets`; they are registered before the next constructor runs.
 Pair construction is not tied to one event—using either half via `accept()` or
-a 101 Response is the boundary. A closed socket leaves `getWebSockets()` before
-its close handler runs, but retains its tags for that handler. Host extraction
+a 101 Response is the boundary. A closed socket stays in `getWebSockets()`, with
+its tags, while its close handler's synchronous part runs, and leaves the list
+one turn later. A socket that sent its own close is released, and `getTags()`
+throws, only when that close completes after the close was dispatched. A
+socket woken from hibernation is accepted again. Host extraction
 with `upgradeWebSocket(response)` transfers the endpoint into a distinct host
 socket that outlives actor eviction; the actor's retained reference becomes
 inert. Host event delivery stays asynchronous. Application sends snapshot binary data before waiting for output
