@@ -32,7 +32,8 @@ export default defineConfig({
       "chat",
       "ai",
       "ai/test",
-      "process"
+      "process",
+      "yaml"
     ]
   },
   resolve: {

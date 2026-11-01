@@ -32,12 +32,14 @@ export default defineConfig({
         ["agents/context", "context/index.ts"],
         ["agents/lifecycle", "lifecycle/index.ts"],
         ["agents/skills", "skills/index.ts"],
+        ["agents/skills/tools/ai-sdk", "skills/tools/ai-sdk.ts"],
         ["agents/agent-tools", "agent-tools.ts"],
         ["agents/workflows", "workflows.ts"],
         ["agents/observability", "observability/index.ts"],
         ["agents/observability/ai", "observability/ai/index.ts"],
         ["agents/browser", "browser/index.ts"],
-        ["agents/browser/ai", "browser/ai.ts"]
+        ["agents/browser/ai", "browser/ai.ts"],
+        ["agents/webfetch", "web/fetch/index.ts"]
       ].map(([specifier, entry]) => ({
         find: new RegExp(`^${specifier.replace(/\//g, "\\/")}$`),
         replacement: path.join(testsDir, "../../../agents/src", entry)
@@ -49,14 +51,6 @@ export default defineConfig({
       {
         find: /^@cloudflare\/codemode$/,
         replacement: workspaceRequire.resolve("@cloudflare/codemode")
-      },
-      {
-        find: /^@cloudflare\/shell$/,
-        replacement: path.join(testsDir, "../../../shell/src/index.ts")
-      },
-      {
-        find: /^@cloudflare\/shell\/workers$/,
-        replacement: path.join(testsDir, "../../../shell/src/workers.ts")
       }
     ]
   },

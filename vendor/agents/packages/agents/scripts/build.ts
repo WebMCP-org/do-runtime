@@ -1,6 +1,6 @@
 import { build } from "tsdown";
 import { globSync } from "glob";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { copyPackageDocs } from "../../../scripts/copy-package-docs";
 import { formatDeclarationFiles } from "../../../scripts/format-declarations";
 import { buildDaemon } from "./build-daemon";
@@ -9,7 +9,9 @@ const entries = [
   "src/*.ts",
   "src/*.tsx",
   "src/skills/index.ts",
-  "src/skills/compile.ts",
+  "src/skills/tools/ai-sdk.ts",
+  // Vendor divergence: no `src/skills/runner.ts` entry; the fork ships no
+  // skill script runner (fork-diff "Deliberate product omissions").
   "src/lifecycle/index.ts",
   "src/harness/ai-sdk/index.ts",
   "src/harness/opencode/index.ts",
@@ -46,12 +48,17 @@ const entries = [
   "src/codemode/ai.ts",
   "src/browser/index.ts",
   "src/browser/ai.ts",
-  "src/browser/ai-sdk.ts",
-  "src/browser/tanstack-ai.ts",
-  "src/websearch/index.ts",
-  "src/websearch/tools/pi.ts",
-  "src/websearch/tools/ai-sdk.ts",
-  "src/websearch/tools/tanstack-ai.ts",
+  "src/browser/tools/ai-sdk.ts",
+  "src/browser/tools/tanstack-ai.ts",
+  "src/browser/tools/pi.ts",
+  "src/web/search/index.ts",
+  "src/web/search/tools/pi.ts",
+  "src/web/search/tools/ai-sdk.ts",
+  "src/web/search/tools/tanstack-ai.ts",
+  "src/web/fetch/index.ts",
+  "src/web/fetch/tools/pi.ts",
+  "src/web/fetch/tools/ai-sdk.ts",
+  "src/web/fetch/tools/tanstack-ai.ts",
   "src/experimental/webmcp.ts",
   "src/voice/index.ts",
   "src/voice/types.ts",
@@ -85,20 +92,6 @@ for (const entry of entries) {
   }
 }
 
-// The `agents:skills` virtual-module types live in a standalone ambient
-// declaration (skills-module.d.ts) so they survive d.ts bundling. Prepend a
-// reference to the main entry so importing `agents` (directly or transitively
-// via @cloudflare/think / @cloudflare/ai-chat) brings them into scope without a
-// per-project shim.
-function injectSkillsTypeReference(): void {
-  const dtsPath = "dist/index.d.ts";
-  const directive = '/// <reference path="../skills-module.d.ts" />\n';
-  const current = readFileSync(dtsPath, "utf8");
-  if (!current.startsWith(directive)) {
-    writeFileSync(dtsPath, directive + current);
-  }
-}
-
 async function main() {
   // Embedded in agents/harness/container, so it must exist first.
   await buildDaemon();
@@ -129,6 +122,7 @@ async function main() {
         "@earendil-works/pi-tui",
         "highlight.js",
         "marked",
+        "marked-cjk-friendly",
         "get-east-asian-width"
       ]
     },
@@ -140,8 +134,6 @@ async function main() {
 
   // then run oxfmt on the generated .d.ts files
   formatDeclarationFiles();
-
-  injectSkillsTypeReference();
 
   copyPackageDocs(import.meta.url, "agents");
 
