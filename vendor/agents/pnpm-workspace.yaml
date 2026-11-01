@@ -31,6 +31,9 @@ allowBuilds:
   esbuild: true
   workerd: true
   core-js-pure: false
+  # Optional just-bash compression accelerators; nothing in the gate uses them.
+  "@mongodb-js/zstd": false
+  node-liblzma: false
   msw: false
   # @opencode/sdk's local-host deps (file watcher, msgpack, shell parsers);
   # the workerd profile stubs them, so their native builds are not needed.
@@ -47,8 +50,6 @@ minimumReleaseAgeExclude:
   - wrangler@4.115.0
   - workers-ai-provider@3.2.1 || 3.3.0 || 4.0.0
   - "@types/node@26.0.1"
-  - nanoid@5.1.16
-  - postal-mime@2.7.5
   - cronstrue@3.23.0
   - es-module-lexer@2.2.0
   - "@modelcontextprotocol/core@2.4.0"

@@ -29,7 +29,9 @@ four changes:
 - a move-later alarm parked behind an in-flight write (`src/io/actor-sqlite.ts`);
 - `entry()` and `bindReentryTarget()` waiting for the output gate
   (`src/server/actor-container.ts`);
-- `WebSocket.getTags()` throwing after the socket's own close;
+- releasing a hibernatable socket when its own close completes after the close
+  was dispatched, so `getTags()` throws one turn after `webSocketClose()`, and
+  keeping a closed socket listed until that handler's synchronous part returns;
 - `Cursor.next()` returning `IteratorResult<T, undefined>`.
 
 **SDK.** The [SDK audit](../vendor/agents/docs/audit/agents-sync-2026-10-31.md)
@@ -107,12 +109,12 @@ The orchestrator fills these numbers from the final gate run.
 
 | Gate | Result |
 | --- | --- |
-| Runtime unit suite | 43 files / 1078 tests pass |
-| Native workerd conformance | 85 / 85 pass against workerd 1.20261031.1 |
-| Node conformance | 85 / 85 pass |
-| Chromium conformance | 100 / 100 pass |
-| Transformed Node / Chromium conformance | 85 / 85 and 85 / 85 pass |
-| SDK regression gate | react 108, chat 657, agents 1675 (+2 todo) + do-runtime lane 2, ai-chat 194 + 106, think 1328, voice 21, codemode 108 + 9, shell 203, browser 68 + 18; think and agents run twice with no flake delta |
+| Runtime unit suite | 43 files / 1086 tests pass |
+| Native workerd conformance | 86 / 86 pass against workerd 1.20261031.1 |
+| Node conformance | 86 / 86 pass |
+| Chromium conformance | 101 / 101 pass |
+| Transformed Node / Chromium conformance | 86 / 86 and 86 / 86 pass |
+| SDK regression gate | react 108, chat 664, agents 1675 (+2 todo) + do-runtime lane 2, ai-chat 194 + 106, think 1340, voice 21, codemode 108 + 9, shell 203, browser 68 + 18; think and agents run twice with no flake delta |
 | SDK exports, formatting, lint and TypeScript | exports 6/6 valid, oxfmt 1443 files clean, oxlint 0 findings, 6 tsgo projects clean |
 | Runtime and example TypeScript | root typecheck (build:package + 7 tsc projects) clean |
 | Dependency installation and oracle | frozen installs pass at root and vendor/agents; `check:oracle` pins agree on v1.20261031.1 |

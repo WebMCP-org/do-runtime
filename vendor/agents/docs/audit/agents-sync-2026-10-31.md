@@ -6,7 +6,7 @@ to
 [Agents 0.32.0 (`be174922`)](https://github.com/cloudflare/agents/tree/be1749221ab3efc8be4e976d8e7d8344d1446032).
 The range has 121 upstream commits. Each one has a row in the
 [commit dispositions](agents-0.32-commit-dispositions.csv), which name the
-writer log or ledger row behind the call. A row records how the commit landed
+ledger row or working note behind the call. A row records how the commit landed
 in the merged tree. It does not mean the commit was tested on its own.
 
 The packages land as Agents 0.32.0, Think 0.23.0, AI Chat 0.12.2, Voice 0.5.0
@@ -78,7 +78,7 @@ added, 1 already matched head and 1 merged cleanly.
 | `think/package.json` (4 hunks)                                                   | Shell and just-bash dropped. Computer `^0.8.0` added as a peer and dev dependency. Fork adapters and Vite `^8.3.0` kept. Peer range `agents >=0.28.0 <1.0.0` |
 | `think/scripts/build.ts`                                                         | Fork messenger entries kept; `src/tools/workspace.ts` dropped                                                                                                |
 | `think/src/tests/vitest.config.ts`                                               | Fork alias list kept, plus `agents/skills/tools/ai-sdk` and `agents/webfetch`; Shell aliases dropped                                                         |
-| `think/src/think.ts` (5 hunks)                                                   | Skills imports moved to the 0.32 layout without a runner. Media field docs re-ported by W5. `prepareModel` kept                                              |
+| `think/src/think.ts` (5 hunks)                                                   | Skills imports moved to the 0.32 layout without a runner. Media field docs re-ported with the `read` wrapper. `prepareModel` kept                            |
 | `agents/src/index.ts`                                                            | Both sides' imports kept                                                                                                                                     |
 | `agents/src/harness/think/tests/worker.ts`                                       | Upstream's version; the fork side was formatting only                                                                                                        |
 | `agents/src/tests-d/browser-tool.test-d.ts`, `agents/src/browser/tanstack-ai.ts` | TanStack 0.54's `AnyServerTool`; browserTool now in `browser/tools/`                                                                                         |
@@ -220,13 +220,13 @@ at `conversation-agent.ts:1183`. Without the filter, a sealed turn would show
 **Residual.** A Stop that lands while admission's `syncStorage` is in flight is
 counted against `maxInterruptedAttempts`, but it is never sealed or reported.
 
-| Test                                                                                                                                                                  | Result             |
-| --------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------ |
-| `think/src/tests/recovery-stop-seal.test.ts` (Stop and cancel near budget, sealed stays sealed in `continue` and `retry`, exhausted filter), on the W1 merge baseline | 6/7 cases failed   |
-| Same file, hoist reverted                                                                                                                                             | 4/7 failed         |
-| Same file, now                                                                                                                                                        | 9/9 pass           |
-| `recovery-engine.test.ts`: four new cases under "a cancel that lands while an at-budget admission syncs"                                                              | Suite passes 68/68 |
-| `ai-chat/src/tests/durable-chat-recovery.test.ts`, now in `test:ai-chat`                                                                                              | Passes             |
+| Test                                                                                                                                                                                    | Result             |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------ |
+| `think/src/tests/recovery-stop-seal.test.ts` (Stop and cancel near budget, sealed stays sealed in `continue` and `retry`, exhausted filter), on the merge baseline before the hand-port | 6/7 cases failed   |
+| Same file, hoist reverted                                                                                                                                                               | 4/7 failed         |
+| Same file, now                                                                                                                                                                          | 9/9 pass           |
+| `recovery-engine.test.ts`: four new cases under "a cancel that lands while an at-budget admission syncs"                                                                                | Suite passes 68/68 |
+| `ai-chat/src/tests/durable-chat-recovery.test.ts`, now in `test:ai-chat`                                                                                                                | Passes             |
 
 **`prepareModel` kept.** It is declared at `think.ts:6996` and awaited at
 `:7845`; `:7943` reads the result. Dropping it would be a compile error in Rook,
@@ -237,8 +237,8 @@ not a silent fallback.
 Think 0.23 builds its file tools from Computer's
 `createAITools({ workspace })`. Computer's `read` has no capability hooks and
 sends image and PDF parts to every model. The fork's 0.20 `read` tool, with its
-gates, PDF text and size preflight, is gone. W5 re-ported the behaviour as a
-wrapper rather than a fork of the tool.
+gates, PDF text and size preflight, is gone. The fork re-ports the behaviour as
+a wrapper rather than a fork of the tool.
 
 `think/src/workspace-read.ts` is new (491 lines). It exports two functions,
 both re-exported from `@cloudflare/think`:
@@ -327,7 +327,7 @@ Tests:
   (`references/`, `scripts/`, `assets/` and five asset folders) and drops other files. The fixture
   proves it: `index.ts` and `notes/draft.md` beside a `SKILL.md` are excluded.
 
-Two upstream-new test helpers were edited outside W6's file list:
+Two upstream-new test helpers were also edited:
 `tests-d/skills-namespace.test-d.ts` and `tests/memory-skill-workspace.ts`.
 
 ### Codemode type printer
@@ -354,8 +354,8 @@ The merge brought back upstream's type-only `codemode?` field
 
 ## Fork-side defaults
 
-These three defaults are reversible. The orchestrator chose them after the
-user decided to take all of 0.32 / 0.23 in one PR.
+These three defaults are reversible. They follow from taking all of 0.32 / 0.23
+in one PR.
 
 1. **Workspace: follow upstream's Computer `Workspace` and drop the
    `think/tools/workspace` subpath.**
@@ -451,16 +451,16 @@ Rook's migration is in [`../rook-0.32-migration.md`](../rook-0.32-migration.md).
 
 ## Verification
 
-The orchestrator fills these numbers from the final gate run.
+These counts are from the refresh's final gate run.
 
 | Suite                                           |  Files |                                                                Tests |
 | ----------------------------------------------- | -----: | -------------------------------------------------------------------: |
 | `test:react`                                    |     10 |                                                                  108 |
-| `test:chat`                                     |     34 |                                                                  657 |
+| `test:chat`                                     |     34 |                                                                  664 |
 | `test:agents` (workerd lane)                    |     73 |                                                        1675 + 2 todo |
 | `test:agents` (do-runtime lane)                 |      1 |                                                                    2 |
 | `test:ai-chat` (plus React)                     | 12 + 1 |                                                            194 + 106 |
-| `test:think`                                    |     56 |                                                                 1328 |
+| `test:think`                                    |     56 |                                                                 1340 |
 | `test:voice`                                    |      1 |                                                                   21 |
 | `test:codemode` (plus Node)                     |  4 + 2 |                                                              108 + 9 |
 | `test:shell`                                    |      2 |                                                                  203 |
@@ -474,5 +474,48 @@ These suites were not run:
 - otel-runtime;
 - the container, OpenCode, Think-harness and Pi harness suites;
 - the Codemode runtime lane;
-- the W3 alarm lane in Chromium;
+- the do-runtime alarm-context test in Chromium;
 - provider-backed suites.
+
+From a fresh clone at `d4d7bead`, `pnpm install --frozen-lockfile` in
+`vendor/agents`, with or without `--ignore-scripts`, exits 1 with
+`ERR_PNPM_IGNORED_BUILDS` for `@mongodb-js/zstd@7.0.0` and `node-liblzma@2.2.0`
+and writes placeholder lines into `pnpm-workspace.yaml`. The install fix below
+makes both forms exit 0 with a clean tree.
+
+## Post-review fixes
+
+A merge-fidelity review after `d4d7bead` found no lost upstream change but
+several ledger gaps. The follow-up commits:
+
+- harden the recovery seal, so a sealed incident stays sealed, and gate AI
+  Chat's matching parity hook the same way;
+- gate workspace media by the file's bytes and read a PDF's header within a
+  bounded window;
+- revert the workerd `getTags` change in do-runtime;
+- correct the Rook guide (`../rook-0.32-migration.md`);
+- close the ledger gaps in `../fork-diff.md`: recovery incident and indicator
+  ownership, the errored-stream late ACK, Agent-tool run-change hook and
+  progress time, eager async entry outside Lifecycle, facet record cleanups,
+  context-wrapper async detection, React tool-result cleanup dependencies,
+  dependency ranges, and corrected Package identity, Tooling and Codemode
+  test statements; sync `AGENTS.md` with upstream 0.32 plus the fork notes;
+- add `@mongodb-js/zstd` and `node-liblzma` to the vendor `allowBuilds` (both
+  `false`, as the root workspace has them) and drop the unused
+  `nanoid@5.1.16` and `postal-mime@2.7.5` release-age exclusions.
+
+Known dead references, left in code:
+
+- 30 comment lines in 29 comments cite dated entries of the
+  [previous chronological ledger](https://github.com/WebMCP-org/do-runtime/blob/ff87e9ef1d38f8beaa579b3a53d445e62df96837/vendor/agents/docs/fork-diff.md)
+  that `fork-diff.md` no longer has: 2026-07-24, 2026-07-31, 2026-08-12,
+  2026-08-14, 2026-08-23, 2026-08-30, 2026-09-05 and 2026-09-11. They sit in
+  `think/src/think.ts` (10 lines), `ai-chat/src/index.ts` (4), `agents/src/sessions/core.ts` (3)
+  and test files in AI Chat, Think and `agents/src/tests/sessions/`. Each entry
+  still exists in that record.
+- `think/src/messengers/chat-sdk.ts:847` keeps upstream's comment that the
+  sub-agent stub's `bindActiveDeliverySurface` must not be offered to delivery.
+  The method remains on Think (`think.ts:5809`), but the fork's delivery target
+  no longer declares it; Think binds the surface inside
+  `chatWithMessengerDelivery`, so the comment guards a path the fork's types
+  already exclude.
