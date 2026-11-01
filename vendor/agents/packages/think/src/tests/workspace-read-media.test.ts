@@ -578,3 +578,194 @@ describe("workspace read — declared type against the bytes", () => {
     expect(extracted).toBe(false);
   });
 });
+
+describe("workspace read — a tool set whose limit differs from the wrapper's", () => {
+  const MIB = 1024 * 1024;
+
+  /** A 4 MiB file: over the wrapper's default limit, under 8 MiB. */
+  function fourMiB(header: Uint8Array): Uint8Array {
+    const bytes = new Uint8Array(4 * MIB);
+    bytes.set(header);
+    return bytes;
+  }
+
+  // Computer sends anything it captured, so a result that carries bytes is
+  // gated whatever its size.
+  it.each([
+    [
+      "image",
+      "/shots/big.png",
+      PNG,
+      { acceptsImages: false },
+      "This model has no image input, so the picture was not sent."
+    ],
+    [
+      "PDF",
+      "/docs/big.pdf",
+      PDF,
+      { acceptsPdfs: false },
+      "This model has no PDF input, so the document was not sent."
+    ]
+  ] as const)(
+    "gates a captured %s larger than the wrapper's limit",
+    async (_kind, path, header, options, refusal) => {
+      const { workspace } = memoryWorkspace({
+        [path]: { bytes: fourMiB(header) }
+      });
+      const tools = withWorkspaceReadMedia(
+        createAITools({ workspace, read: { maxModelBytes: 8 * MIB } }),
+        workspace,
+        options
+      );
+      const output = await execute(tools.read!, { path });
+      expect(output).toMatchObject({ sizeBytes: 4 * MIB });
+      expect((output as { data?: string }).data).toBeDefined();
+      await expect(render(tools.read!, { path }, output)).resolves.toEqual({
+        type: "error-text",
+        value: `Read ${path} (${path.endsWith(".png") ? "image/png" : "application/pdf"}, ${4 * MIB} bytes). ${refusal}`
+      });
+    }
+  );
+
+  it("checks the bytes of a captured file larger than the wrapper's limit", async () => {
+    const path = "/shots/big.png";
+    const html = new TextEncoder().encode("<!doctype html>");
+    const { workspace } = memoryWorkspace({ [path]: { bytes: fourMiB(html) } });
+    const tools = withWorkspaceReadMedia(
+      createAITools({ workspace, read: { maxModelBytes: 8 * MIB } }),
+      workspace
+    );
+    await expect(readAndRender(tools.read!, { path })).resolves.toEqual({
+      type: "error-text",
+      value: `Read ${path} (image/png, ${4 * MIB} bytes), but its contents are not image/png, so it was not sent. Convert or rename the file to view it.`
+    });
+  });
+
+  it("does not re-read a fresh result Computer left without bytes", async () => {
+    const path = "/shots/big.png";
+    const { workspace, reads } = memoryWorkspace({
+      [path]: { bytes: fourMiB(PNG) }
+    });
+    const tools = withWorkspaceReadMedia(
+      createAITools({ workspace }),
+      workspace,
+      { maxModelBytes: 8 * MIB }
+    );
+    const output = await execute(tools.read!, { path });
+    expect((output as { data?: string }).data).toBeUndefined();
+    const readsAtExecute = reads.length;
+    const expected = {
+      type: "error-text",
+      value: `Read ${path} (image/png, ${4 * MIB} bytes), but it exceeds the ${INLINE_LIMIT}-byte inline model output limit.`
+    };
+    await expect(render(tools.read!, { path }, output)).resolves.toEqual(
+      expected
+    );
+    await expect(render(tools.read!, { path }, output)).resolves.toEqual(
+      expected
+    );
+    expect(reads).toHaveLength(readsAtExecute);
+  });
+
+  it("still re-reads a small Think 0.20 result under a larger wrapper limit", async () => {
+    const path = "/shots/small.png";
+    const { workspace, reads } = memoryWorkspace({ [path]: { bytes: PNG } });
+    const tools = withWorkspaceReadMedia(
+      createAITools({ workspace }),
+      workspace,
+      { maxModelBytes: 8 * MIB }
+    );
+    const legacy = {
+      kind: "image",
+      path,
+      name: "small.png",
+      mediaType: "image/png",
+      sizeBytes: PNG.byteLength
+    };
+    await expect(render(tools.read!, { path }, legacy)).resolves.toMatchObject({
+      type: "content",
+      value: [{ type: "text" }, { type: "file", mediaType: "image/png" }]
+    });
+    expect(reads).toEqual([{ path, byteLength: 8 * MIB + 1 }]);
+  });
+});
+
+describe("workspace read — the PDF header", () => {
+  const BODY = "%PDF-1.4\n1 0 obj\n";
+  const HTML = new TextEncoder().encode("<!doctype html><p>hi</p>");
+
+  // PDF readers accept the header anywhere in the first 1 KiB, and so did
+  // Computer and the fork's Think 0.20 `read`.
+  it.each([
+    ["a byte-order mark", "﻿"],
+    ["a newline", "\n"],
+    ["junk", "junk\n"],
+    ["1000 bytes of padding", " ".repeat(1000)]
+  ])("sends a PDF with %s before its header", async (_label, prefix) => {
+    const path = "/docs/lead.pdf";
+    const bytes = new TextEncoder().encode(prefix + BODY);
+    const { workspace } = memoryWorkspace({ [path]: { bytes } });
+
+    const pdfModel = createWorkspaceReadTool({ workspace });
+    await expect(readAndRender(pdfModel, { path })).resolves.toMatchObject({
+      type: "content",
+      value: [{ type: "text" }, { type: "file", mediaType: "application/pdf" }]
+    });
+
+    const extracted: Uint8Array[] = [];
+    const textModel = createWorkspaceReadTool({
+      workspace,
+      acceptsPdfs: false,
+      pdfText: async (data) => {
+        extracted.push(data);
+        return ["Page text"];
+      }
+    });
+    await expect(readAndRender(textModel, { path })).resolves.toMatchObject({
+      type: "text",
+      value: expect.stringContaining("2\tPage text")
+    });
+    expect(extracted).toEqual([bytes]);
+  });
+
+  it("refuses a header past the first 1 KiB", async () => {
+    const path = "/docs/late.pdf";
+    const bytes = new TextEncoder().encode(" ".repeat(1024) + BODY);
+    const { workspace } = memoryWorkspace({ [path]: { bytes } });
+    await expect(
+      readAndRender(createWorkspaceReadTool({ workspace }), { path })
+    ).resolves.toEqual({
+      type: "error-text",
+      value: `Read ${path} (application/pdf, ${bytes.byteLength} bytes), but its contents are not application/pdf, so it was not sent. Convert or rename the file to view it.`
+    });
+  });
+
+  // The same file renders the same way for a PDF model and a text model.
+  it("refuses HTML declared as a PDF on the text path too", async () => {
+    const path = "/docs/page.pdf";
+    const { workspace } = memoryWorkspace({ [path]: { bytes: HTML } });
+    let extracted = false;
+    const read = createWorkspaceReadTool({
+      workspace,
+      acceptsPdfs: false,
+      pdfText: async () => {
+        extracted = true;
+        return ["never"];
+      }
+    });
+    const expected = {
+      type: "error-text",
+      value: `Read ${path} (application/pdf, ${HTML.byteLength} bytes), but its contents are not application/pdf, so it was not sent. Convert or rename the file to view it.`
+    };
+    await expect(readAndRender(read, { path })).resolves.toEqual(expected);
+    const legacy = {
+      kind: "file",
+      path,
+      name: "page.pdf",
+      mediaType: "application/pdf",
+      sizeBytes: HTML.byteLength
+    };
+    await expect(render(read, { path }, legacy)).resolves.toEqual(expected);
+    expect(extracted).toBe(false);
+  });
+});

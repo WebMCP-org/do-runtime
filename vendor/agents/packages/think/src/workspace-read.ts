@@ -60,8 +60,9 @@ export interface WorkspaceReadMediaOptions {
    */
   pdfText?: WorkspacePdfText;
   /**
-   * Largest image or PDF sent inline. Must match the `read` tool's
-   * `maxModelBytes`. Default 3.5 MiB, Computer's default.
+   * Largest image or PDF re-read for a result saved by Think 0.20. Set it to
+   * the `read` tool's `maxModelBytes`; where the two differ, the smaller one
+   * decides. Default 3.5 MiB, Computer's default.
    */
   maxModelBytes?: number;
 }
@@ -76,6 +77,9 @@ export interface CreateWorkspaceReadToolOptions extends WorkspaceReadMediaOption
 
 type ToolModelOutput = ToolResultPart["output"];
 type ToModelOutput = NonNullable<Tool["toModelOutput"]>;
+type ReadCall = Parameters<ToModelOutput>[0];
+/** The limit error for a part of `sizeBytes`, if it is too large to send. */
+type SizeLimit = (sizeBytes: number) => Promise<ToolModelOutput | undefined>;
 
 type MediaReadResult = {
   kind: "image" | "file";
@@ -90,6 +94,10 @@ type MediaReadResult = {
 const DEFAULT_MAX_MODEL_BYTES = 3.5 * 1024 * 1024;
 const MAX_PDF_TEXT_LINES = 2000;
 const MAX_PDF_TEXT_LINE_LENGTH = 2000;
+const PDF_HEADER = [0x25, 0x50, 0x44, 0x46, 0x2d]; // "%PDF-"
+const PDF_HEADER_WINDOW = 1024;
+// Base64 characters that decode to at least PDF_HEADER_WINDOW bytes.
+const SNIFF_BASE64_CHARS = Math.ceil(PDF_HEADER_WINDOW / 3) * 4;
 // The raster formats a model reads as an inline image. Computer classifies
 // only these as images; a result saved by Think 0.20 may name another.
 const MODEL_IMAGE_MEDIA_TYPES = new Set([
@@ -132,7 +140,8 @@ export function createWorkspaceReadTool(
  *
  * @param tools - A tool set from `createAITools`.
  * @param workspace - The Workspace the tool set reads from, used to re-read
- *   results saved by Think 0.20's `read`.
+ *   results saved by Think 0.20's `read`. Those re-reads use `workspace.fs`
+ *   directly, so a `root` given to `createAITools` does not confine them.
  * @param options - Media options.
  * @returns The tool set with `read` replaced.
  *
@@ -162,16 +171,40 @@ function gateReadTool(
     maxModelBytes = DEFAULT_MAX_MODEL_BYTES
   } = options;
 
+  // A tool set built elsewhere may give Computer a different `maxModelBytes`,
+  // which its render enforces but does not expose, so the render is asked
+  // with placeholder bytes. That does no I/O.
+  const sizeLimit =
+    (call: ReadCall, output: MediaReadResult): SizeLimit =>
+    async (sizeBytes) => {
+      if (sizeBytes > maxModelBytes) {
+        return errorText(
+          `Read ${output.path} (${output.mediaType}, ${sizeBytes} bytes), but it exceeds the ${maxModelBytes}-byte inline model output limit.`
+        );
+      }
+      const probe = await render({
+        ...call,
+        output: { ...output, sizeBytes, data: "AA==" }
+      });
+      return probe.type === "error-text" ? probe : undefined;
+    };
+
   const toModelOutput: ToModelOutput = async (call) => {
     const { input, output } = call;
-    // Text, binary, errors, and media too large to send keep Computer's render.
-    // A result recorded over the limit stays an error even if the file later
-    // shrinks: Computer's oversize result has no bytes either, so it cannot be
-    // told from a Think 0.20 one, and re-reading it would break captured
-    // semantics for every new result. Reading the file again recovers it.
-    if (!isMediaReadResult(output) || output.sizeBytes > maxModelBytes) {
-      return render(call);
+    // Text, binary, and errors keep Computer's render.
+    if (!isMediaReadResult(output)) return render(call);
+    // A result with bytes is gated whatever its size, since those bytes are
+    // what Computer sends. A result without them is Computer's oversize
+    // result or one saved by Think 0.20, and the two share a shape. Over the
+    // limit it stays an error even if the file later shrinks, because
+    // re-reading would break captured semantics for every new result.
+    // Reading the file again recovers it. Under the limit it is re-read.
+    const limit = sizeLimit(call, output);
+    if (output.data === undefined) {
+      const tooLarge = await limit(output.sizeBytes);
+      if (tooLarge) return tooLarge;
     }
+    const reread = () => rereadLegacy(output, workspace, maxModelBytes, limit);
     const note = `Read ${output.path} (${output.mediaType}, ${output.sizeBytes} bytes).`;
 
     if (output.kind === "image") {
@@ -189,7 +222,7 @@ function gateReadTool(
             `re-render or convert this file to one of those to view it.`
         );
       }
-      return renderWithBytes(render, call, output, workspace, maxModelBytes);
+      return renderWithBytes(render, call, output, reread);
     }
     // Computer 0.8 maps only PDFs to `kind: "file"`; any other file kind is
     // not ours to gate or extract.
@@ -199,7 +232,7 @@ function gateReadTool(
     // that rejects the part fails every later request, and one that strips it
     // leaves the model a note naming a document it never received.
     if (await isAccepted(acceptsPdfs)) {
-      return renderWithBytes(render, call, output, workspace, maxModelBytes);
+      return renderWithBytes(render, call, output, reread);
     }
     if (!pdfText) {
       return errorText(
@@ -207,12 +240,15 @@ function gateReadTool(
       );
     }
     const bytes =
-      output.data === undefined
-        ? await rereadLegacy(output, workspace, maxModelBytes)
-        : base64ToBytes(output.data);
+      output.data === undefined ? await reread() : base64ToBytes(output.data);
     if (!(bytes instanceof Uint8Array)) return bytes;
     if (bytes.byteLength === 0) {
       return errorText(`Cannot attach empty file: ${output.path}`);
+    }
+    // The extractor is not the validator: the same file renders the same way
+    // for a model with PDF input and one without.
+    if (sniffMediaType(bytes) !== "application/pdf") {
+      return contentsMismatch(output, bytes.byteLength);
     }
     let pages: readonly string[];
     try {
@@ -249,23 +285,22 @@ function gateReadTool(
  */
 async function renderWithBytes(
   render: ToModelOutput,
-  call: Parameters<ToModelOutput>[0],
+  call: ReadCall,
   output: MediaReadResult,
-  workspace: ThinkWorkspace,
-  maxModelBytes: number
+  reread: () => Promise<Uint8Array | ToolModelOutput>
 ): Promise<ToolModelOutput> {
   let data = output.data;
   let sizeBytes = output.sizeBytes;
   let prefix: Uint8Array | ToolModelOutput;
   if (data === undefined) {
-    const bytes = await rereadLegacy(output, workspace, maxModelBytes);
+    const bytes = await reread();
     if (!(bytes instanceof Uint8Array)) return bytes;
     data = bytesToBase64(bytes);
     sizeBytes = bytes.byteLength;
     prefix = bytes;
   } else {
-    // 16 base64 characters decode to the 12 bytes the signatures need.
-    prefix = base64ToBytes(data.slice(0, 16));
+    // Enough base64 to decode the window the PDF header may sit in.
+    prefix = base64ToBytes(data.slice(0, SNIFF_BASE64_CHARS));
     if (!(prefix instanceof Uint8Array)) return prefix;
   }
   // Computer types a file by its extension, and a Think 0.20 result keeps the
@@ -276,9 +311,7 @@ async function renderWithBytes(
   const sniffed = sniffMediaType(prefix);
   if (sniffed !== mediaType) {
     if (output.kind !== "image" || !sniffed?.startsWith("image/")) {
-      return errorText(
-        `Read ${output.path} (${output.mediaType}, ${sizeBytes} bytes), but its contents are not ${output.mediaType}, so it was not sent. Convert or rename the file to view it.`
-      );
+      return contentsMismatch(output, sizeBytes);
     }
     mediaType = sniffed;
   }
@@ -295,6 +328,15 @@ async function renderWithBytes(
   });
 }
 
+function contentsMismatch(
+  output: MediaReadResult,
+  sizeBytes: number
+): ToolModelOutput {
+  return errorText(
+    `Read ${output.path} (${output.mediaType}, ${sizeBytes} bytes), but its contents are not ${output.mediaType}, so it was not sent. Convert or rename the file to view it.`
+  );
+}
+
 /** The inline media type the first bytes declare, if any. */
 function sniffMediaType(bytes: Uint8Array): string | undefined {
   const at = (offset: number, signature: number[]) =>
@@ -307,7 +349,14 @@ function sniffMediaType(bytes: Uint8Array): string | undefined {
   if (at(0, [0x52, 0x49, 0x46, 0x46]) && at(8, [0x57, 0x45, 0x42, 0x50])) {
     return "image/webp";
   }
-  if (at(0, [0x25, 0x50, 0x44, 0x46, 0x2d])) return "application/pdf";
+  // PDF readers accept `%PDF-` anywhere in the first 1 KiB, after a
+  // byte-order mark, a newline, or other junk, and Computer and Think 0.20
+  // sent such files.
+  const last =
+    Math.min(bytes.byteLength, PDF_HEADER_WINDOW) - PDF_HEADER.length;
+  for (let offset = 0; offset <= last; offset++) {
+    if (at(offset, PDF_HEADER)) return "application/pdf";
+  }
   return undefined;
 }
 
@@ -322,27 +371,23 @@ function sniffMediaType(bytes: Uint8Array): string | undefined {
 async function rereadLegacy(
   output: MediaReadResult,
   workspace: ThinkWorkspace,
-  maxModelBytes: number
+  maxModelBytes: number,
+  limit: SizeLimit
 ): Promise<Uint8Array | ToolModelOutput> {
   const path = output.path;
   try {
     const stat = await workspace.fs.stat(path);
-    if (stat.size > maxModelBytes) {
-      return errorText(
-        `Read ${path} (${output.mediaType}, ${stat.size} bytes), but it exceeds the ${maxModelBytes}-byte inline model output limit.`
-      );
-    }
+    const tooLarge = await limit(stat.size);
+    if (tooLarge) return tooLarge;
     const bytes = await drain(
       await workspace.fs.readFile(path, {
         byteOffset: 0,
         byteLength: maxModelBytes + 1
       })
     );
-    if (bytes.byteLength > maxModelBytes) {
-      return errorText(
-        `Read ${path} (${output.mediaType}, ${bytes.byteLength} bytes), but it exceeds the ${maxModelBytes}-byte inline model output limit.`
-      );
-    }
+    // The file can grow between `stat` and the read.
+    const grown = await limit(bytes.byteLength);
+    if (grown) return grown;
     if (bytes.byteLength === 0) {
       return errorText(`Cannot attach empty file: ${path}`);
     }
@@ -446,11 +491,20 @@ function isMediaReadResult(value: unknown): value is MediaReadResult {
 }
 
 async function drain(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {
+  // A reader, as Computer's file store uses: not every engine iterates a
+  // ReadableStream with `for await`.
+  const reader = stream.getReader();
   const parts: Uint8Array[] = [];
   let total = 0;
-  for await (const part of stream) {
-    parts.push(part);
-    total += part.byteLength;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      parts.push(value);
+      total += value.byteLength;
+    }
+  } finally {
+    reader.releaseLock();
   }
   const bytes = new Uint8Array(total);
   let offset = 0;
