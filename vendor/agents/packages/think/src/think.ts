@@ -18265,16 +18265,30 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
       // exhaustion (terminalMessage + onExhausted + chat:recovery:exhausted +
       // submission interrupted) instead of letting the raw stall error leak
       // out. `firstSeenAt` is the closest available turn-start proxy here.
-      // A sealed incident already delivered that UX: keep the partial, skip
-      // the second banner and `onExhausted`.
       await input.persistPartial();
-      if (sealed) return "exhausted";
+      // A sealed incident already delivered that UX, and its done frame and
+      // terminal record went out under the sealer's request id. When that is
+      // this request, skip the second banner and `onExhausted`. For any other
+      // request id fall through, so this request's clients get their done
+      // frame and terminal record too (a second `onExhausted` for the chain
+      // is the same documented at-least-once edge as a give-up re-run).
+      if (sealed && incident.requestId === input.requestId) return "exhausted";
+      // An incident handed back exhausted without a re-evaluation (sealed,
+      // or sealed but not yet delivered) still names the sealer's request
+      // id; deliver under this request's, as upstream's re-evaluation does.
       await this._exhaustChatRecovery(
-        incident,
+        incident.requestId === input.requestId
+          ? incident
+          : { ...incident, requestId: input.requestId },
         config,
         { text: partialText, parts: input.partialParts },
         input.streamId,
         incident.firstSeenAt
+      );
+      // Only now is the seal final; a delivery that threw stays unstamped
+      // and re-deliverable.
+      await this._chatRecoveryEngine().markTerminalDelivered(
+        incident.incidentId
       );
       return "exhausted";
     }

@@ -142,6 +142,16 @@ export type ChatRecoveryIncident = {
    * run out of attempts. Bumped by `ChatRecoveryEngine.recordTransientRetry`.
    */
   transientRetries?: number;
+  /**
+   * The exhausted record's terminal UX (banner, `onExhausted`, terminal
+   * record) has been delivered. Set only by hosts that opt into
+   * `sealedIncidentsAreFinal`, after the delivery returns
+   * (`ChatRecoveryEngine.markTerminalDelivered`, or the give-up seal). An
+   * `exhausted` record without it was sealed by a budget evaluation whose
+   * delivery may not have happened, so `beginIncident` hands it back for
+   * re-terminalization. Optional for backward-compat.
+   */
+  terminalDelivered?: true;
 };
 
 // ── Persisted storage keys (cutover contract) ──────────────────────────────

@@ -106,10 +106,16 @@ export interface BeginChatRecoveryIncidentResult {
   config: ResolvedChatRecoveryConfig;
   exhausted: boolean;
   /**
-   * The record was already `exhausted` and the adapter sets
+   * The record was already `exhausted` with
+   * {@link ChatRecoveryIncident.terminalDelivered} set, and the adapter sets
    * {@link ChatRecoveryAdapter.sealedIncidentsAreFinal}: nothing was written
    * or emitted, and the seal's terminal delivery already happened, so the
    * caller must not terminalize again. Implies `exhausted`.
+   *
+   * An `exhausted` record WITHOUT the stamp (its sealing evaluation may have
+   * died before delivering) comes back `exhausted: true, sealed: false`, also
+   * without a write, an event or a re-evaluation: the caller terminalizes it
+   * and then stamps it with {@link ChatRecoveryEngine.markTerminalDelivered}.
    */
   sealed: boolean;
   /**
@@ -183,12 +189,18 @@ export interface ChatRecoveryAdapter {
    * Optional: `true` makes an `exhausted` incident final. Every later
    * {@link ChatRecoveryEngine.updateIncident} on it is a no-op: no write, no
    * lifecycle event and no recovering-flag change;
-   * {@link ChatRecoveryEngine.beginIncident} returns it `sealed` instead of
-   * re-evaluating the budget, and
-   * {@link ChatRecoveryEngine.rescheduleAfterStableTimeout} declines. A host that lets a callback
-   * run past an at-budget admission (see {@link isRecoveryAttemptCancelled})
-   * sets it, so that callback's own skip or completion cannot reopen an
-   * incident a concurrent delivery sealed during the sync.
+   * {@link ChatRecoveryEngine.beginIncident} never re-evaluates its budget (it
+   * returns it `sealed` once the terminal UX is stamped delivered, and hands
+   * it back `exhausted` for re-terminalization otherwise);
+   * {@link ChatRecoveryEngine.scheduleRecovery} neither emits nor enqueues;
+   * and {@link ChatRecoveryEngine.rescheduleAfterStableTimeout} declines. The
+   * engine stamps {@link ChatRecoveryIncident.terminalDelivered} after each
+   * terminal delivery it drives, and a host that delivers one itself calls
+   * {@link ChatRecoveryEngine.markTerminalDelivered}. A host that lets a
+   * callback run past an at-budget admission (see
+   * {@link isRecoveryAttemptCancelled}) sets it, so that callback's own skip
+   * or completion cannot reopen an incident a concurrent delivery sealed
+   * during the sync.
    */
   sealedIncidentsAreFinal?: boolean;
   /**
@@ -715,9 +727,10 @@ export class ChatRecoveryEngine {
     } = input;
 
     if (sealed) {
-      // The attempt that sealed the incident already delivered the terminal
-      // UX. Settle only what this replay found, as the cancelled branch does:
-      // keep settled work, close the orphaned stream, clear the flag.
+      // The seal's terminal UX was delivered and stamped. This is the
+      // exhausted branch below minus the delivery: keep settled work and
+      // clear the flag. Like that branch, it leaves the orphaned stream row
+      // as the sealer left it.
       if (
         await this._shouldPersistOrphanedPartial(wake, {
           streamId,
@@ -730,7 +743,6 @@ export class ChatRecoveryEngine {
       ) {
         await wake.persistOrphanedStream(streamId);
       }
-      if (streamStillActive) await wake.completeRecoveredStream(streamId);
       await adapter.setRecovering(false, recoveryRootRequestId);
       return true;
     }
@@ -762,6 +774,9 @@ export class ChatRecoveryEngine {
         ctx.createdAt,
         snapshot?.originMessageIds
       );
+      // Only now is the seal final: a delivery that threw above leaves the
+      // record unstamped, so the retried replay terminalizes it again.
+      await this.markTerminalDelivered(incident.incidentId);
       return true;
     }
 
@@ -865,18 +880,8 @@ export class ChatRecoveryEngine {
     // resuming a dead budget.
     await adapter.sweepStaleIncidents(now);
     const existing = await adapter.getIncident(key);
-    if (adapter.sealedIncidentsAreFinal && existing?.status === "exhausted") {
-      // Sealed stays sealed: a replayed fiber or a later stall on an exhausted
-      // incident neither re-evaluates the budget (which would reopen the
-      // record as `attempting`) nor terminalizes it a second time.
-      return {
-        incident: existing,
-        config,
-        exhausted: true,
-        sealed: true,
-        attempt: null
-      };
-    }
+    const sealedBefore = this.#sealedResult(existing, config);
+    if (sealedBefore) return sealedBefore;
     // Ordering invariant: rehydrate interaction state BEFORE the budget reads
     // `isAwaitingClientInteraction()` (see the adapter hook's contract).
     adapter.ensureInteractionStateLoaded?.();
@@ -899,6 +904,17 @@ export class ChatRecoveryEngine {
         adapter.onShouldKeepRecoveringError?.(error)
     });
 
+    if (adapter.sealedIncidentsAreFinal) {
+      // `readProgress` and `shouldKeepRecovering` (arbitrary host I/O) opened
+      // the input gate, so a concurrent writer may have sealed the record
+      // since the read above. Re-read and decide with no await before the
+      // put: the gate keeps that read-then-write atomic.
+      const sealedAfter = this.#sealedResult(
+        await adapter.getIncident(key),
+        config
+      );
+      if (sealedAfter) return sealedAfter;
+    }
     await adapter.putIncident(key, incident);
     // Confirm the record before the caller acts on it. The next attempt may
     // run in this invocation, and if it hits a memory-limit reset, writes that
@@ -910,6 +926,50 @@ export class ChatRecoveryEngine {
     const attempt =
       trigger.kind === "interrupted" && !exhausted ? trigger.attempt : null;
     return { incident, config, exhausted, sealed: false, attempt };
+  }
+
+  /**
+   * Sealed stays sealed: for a host that sets
+   * {@link ChatRecoveryAdapter.sealedIncidentsAreFinal}, an `exhausted` record
+   * is never re-evaluated (which would reopen it as `attempting`). Its
+   * delivered terminal UX is not repeated (`sealed: true`); an undelivered
+   * one is handed back `exhausted` for the caller to terminalize and stamp.
+   * Neither writes nor emits. `null` when the record is not sealed.
+   */
+  #sealedResult(
+    existing: ChatRecoveryIncident | null,
+    config: ResolvedChatRecoveryConfig
+  ): BeginChatRecoveryIncidentResult | null {
+    if (!this.adapter.sealedIncidentsAreFinal) return null;
+    if (existing?.status !== "exhausted") return null;
+    return {
+      incident: existing,
+      config,
+      exhausted: true,
+      sealed: existing.terminalDelivered === true,
+      attempt: null
+    };
+  }
+
+  /**
+   * Stamp {@link ChatRecoveryIncident.terminalDelivered} on an `exhausted`
+   * incident once its terminal UX (banner, `onExhausted`, terminal record)
+   * has been delivered, so a later {@link beginIncident} reports it `sealed`
+   * instead of delivering again. Call it only after the delivery returns: a
+   * delivery that threw leaves the record unstamped and re-deliverable. No-op
+   * unless the adapter sets {@link ChatRecoveryAdapter.sealedIncidentsAreFinal},
+   * and for a record that is gone, not `exhausted`, or already stamped.
+   *
+   * @param incidentId - The incident whose terminal UX was delivered.
+   */
+  async markTerminalDelivered(incidentId: string): Promise<void> {
+    const { adapter } = this;
+    if (!adapter.sealedIncidentsAreFinal) return;
+    const key = chatRecoveryIncidentKey(incidentId);
+    const stored = await adapter.getIncident(key);
+    if (stored?.status !== "exhausted" || stored.terminalDelivered) return;
+    await adapter.putIncident(key, { ...stored, terminalDelivered: true });
+    await adapter.syncStorage();
   }
 
   /**
@@ -929,6 +989,10 @@ export class ChatRecoveryEngine {
    * but schedules (and reports) a `retry`. `requestId` always matches
    * `incident.requestId` (the evaluation rewrites it to the current attempt), so
    * it is read from the incident.
+   *
+   * For a host that sets {@link ChatRecoveryAdapter.sealedIncidentsAreFinal},
+   * an incident already `exhausted` (sealed after the caller opened it) is
+   * left alone: no transition, no event and no enqueue.
    */
   async scheduleRecovery(input: {
     incident: ChatRecoveryIncident;
@@ -939,6 +1003,15 @@ export class ChatRecoveryEngine {
     delaySeconds?: number;
   }): Promise<void> {
     const { incident } = input;
+    if (this.adapter.sealedIncidentsAreFinal) {
+      // A seal can land after the caller's `beginIncident` (e.g. across
+      // `onChatRecovery`). The transition below would no-op on it; the
+      // event and the enqueue must not go out either.
+      const stored = await this.adapter.getIncident(
+        chatRecoveryIncidentKey(incident.incidentId)
+      );
+      if (stored?.status === "exhausted") return;
+    }
     await this.updateIncident(incident.incidentId, "scheduled");
     this.adapter.emitRecoveryEvent({
       type: "chat:recovery:scheduled",
@@ -1089,7 +1162,8 @@ export class ChatRecoveryEngine {
    *    terminal record. The re-run is idempotent (terminal writes overwrite the
    *    same key); a second banner is the documented at-least-once edge; and
    * 7. best-effort SEAL write so the re-entry guard sees `exhausted` on a
-   *    duplicate alarm — a failed seal (reported via
+   *    duplicate alarm (stamped `terminalDelivered` for a host that sets
+   *    {@link ChatRecoveryAdapter.sealedIncidentsAreFinal}) — a failed seal (reported via
    *    `onGiveUpBookkeepingError("seal", …)`) costs at most one re-delivered
    *    banner.
    *
@@ -1175,7 +1249,14 @@ export class ChatRecoveryEngine {
 
     if (incidentKey) {
       try {
-        await adapter.putIncident(incidentKey, incident);
+        // The delivery above returned, so the seal can carry the delivered
+        // stamp (only for a host that opts into final seals).
+        await adapter.putIncident(
+          incidentKey,
+          adapter.sealedIncidentsAreFinal
+            ? { ...incident, terminalDelivered: true }
+            : incident
+        );
       } catch (writeError) {
         adapter.onGiveUpBookkeepingError("seal", writeError);
       }
