@@ -383,6 +383,26 @@ describe("handler dispatch and close state", () => {
     ]);
   });
 
+  it("D6 an own close sent before the 101 is returned also keeps the tags through the echo", async () => {
+    const actor = await host.spawn("ws-own-close-before-return");
+    await actor.call("closeNextConnect", 4002, "server out");
+    const client = await host.connect(actor, ["connection-id"]);
+    expect(await client.nextClose()).toMatchObject({ code: 4002, reason: "server out" });
+    const result = await eventually(
+      () => journal(actor),
+      (value) => value.afterTurn.some((event) => event.event === "close"),
+    );
+    // The coupling pump reads the queued close as the Response goes out, so the own close
+    // is complete before the echo arrives (raw workerd 1.20261031.1: netCloseBeforeReturn).
+    expect(result.events.at(-1)).toMatchObject({
+      id: "connection-id",
+      close: { code: 4002, reason: "server out", wasClean: true },
+    });
+    expect(result.afterTurn).toEqual([
+      { id: "connection-id", event: "close", listed: false, tags: ["connection-id"] },
+    ]);
+  });
+
   it("D7 exposes ready states on the constructor and prototype", async () => {
     const actor = await host.spawn("ws-ready-state");
     expect(await actor.call("readyStateConstants")).toEqual({

@@ -113,6 +113,8 @@ type PairState = {
   hibernationAccepted: boolean;
   /** One half went out in a Response, so the other half's peer is the network. */
   coupled?: true;
+  /** Both halves, so coupling one can settle what the other already wrote. */
+  halves?: readonly [AcceptedWebSocket, AcceptedWebSocket];
 };
 
 type SocketAcceptance =
@@ -512,7 +514,17 @@ export class AcceptedWebSocket extends EventTarget implements RawWebSocket, WebS
     host.#peerClose = this.#peerClose;
     host.#binaryType = this.#binaryType;
     this.#markPairUsed();
-    if (this.#pairState !== undefined) this.#pairState.coupled = true;
+    if (this.#pairState !== undefined) {
+      this.#pairState.coupled = true;
+      // ← the coupling pump starts reading as the Response goes out, so a close
+      // the other half wrote before this point completes now, ahead of the echo
+      // the host sends once it accepts, not when its next event arrives. Raw
+      // workerd keeps the tags through the echo of such a close
+      // (docs/workerd-sync.md, close before the Response is returned).
+      const other = this.#pairState.halves?.find((half) => half !== this);
+      const state = other === undefined ? undefined : socketMetadata(other);
+      if (state?.ownCloseCompletion !== undefined) completeOwnClose(state);
+    }
     this.#released = true;
     this.#ctx = undefined;
     this.#pending = [];
@@ -538,7 +550,25 @@ export class AcceptedWebSocket extends EventTarget implements RawWebSocket, WebS
     const pending = this.#pending;
     this.#pending = [];
     for (const item of pending) {
+      // ← the `accept()` read loop answers a close it finds queued, as it would
+      // one that arrives later; raw workerd fires `webSocketClose` on the other
+      // half after a late `accept()` with no echo from the handler.
+      if (item.type === "close") this.#answerPeerClose(item.event as CloseEvent);
       this.#deliverClassic(item.type, item.event, delivery.criticalSection);
+    }
+  }
+
+  /**
+   * Pair halves perform the WebSocket close handshake in-memory. An
+   * embedder-supplied raw socket owns its own protocol and only reports.
+   * A dropped connection leaves nobody to answer.
+   */
+  #answerPeerClose(event: CloseEvent): void {
+    if (this.#pairState === undefined || this.#ownClose) return;
+    if (!event.wasClean || event.code === 1005 || event.code === 1006 || event.code === 1015) {
+      this.#readyState = AcceptedWebSocket.CLOSED;
+    } else {
+      this.close(event.code, event.reason);
     }
   }
 
@@ -577,16 +607,7 @@ export class AcceptedWebSocket extends EventTarget implements RawWebSocket, WebS
     } else {
       this.#peerClose = true;
       this.#readyState = AcceptedWebSocket.CLOSING;
-      if (this.#delivery.mode === "classic" && this.#pairState !== undefined) {
-        // Pair halves perform the WebSocket close handshake in-memory. An
-        // embedder-supplied raw socket owns its own protocol and only reports.
-        // A dropped connection leaves nobody to answer.
-        if (!event.wasClean || event.code === 1005 || event.code === 1006 || event.code === 1015) {
-          this.#readyState = AcceptedWebSocket.CLOSED;
-        } else {
-          this.close(event.code, event.reason);
-        }
-      }
+      if (this.#delivery.mode === "classic") this.#answerPeerClose(event);
     }
     const delivery = this.#delivery;
     if (delivery.mode === "pending") this.#pending.push({ type: "close", event });
@@ -935,10 +956,12 @@ export class HibernatableWebSocketRegistry {
     const right = new MemoryWebSocketEndpoint();
     left.peer = right;
     right.peer = left;
-    return {
-      0: new AcceptedWebSocket(this.#ctx, left, pairState),
-      1: new AcceptedWebSocket(this.#ctx, right, pairState),
-    };
+    const halves = [
+      new AcceptedWebSocket(this.#ctx, left, pairState),
+      new AcceptedWebSocket(this.#ctx, right, pairState),
+    ] as const;
+    pairState.halves = halves;
+    return { 0: halves[0], 1: halves[1] };
   }
 }
 

@@ -1286,7 +1286,20 @@ export class Probe extends DurableObject<ProbeEnv> {
     });
     const connects = ((await this.ctx.storage.get<number>("wsConnects")) ?? 0) + 1;
     await this.ctx.storage.put("wsConnects", connects);
+    const closeOnConnect = await this.ctx.storage.get<{ code: number; reason: string }>(
+      "wsCloseOnConnect",
+    );
+    if (closeOnConnect !== undefined) {
+      // A handler that rejects the socket it just accepted: own close before the 101 goes out.
+      await this.ctx.storage.delete("wsCloseOnConnect");
+      server.close(closeOnConnect.code, closeOnConnect.reason);
+    }
     return new Response(null, { status: 101, webSocket: client });
+  }
+
+  /** The next upgrade accepts its socket, closes it, and only then returns the 101. */
+  async closeNextConnect(code: number, reason: string): Promise<void> {
+    await this.ctx.storage.put("wsCloseOnConnect", { code, reason });
   }
 
   acceptanceSemantics(): Record<string, unknown> {

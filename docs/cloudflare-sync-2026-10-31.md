@@ -40,11 +40,11 @@ covers all 121 upstream commits. Each one has a row in the
 
 | Disposition | Commits |
 | --- | --- |
-| Taken as-is | 54 |
+| Taken as-is | 55 |
 | Taken with a fork adaptation | 28 |
 | Overridden by the fork | 3 |
 | Deferred | 2 |
-| Outside the retained packages | 34 |
+| Outside the retained packages | 33 |
 
 Eighteen files conflicted.
 
@@ -109,11 +109,11 @@ The orchestrator fills these numbers from the final gate run.
 
 | Gate | Result |
 | --- | --- |
-| Runtime unit suite | 43 files / 1087 tests pass |
-| Native workerd conformance | 87 / 87 pass against workerd 1.20261031.1 |
-| Node conformance | 87 / 87 pass |
-| Chromium conformance | 102 / 102 pass |
-| Transformed Node / Chromium conformance | 87 / 87 and 87 / 87 pass |
+| Runtime unit suite | 43 files / 1089 tests pass |
+| Native workerd conformance | 88 / 88 pass against workerd 1.20261031.1 |
+| Node conformance | 88 / 88 pass |
+| Chromium conformance | 103 / 103 pass |
+| Transformed Node / Chromium conformance | 88 / 88 and 88 / 88 pass |
 | SDK regression gate | react 108, chat 668, agents 1675 (+2 todo) + do-runtime lane 2, ai-chat 194 + 106, think 1340, voice 21, codemode 108 + 9, shell 203, browser 68 + 18; think and agents run twice with no flake delta |
 | SDK exports, formatting, lint and TypeScript | exports 6/6 valid, oxfmt 1443 files clean, oxlint 0 findings, 6 tsgo projects clean |
 | Runtime and example TypeScript | root typecheck (build:package + 7 tsc projects) clean |

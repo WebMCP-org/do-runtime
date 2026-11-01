@@ -544,6 +544,48 @@ describe("hibernatable close settlement", () => {
     expect(observe(() => registry, server)).toEqual({ tags: ["t"], listed: false });
   });
 
+  test("an own close written before the pair is coupled completes at coupling, so the echo keeps the tags", async () => {
+    const { ctx } = newFixture();
+    const { registry, seen } = recordingRegistry(ctx);
+    const { 0: client, 1: server } = new registry.WebSocketPair();
+    // `acceptWebSocket(server); server.close(); return 101`: the write lands before
+    // the host couples the client half (raw workerd 1.20261031.1 keeps the tags).
+    await ctx.run(() => {
+      registry.acceptWebSocket(server, ["t"]);
+      server.close(4002, "server out");
+    });
+    await quiesce();
+    const host = (client as AcceptedWebSocket).coupleToHost();
+    const echoes: number[] = [];
+    host.addEventListener("close", (event) => echoes.push((event as CloseEvent).code));
+    host.accept();
+    await quiesce();
+    expect(echoes).toEqual([4002]);
+    const during = { tags: ["t"], listed: true };
+    expect(seen).toEqual([{ event: "close:4002", sync: during, microtask: during }]);
+    expect(observe(() => registry, server)).toEqual({ tags: ["t"], listed: false });
+  });
+
+  test("a close queued before accept() is answered when accept() delivers it", async () => {
+    const { ctx } = newFixture();
+    const { registry, seen } = recordingRegistry(ctx);
+    const { 0: client, 1: server } = new registry.WebSocketPair();
+    await ctx.run(() => {
+      registry.acceptWebSocket(server, ["t"]);
+      server.close(4002, "server out");
+    });
+    await quiesce();
+    expect(seen).toEqual([]);
+    // ← a late `accept()` on raw workerd auto-replies, and `webSocketClose` fires.
+    const clientSeen: number[] = [];
+    client.addEventListener("close", (event) => clientSeen.push((event as CloseEvent).code));
+    await ctx.run(() => client.accept());
+    await quiesce();
+    expect(clientSeen).toEqual([4002]);
+    expect(seen.map((entry) => entry.event)).toEqual(["close:4002"]);
+    expect(client.readyState).toBe(3);
+  });
+
   test("a message ahead of a pair's echo takes the completion, so nothing releases", async () => {
     const { ctx } = newFixture();
     const { registry, seen } = recordingRegistry(ctx);
