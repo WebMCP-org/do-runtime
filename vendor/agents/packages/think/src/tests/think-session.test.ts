@@ -10,7 +10,7 @@ import type {
   ThinkSystemPromptSkillsWarningAgent,
   ThinkDefaultSystemPromptSkillsAgent,
   ThinkInheritedSystemPromptSkillsAgent,
-  ThinkSystemPromptFieldSkillsAgent,
+  ThinkWorkspaceSkillsAgent,
   ThinkMissingClassifierWarningAgent,
   ThinkClassifierMethodAgent,
   ThinkInheritedClassifierAgent,
@@ -1754,115 +1754,122 @@ describe("Think — context blocks", () => {
     expect(systemPrompt).toContain("[writable]");
   });
 
-  it("does not warn when a skills agent inherits the default getSystemPrompt", async () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  it("keeps Think's default prompt out when a skills agent does not override getSystemPrompt", async () => {
+    // Construct the intermediate class first. Agent's method wrapping mutates
+    // this prototype, which used to poison later override detection.
+    await (await freshSessionAgent("skills-default-parent")).getContextLabels();
 
-    try {
-      // Construct the intermediate class first. Agent's method wrapping mutates
-      // this prototype, which used to poison later override detection.
-      await (
-        await freshSessionAgent("skills-default-parent")
-      ).getContextLabels();
-
-      for (const name of ["skills-default-first", "skills-default-second"]) {
-        const agent = await getAgentByName(
-          env.ThinkDefaultSystemPromptSkillsAgent as unknown as DurableObjectNamespace<ThinkDefaultSystemPromptSkillsAgent>,
-          `${name}-${crypto.randomUUID()}`
-        );
-        await expect(agent.testChat("Hello")).resolves.toMatchObject({
-          done: true
-        });
-        await expect(agent.getAssembledSystemPrompt()).resolves.toContain(
-          "map-reading"
-        );
-      }
-
-      const fallbackWarnings = warn.mock.calls
-        .flat()
-        .filter(
-          (value) =>
-            typeof value === "string" &&
-            value.includes(
-              "getSystemPrompt() is only used as a fallback when no context blocks are configured"
-            )
-        );
-      expect(fallbackWarnings).toEqual([]);
-    } finally {
-      warn.mockRestore();
+    for (const name of ["skills-default-first", "skills-default-second"]) {
+      const agent = await getAgentByName(
+        env.ThinkDefaultSystemPromptSkillsAgent as unknown as DurableObjectNamespace<ThinkDefaultSystemPromptSkillsAgent>,
+        `${name}-${crypto.randomUUID()}`
+      );
+      await expect(agent.testChat("Hello")).resolves.toMatchObject({
+        done: true
+      });
+      const prompt = await agent.getAssembledSystemPrompt();
+      expect(prompt).toContain("map-reading");
+      expect(prompt).not.toContain("You are a careful, capable assistant");
     }
   });
 
-  it("warns when getSkills makes an overridden getSystemPrompt fallback-only", async () => {
+  it("puts an overridden getSystemPrompt above the skills block", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const agent = await getAgentByName(
       env.ThinkSystemPromptSkillsWarningAgent as unknown as DurableObjectNamespace<ThinkSystemPromptSkillsWarningAgent>,
-      // Unique per run: the warning fires once per instance, so a retry
-      // against a warm object would see no call.
-      `skills-system-prompt-warning-${crypto.randomUUID()}`
+      `skills-system-prompt-${crypto.randomUUID()}`
     );
 
     try {
       await expect(agent.runChatTurnForWarningTest()).resolves.toMatchObject({
         done: true
       });
-      await expect(agent.runChatTurnForWarningTest()).resolves.toMatchObject({
-        done: true
-      });
-      const fallbackWarnings = warn.mock.calls
-        .flat()
-        .filter(
-          (value) =>
-            typeof value === "string" &&
-            value.includes(
-              "getSystemPrompt() is only used as a fallback when no context blocks are configured"
-            )
-        );
-      expect(fallbackWarnings).toHaveLength(1);
+      const prompt = await agent.getAssembledSystemPrompt();
+      expect(prompt.indexOf("You are Robbie, a pirate.")).toBe(0);
+      expect(prompt).toContain("knot-tying: How to tie useful knots.");
+      expect(
+        warn.mock.calls
+          .flat()
+          .some(
+            (value) =>
+              typeof value === "string" && value.includes("getSystemPrompt()")
+          )
+      ).toBe(false);
     } finally {
       warn.mockRestore();
     }
   });
 
-  it("warns for an inherited getSystemPrompt override", async () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const agent = await getAgentByName(
-      env.ThinkInheritedSystemPromptSkillsAgent as unknown as DurableObjectNamespace<ThinkInheritedSystemPromptSkillsAgent>,
-      `skills-inherited-system-prompt-warning-${crypto.randomUUID()}`
-    );
-
-    try {
+  it("keeps an inherited or class-field getSystemPrompt alongside skills", async () => {
+    for (const [namespace, name] of [
+      [env.ThinkInheritedSystemPromptSkillsAgent, "skills-inherited"],
+      [env.ThinkSystemPromptFieldSkillsAgent, "skills-field"]
+    ] as const) {
+      const agent = await getAgentByName(
+        namespace as unknown as DurableObjectNamespace<ThinkInheritedSystemPromptSkillsAgent>,
+        `${name}-${crypto.randomUUID()}`
+      );
       await expect(agent.testChat("Hello")).resolves.toMatchObject({
         done: true
       });
-      expect(warn).toHaveBeenCalledWith(
-        expect.stringContaining(
-          "getSystemPrompt() is only used as a fallback when no context blocks are configured"
-        )
-      );
-    } finally {
-      warn.mockRestore();
+      const prompt = await agent.getAssembledSystemPrompt();
+      expect(prompt.indexOf("You are an experienced cartographer.")).toBe(0);
+      expect(prompt).toContain("map-reading: How to read a map.");
     }
   });
 
-  it("warns for a getSystemPrompt class-field override", async () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  it("loads skills from files in the Workspace and follows edits without rebuilding the prompt", async () => {
     const agent = await getAgentByName(
-      env.ThinkSystemPromptFieldSkillsAgent as unknown as DurableObjectNamespace<ThinkSystemPromptFieldSkillsAgent>,
-      `skills-field-system-prompt-warning-${crypto.randomUUID()}`
+      env.ThinkWorkspaceSkillsAgent as unknown as DurableObjectNamespace<ThinkWorkspaceSkillsAgent>,
+      `workspace-skills-${crypto.randomUUID()}`
     );
 
-    try {
-      await expect(agent.testChat("Hello")).resolves.toMatchObject({
-        done: true
-      });
-      expect(warn).toHaveBeenCalledWith(
-        expect.stringContaining(
-          "getSystemPrompt() is only used as a fallback when no context blocks are configured"
-        )
-      );
-    } finally {
-      warn.mockRestore();
-    }
+    // No skills yet: no catalog and no skill tools.
+    await agent.testChat("Hello");
+    const frozen = await agent.getAssembledSystemPrompt();
+    expect(frozen).toContain("No skills are available.");
+    expect(await agent.getTurnToolNames()).not.toContain("activate_skill");
+    await expect(agent.getContextReminder()).resolves.toBeNull();
+
+    // A new skill reaches the model as a reminder; the frozen prompt (and
+    // the provider's prefix cache) stays the same.
+    await agent.writeSkill("map-reading", "How to read a map.");
+    await agent.testChat("Hello again");
+    await expect(agent.getAssembledSystemPrompt()).resolves.toBe(frozen);
+    await expect(agent.getContextReminder()).resolves.toContain(
+      "- map-reading: How to read a map."
+    );
+    expect(await agent.getTurnToolNames()).toEqual(
+      expect.arrayContaining(["activate_skill", "read_skill_resource"])
+    );
+
+    await agent.writeSkill("map-reading", "How to read a nautical chart.");
+    await agent.testChat("And again");
+    await expect(agent.getAssembledSystemPrompt()).resolves.toBe(frozen);
+    const edited = await agent.getContextReminder();
+    expect(edited).toContain("- map-reading: How to read a nautical chart.");
+    expect(edited).not.toContain("How to read a map.");
+
+    // Deleting the skill brings the catalog back to what the prompt froze.
+    await agent.deleteSkill("map-reading");
+    await agent.testChat("Last one");
+    await expect(agent.getContextReminder()).resolves.toBeNull();
+    expect(await agent.getTurnToolNames()).not.toContain("activate_skill");
+  });
+
+  it("folds a changed skills catalog into the prompt when history is cleared", async () => {
+    const agent = await getAgentByName(
+      env.ThinkWorkspaceSkillsAgent as unknown as DurableObjectNamespace<ThinkWorkspaceSkillsAgent>,
+      `workspace-skills-clear-${crypto.randomUUID()}`
+    );
+    await agent.testChat("Hello");
+    await agent.writeSkill("map-reading", "How to read a map.");
+    await agent.testChat("Hello again");
+    await agent.clearSkillHistory();
+    await expect(agent.getAssembledSystemPrompt()).resolves.toContain(
+      "- map-reading: How to read a map."
+    );
+    await expect(agent.getContextReminder()).resolves.toBeNull();
   });
 
   it("warns when reactive overflow recovery has no classifier", async () => {
@@ -2594,64 +2601,77 @@ describe("Think — model message conversion", () => {
     expect(toolOutput?.value).toBe(legacyOutput);
   });
 
-  it("rehydrates compact workspace image read outputs during replay", async () => {
-    const agent = await freshAgent("model-conversion-image-read");
-    const imageBytes = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
-    await agent.seedWorkspaceBytes("/screenshot", imageBytes, "image/png");
+  // Vendor divergence (fork-diff.md "Early model preparation and media"):
+  // upstream replays an old image read as an error. The fork's
+  // workspace-read.ts re-reads it from the file, as Think 0.20 did, and
+  // renders an error only when the file cannot be read.
+  it.each([
+    ["re-reads", "/screenshot"],
+    ["renders an error for", "/missing-screenshot"]
+  ])(
+    "%s an image read stored by the old read tool without failing the turn",
+    async (_, path) => {
+      // Think's own read tool stored images as `{ kind: "image", ... }` and
+      // re-read the bytes on replay. The @cloudflare/computer read tool
+      // captures bytes when it runs instead.
+      const agent = await freshAgent(`model-conversion-image-read${path}`);
+      const imageBytes = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+      await agent.seedWorkspaceBytes("/screenshot", imageBytes, "image/png");
 
-    await agent.persistTestMessage({
-      id: "u-read-image",
-      role: "user",
-      parts: [{ type: "text", text: "Read /screenshot" }]
-    });
-    await agent.persistTestMessage({
-      id: "a-read-image",
-      role: "assistant",
-      parts: [
-        {
-          type: "tool-read",
-          toolCallId: "tc-read-image",
-          state: "output-available",
-          input: { path: "/screenshot" },
-          output: {
-            kind: "image",
-            path: "/screenshot",
-            name: "screenshot",
-            mediaType: "image/png",
-            sizeBytes: imageBytes.length
-          }
-        } as UIMessage["parts"][number]
-      ]
-    });
+      await agent.persistTestMessage({
+        id: "u-read-image",
+        role: "user",
+        parts: [{ type: "text", text: `Read ${path}` }]
+      });
+      await agent.persistTestMessage({
+        id: "a-read-image",
+        role: "assistant",
+        parts: [
+          {
+            type: "tool-read",
+            toolCallId: "tc-read-image",
+            state: "output-available",
+            input: { path },
+            output: {
+              kind: "image",
+              path,
+              name: "screenshot",
+              mediaType: "image/png",
+              sizeBytes: imageBytes.length
+            }
+          } as UIMessage["parts"][number]
+        ]
+      });
 
-    await agent.testChat("What is in the screenshot?");
+      const result = await agent.testChat("What is in the screenshot?");
+      expect(result.error).toBeUndefined();
 
-    const messagesJson = await agent.getLastBeforeTurnMessagesJson();
-    expect(messagesJson).not.toBeNull();
-    const messages = JSON.parse(messagesJson!) as Array<{
-      role: string;
-      content?: Array<{
-        output?: {
-          type: string;
-          value?: Array<{
-            type: string;
-            data?: unknown;
-            mediaType?: string;
-            filename?: string;
-          }>;
-        };
+      const messagesJson = await agent.getLastBeforeTurnMessagesJson();
+      expect(messagesJson).not.toBeNull();
+      const messages = JSON.parse(messagesJson!) as Array<{
+        role: string;
+        content?: Array<{ output?: { type: string; value?: unknown } }>;
       }>;
-    }>;
-    const toolResult = messages
-      .find((message) => message.role === "tool")
-      ?.content?.find((part) => part.output?.type === "content")?.output;
+      const toolResult = messages
+        .find((message) => message.role === "tool")
+        ?.content?.find((part) => part.output !== undefined)?.output;
 
-    expect(toolResult?.value).toContainEqual({
-      type: "image-data",
-      data: "iVBORw0KGgo=",
-      mediaType: "image/png"
-    });
-  });
+      if (path === "/screenshot") {
+        expect(toolResult).toMatchObject({
+          type: "content",
+          value: [
+            { type: "text", text: "Read /screenshot (image/png, 8 bytes)." },
+            { type: "file", mediaType: "image/png" }
+          ]
+        });
+      } else {
+        expect(toolResult?.type).toBe("error-text");
+        expect(String(toolResult?.value)).toContain(
+          `Could not read file bytes: ${path}`
+        );
+      }
+    }
+  );
 });
 
 // ── tool-call preservation (no default pruning) ─────────────────
@@ -3765,6 +3785,89 @@ describe("Think — onChatRecovery", () => {
       maxAttempts: 1,
       status: "exhausted",
       reason: "max_attempts_exceeded"
+    });
+  });
+
+  it("seals a turn whose replayed attempts keep dying, even when each streams output inside the debounce window (#2613)", async () => {
+    const agent = await freshRecoveryAgent("recovery-interrupted-attempts");
+    // A high attempt cap so only the interruption budget can seal; the
+    // default maxInterruptedAttempts (5) applies.
+    await agent.enableExhaustedCaptureForTest(100);
+    await agent.setRecoveryOverride({ continue: false });
+
+    for (let death = 1; death <= 5; death++) {
+      // From the second death on, the recovery attempt that ran the turn
+      // died with it and left its record behind.
+      if (death > 1) {
+        await agent.simulateDeadAttemptForTest("req-crash-loop:");
+      }
+      // Each attempt streamed a little before its isolate died, and the
+      // replay comes inside the debounce window. Neither resets the count.
+      await agent.bumpRecoveryProgressForTest();
+      await agent.insertInterruptedFiber(
+        "__cf_internal_chat_turn:req-crash-loop"
+      );
+      await agent.triggerFiberRecovery();
+    }
+
+    const incidents = (await agent.getChatRecoveryIncidentsForTest()) as Array<{
+      attempt: number;
+      interruptedAttempts?: number;
+      status: string;
+      reason?: string;
+    }>;
+    expect(incidents).toHaveLength(1);
+    expect(incidents[0]).toMatchObject({
+      attempt: 1,
+      interruptedAttempts: 5,
+      status: "exhausted",
+      reason: "interrupted_attempts_exceeded"
+    });
+    const exhausted = (await agent.getExhaustedContextsForTest()) as Array<{
+      reason: string;
+    }>;
+    expect(exhausted).toHaveLength(1);
+    expect(exhausted[0].reason).toBe("interrupted_attempts_exceeded");
+    // The first four replays reached onChatRecovery; the fifth sealed first.
+    expect(await agent.getRecoveryContexts()).toHaveLength(4);
+  });
+
+  it("seals a recovery callback whose attempts die before starting a turn (#2613)", async () => {
+    const agent = await freshRecoveryAgent("recovery-pre-turn-deaths");
+    await agent.enableExhaustedCaptureForTest(100);
+    await agent.seedIncidentForTest({
+      incidentId: "req-pre-turn:",
+      requestId: "req-pre-turn",
+      recoveryKind: "continue",
+      attempt: 1,
+      maxAttempts: 100,
+      status: "scheduled",
+      firstSeenAt: Date.now(),
+      lastAttemptAt: Date.now(),
+      interruptedAttempts: 4
+    });
+    // The last callback died while it was still checking stable state, so
+    // no turn run exists to replay; only its attempt record is left.
+    await agent.simulateDeadAttemptForTest("req-pre-turn:");
+
+    await agent.runChatRecoveryContinueForTestWith({
+      incidentId: "req-pre-turn:",
+      originalRequestId: "req-pre-turn"
+    });
+
+    const exhausted = (await agent.getExhaustedContextsForTest()) as Array<{
+      reason: string;
+    }>;
+    expect(exhausted).toHaveLength(1);
+    expect(exhausted[0].reason).toBe("interrupted_attempts_exceeded");
+    expect(await agent.getTurnBodies()).toHaveLength(0);
+    const incidents = (await agent.getChatRecoveryIncidentsForTest()) as Array<{
+      interruptedAttempts?: number;
+      status: string;
+    }>;
+    expect(incidents[0]).toMatchObject({
+      interruptedAttempts: 5,
+      status: "exhausted"
     });
   });
 
@@ -6283,6 +6386,24 @@ describe("Think — onChatRecovery", () => {
     expect(result.exhaustedReason).toBe("recovery_error");
     expect(result.terminalBroadcast).toBe(terminalMessage);
     expect(result.incidentStatus).toBe("exhausted");
+  });
+
+  it("re-throws a memory-limit reset from a recovery callback without writing anything (#2613)", async () => {
+    const agent = await freshRecoveryAgent("recovery-throw-memory-limit");
+
+    const result = await agent.testRecoveryCallbackError({
+      errorMessage:
+        "Durable Object's isolate exceeded its memory limit and was reset.",
+      errorShape: "sql-wrapped"
+    });
+
+    // The isolate is condemned, so the callback records nothing: no give-up,
+    // no banner, and the incident stays as its opening left it. The next
+    // isolate's replay of the interrupted run counts the attempt.
+    expect(result.threw).toBe(true);
+    expect(result.exhaustedContexts).toBe(0);
+    expect(result.terminalBroadcast).toBeUndefined();
+    expect(result.incidentStatus).toBe("attempting");
   });
 
   it("re-throws a deploy code-update reset (preserve the row to re-run on the fresh isolate) and does NOT terminalize", async () => {

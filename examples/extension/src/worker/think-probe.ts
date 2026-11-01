@@ -45,7 +45,6 @@ function text(message: UIMessage): string {
 export class ThinkProbe extends Think<CounterEnv> {
   override includeMcpTools = false;
   override mediaEviction = false;
-  override workspaceBash = false;
   override chatRecovery = { stableTimeoutMs: 2_000 };
 
   async #bump(key: string): Promise<number> {
