@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.13.0
+
+### Minor Changes
+
+- abba5d6: Expose client and server Chrome runtime.Port WebSocket adapters. Reuse the native MessagePort socket lifecycle, with JSON binary framing, readiness deadlines shared across replacement connections, and optional dead-pipe probing for MV3 hosts.
+- abba5d6: Add browser actor-tree and worker-supervisor primitives with native activity observation.
+  
+  `BrowserActorTree` owns facet placement, scoped capabilities, storage handles and hibernation restoration. `BrowserWorkerSupervisor` owns worker bootstrap and readiness, Cap’n Web sessions, transport rebinding across real worker termination, and deletion-fenced logical references. Its lifecycle reporting context is bound to the physical worker generation.
+  
+  Intentional deletion closes live and hibernated transports with code 1001, retires them even when a Chrome port is already disconnected, and preserves physical storage removal when a cleanup callback throws.
+  
+  `ActorContainer` now exposes full-event quiescence and activity leases independently of input/output gate ownership, plus activity-change observation. Browser hosts can use these facts to hibernate idle workers without maintaining parallel event counters.
+- deb3707: Align the runtime with workerd 1.20261031.1: a move-later alarm whose request
+  completes after a commit stored an earlier alarm no longer reschedules its parked
+  time; an actor method's exception, sync or async, waits for the output gate
+  before it reaches the caller, and a broken gate's error replaces it; and a
+  hibernatable socket that sent its own close is released, so `getTags()` throws,
+  once that close completes after the close event was dispatched. A message
+  received after the own close keeps the tags readable. A closed socket stays in
+  `getWebSockets()` until its close handler's synchronous part returns, and its
+  tags stay readable unless the socket is released. A `WebSocketPair` half
+  returned in a 101 `Response` closes like a network transport, including a close
+  sent before the `Response` was returned, and `accept()` on a pair half answers a
+  close that arrived before it. `SqlStorageCursor.next()` is
+  typed `IteratorResult<T, undefined>`. Pin the conformance oracle and Workers
+  types to the October 31 release.
+- abba5d6: Add idle whole-pool SQLite snapshots across actor and facet prefixes. Validate every image and native filename before replacement, reject newer runtime storage on import, reserve pool capacity, and share the existing rollback implementation with scoped provider snapshots and cloning. Exports remain available to rescue databases written by newer runtimes.
+
+### Patch Changes
+
+- abba5d6: `BrowserWorkerSupervisor` now runs `discarded` even when tearing down a worker's sessions throws, and warns when a worker sends an event that fails protocol validation. `BrowserActorTree` accepts a `broken(request, reason)` option that reports a placed facet's container breaking.
+- abba5d6: Report a Chrome runtime.Port that fails during `send()` as closed after `send()` returns, so callers record what they sent before observing the close. Further sends on the lost port are dropped.
+- abba5d6: Preserve optional method invocation in the browser async-context transform. Use
+  targeted Babel async plugins so callable RPC capabilities are invoked directly
+  instead of dispatching a remote `.call` property, retain optional `super` call
+  receivers and SDK async-method identity, and compose the original source maps.
+  Use Babel's canonical async-generator helper for awaited early-return cleanup.
+- abba5d6: Whole-pool SQLite export and restore now let SQLite roll back a hot journal left by a terminated worker instead of refusing the pool. A sidecar that recovery cannot remove is still refused, and the error names the operation that refused it.
+
 ## 0.12.1
 
 ### Patch Changes
