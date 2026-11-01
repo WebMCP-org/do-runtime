@@ -25,17 +25,17 @@ Chromium, including native sockets in a real Worker. See
 
 The native Agents and Think files run serially. Agents has a recorded
 parallel-worker bridge-test flake; Think's expanded suite hit its 60-second
-module-warmup deadline locally when loaded in parallel. All 763 Think cases
+module-warmup deadline locally when loaded in parallel. All 1328 Think cases
 passed with serial file execution; retries remain disabled.
 
 ## Packages
 
-- `agents@0.24.0`
-- `@cloudflare/ai-chat@0.12.0`
-- `@cloudflare/think@0.19.0`
+- `agents@0.32.0`
+- `@cloudflare/ai-chat@0.12.2`
+- `@cloudflare/think@0.23.0`
 - `@cloudflare/voice@0.5.0`
-- `@cloudflare/shell@0.4.3`
-- `@cloudflare/codemode@0.5.2`
+- `@cloudflare/shell@0.5.0`
+- `@cloudflare/codemode@0.5.6`
 
 Rook consumes these built packages. `@mcp-b/do-runtime` remains a lower
 layer and has no dependency on the SDK.

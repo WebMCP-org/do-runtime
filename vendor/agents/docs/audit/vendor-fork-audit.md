@@ -13,6 +13,8 @@ new replay ledger. The October 9 refresh moves it to Agents 0.27 / Think 0.20.1
 after reviewing all 34 intervening commits. It retires no divergence and adds
 no runtime divergence: the auto-continuation fix composes with the fork's Stop-aware `finish`,
 and 0.27's socket-close protection release overlaps the fork's reopen reset.
+The October 31 refresh moves it to Agents 0.32 / Think 0.23
+([`be174922`](https://github.com/cloudflare/agents/tree/be1749221ab3efc8be4e976d8e7d8344d1446032)).
 [VENDOR.md](../../VENDOR.md) owns provenance and the
 [current inventory](../fork-diff.md) records retained owners and retirement
 conditions. Historical audits remain in Git.
@@ -82,7 +84,8 @@ with Think 0.18.0, at
 [`5f7ad7e4`](https://github.com/cloudflare/agents/tree/5f7ad7e4edac2ec8dd1d6a31758f251cb52373fa).
 Main was
 [`43a58a10`](https://github.com/cloudflare/agents/tree/43a58a1014fbe6f1fe3a1fcc38ad08d53bb5b112).
-The current baseline is
+The baseline after the 2026-09-23 refresh (historical; the current pin is in
+[VENDOR.md](../../VENDOR.md)) was
 [Agents 0.24.0](https://github.com/cloudflare/agents/releases/tag/agents%400.24.0),
 with Think 0.19.0, at
 [`c076e4c9`](https://github.com/cloudflare/agents/tree/c076e4c9ff6cfb72931085226edfd3ee7965ac48),
