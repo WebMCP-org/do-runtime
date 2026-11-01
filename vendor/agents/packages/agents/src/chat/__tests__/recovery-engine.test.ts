@@ -448,8 +448,9 @@ describe("ChatRecoveryEngine.beginIncident (fake adapter)", () => {
       };
     }
 
-    it("runs the callback instead of sealing a cancelled incident", async () => {
+    it("runs the callback instead of sealing a cancelled incident for a host with the hook", async () => {
       const { fake, key, data, cancelDuringSync } = await nearBudget();
+      fake.adapter.isRecoveryAttemptCancelled = () => false;
       cancelDuringSync(() => {
         const current = fake.read(key);
         if (current)
@@ -472,6 +473,34 @@ describe("ChatRecoveryEngine.beginIncident (fake adapter)", () => {
       expect(fake.read(key)).toMatchObject({
         status: "skipped",
         reason: CHAT_RECOVERY_CANCELLED_REASON
+      });
+    });
+
+    it("seals a cancelled incident, as upstream does, for a host without the hook (AIChatAgent shape)", async () => {
+      const { fake, key, data, cancelDuringSync } = await nearBudget();
+      cancelDuringSync(() => {
+        const current = fake.read(key);
+        if (current)
+          fake.storage.set(key, {
+            ...current,
+            status: "skipped",
+            reason: CHAT_RECOVERY_CANCELLED_REASON
+          });
+      });
+      let runs = 0;
+      await new ChatRecoveryEngine(fake.adapter).runRecoveryAttempt({
+        callback: "_chatRecoveryContinue",
+        data,
+        run: async () => {
+          runs += 1;
+        }
+      });
+      expect(runs).toBe(0);
+      expect(fake.exhausted).toHaveLength(1);
+      expect(fake.read(key)).toMatchObject({
+        status: "exhausted",
+        reason: "interrupted_attempts_exceeded",
+        interruptedAttempts: 5
       });
     });
 
@@ -503,6 +532,51 @@ describe("ChatRecoveryEngine.beginIncident (fake adapter)", () => {
         interruptedAttempts: 5
       });
       expect(fake.read(key)?.attemptsInFlight).toBeUndefined();
+    });
+
+    it("keeps a seal that a concurrent delivery wrote during the sync when the callback's own Stop check runs", async () => {
+      // Callback A is admitted at the budget; while its sync has the input
+      // gate open, a duplicate delivery seals the incident and the user
+      // presses Stop. A then runs (the host reports the Stop), and its body's
+      // Stop check writes `skipped`, which must not overwrite the seal.
+      const { fake, key, data, cancelDuringSync } = await nearBudget();
+      let stopped = false;
+      fake.adapter.isRecoveryAttemptCancelled = () => stopped;
+      fake.adapter.sealedIncidentsAreFinal = true;
+      cancelDuringSync(() => {
+        const current = fake.read(key);
+        if (current)
+          fake.storage.set(key, {
+            ...current,
+            status: "exhausted",
+            reason: "interrupted_attempts_exceeded"
+          });
+        stopped = true;
+      });
+      const engine = new ChatRecoveryEngine(fake.adapter);
+      let runs = 0;
+      await engine.runRecoveryAttempt({
+        callback: "_chatRecoveryContinue",
+        data,
+        run: async () => {
+          runs += 1;
+          if (stopped)
+            await engine.updateIncident(
+              data.incidentId,
+              "skipped",
+              "cancelled"
+            );
+        }
+      });
+      expect(runs).toBe(1);
+      expect(fake.read(key)).toMatchObject({
+        status: "exhausted",
+        reason: "interrupted_attempts_exceeded"
+      });
+      expect(fake.events.map(({ type }) => type)).not.toContain(
+        "chat:recovery:skipped"
+      );
+      expect(fake.recovering).toEqual([]);
     });
 
     it("still seals when the host does not report a cancel", async () => {
@@ -708,6 +782,44 @@ describe("ChatRecoveryEngine.updateIncident (fake adapter)", () => {
     expect(fake.events).toHaveLength(0);
     expect(fake.recovering).toHaveLength(0);
     expect(fake.storage.size).toBe(0);
+  });
+
+  it.each(["completed", "skipped", "failed", "scheduled"] as const)(
+    "leaves an exhausted record alone on %s when sealed incidents are final",
+    async (status) => {
+      const fake = makeFakeAdapter();
+      fake.adapter.sealedIncidentsAreFinal = true;
+      const engine = new ChatRecoveryEngine(fake.adapter);
+      const { incidentId, key, incident } = seedIncident(fake.storage, {
+        status: "exhausted",
+        reason: "interrupted_attempts_exceeded"
+      });
+
+      await engine.updateIncident(incidentId, status, "cancelled");
+
+      expect(fake.storage.get(key)).toEqual(incident);
+      expect(fake.events).toHaveLength(0);
+      expect(fake.recovering).toHaveLength(0);
+    }
+  );
+
+  it("overwrites an exhausted record, as upstream does, for a host that does not opt in", async () => {
+    const fake = makeFakeAdapter();
+    const engine = new ChatRecoveryEngine(fake.adapter);
+    const { incidentId, key } = seedIncident(fake.storage, {
+      status: "exhausted",
+      reason: "interrupted_attempts_exceeded"
+    });
+
+    await engine.updateIncident(incidentId, "skipped", "cancelled");
+
+    expect(fake.storage.get(key)).toMatchObject({
+      status: "skipped",
+      reason: "cancelled"
+    });
+    expect(fake.events.map(({ type }) => type)).toEqual([
+      "chat:recovery:skipped"
+    ]);
   });
 });
 

@@ -6265,31 +6265,22 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
       // Stop and cancel are decided before the attempt is admitted, so a
       // stopped or cancelled turn is never sealed or reported to
       // `onExhausted`. The checks inside `detached` stay: they also guard its
-      // stable-wait windows. A sealed incident stays sealed: its callback
-      // goes straight to the engine, whose guard makes it a no-op.
+      // stable-wait windows. A sealed incident stays sealed: the engine
+      // ignores every transition on it (`sealedIncidentsAreFinal`), so the
+      // Stop check leaves it alone and the engine's guard no-ops the attempt.
       detached: async (onTurnStarted) => {
         const payload = data as
           | ChatRecoveryContinueData
           | ChatRecoveryRetryData
           | undefined;
-        const sealed =
-          payload?.incidentId !== undefined &&
-          (
-            await this.ctx.storage.get<ChatRecoveryIncident>(
-              CHAT_RECOVERY_INCIDENT_KEY_PREFIX +
-                encodeURIComponent(payload.incidentId)
-            )
-          )?.status === "exhausted";
-        if (!sealed) {
-          if (
-            await this._cancelRecoveryIfStopped(
-              payload?.stopEpoch ?? 0,
-              payload?.incidentId
-            )
+        if (
+          await this._cancelRecoveryIfStopped(
+            payload?.stopEpoch ?? 0,
+            payload?.incidentId
           )
-            return;
-          if (await this._recoveryCancelled(payload)) return;
-        }
+        )
+          return;
+        if (await this._recoveryCancelled(payload)) return;
         return this._chatRecoveryEngine().runRecoveryAttempt({
           callback,
           data,
@@ -18021,6 +18012,9 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
         this._isStoppedRecovery(
           (data as ChatRecoveryContinueData | undefined)?.stopEpoch ?? 0
         ),
+      // That callback then runs its own Stop check, which must not overwrite
+      // a seal a concurrent delivery wrote during the same sync.
+      sealedIncidentsAreFinal: true,
       listActiveIncidents: async () =>
         (await listActiveChatRecoveryIncidents(this.ctx.storage)).map(
           ({ incident }) => incident
@@ -18110,7 +18104,8 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
 
   /**
    * `true` when Stop invalidated this recovery, after sealing its incident as a
-   * benign cancellation. Stop itself owns terminalizing the submission.
+   * benign cancellation. An incident already sealed as `exhausted` keeps that
+   * seal. Stop itself owns terminalizing the submission.
    */
   private async _cancelRecoveryIfStopped(
     stopEpoch: number,

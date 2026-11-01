@@ -164,12 +164,23 @@ export interface ChatRecoveryAdapter {
    * {@link ChatRecoveryEngine.runRecoveryAttempt} finds the interruption
    * budget spent, after its `syncStorage` (which opens the input gate). `true`
    * runs the callback instead of sealing, so the host's own cancellation path
-   * settles the turn. A cancelled incident
-   * ({@link ChatRecoveryEngine.isRecoveryCancelled}) is honoured without it.
+   * settles the turn. Implementing it also opts into the same re-check for a
+   * cancelled incident ({@link ChatRecoveryEngine.isRecoveryCancelled}). A
+   * host that omits it seals at the budget even when the incident was
+   * cancelled during the sync.
    */
   isRecoveryAttemptCancelled?(
     data: Record<string, unknown> | undefined
   ): boolean | Promise<boolean>;
+  /**
+   * Optional: `true` makes an `exhausted` incident final. Every later
+   * {@link ChatRecoveryEngine.updateIncident} on it is a no-op: no write, no
+   * lifecycle event and no recovering-flag change. A host that lets a callback
+   * run past an at-budget admission (see {@link isRecoveryAttemptCancelled})
+   * sets it, so that callback's own skip or completion cannot reopen an
+   * incident a concurrent delivery sealed during the sync.
+   */
+  sealedIncidentsAreFinal?: boolean;
   /**
    * Optional: list the live (not yet terminalized) incidents. Required for
    * {@link ChatRecoveryEngine.cancelScheduledRecovery}; a host that omits it
@@ -455,8 +466,9 @@ export class ChatRecoveryEngine {
    * and records itself, confirmed with `syncStorage`. Once
    * `maxInterruptedAttempts` attempts have died the turn is sealed with
    * `interrupted_attempts_exceeded` and `run` is never called, unless the
-   * callback was cancelled meanwhile: then `run` executes untracked so the
-   * host's cancellation path settles the turn. The entry is removed when
+   * host implements {@link ChatRecoveryAdapter.isRecoveryAttemptCancelled}
+   * and the callback was cancelled meanwhile: then `run` executes untracked so
+   * the host's cancellation path settles the turn. The entry is removed when
    * `run` settles, whatever its outcome.
    *
    * This catches deaths the replay of an interrupted turn run cannot see, such
@@ -500,12 +512,14 @@ export class ChatRecoveryEngine {
 
     if (exhausted) {
       // The sync above opens the input gate, so a cancel can land between the
-      // budget decision and the seal. It still wins: the spent attempt was not
-      // recorded, and `run` lets the host's cancellation path settle the turn
-      // instead of a terminal banner and `onExhausted`.
+      // budget decision and the seal. For a host that opts in with the hook it
+      // still wins: the spent attempt was not recorded, and `run` lets the
+      // host's cancellation path settle the turn instead of a terminal banner
+      // and `onExhausted`. A host without the hook seals, as upstream does.
       if (
-        (await this.isRecoveryCancelled(incidentId)) ||
-        (await adapter.isRecoveryAttemptCancelled?.(input.data))
+        adapter.isRecoveryAttemptCancelled &&
+        ((await this.isRecoveryCancelled(incidentId)) ||
+          (await adapter.isRecoveryAttemptCancelled(input.data)))
       ) {
         await input.run();
         return;
@@ -1129,8 +1143,10 @@ export class ChatRecoveryEngine {
    * - drive the live "recovering…" status (#1620): `scheduled` marks it active
    *   (keyed by the recovery-root request id), terminal states clear it.
    *
-   * No-op when `incidentId` is undefined or the record is already gone. This is
-   * the transition twin of {@link beginIncident}: all I/O is adapter-owned, the
+   * No-op when `incidentId` is undefined or the record is already gone, and
+   * for an `exhausted` record when the adapter sets
+   * {@link ChatRecoveryAdapter.sealedIncidentsAreFinal}. This is the
+   * transition twin of {@link beginIncident}: all I/O is adapter-owned, the
    * engine owns only the state-machine shape.
    */
   async updateIncident(
@@ -1143,6 +1159,8 @@ export class ChatRecoveryEngine {
     const key = chatRecoveryIncidentKey(incidentId);
     const incident = await adapter.getIncident(key);
     if (!incident) return;
+    if (adapter.sealedIncidentsAreFinal && incident.status === "exhausted")
+      return;
 
     if (status === "completed") {
       await adapter.deleteIncident(key);

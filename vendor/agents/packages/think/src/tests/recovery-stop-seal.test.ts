@@ -196,6 +196,51 @@ describe("a sealed incident stays sealed", () => {
       expect(await agent.getTurnBodies()).toHaveLength(0);
     }
   );
+
+  it("no later transition reopens an exhausted incident", async () => {
+    // A callback admitted at the budget can run past a seal that a duplicate
+    // delivery wrote while its sync had the input gate open, if Stop lands in
+    // the same window. Its Stop check, and any other transition, must leave
+    // the seal in place.
+    const agent = await freshAgent("sealed-final");
+    const incidentId = "sealed-final:";
+    const root = "sealed-final";
+    await seedNearBudget(agent, incidentId, root);
+    await agent.runChatRecoveryContinueForTestWith({
+      incidentId,
+      originalRequestId: root,
+      stopEpoch: 0
+    });
+    const sealed = await incident(agent, incidentId);
+    expect(sealed).toMatchObject({
+      status: "exhausted",
+      reason: "interrupted_attempts_exceeded"
+    });
+
+    const events: string[] = [];
+    const unsubscribe = subscribe("chat", (event) => {
+      const payload = event.payload as { incidentId?: string };
+      if (
+        event.type.startsWith("chat:recovery:") &&
+        payload.incidentId === incidentId
+      )
+        events.push(event.type);
+    });
+    try {
+      await agent.stopCurrentWork();
+      // The write `_cancelRecoveryIfStopped` makes, then every other status.
+      await agent.updateIncidentForTest(incidentId, "skipped", "cancelled");
+      await agent.updateIncidentForTest(incidentId, "failed", "boom");
+      await agent.updateIncidentForTest(incidentId, "scheduled");
+      await agent.updateIncidentForTest(incidentId, "completed");
+    } finally {
+      unsubscribe();
+    }
+
+    expect(await incident(agent, incidentId)).toEqual(sealed);
+    expect(events).toEqual([]);
+    expect(await agent.getExhaustedContextsForTest()).toHaveLength(1);
+  });
 });
 
 describe("listRecoverableChatRequests and sealed incidents", () => {
