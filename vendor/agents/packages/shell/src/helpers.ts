@@ -52,8 +52,12 @@ export function diffContent(
 }
 
 export function createGlobMatcher(pattern: string): RegExp {
+  return new RegExp(`^${globSource(pattern)}$`);
+}
+
+function globSource(pattern: string): string {
   let i = 0;
-  let re = "^";
+  let re = "";
   while (i < pattern.length) {
     const ch = pattern[i];
     if (ch === "*") {
@@ -81,26 +85,45 @@ export function createGlobMatcher(pattern: string): RegExp {
         re += pattern.slice(i, close + 1);
         i = close + 1;
       }
-    } else if (ch === "{") {
-      const close = pattern.indexOf("}", i + 1);
-      if (close === -1) {
-        re += "\\{";
-        i++;
-      } else {
-        const inner = pattern
-          .slice(i + 1, close)
-          .split(",")
-          .join("|");
-        re += `(?:${inner})`;
-        i = close + 1;
-      }
     } else {
-      re += ch.replace(/[.+^$|\\()]/g, "\\$&");
-      i++;
+      const group = ch === "{" ? braceAlternatives(pattern, i) : undefined;
+      if (group) {
+        re += `(?:${group.parts.map(globSource).join("|")})`;
+        i = group.end + 1;
+      } else {
+        re += ch.replace(/[.+^$|\\(){}\]]/g, "\\$&");
+        i++;
+      }
     }
   }
-  re += "$";
-  return new RegExp(re);
+  return re;
+}
+
+// Same dialect as @cloudflare/computer: a group needs a closing brace and at
+// least one top-level comma, otherwise `{` is literal. ponytail: commas and
+// braces inside a `[...]` class still count as brace syntax.
+function braceAlternatives(
+  pattern: string,
+  open: number
+): { parts: string[]; end: number } | undefined {
+  const parts: string[] = [];
+  let depth = 0;
+  let start = open + 1;
+  for (let i = open + 1; i < pattern.length; i++) {
+    const ch = pattern[i];
+    if (ch === "{") depth++;
+    else if (ch === "}") {
+      if (depth === 0) {
+        parts.push(pattern.slice(start, i));
+        return parts.length > 1 ? { parts, end: i } : undefined;
+      }
+      depth--;
+    } else if (ch === "," && depth === 0) {
+      parts.push(pattern.slice(start, i));
+      start = i + 1;
+    }
+  }
+  return undefined;
 }
 
 export function sortPaths(paths: string[]): string[] {
