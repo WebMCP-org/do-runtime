@@ -20,7 +20,7 @@
     "test:think": "pnpm --filter @cloudflare/think exec vitest --run -c src/tests/vitest.config.ts --retry=0 --fileParallelism=false",
     "test:voice": "pnpm --filter agents exec vitest --run -c src/voice/tests/vitest.config.ts src/voice/tests/voice-input.test.ts --retry=0",
     "test:browser": "pnpm --filter @cloudflare/think build && pnpm --filter @cloudflare/think test:browser && pnpm --filter @cloudflare/shell build && pnpm --filter @cloudflare/shell test:browser",
-    "test:shell": "pnpm --filter @cloudflare/shell exec vitest run src/tests/memory.test.ts src/tests/workspace.test.ts --retry=0 --fileParallelism=false",
+    "test:shell": "pnpm --filter @cloudflare/shell exec vitest run src/tests/memory.test.ts src/tests/workspace.test.ts src/tests/helpers.test.ts --retry=0 --fileParallelism=false",
     "test:codemode": "pnpm --filter @cloudflare/codemode exec vitest run src/tests/json-schema-types.test.ts src/tests/schema-conversion.test.ts src/tests/tool-types.test.ts src/tests/tanstack-ai.test.ts --retry=0 --fileParallelism=false && pnpm --filter @cloudflare/codemode exec vitest run --config vitest.node.config.ts --retry=0"
   },
   "devDependencies": {
