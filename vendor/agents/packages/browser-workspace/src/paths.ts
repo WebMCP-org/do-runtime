@@ -1,4 +1,4 @@
-import { createGlobMatcher, getGlobPrefix } from "./glob";
+import { GLOB_MAGIC, createGlobMatcher, getGlobPrefix } from "./glob";
 import { dirname, normalizePath } from "./path-utils";
 
 export const MAX_WORKSPACE_PATH_LENGTH = 4096;
@@ -28,7 +28,7 @@ export function workspacePathParts(path: string): string[] {
 }
 
 export function hasWorkspaceGlobMagic(pattern: string): boolean {
-  return /[*?[{]/.test(pattern);
+  return GLOB_MAGIC.test(pattern);
 }
 
 export function workspaceGlobPrefix(pattern: string): string {
@@ -42,4 +42,17 @@ export function fileSystemError(
   return Object.assign(new Error(`${code}: ${message}`), { code });
 }
 
-export { validateReadRange } from "./read-range";
+/** Validate byte ranges before calling APIs whose slicing rules accept negatives. */
+export function validateReadRange(offset: number, length: number): void {
+  if (
+    !Number.isSafeInteger(offset) ||
+    offset < 0 ||
+    !Number.isSafeInteger(length) ||
+    length < 0 ||
+    !Number.isSafeInteger(offset + length)
+  ) {
+    throw Object.assign(new RangeError("EINVAL: invalid byte range"), {
+      code: "EINVAL"
+    });
+  }
+}

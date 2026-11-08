@@ -44,7 +44,6 @@ async function run(name: string, operation: string, writer = "") {
         Uint8Array.from({ length: 256 }, (_, i) => i)
       );
       await ws.symlink("data", "/link");
-      const fs = ws;
       const reads: number[] = [];
       const arrayBuffer = Blob.prototype.arrayBuffer;
       Blob.prototype.arrayBuffer = function () {

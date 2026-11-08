@@ -1,11 +1,11 @@
 import type { FileInfo, Workspace } from "@cloudflare/shell";
 import { MAX_SYMLINK_DEPTH } from "./path-utils";
-import { validateReadRange } from "./read-range";
 import type { RangeWorkspaceFsLike } from "./workspace-file-system";
 import {
   MAX_WORKSPACE_PATH_LENGTH,
   fileSystemError as fsError,
   hasWorkspaceGlobMagic,
+  validateReadRange,
   normalizeWorkspacePath as normalizePath,
   workspaceBasename as getBasename,
   workspaceDirname as getParent,

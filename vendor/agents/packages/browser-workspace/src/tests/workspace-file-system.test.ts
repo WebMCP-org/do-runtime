@@ -1,9 +1,7 @@
 import { InMemoryFs, type WorkspaceFsLike } from "@cloudflare/shell";
 import { describe, expect, it } from "vitest";
-import {
-  validateReadRange,
-  WorkspaceFileSystem
-} from "@mcp-b/browser-workspace";
+import { WorkspaceFileSystem } from "@mcp-b/browser-workspace";
+import { validateReadRange } from "@mcp-b/browser-workspace/paths";
 
 const unsupported = async (): Promise<never> => {
   throw new Error("unsupported");
@@ -51,6 +49,25 @@ describe("WorkspaceFileSystem", () => {
     ]);
     expect(Array.from(await fs.readFileRange("/ranges", 8, 2))).toEqual([]);
     expect(Array.from(await fs.readFileRange("/ranges", 0, 0))).toEqual([]);
+    await expect(fs.readFileRange("/missing", 0, 1)).rejects.toMatchObject({
+      code: "ENOENT"
+    });
+    // No appendFileBytes: the adapter must read, join and write.
+    await fs.appendFile("/ranges", new Uint8Array([9]));
+    expect(Array.from(await fs.readFileBytes("/ranges"))).toEqual([
+      0, 128, 255, 4, 9
+    ]);
+  });
+
+  it("rejects backends that return more bytes than requested", async () => {
+    const fs = new WorkspaceFileSystem(
+      Object.assign(workspaceLike({}), {
+        readFileRange: async () => new Uint8Array(3)
+      })
+    );
+    await expect(fs.readFileRange("/f", 0, 2)).rejects.toMatchObject({
+      code: "EIO"
+    });
   });
 
   it("lists a large directory once from a proxy that ignores readDir paging", async () => {

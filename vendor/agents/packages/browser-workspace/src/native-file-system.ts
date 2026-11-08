@@ -1,4 +1,4 @@
-/** File System Access metadata, ordering, and errno conversion for OPFS. */
+/** File System Access handle metadata, ordering, and errno conversion. */
 
 import type { FileInfo } from "@cloudflare/shell";
 import { MIME_BY_EXTENSION } from "./mime-types";
@@ -39,7 +39,7 @@ const DIRECTORY_MIME_TYPE = "inode/directory";
 export const SYMLINK_MIME_TYPE = "inode/symlink";
 const UNKNOWN_FILE_MIME_TYPE = "application/octet-stream";
 
-export function nativeMimeType(name: string, declared = ""): string {
+function nativeMimeType(name: string, declared = ""): string {
   const extension = name.split(".").at(-1)?.toLowerCase() ?? "";
   return MIME_BY_EXTENSION[extension] ?? (declared || UNKNOWN_FILE_MIME_TYPE);
 }
@@ -161,7 +161,7 @@ export function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
   return Uint8Array.from(bytes).buffer;
 }
 
-export function domErrorName(error: unknown): string | undefined {
+function domErrorName(error: unknown): string | undefined {
   if (error instanceof DOMException) return error.name;
   return hasErrorName(error) ? error.name : undefined;
 }

@@ -2,8 +2,8 @@
 
 ## Local fork scope
 
-This directory is Rook's isolated six-package SDK fork. Only
-`packages/{agents,ai-chat,think,voice,shell,codemode}` and their maintained
+This directory is Rook's isolated SDK fork. Only
+`packages/{agents,ai-chat,think,voice,shell,codemode,browser-workspace}` and their maintained
 regression suites are present. Commands in this workspace's `package.json`
 are authoritative; upstream sections below that refer to Nx, sites, examples,
 guides, or experiments describe content intentionally left out of this fork.
@@ -196,9 +196,10 @@ Fork note: this copy has no workflows or Nx of its own. do-runtime's CI runs
 
 - `packages/shell/` (`@cloudflare/shell`) is deprecated. Agent workspaces are a `Workspace` from `@cloudflare/computer` (github.com/cloudflare/computer); do not add new uses of Shell.
 - Think's `workspace` is a Computer `Workspace`. Its workspace tools are Computer's `createAITools`, called with no options; execution backends and their modules are configured on the `Workspace`. Do not add Think options for them.
-- Fork note: the fork still ships and maintains Shell for Rook's browser
-  filesystem backends (OPFS, directory handles, `WorkspaceFileSystem`); see
-  [the divergence ledger](docs/fork-diff.md). Think's workspace follows upstream's
+- Fork note: Rook's browser filesystem backends (OPFS, directory handles,
+  `WorkspaceFileSystem`) live in the fork-owned `packages/browser-workspace`
+  (`@mcp-b/browser-workspace`), which imports only types from Shell; Shell
+  itself carries only the edits in [the divergence ledger](docs/fork-diff.md). Think's workspace follows upstream's
   Computer `Workspace`; do not wire it through Shell.
 
 ## Learned User Preferences

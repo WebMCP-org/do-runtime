@@ -18,8 +18,7 @@ They moved here so Shell can stay frozen at upstream.
 - `@mcp-b/browser-workspace`: `OpfsWorkspace` (`OpfsWorkspaceOptions`),
   `DirectoryHandleWorkspace` (`DirectoryHandleWorkspaceOptions`),
   `WorkspaceFileSystem`, `RangeWorkspaceFsLike` (`WorkspaceFsLike` plus the
-  optional native `readFileRange` and `appendFileBytes` the adapter prefers),
-  and `validateReadRange`.
+  optional native `readFileRange` and `appendFileBytes` the adapter prefers).
 - `@mcp-b/browser-workspace/paths`: workspace path helpers
   (`normalizeWorkspacePath`, `workspaceDirname`, `workspaceBasename`,
   `workspacePathParts`, `workspaceGlobToRegex`, `workspaceGlobPrefix`,

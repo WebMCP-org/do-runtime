@@ -1,8 +1,9 @@
 # Rook Agents SDK fork
 
 This workspace owns the Cloudflare Agents SDK behavior that Rook depends on.
-It preserves the upstream package names and builds JavaScript and declarations
-from the same source.
+It preserves the upstream package names, except the fork-owned
+`@mcp-b/browser-workspace`, and builds JavaScript and declarations from the
+same source.
 
 ## Setup
 
@@ -18,8 +19,9 @@ pnpm test
 `pnpm test` is the maintained Rook regression gate. It covers the fork's
 recovery, replay, Stop, messenger, model, React, voice, and browser transport behavior. It does
 not run intentionally retired Codemode execution or unrelated upstream apps.
-`pnpm test:browser` builds and exercises the browser messenger leaves in
-Chromium, including native sockets in a real Worker. See
+`pnpm test:browser` builds and exercises the browser messenger leaves and the
+`@mcp-b/browser-workspace` OPFS and directory-handle suites in Chromium,
+including native sockets in a real Worker. See
 [the integration guide](docs/think/browser-messengers.md) and
 [current browser integrations](docs/browser-compatibility.md).
 
@@ -36,7 +38,7 @@ passed with serial file execution; retries remain disabled.
 - `@cloudflare/voice@0.5.0`
 - `@cloudflare/shell@0.5.0`
 - `@cloudflare/codemode@0.5.6`
-- `@mcp-b/browser-workspace@0.1.0` (fork-owned, no upstream counterpart)
+- `@mcp-b/browser-workspace@0.2.0` (fork-owned, no upstream counterpart; 0.1.0 shipped in `rook-sdk-576d9f3fe35a`)
 
 Rook consumes these built packages. `@mcp-b/do-runtime` remains a lower
 layer and has no dependency on the SDK.

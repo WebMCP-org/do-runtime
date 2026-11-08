@@ -590,13 +590,13 @@ pnpm sdk:check && pnpm sdk:test          # Rook's Agents SDK fork
 ```
 
 The repository has two independently tested layers: the runtime at the root
-and Rook's six-package Agents SDK fork in
+and Rook's Agents SDK fork in
 [`vendor/agents/`](vendor/agents/README.md). The examples consume the fork's
 built `agents` package through a `file:` dependency, which resolves their
 own peer dependencies without installing a second SDK implementation.
 
-`pnpm sdk:pack` builds and packs the six SDK packages into `.sdk-pack/` with
-their upstream names. After the SDK and consumer gates pass, attach these
+`pnpm sdk:pack` builds and packs the six upstream-named SDK packages plus the
+fork-owned `@mcp-b/browser-workspace` into `.sdk-pack/`. After the SDK and consumer gates pass, attach these
 tarballs to a GitHub release tagged `rook-sdk-<source-commit>` at the tested
 commit. Rook pins those release asset URLs and their lockfile integrity;
 it does not need a sibling checkout, SDK source aliases, or a local candidate

@@ -1,12 +1,16 @@
-import type { FileInfo, FsStat } from "@cloudflare/shell";
-import type { FileSystem, WorkspaceFsLike } from "@cloudflare/shell";
+import type {
+  FileInfo,
+  FileSystem,
+  FsStat,
+  WorkspaceFsLike
+} from "@cloudflare/shell";
 import {
   MAX_SYMLINK_DEPTH,
   normalizePath,
   resolvePath,
   resolveSymlinkTarget
 } from "./path-utils";
-import { validateReadRange } from "./read-range";
+import { fileSystemError, validateReadRange } from "./paths";
 
 type FileSystemDirent = Awaited<
   ReturnType<FileSystem["readdirWithFileTypes"]>
@@ -14,13 +18,8 @@ type FileSystemDirent = Awaited<
 
 const READ_DIRECTORY_PAGE_SIZE = 1000;
 
-/** Create an Error with code='ENOENT' that Node fs consumers expect. */
-function enoent(path: string): Error & { code: string } {
-  return Object.assign(
-    new Error(`ENOENT: no such file or directory, stat '${path}'`),
-    { code: "ENOENT" }
-  );
-}
+const enoent = (path: string) =>
+  fileSystemError("ENOENT", `no such file or directory, stat '${path}'`);
 
 /** Shell's `WorkspaceFsLike` plus the optional native range/append members this
  * package's workspaces provide and `WorkspaceFileSystem` prefers when present.
@@ -85,7 +84,7 @@ export class WorkspaceFileSystem implements FileSystem {
       : (await this.ws.readFileBytes(path))?.slice(offset, offset + length);
     if (bytes == null) throw enoent(path);
     if (bytes.byteLength > length)
-      throw new Error("EIO: byte range exceeded requested length");
+      throw fileSystemError("EIO", "byte range exceeded requested length");
     return bytes;
   }
 
@@ -214,9 +213,9 @@ export class WorkspaceFileSystem implements FileSystem {
         continue;
       }
       if (++followed > MAX_SYMLINK_DEPTH) {
-        throw Object.assign(
-          new Error(`ELOOP: too many levels of symbolic links: ${original}`),
-          { code: "ELOOP" }
+        throw fileSystemError(
+          "ELOOP",
+          `too many levels of symbolic links: ${original}`
         );
       }
       const target = resolveSymlinkTarget(
