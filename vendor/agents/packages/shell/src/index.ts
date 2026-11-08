@@ -15,17 +15,7 @@ export {
 
 // ── FileSystem interface + InMemoryFs ─────────────────────────────────
 export { InMemoryFs } from "./fs/in-memory-fs";
-export type {
-  FileSystem,
-  FileSystemDirent,
-  FsStat,
-  InitialFiles
-} from "./fs/interface";
-
-// ── Leaves shared with @mcp-b/browser-workspace ───────────────────────
-export { createGlobMatcher, getGlobPrefix } from "./helpers";
-export { MIME_BY_EXTENSION } from "./fs/mime-types";
-export { dirname, MAX_SYMLINK_DEPTH, normalizePath } from "./fs/path-utils";
+export type { FileSystem, FsStat, InitialFiles } from "./fs/interface";
 
 // ── StateBackend adapter ──────────────────────────────────────────────
 export type { StateBackend } from "./backend";

@@ -1,13 +1,16 @@
-import { validateReadRange } from "./fs/read-range";
-import type { FileInfo, WorkspaceFsLike } from "./filesystem";
-import type { FileSystem, FileSystemDirent, FsStat } from "./fs/interface";
-
+import type { FileInfo, FsStat } from "@cloudflare/shell";
+import type { FileSystem, WorkspaceFsLike } from "@cloudflare/shell";
 import {
   MAX_SYMLINK_DEPTH,
   normalizePath,
   resolvePath,
   resolveSymlinkTarget
-} from "./fs/path-utils";
+} from "./path-utils";
+import { validateReadRange } from "./read-range";
+
+type FileSystemDirent = Awaited<
+  ReturnType<FileSystem["readdirWithFileTypes"]>
+>[number];
 
 const READ_DIRECTORY_PAGE_SIZE = 1000;
 
@@ -18,6 +21,28 @@ function enoent(path: string): Error & { code: string } {
     { code: "ENOENT" }
   );
 }
+
+/** Shell's `WorkspaceFsLike` plus the optional native range/append members this
+ * package's workspaces provide and `WorkspaceFileSystem` prefers when present.
+ */
+export type RangeWorkspaceFsLike = WorkspaceFsLike & {
+  /** Optional native binary append. Backends providing it serialize the entire
+   * append, avoiding the adapter's read/concatenate/write fallback. */
+  appendFileBytes?(
+    path: string,
+    content: Uint8Array | ArrayBuffer,
+    mimeType?: string
+  ): Promise<void>;
+  /** Optional bounded byte read; follows symlinks, returns null for missing files.
+   * Offset and length must be nonnegative safe integers with a safe sum.
+   * Reads past EOF return an empty buffer; short reads at EOF are allowed.
+   */
+  readFileRange?(
+    path: string,
+    offset: number,
+    length: number
+  ): Promise<Uint8Array | null>;
+};
 
 // ── WorkspaceFileSystem ───────────────────────────────────────────────
 //
@@ -30,7 +55,7 @@ function enoent(path: string): Error & { code: string } {
 //     FileSystem.stat / lstat return FsStat = { type, size, mtime, mode? }.
 
 export class WorkspaceFileSystem implements FileSystem {
-  constructor(private readonly ws: WorkspaceFsLike) {}
+  constructor(private readonly ws: RangeWorkspaceFsLike) {}
 
   async readFile(path: string): Promise<string> {
     const content = await this.ws.readFile(path);
@@ -48,6 +73,7 @@ export class WorkspaceFileSystem implements FileSystem {
     return bytes;
   }
 
+  /** Bounded byte read. Nonnegative safe integer range; missing paths throw ENOENT. */
   async readFileRange(
     path: string,
     offset: number,

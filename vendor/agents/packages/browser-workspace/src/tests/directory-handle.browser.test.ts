@@ -3,13 +3,13 @@ import {
   DirectoryHandleWorkspace,
   OpfsWorkspace,
   WorkspaceFileSystem
-} from "@cloudflare/shell/browser";
+} from "@mcp-b/browser-workspace";
 import {
   normalizeWorkspacePath,
   workspaceDirname,
   workspaceGlobPrefix,
   workspaceGlobToRegex
-} from "@cloudflare/shell/paths";
+} from "@mcp-b/browser-workspace/paths";
 
 let root: FileSystemDirectoryHandle;
 let name: string;

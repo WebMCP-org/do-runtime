@@ -60,8 +60,7 @@
   "files": [
     "dist",
     "docs",
-    "README.md",
-    "THIRD_PARTY_NOTICES"
+    "README.md"
   ],
   "nx": {
     "targets": {

@@ -14,6 +14,9 @@ The package versions match the 0.32 release:
 - `@cloudflare/shell@0.5.0`
 - `@cloudflare/codemode@0.5.6`
 
+`packages/browser-workspace` (`@mcp-b/browser-workspace`) is fork-owned and
+has no upstream counterpart, so syncs leave it alone.
+
 This fork contains only the package closure used by Rook. Compare future
 upstream releases against the commit above, reconcile
 [current divergences](docs/fork-diff.md), update each affected row in place

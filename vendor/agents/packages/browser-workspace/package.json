@@ -7,7 +7,10 @@
     "type": "git",
     "url": "git+https://github.com/WebMCP-org/do-runtime.git"
   },
-  "dependencies": {
+  "peerDependencies": {
+    "@cloudflare/shell": ">=0.5.0"
+  },
+  "devDependencies": {
     "@cloudflare/shell": "workspace:^"
   },
   "types": "dist/index.d.ts",
@@ -34,6 +37,7 @@
   "type": "module",
   "files": [
     "dist",
-    "README.md"
+    "README.md",
+    "THIRD_PARTY_NOTICES"
   ]
 }

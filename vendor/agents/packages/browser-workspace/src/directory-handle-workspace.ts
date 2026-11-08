@@ -3,7 +3,7 @@
  * https://github.com/componentor/fs/blob/v3.3.1/src/src/drives/localfolder-drive.ts
  * See THIRD_PARTY_NOTICES in this package for the retained license.
  */
-import type { FileInfo, WorkspaceFsLike } from "../filesystem";
+import type { FileInfo } from "@cloudflare/shell";
 import {
   DEFAULT_READ_DIR_LIMIT,
   compareBinaryString,
@@ -18,6 +18,7 @@ import {
   translateFileSystemError,
   type NativeEntry
 } from "./native-file-system";
+import type { RangeWorkspaceFsLike } from "./workspace-file-system";
 import {
   hasWorkspaceGlobMagic,
   normalizeWorkspacePath,
@@ -43,7 +44,7 @@ const TEXT_ENCODER = new TextEncoder();
  * mutations across workers; failed native writes abort their uncommitted data.
  * Native directories do not support symbolic links or removal of their root.
  */
-export class DirectoryHandleWorkspace implements WorkspaceFsLike {
+export class DirectoryHandleWorkspace implements RangeWorkspaceFsLike {
   private readonly root: FileSystemDirectoryHandle;
   private readonly lockName: string;
 
