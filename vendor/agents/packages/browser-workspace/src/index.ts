@@ -7,4 +7,3 @@ export {
   WorkspaceFileSystem,
   type RangeWorkspaceFsLike
 } from "./workspace-file-system";
-export { validateReadRange } from "./read-range";

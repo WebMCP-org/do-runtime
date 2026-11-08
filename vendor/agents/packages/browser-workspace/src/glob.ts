@@ -75,8 +75,10 @@ function braceAlternatives(
   return undefined;
 }
 
+export const GLOB_MAGIC = /[*?[{]/;
+
 export function getGlobPrefix(pattern: string): string {
-  const first = pattern.search(/[*?[{]/);
+  const first = pattern.search(GLOB_MAGIC);
   if (first === -1) return pattern;
   const before = pattern.slice(0, first);
   const lastSlash = before.lastIndexOf("/");

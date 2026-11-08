@@ -63,9 +63,9 @@ Trend per pin, same method: 0.24 (`c076e4c9`) 66 files, 7,995 added / 2,224
 removed; 0.27 (`e3351863`) 68 files, 7,875 / 1,575; 0.32 (`be174922`,
 2026-11-07) 76 files, 9,995 / 2,140, of which 20 fork-only files held 4,199
 lines; 0.32 after the browser-filesystem extraction (2026-11-08) 66 files,
-7,162 / 1,940, of which 13 fork-only files hold 1,411 lines. The 0.27 to 0.32 growth is Rook features moved into the fork as new
+7,162 / 1,940, of which 13 fork-only files hold 1,411 lines. The 0.27 to 0.32 growth was Rook features moved into the fork as new
 files (native-directory workspace, `workspace-file-system.ts`, codemode schema
-printer), the `think/src/workspace-read.ts` hand-port, and more `think.ts`
+printer; the first two have since left Shell for `@mcp-b/browser-workspace`), the `think/src/workspace-read.ts` hand-port, and more `think.ts`
 edits. Edits inside upstream-owned files are the merge surface: `think.ts`
 alone carries about 2,600 changed lines, `agents/src/index.ts` about 1,000.
 
@@ -76,12 +76,13 @@ filesystem (about 3,000 source lines) is `@mcp-b/browser-workspace`, a package t
 fork owns outright, so it is outside this table. Tests,
 fixtures, declarations outside `src`, build scripts, manifests, dependencies and
 documentation are excluded. Removing an unused upstream skill integration also
-counts as a source difference. The six-package build/export configuration
+counts as a source difference. The six upstream packages' build/export configuration
 remains part of the maintained surface even though it is excluded here.
 
 Measured with `git diff --no-index --numstat`, one file at a time, between
 upstream `be174922` (Agents 0.32 / Think 0.23) and this fork. Include
-`.ts`, `.tsx`, `.js`, `.jsx`, `.mjs` under the six `packages/*/src` trees;
+`.ts`, `.tsx`, `.js`, `.jsx`, `.mjs` under the six upstream `packages/*/src` trees
+(`browser-workspace` is fork-owned and not compared);
 exclude paths with `test` or `fixture` in any component and `__mocks__`.
 Count files present on only one side against `/dev/null`. This classification
 counts added browser files as well as edits; Voice moved into Agents.
@@ -123,7 +124,7 @@ release inclusion to the retained behavior.
 | [#2179 State capability](https://github.com/cloudflare/agents/pull/2179)                                                                                                                                                                                                                  | Released in 0.24; moves the old corrupt-row fallback into `agents/state`.                                                                                                          | Re-homed, not retired: `State` takes the fork's `migratePersistedState` option and Agent passes its hook. Plain `State` hosts keep the upstream fallback.                                                                            |
 | [#2014 truncation](https://github.com/cloudflare/agents/issues/2014), [#1997 persistence failure](https://github.com/cloudflare/agents/issues/1997)                                                                                                                                       | Open reports suggest host before-step restoration and an external database retry.                                                                                                  | Do not stack those workarounds here. Fix opaque output at its SDK owner; external Postgres retry is not evidence for a native Agent SQL retry layer.                                                                                 |
 
-No exact upstream browser-messenger or Shell OPFS replacement was found.
+No exact upstream browser-messenger or browser-workspace OPFS replacement was found.
 Storage-extensibility issue [#1554](https://github.com/cloudflare/agents/issues/1554)
 is not an OPFS implementation. Rook's own current shim inventory covers MCP
 browser-validator and AI SDK multipart-media issue findings; those are separate

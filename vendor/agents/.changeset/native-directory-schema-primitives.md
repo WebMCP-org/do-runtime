@@ -1,5 +1,5 @@
 ---
-"@cloudflare/shell": patch
+"@mcp-b/browser-workspace": patch
 "@cloudflare/codemode": patch
 ---
 
@@ -20,7 +20,7 @@ Preserve TanStack AI's inferred code-tool schema and literal name instead of
 annotating it with the schema-less ServerTool default. Include Codemode's
 production and Node compiler/type regressions in the SDK check/test gates.
 
-Expose the existing WorkspaceFileSystem adapter from the browser entry without
+Expose the existing WorkspaceFileSystem adapter from this package without
 loading the state-backend factory or Node-only archive/hash utilities. Resolve
 intermediate symlinks, consume complete directory listings (stopping when a
 backend that ignores `offset` repeats a page), and use a backend's optional
