@@ -129,7 +129,7 @@ export class ThinkWorkspaceToolsAgent extends Think {
    */
   async useHostWorkspace(files: Record<string, string>): Promise<void> {
     this.#hostPaths = [];
-    const contents = new Map(
+    const contents = new Map<string, Uint8Array>(
       Object.entries(files).map(([path, text]) => [
         path,
         new TextEncoder().encode(text)

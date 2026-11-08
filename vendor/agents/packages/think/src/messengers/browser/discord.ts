@@ -11,34 +11,9 @@ const discordChannelSchema = z
   })
   .loose();
 
-// The installed adapter does not export this forwarded-event type even though
-// subclasses are its documented extension seam.
-interface ForwardedDiscordMessage {
-  attachments: Array<{
-    content_type?: string;
-    filename: string;
-    id: string;
-    size: number;
-    url: string;
-  }>;
-  author: {
-    bot: boolean;
-    global_name?: string;
-    id: string;
-    username: string;
-  };
-  channel_id: string;
-  channel_type?: number;
-  content: string;
-  guild_id: string | null;
-  id: string;
-  is_mention?: boolean;
-  mention_everyone?: boolean;
-  mention_roles?: string[];
-  mentions: Array<{ id: string; username: string }>;
-  thread?: { id: string; parent_id: string };
-  timestamp: string;
-}
+type ForwardedDiscordMessage = Parameters<
+  DiscordAdapter["handleForwardedMessage"]
+>[0];
 
 /**
  * Supplies the channel metadata Discord omits from ordinary MESSAGE_CREATE

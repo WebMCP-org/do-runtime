@@ -97,10 +97,10 @@ System Access helpers and the range-reading `WorkspaceFileSystem` adapter) lives
 in `packages/browser-workspace` as `@mcp-b/browser-workspace`. The fork owns that
 package outright and it has no upstream counterpart, so it is not tracked as a
 fork edit. It carries its own copies of the glob compiler, path utilities and
-MIME table, so it has no runtime dependency on Shell. `shell/src/fs/mime-types.ts`
-stays only because `extras.ts` (the archive-formats row) uses it. Shell's
-remaining fork-only files are `src/fs/mime-types.ts` and
-`src/tests/helpers.test.ts`.
+MIME table, so it has no runtime dependency on Shell. Shell keeps its MIME table
+inline in `extras.ts` where upstream has it, extended from upstream's 14
+extensions to the same 31 as the browser-workspace copy. Shell's remaining
+fork-only file is `src/tests/helpers.test.ts`.
 
 ## Chat, replay and recovery
 
