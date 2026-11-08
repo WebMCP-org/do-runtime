@@ -384,11 +384,11 @@ export class DirectoryHandleWorkspace implements RangeWorkspaceFsLike {
 
   async glob(pattern: string): Promise<FileInfo[]> {
     const normalized = normalizeWorkspacePath(pattern);
-    const regex = workspaceGlobToRegex(normalized);
     if (!hasWorkspaceGlobMagic(normalized)) {
       const info = await this.stat(normalized);
-      return info && regex.test(info.path) ? [info] : [];
+      return info ? [info] : [];
     }
+    const regex = workspaceGlobToRegex(normalized);
     return this.withLock("shared", async () => {
       try {
         const output: FileInfo[] = [];

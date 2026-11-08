@@ -69,9 +69,7 @@ export function upgradeWebSocket(response: Response): UpgradeWebSocket | undefin
  * reason when it is printable ASCII of at most 123 bytes. The returned promise
  * rejects in each of those cases.
  *
- * It does not tell the peer that the socket opened. `serveMessagePortWebSockets`
- * sends that signal to clients made by `createMessagePortWebSocketConstructor`;
- * a host running its own port protocol opens its end itself.
+ * It does not tell the peer that the socket opened; the host opens its own end.
  */
 export async function connectMessagePortWebSocket(
   bridge: MessagePortWebSocket,

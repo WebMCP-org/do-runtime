@@ -117,6 +117,11 @@ async function run(name: string, operation: string, writer = "") {
       await ws.symlink("nested/file.txt", "/src/link");
       await ws.cp("/src", "/copy", { recursive: true });
       await ws.mv("/src", "/moved");
+      const linkBefore = await ws.lstat("/moved/link");
+      // Let the clock move, so a rewritten createdAt would differ.
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await ws.mv("/moved/link", "/moved/renamed-link");
+      const linkAfter = await ws.lstat("/moved/renamed-link");
       await ws.writeFile("/destination.txt", "old");
       await ws.mv("/moved/nested/file.txt", "/destination.txt");
       const overlap = await errorCode(
@@ -126,7 +131,9 @@ async function run(name: string, operation: string, writer = "") {
       return {
         copy: await ws.readFile("/copy/nested/file.txt"),
         copiedLink: await ws.exists("/copy/link"),
-        movedLink: await ws.readlink("/moved/link"),
+        movedLink: await ws.readlink("/moved/renamed-link"),
+        movedLinkKeptCreatedAt:
+          linkBefore !== null && linkAfter?.createdAt === linkBefore.createdAt,
         replaced: await ws.readFile("/destination.txt"),
         source: await ws.exists("/src"),
         overlap,
@@ -182,6 +189,48 @@ async function run(name: string, operation: string, writer = "") {
         )
       );
       return { failures, kept: await ws.readFile("/kept.txt") };
+    }
+    case "failed-copy": {
+      await ws.writeFile("/source/file.txt", "source");
+      const createWritable = FileSystemFileHandle.prototype.createWritable;
+      try {
+        FileSystemFileHandle.prototype.createWritable = async function () {
+          throw new DOMException("simulated disk quota", "QuotaExceededError");
+        };
+        return await errorCode(ws.cp("/source", "/copy", { recursive: true }));
+      } finally {
+        FileSystemFileHandle.prototype.createWritable = createWritable;
+      }
+    }
+    case "corrupt-manifests": {
+      await ws.writeFile("/files/kept.txt", "preserved");
+      await ws.symlink("kept.txt", "/files/link");
+      const metadata = await root.getDirectoryHandle("meta");
+      const handle = await (
+        await metadata.getDirectoryHandle("files")
+      ).getFileHandle("entries.json");
+      const record = '"target":"a","createdAt":1,"updatedAt":1';
+      const bodies = [
+        "not json",
+        '{"entries":{},"x":1}',
+        '{"entries":[]}',
+        `{"entries":{"..":{${record}}}}`,
+        '{"entries":{"l":{"target":"","createdAt":1,"updatedAt":1}}}',
+        '{"entries":{"l":{"target":"a","createdAt":null,"updatedAt":1}}}',
+        `{"entries":{"l":{${record},"mode":1}}}`
+      ];
+      const results = [];
+      for (const body of bodies) {
+        const write = await handle.createWritable();
+        await write.write(body);
+        await write.close();
+        results.push({
+          body,
+          code: await errorCode(ws.readDir("/files")),
+          stored: await (await handle.getFile()).text()
+        });
+      }
+      return results;
     }
     case "metadata": {
       await ws.writeFile("/files/kept.txt", "preserved");

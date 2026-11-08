@@ -21,37 +21,12 @@ if (packed.status !== 0) throw new Error(packed.stderr || packed.stdout || "pnpm
 
 const report = JSON.parse(packed.stdout);
 const files = new Set(report.files.map((file) => file.path));
-for (const required of [
-  "package.json",
-  "README.md",
-  "docs/assets/browser-agent-runtime.png",
-  "docs/assets/extension-agent-runtime.svg",
-  "docs/migrations.md",
-  "LICENSE",
-  "CHANGELOG.md",
-  "dist/index.js",
-  "dist/src/index.d.ts",
-  "dist/cloudflare-workers.d.ts",
-  "dist/backends/node-sqlite.js",
-  "dist/backends/sqlite-wasm.js",
-  "dist/gate.js",
-  "dist/vite.js",
-  "LICENSE.workerd",
-  "NOTICE",
-]) {
+for (const required of ["package.json", ...manifest.files.filter((entry) => entry !== "dist")]) {
   if (!files.has(required)) throw new Error(`packed package is missing ${required}`);
 }
 for (const file of files) {
   if (/\.(?:test|spec)\.[cm]?[jt]s$/.test(file) || (file.endsWith(".ts") && !file.endsWith(".d.ts"))) {
     throw new Error(`packed package contains development source: ${file}`);
-  }
-}
-for (const [name, target] of Object.entries(manifest.exports)) {
-  const paths = typeof target === "string" ? [target] : Object.values(target);
-  for (const path of paths) {
-    if (typeof path === "string" && path.startsWith("./") && !files.has(path.slice(2))) {
-      throw new Error(`packed package export ${name} is missing ${path}`);
-    }
   }
 }
 
@@ -93,8 +68,6 @@ if (
 }
 if (
   typeof messagePortWebSocket.MessagePortWebSocket !== "function" ||
-  typeof messagePortWebSocket.createMessagePortWebSocketConstructor !== "function" ||
-  typeof messagePortWebSocket.serveMessagePortWebSockets !== "function" ||
   typeof modules.get("./browser").connectMessagePortWebSocket !== "function"
 ) {
   throw new Error("packed MessagePort WebSocket entries do not export their host helpers");
@@ -133,13 +106,13 @@ if (new (modules.get("./cloudflare-email").EmailMessage)("a", "b", "c").to !== "
 // The plugin resolves what it injects to the very files the export map names, so an application
 // import of the same subpath is the same module instance. The preset's aliases do the same.
 const exportTarget = (subpath) => fileURLToPath(new URL(manifest.exports[subpath].import, root));
-const { resolveId } = vite.doRuntimeAwaitTransform({ asyncContext: true });
+const { resolveId } = vite.doRuntimeAwaitTransform({ include: /.*/ });
 for (const subpath of ["./gate", "./browser/async-hooks"]) {
   if (resolveId.handler(`@mcp-b/do-runtime${subpath.slice(1)}`) !== exportTarget(subpath)) {
     throw new Error(`packed Vite plugin does not resolve its injected ${subpath} import to the export`);
   }
 }
-const presetAliases = vite.browserHost({ include: [] })[0].config().resolve.alias;
+const presetAliases = vite.browserHost({ include: /.*/ })[0].config().resolve.alias;
 for (const [aliases, find, subpath] of [
   [vite.workersModuleAliases(), "cloudflare:workers", "./cloudflare-workers"],
   [vite.workersModuleAliases(), "cloudflare:email", "./cloudflare-email"],

@@ -48,8 +48,8 @@ gaps. These are live transports, not a durable inbox.
 Use `SocketModeSlackAdapter` from
 `@cloudflare/think/messengers/browser/slack` and `ForwardedDiscordAdapter` from
 `@cloudflare/think/messengers/browser/discord` with their ordinary adapter
-configuration. Install the optional `@chat-adapter/slack@4.37.0` and/or
-`@chat-adapter/discord@4.37.0` peers for the leaves you use. The socket-only
+configuration. Install the optional `@chat-adapter/slack@4.38.0` and/or
+`@chat-adapter/discord@4.38.0` peers for the leaves you use. The socket-only
 entry does not import either adapter.
 
 `SocketModeSlackAdapter` disables native Assistant streaming and makes the

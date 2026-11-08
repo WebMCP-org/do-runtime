@@ -1,5 +1,5 @@
 import type { FileInfo, Workspace } from "@cloudflare/shell";
-import { MAX_SYMLINK_DEPTH } from "./path-utils";
+import { MAX_SYMLINK_DEPTH, resolveSymlinkTarget } from "./path-utils";
 import type { RangeWorkspaceFsLike } from "./workspace-file-system";
 import {
   MAX_WORKSPACE_PATH_LENGTH,
@@ -133,45 +133,31 @@ export class OpfsWorkspace implements RangeWorkspaceFsLike {
     length: number
   ): Promise<Uint8Array | null> {
     validateReadRange(offset, length);
-    return this.readBytes(path, { offset, length });
+    return this.withNativeFile(
+      path,
+      async (file) =>
+        new Uint8Array(await file.slice(offset, offset + length).arrayBuffer())
+    );
   }
 
   async readFileBytes(path: string): Promise<Uint8Array | null> {
-    return this.readBytes(path);
-  }
-
-  private async readBytes(
-    path: string,
-    range?: { offset: number; length: number }
-  ): Promise<Uint8Array | null> {
-    const normalized = normalizePath(path);
-    return this.withSharedTree(async () => {
-      if (normalized === "/") {
-        throw fsError("EISDIR", `${path} is a directory`);
-      }
-      const resolved = await this.resolveSymlink(normalized);
-      if (resolved === "/") {
-        throw fsError("EISDIR", `${path} is a directory`);
-      }
-      return this.withEntryRead(resolved, async (native) => {
-        if (!native) return null;
-        if (native.kind !== "file")
-          throw fsError("EISDIR", `${path} is a directory`);
-        const file = await native.getFile();
-        const blob = range
-          ? file.slice(range.offset, range.offset + range.length)
-          : file;
-        return new Uint8Array(await blob.arrayBuffer());
-      });
-    });
+    return this.withNativeFile(
+      path,
+      async (file) => new Uint8Array(await file.arrayBuffer())
+    );
   }
 
   async getNativeFile(path: string): Promise<File | null> {
+    return this.withNativeFile(path, async (file) => file);
+  }
+
+  /** Hold the shared lock through snapshot creation and any byte read. */
+  private async withNativeFile<T>(
+    path: string,
+    read: (file: File) => Promise<T>
+  ): Promise<T | null> {
     const normalized = normalizePath(path);
     return this.withSharedTree(async () => {
-      if (normalized === "/") {
-        throw fsError("EISDIR", `${path} is a directory`);
-      }
       const resolved = await this.resolveSymlink(normalized);
       if (resolved === "/") {
         throw fsError("EISDIR", `${path} is a directory`);
@@ -180,7 +166,7 @@ export class OpfsWorkspace implements RangeWorkspaceFsLike {
         if (!native) return null;
         if (native.kind !== "file")
           throw fsError("EISDIR", `${path} is a directory`);
-        return native.getFile();
+        return read(await native.getFile());
       });
     });
   }
@@ -250,10 +236,8 @@ export class OpfsWorkspace implements RangeWorkspaceFsLike {
 
   async exists(path: string): Promise<boolean> {
     const normalized = normalizePath(path);
-    return this.withSharedTree(async () =>
-      normalized === "/"
-        ? true
-        : (await this.lstatWithinTree(normalized)) !== null
+    return this.withSharedTree(
+      async () => (await this.lstatWithinTree(normalized)) !== null
     );
   }
 
@@ -345,23 +329,17 @@ export class OpfsWorkspace implements RangeWorkspaceFsLike {
         throw fsError("ENOENT", `no such file or directory: ${source}`);
       }
       if (sourcePath === destinationPath) return;
-      if (stat.type !== "directory") {
-        try {
-          await this.copyEntryUnlocked(sourcePath, destinationPath);
-        } catch (error) {
-          throw partialCopyError(error, source, destination);
+      if (stat.type === "directory") {
+        if (!options?.recursive) {
+          throw fsError(
+            "EISDIR",
+            `cannot copy directory without recursive: ${source}`
+          );
         }
-        return;
-      }
-      if (!options?.recursive) {
-        throw fsError(
-          "EISDIR",
-          `cannot copy directory without recursive: ${source}`
-        );
-      }
-      assertNoDirectoryOverlap(sourcePath, destinationPath, "copy");
-      if (destinationPath === "/") {
-        throw fsError("EPERM", "cannot overwrite root directory");
+        assertNoDirectoryOverlap(sourcePath, destinationPath, "copy");
+        if (destinationPath === "/") {
+          throw fsError("EPERM", "cannot overwrite root directory");
+        }
       }
       try {
         await this.copyEntryUnlocked(sourcePath, destinationPath);
@@ -406,11 +384,20 @@ export class OpfsWorkspace implements RangeWorkspaceFsLike {
         }
         if (destinationStat) await this.removeLeafUnlocked(destinationPath);
         try {
-          await this.copyEntryUnlocked(sourcePath, destinationPath);
+          // The manifest is the only place a symlink's timestamps live, so a
+          // moved one carries its creation time across.
+          if (stat.type === "symlink") {
+            await this.createSymlinkUnlocked(destinationPath, {
+              target: stat.target!,
+              createdAt: stat.createdAt,
+              updatedAt: Date.now()
+            });
+          } else {
+            await this.copyEntryUnlocked(sourcePath, destinationPath);
+          }
         } catch (error) {
           throw partialCopyError(error, source, destination);
         }
-        await this.preserveMovedSymlinkTimestamps(destinationPath, stat);
         try {
           await this.removeLeafUnlocked(sourcePath);
         } catch (error) {
@@ -457,22 +444,15 @@ export class OpfsWorkspace implements RangeWorkspaceFsLike {
       if (resolved === "/") {
         throw fsError("EPERM", "cannot create symlink at root");
       }
-      await this.createDirectoryChainUnlocked(getParent(resolved));
-      const existing = await this.lstatUnlocked(resolved);
-      if (existing) {
+      if (await this.lstatUnlocked(resolved)) {
         throw fsError("EEXIST", `path already exists: ${linkPath}`);
       }
-      const parentPath = getParent(resolved);
-      const state = await this.openDirectoryState(parentPath);
-      if (!state)
-        throw fsError("ENOENT", `parent directory not found: ${parentPath}`);
       const now = Date.now();
-      state.manifest.entries[getBasename(resolved)] = {
+      await this.createSymlinkUnlocked(resolved, {
         target,
         createdAt: now,
         updatedAt: now
-      };
-      await this.saveManifestIfChanged(parentPath, state);
+      });
     });
   }
 
@@ -667,13 +647,12 @@ export class OpfsWorkspace implements RangeWorkspaceFsLike {
   private async lstatResolvedWithinTree(
     path: string
   ): Promise<FileInfo | null> {
-    const normalized = normalizePath(path);
-    if (normalized === "/") return nativeDirectoryInfo("/");
-    const parentPath = getParent(normalized);
-    const name = getBasename(normalized);
+    if (path === "/") return nativeDirectoryInfo("/");
+    const parentPath = getParent(path);
+    const name = getBasename(path);
     try {
       return await this.withDirectoryRead(parentPath, (state) =>
-        this.describeNamedChild(normalized, state, name)
+        this.describeNamedChild(path, state, name)
       );
     } catch (error) {
       if (hasFsCode(error, "ENOENT")) return null;
@@ -703,24 +682,20 @@ export class OpfsWorkspace implements RangeWorkspaceFsLike {
     path: string,
     operation: (native: NativeEntry | undefined) => Promise<T> | T
   ): Promise<T> {
-    const normalized = normalizePath(path);
-    const name = getBasename(normalized);
+    const name = getBasename(path);
     try {
-      return await this.withDirectoryRead(
-        getParent(normalized),
-        async (state) => {
-          const native = await openChildEntry(state.handle, name);
-          // Symlinks were followed before this point, so one recorded here is a
-          // manifest describing something the path can no longer mean.
-          if (state.manifest.entries[name]) {
-            throw fsError(
-              "EIO",
-              `corrupt manifest: ${normalized} is recorded as a symlink`
-            );
-          }
-          return operation(native);
+      return await this.withDirectoryRead(getParent(path), async (state) => {
+        const native = await openChildEntry(state.handle, name);
+        // Symlinks were followed before this point, so one recorded here is a
+        // manifest describing something the path can no longer mean.
+        if (state.manifest.entries[name]) {
+          throw fsError(
+            "EIO",
+            `corrupt manifest: ${path} is recorded as a symlink`
+          );
         }
-      );
+        return operation(native);
+      });
     } catch (error) {
       if (hasFsCode(error, "ENOENT")) return operation(undefined);
       throw error;
@@ -951,7 +926,7 @@ export class OpfsWorkspace implements RangeWorkspaceFsLike {
    * OPFS creates a directory that already exists by handing back the one that is
    * there, so the chain needs no per-level existence check. */
   private async createDirectoryChainUnlocked(path: string): Promise<void> {
-    if (!path || path === "/") return;
+    if (path === "/") return;
     const parts = pathParts(path);
     if (parts.length > MAX_MKDIR_DEPTH) {
       throw fsError(
@@ -1002,7 +977,12 @@ export class OpfsWorkspace implements RangeWorkspaceFsLike {
         }
         throw fsError("EEXIST", `path already exists: ${destination}`);
       }
-      await this.createSymlinkUnlocked(sourceStat.target!, destination);
+      const now = Date.now();
+      await this.createSymlinkUnlocked(destination, {
+        target: sourceStat.target!,
+        createdAt: now,
+        updatedAt: now
+      });
       return;
     }
     if (sourceStat.type === "file") {
@@ -1087,43 +1067,15 @@ export class OpfsWorkspace implements RangeWorkspaceFsLike {
   }
 
   private async createSymlinkUnlocked(
-    target: string,
-    linkPath: string
+    linkPath: string,
+    entry: SymlinkEntry
   ): Promise<void> {
     const parentPath = getParent(linkPath);
     await this.createDirectoryChainUnlocked(parentPath);
     const state = await this.openDirectoryState(parentPath);
     if (!state)
       throw fsError("ENOENT", `parent directory not found: ${parentPath}`);
-    const now = Date.now();
-    state.manifest.entries[getBasename(linkPath)] = {
-      target,
-      createdAt: now,
-      updatedAt: now
-    };
-    await this.saveManifestIfChanged(parentPath, state);
-  }
-
-  /** A moved symlink carries its source's creation time across, because the
-   * manifest is the only place a symlink's timestamps live. A moved file's come
-   * from the copy OPFS just made. */
-  private async preserveMovedSymlinkTimestamps(
-    path: string,
-    source: FileInfo
-  ): Promise<void> {
-    if (source.type !== "symlink") return;
-    const parentPath = getParent(path);
-    const state = await this.openDirectoryState(parentPath);
-    const entry = state?.manifest.entries[getBasename(path)];
-    // The copy that ran a moment ago, under this same lock, wrote this record.
-    if (!state || !entry) {
-      throw fsError(
-        "EIO",
-        `moved symlink is missing from ${parentPath} after the copy`
-      );
-    }
-    entry.createdAt = source.createdAt;
-    entry.updatedAt = Date.now();
+    state.manifest.entries[getBasename(linkPath)] = entry;
     await this.saveManifestIfChanged(parentPath, state);
   }
 
@@ -1209,9 +1161,6 @@ export class OpfsWorkspace implements RangeWorkspaceFsLike {
   }
 
   private async initializeRoots(): Promise<WorkspaceRoots> {
-    if (!navigator.storage?.getDirectory) {
-      throw fsError("ENOTSUP", "OPFS is required for the direct workspace");
-    }
     const root = this.root;
     const [data, meta] = await Promise.all([
       root.getDirectoryHandle(WORKSPACE_DATA_DIRECTORY, { create: true }),
@@ -1562,9 +1511,7 @@ async function resolvePathSymlinks(
     if (followed > MAX_SYMLINK_DEPTH) {
       throw fsError("ELOOP", `too many levels of symbolic links: ${original}`);
     }
-    const target = link.target.startsWith("/")
-      ? normalizePath(link.target)
-      : normalizePath(`${getParent(candidate)}/${link.target}`);
+    const target = resolveSymlinkTarget(candidate, link.target);
     pending = pathParts(
       pending.length > 0 ? `${target}/${pending.join("/")}` : target
     );
@@ -1624,9 +1571,13 @@ function partialCopyError(
   source: string,
   destination: string
 ): Error {
+  const translated = translateFileSystemError(
+    error,
+    `${source} -> ${destination}`
+  );
   return fsError(
-    fsCode(error),
-    `copy failed from ${source} to ${destination}; the destination may be partial and the source was not removed (${errorMessage(error)})`
+    translated.code,
+    `copy failed from ${source} to ${destination}; the destination may be partial and the source was not removed (${translated.message})`
   );
 }
 
@@ -1635,18 +1586,11 @@ function moveSourceRemovalError(
   source: string,
   destination: string
 ): Error {
+  const translated = translateFileSystemError(error, source);
   return fsError(
-    fsCode(error),
-    `move copied ${source} to ${destination}, but could not remove the source; both may remain (${errorMessage(error)})`
+    translated.code,
+    `move copied ${source} to ${destination}, but could not remove the source; both may remain (${translated.message})`
   );
-}
-
-function fsCode(error: unknown): string {
-  return hasStringCode(error) ? error.code : "EIO";
-}
-
-function hasStringCode(error: unknown): error is { code: string } {
-  return isObject(error) && "code" in error && typeof error.code === "string";
 }
 
 function errorMessage(error: unknown): string {

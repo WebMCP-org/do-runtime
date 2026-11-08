@@ -7,7 +7,6 @@
     "browser/chrome-port-websocket.ts",
     "browser/actor-tree.ts",
     "browser/worker-supervisor.ts",
-    "browser/worker-protocol.ts",
     "browser/alarm-coordinator.ts",
     "browser/message-port-websocket.ts",
     "browser/offscreen-document.ts",

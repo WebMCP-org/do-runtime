@@ -191,7 +191,7 @@ three runtime contexts and a build. Each one imports only the subpaths it needs:
 | ------------------ | ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Service worker     | `src/background.ts`          | `/browser/offscreen-document` (`OffscreenDocumentCoordinator`) and `/browser/alarm-coordinator` (`BrowserAlarmCoordinator`, `parseBrowserAlarmProjection`, `parseBrowserAlarmTransportJournal`).                                                                                                                                                                                                                                                                                                                                                                                                |
 | Offscreen document | `src/offscreen/offscreen.ts` | `/browser/worker-supervisor` (`BrowserWorkerSupervisor`) owns worker placement, Cap'n Web sessions, readiness and retained client transports; `/browser/message-port-websocket` supplies client sockets.                                                                                                                                                                                                                                                                                                                                                                                        |
-| Actor Worker       | `src/worker/actor.worker.ts` | The root (`createActorContainer`, `installActorScope`, `AlarmScheduler`, `newRpcSession`, `platformTimer`, `platformFetch`, `platformWebSocket` and more), `/backends/sqlite-wasm` (`installSqliteWasmHost`, `SqliteWasmActorStorage`, `createSqliteWasmProvider`), `/browser` (`connectMessagePortWebSocket`, `installWebSocketUpgradeGlobals`, `withWebSocketUpgrade`), `/browser/message-port-websocket` (`serveMessagePortWebSockets`) and `/browser/alarm-coordinator` (`createBrowserAlarmProjector`). `browserHost()` resolves its `cloudflare:workers` import to `/cloudflare-workers`. |
+| Actor Worker       | `src/worker/actor.worker.ts` | The root (`createActorContainer`, `installActorScope`, `AlarmScheduler`, `newRpcSession`, `platformTimer`, `platformFetch`, `platformWebSocket` and more), `/backends/sqlite-wasm` (`installSqliteWasmHost`, `SqliteWasmActorStorage`, `createSqliteWasmProvider`), `/browser` (`connectMessagePortWebSocket`, `installWebSocketUpgradeGlobals`, `withWebSocketUpgrade`), `/browser/message-port-websocket` (`MessagePortWebSocket`), `/browser/worker-supervisor` (`serveBrowserWorker`) and `/browser/alarm-coordinator` (`createBrowserAlarmProjector`). `browserHost()` resolves its `cloudflare:workers` import to `/cloudflare-workers`. |
 | Build              | `vite.config.ts`             | `/vite`: `...browserHost({ include, facets })` in `plugins`. Each facet builds in a pass of its own (`vite build --mode <facet>`), which adds `doRuntimeAwaitTransform` and `output.keepNames: true` itself.                                                                                                                                                                                                                                                                                                                                                                                    |
 
 The [browser hosting guide](docs/browser-hosting.md) covers typed worker bootstrap,
@@ -459,20 +459,18 @@ replacement mirror with the prior socket snapshot and auto-response pair, then
 pass that mirror to `ports.hibernation` and its `snapshot()` to `webSockets`.
 Browser hosts can install the remaining Request/Response upgrade accommodation
 from `@mcp-b/do-runtime/browser`; the runtime itself supplies `WebSocketPair`.
-Hosts whose actor lives in another Worker can use `MessagePortWebSocket`,
-`createMessagePortWebSocketConstructor`, and `serveMessagePortWebSockets` from
+Hosts whose actor lives in another Worker can use `MessagePortWebSocket` from
 `@mcp-b/do-runtime/browser/message-port-websocket`; binary frames stay in
 structured clone and each socket gets one dedicated `MessagePort`.
 `connectMessagePortWebSocket(bridge, url, fetch)` from `@mcp-b/do-runtime/browser`
 routes one socket through a Workers-style router such as `routeAgentRequest()`.
 A missing route closes the client 1011, and a refused upgrade closes it 1008
 with the refusal's text when it is printable ASCII of at most 123 bytes. It does
-not tell the peer the socket opened: `serveMessagePortWebSockets(port, (bridge, url) => …)`
-sends that to clients from `createMessagePortWebSocketConstructor`, and a host
-with its own port protocol opens its end itself. Embedders relay
-`MessagePortWebSocketWireMessage` verbatim to extension clients, so a new frame
-type is a breaking change for them. That is why the "open" frame stayed out of
-`connectMessagePortWebSocket`.
+not tell the peer the socket opened; the client opens its own end, as a
+`MessagePortWebSocket` over `BrowserWorkerSupervisor.connectPort()` does by default.
+Embedders relay `MessagePortWebSocketWireMessage` verbatim to extension clients,
+so it has exactly two frames, `message` and `close`, and a new frame type is a
+breaking change for them.
 
 Chrome extensions using JSON-only `chrome.runtime.Port` can use
 `createChromePortWebSocketConstructor({ connect, beforeConnect, readLastError })`

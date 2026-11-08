@@ -52,6 +52,10 @@ export function createNodeSqlProvider(
   const openDatabases = new Set<NodeSqlDatabase>();
   return {
     async open(name: string): Promise<SqlDatabase> {
+      // Names come from inside the package (`"root"`, `` `facet-${facetId}` ``), so
+      // this is defence in depth rather than input validation — but it is the one
+      // place a name becomes a path, and a silent traversal here writes an actor's
+      // storage somewhere nobody will look for it.
       requireSafeDatabaseName(name);
       const path = directory === undefined ? ":memory:" : join(directory, `${name}.sqlite`);
       let database: NodeSqlDatabase;
@@ -125,7 +129,7 @@ export function createNodeSqlProvider(
   };
 }
 
-export class NodeSqlDatabase implements SqlDatabase {
+class NodeSqlDatabase implements SqlDatabase {
   readonly #path: string;
   #database: DatabaseSync;
   /** Prepared once per connection, because every statement reads them. */
@@ -134,7 +138,7 @@ export class NodeSqlDatabase implements SqlDatabase {
 
   #closed = false;
 
-  constructor(path: string, private readonly onClose: () => void = () => {}) {
+  constructor(path: string, private readonly onClose: () => void) {
     this.#path = path;
     this.#database = new DatabaseSync(path);
     this.#totalChangesQuery = this.#database.prepare(TOTAL_CHANGES);
@@ -430,12 +434,6 @@ function normalizeInteger(value: unknown): unknown {
   return Number.isSafeInteger(number) && BigInt(number) === value ? number : value;
 }
 
-/**
- * Names come from inside the package (`"root"`, `` `facet-${facetId}` ``), so
- * this is defence in depth rather than input validation — but it is the one
- * place a name becomes a path, and a silent traversal here writes an actor's
- * storage somewhere nobody will look for it.
- */
 function requireSnapshotDirectory(directory: string | undefined): string {
   if (directory === undefined) {
     throw new Error("SQLite snapshots require a directory-backed Node provider.");

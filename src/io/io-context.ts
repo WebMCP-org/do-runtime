@@ -156,7 +156,7 @@ export interface Actor {
 const MAX_TIMEOUT_MS = 3_153_600_000_000;
 
 /** ← `afterLimitTimeout(30 * kj::SECONDS)` in `IoContext::blockConcurrencyWhile`. */
-export const BLOCK_CONCURRENCY_WHILE_TIMEOUT_MS = 30_000;
+const BLOCK_CONCURRENCY_WHILE_TIMEOUT_MS = 30_000;
 
 /** Copied verbatim: users and upstream tests match on it. */
 export const BLOCK_CONCURRENCY_WHILE_TIMEOUT_MESSAGE =
@@ -690,7 +690,7 @@ class TimeoutManager {
  * array: a failing task reports to `taskFailed` instead of becoming an unhandled
  * rejection, and the set can be waited on until empty.
  */
-class TaskSet {
+export class TaskSet {
   readonly #tasks = new Set<Promise<void>>();
   readonly #taskFailed: (exception: unknown) => void;
   readonly #sizeChanged: () => void;

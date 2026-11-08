@@ -911,7 +911,9 @@ class ActorImpl implements Actor {
   }
 }
 
-function hasAlarmHandler(instance: object): boolean {
+function hasAlarmHandler(
+  instance: object,
+): instance is { alarm(info: AlarmInvocationInfo): unknown } {
   return typeof (instance as { alarm?: unknown }).alarm === "function";
 }
 
@@ -1745,9 +1747,7 @@ class ActorContainerImpl implements ActorContainer {
       throw new TypeError("Your Durable Object class must have an alarm() handler.");
     }
     // ← `alarm(lock, js.alloc<AlarmInvocationInfo>(scheduledTime, retryCount))` (`:588`).
-    return (instance.instance as { alarm: (info: AlarmInvocationInfo) => unknown }).alarm(
-      new AlarmInvocationInfo(scheduledTime, retryCount),
-    );
+    return instance.instance.alarm(new AlarmInvocationInfo(scheduledTime, retryCount));
   }
 
   #runWebSocketHandler(

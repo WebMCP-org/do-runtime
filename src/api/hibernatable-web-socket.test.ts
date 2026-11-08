@@ -171,7 +171,17 @@ function recorder(): {
     attached,
     autoResponse,
     closed,
-    host: { accepted, attachment: attached, autoResponse, closed },
+    host: {
+      autoResponsePair: null,
+      accepted,
+      attachment: attached,
+      autoResponse,
+      autoResponseTimestamp(socket: RawWebSocket, timestamp: number) {
+        const entry = entries.get(socket);
+        if (entry !== undefined) entry.autoResponseTimestamp = timestamp;
+      },
+      closed,
+    },
   };
 }
 

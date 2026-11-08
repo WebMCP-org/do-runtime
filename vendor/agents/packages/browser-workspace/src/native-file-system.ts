@@ -39,7 +39,7 @@ const DIRECTORY_MIME_TYPE = "inode/directory";
 export const SYMLINK_MIME_TYPE = "inode/symlink";
 const UNKNOWN_FILE_MIME_TYPE = "application/octet-stream";
 
-function nativeMimeType(name: string, declared = ""): string {
+function nativeMimeType(name: string, declared: string): string {
   const extension = name.split(".").at(-1)?.toLowerCase() ?? "";
   return MIME_BY_EXTENSION[extension] ?? (declared || UNKNOWN_FILE_MIME_TYPE);
 }

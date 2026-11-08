@@ -13,8 +13,6 @@ import {
 import {
   MessagePortWebSocket,
   bridgeWebSocket,
-  createMessagePortWebSocketConstructor,
-  serveMessagePortWebSockets,
   type MessagePortWebSocketData,
   type MessagePortWebSocketWireMessage,
 } from "./message-port-websocket";
@@ -526,85 +524,6 @@ describe("MessagePortWebSocket", () => {
     expect(wire).toEqual([]);
   });
 
-  it("serves WebSocket constructors over a broker MessagePort", async () => {
-    const broker = new MessageChannel();
-    const runtime = new MemorySocket();
-    const connection = Promise.withResolvers<UpgradeWebSocket>();
-    const connect = vi.fn(async (bridge: MessagePortWebSocket) => {
-      bridgeWebSocket(await connection.promise, bridge);
-    });
-    const stop = serveMessagePortWebSockets(broker.port2, connect);
-    const BrokeredWebSocket = createMessagePortWebSocketConstructor(broker.port1);
-    const client = new BrokeredWebSocket("ws://actor.test");
-    const received: MessagePortWebSocketData[] = [];
-    client.addEventListener("message", (event) => received.push(event.data));
-
-    await vi.waitFor(() => expect(connect).toHaveBeenCalledOnce());
-    expect(client.readyState).toBe(MessagePortWebSocket.CONNECTING);
-    connection.resolve(runtime);
-    await vi.waitFor(() => expect(runtime.readyState).toBe(MessagePortWebSocket.OPEN));
-    await vi.waitFor(() => expect(client.readyState).toBe(MessagePortWebSocket.OPEN));
-    client.send("request");
-    await vi.waitFor(() => expect(runtime.sent).toEqual(["request"]));
-
-    runtime.receive("answer");
-    await vi.waitFor(() => expect(received).toEqual(["answer"]));
-
-    stop();
-    await vi.waitFor(() => expect(client.readyState).toBe(MessagePortWebSocket.CLOSED));
-  });
-
-  it("closes a brokered client and reports the failure when connecting throws", async () => {
-    const { reported, restore } = captureReported();
-    const failure = new Error("WebSocket already accepted");
-    const runtime = new MemorySocket();
-    runtime.accept = () => {
-      throw failure;
-    };
-    const broker = new MessageChannel();
-    const connect = vi.fn(async (bridge: MessagePortWebSocket) => bridgeWebSocket(runtime, bridge));
-    const stop = serveMessagePortWebSockets(broker.port2, connect);
-    const BrokeredWebSocket = createMessagePortWebSocketConstructor(broker.port1);
-    broker.port1.postMessage({ type: "connect", url: "ws://invalid.test" });
-    const client = new BrokeredWebSocket("ws://actor.test");
-    const closed = new Promise<CloseEvent>((resolve) => {
-      client.addEventListener("close", resolve, { once: true });
-    });
-    try {
-      await expect(closed).resolves.toMatchObject({
-        code: 1011,
-        reason: "WebSocket connection failed",
-        wasClean: true,
-      });
-      expect(connect).toHaveBeenCalledOnce();
-      expect(connect).toHaveBeenCalledWith(expect.any(MessagePortWebSocket), "ws://actor.test");
-      expect(runtime.readyState).toBe(MessagePortWebSocket.CLOSED);
-      await vi.waitFor(() => expect(reported).toEqual([failure]));
-    } finally {
-      restore();
-      stop();
-    }
-  });
-
-  it("closes a runtime socket that finishes connecting after the server stops", async () => {
-    const broker = new MessageChannel();
-    const connection = Promise.withResolvers<UpgradeWebSocket>();
-    const connect = vi.fn(async (bridge: MessagePortWebSocket) => {
-      bridgeWebSocket(await connection.promise, bridge);
-    });
-    const stop = serveMessagePortWebSockets(broker.port2, connect);
-    const BrokeredWebSocket = createMessagePortWebSocketConstructor(broker.port1);
-    const client = new BrokeredWebSocket("ws://actor.test");
-    const runtime = new MemorySocket();
-
-    await vi.waitFor(() => expect(connect).toHaveBeenCalledOnce());
-    stop();
-    connection.resolve(runtime);
-
-    await vi.waitFor(() => expect(runtime.readyState).toBe(MessagePortWebSocket.CLOSED));
-    await vi.waitFor(() => expect(client.readyState).toBe(MessagePortWebSocket.CLOSED));
-  });
-
   it("closes 1011 and rejects when no route matches", async () => {
     const channel = new MessageChannel();
     const bridge = new MessagePortWebSocket("ws://actor.test/missing", channel.port1, false);
@@ -659,9 +578,7 @@ describe("MessagePortWebSocket", () => {
     channel.port2.close();
   });
 
-  it("serves fetch-routed sockets and forwards a refusal reason to the client", async () => {
-    const { reported, restore } = captureReported();
-    const broker = new MessageChannel();
+  it("routes fetch-upgraded sockets and forwards a refusal reason to the client", async () => {
     const runtime = new MemorySocket();
     const requests: (readonly [string, string | null])[] = [];
     const route = async (request: Request): Promise<Response> => {
@@ -670,29 +587,35 @@ describe("MessagePortWebSocket", () => {
         ? new Response("Unauthorized", { status: 401 })
         : upgradeResponse(runtime);
     };
-    const stop = serveMessagePortWebSockets(broker.port2, (bridge, url) =>
-      connectMessagePortWebSocket(bridge, url, route),
-    );
-    const BrokeredWebSocket = createMessagePortWebSocketConstructor(broker.port1);
-    const refused = new BrokeredWebSocket("ws://actor.test/refused");
+    const refusedChannel = new MessageChannel();
+    const refused = new MessagePortWebSocket("ws://actor.test/refused", refusedChannel.port1, false);
     const refusal = new Promise<CloseEvent>((resolve) => {
       refused.addEventListener("close", resolve, { once: true });
     });
-    const client = new BrokeredWebSocket("wss://actor.test/agents/counter");
-    try {
-      await expect(refusal).resolves.toMatchObject({ code: 1008, reason: "Unauthorized" });
-      await vi.waitFor(() => expect(client.readyState).toBe(MessagePortWebSocket.OPEN));
-      client.send("request");
-      await vi.waitFor(() => expect(runtime.sent).toEqual(["request"]));
-      expect(requests).toEqual([
-        ["http://actor.test/refused", "websocket"],
-        ["https://actor.test/agents/counter", "websocket"],
-      ]);
-      await vi.waitFor(() => expect(reported).toHaveLength(1));
-      expect(String(reported[0])).toContain("WebSocket upgrade failed with 401");
-    } finally {
-      restore();
-      stop();
-    }
+    const channel = new MessageChannel();
+    const client = new MessagePortWebSocket("wss://actor.test/agents/counter", channel.port1);
+
+    await expect(
+      connectMessagePortWebSocket(
+        new MessagePortWebSocket("ws://actor.test/refused", refusedChannel.port2, false),
+        "ws://actor.test/refused",
+        route,
+      ),
+    ).rejects.toThrow("WebSocket upgrade failed with 401 for http://actor.test/refused");
+    await expect(refusal).resolves.toMatchObject({ code: 1008, reason: "Unauthorized" });
+
+    await connectMessagePortWebSocket(
+      new MessagePortWebSocket("wss://actor.test/agents/counter", channel.port2, false),
+      "wss://actor.test/agents/counter",
+      route,
+    );
+    await vi.waitFor(() => expect(client.readyState).toBe(MessagePortWebSocket.OPEN));
+    client.send("request");
+    await vi.waitFor(() => expect(runtime.sent).toEqual(["request"]));
+    expect(requests).toEqual([
+      ["http://actor.test/refused", "websocket"],
+      ["https://actor.test/agents/counter", "websocket"],
+    ]);
+    client.close();
   });
 });

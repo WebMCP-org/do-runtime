@@ -1,0 +1,8 @@
+{
+  "extends": "agents/tsconfig",
+  "compilerOptions": {
+    "lib": ["ES2022", "DOM", "DOM.Iterable", "DOM.AsyncIterable"],
+    "types": []
+  },
+  "include": ["./**/*.ts"]
+}

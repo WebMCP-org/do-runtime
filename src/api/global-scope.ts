@@ -320,13 +320,6 @@ export type ActorGlobalScopeOptions = {
   /** Opaque identity of the external entry whose synchronous body is running. */
   readonly currentExternalEntry?: (() => object | undefined) | undefined;
   /**
-   * The `Crypto` the gated one delegates to. Defaults to the realm's own, which
-   * is what a host wants: unlike `fetch`, there is no per-actor outbound to
-   * route this through — `SubtleCrypto` is pure computation, and the only thing
-   * the actor's scope adds is the gate around its promise.
-   */
-  readonly crypto?: Crypto | undefined;
-  /**
    * ← the global outbound `Fetcher` `ServiceWorkerGlobalScope::fetch` resolves
    * (`global-scope.c++:1160`). Absent means this actor has no ambient outbound,
    * which is upstream's `globalOutbound: null` posture (§1.11) — `fetch` then
@@ -391,7 +384,7 @@ export class ActorGlobalScope {
       // `platformCrypto`, captured at import, and NOT `globalThis.crypto` read here: a
       // host installs its scope before it builds the container, so reading the global now
       // would find the installed binding and recurse into itself on the first digest.
-      options.crypto ?? platformCrypto,
+      platformCrypto,
     );
   }
 

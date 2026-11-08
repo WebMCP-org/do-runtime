@@ -21,11 +21,11 @@ export interface RawWebSocket {
 
 export interface HibernationHost {
   /** Retained auto-response configuration, restored before actor construction. */
-  readonly autoResponsePair?: { request: string; response: string } | null;
+  readonly autoResponsePair: { request: string; response: string } | null;
   accepted(socket: RawWebSocket, tags: readonly string[]): void;
   attachment(socket: RawWebSocket, bytes: Uint8Array | null): void;
   autoResponse(pair: { request: string; response: string } | null): void;
-  autoResponseTimestamp?(socket: RawWebSocket, timestamp: number): void;
+  autoResponseTimestamp(socket: RawWebSocket, timestamp: number): void;
   closed(socket: RawWebSocket): void;
 }
 
@@ -77,11 +77,11 @@ export const ALREADY_ACCEPTED_MESSAGE =
   "acceptWebSocket(): this socket has already been accepted by an actor. A socket's frames are " +
   "delivered by exactly one read loop, and a second accept would deliver them under two gates.";
 
-export const HIBERNATION_ALREADY_ACCEPTED_MESSAGE =
+const HIBERNATION_ALREADY_ACCEPTED_MESSAGE =
   "Cannot call `acceptWebSocket()` if the WebSocket was already accepted via `accept()`";
-export const HIBERNATION_AFTER_ACCEPT_MESSAGE =
+const HIBERNATION_AFTER_ACCEPT_MESSAGE =
   "Can't accept() WebSocket after enabling hibernation.";
-export const HIBERNATION_PAIR_USED_MESSAGE =
+const HIBERNATION_PAIR_USED_MESSAGE =
   "Cannot call `acceptWebSocket()` on this WebSocket because its pair has already been accepted or used in a Response.";
 
 const MAX_HIBERNATABLE_SOCKETS = 32_768;
@@ -731,9 +731,9 @@ export class HibernatableWebSocketRegistry {
       if (typeof tag !== "string") return [];
       return this.#entries
         .filter((entry) => entry.tags.includes(tag))
-        .map((entry) => entry.socket as WebSocket);
+        .map((entry) => entry.socket);
     }
-    return this.#entries.map((entry) => entry.socket as WebSocket).reverse();
+    return this.#entries.map((entry) => entry.socket).reverse();
   }
 
   getTags(socket: RawWebSocket): string[] {
@@ -823,7 +823,7 @@ export class HibernatableWebSocketRegistry {
       const data = (event as MessageEvent).data as unknown;
       if (typeof data === "string" && data === this.#autoResponse?.request) {
         entry.autoResponseTimestamp = this.#ctx.now();
-        this.#host?.autoResponseTimestamp?.(entry.raw, entry.autoResponseTimestamp);
+        this.#host?.autoResponseTimestamp(entry.raw, entry.autoResponseTimestamp);
         // A host transport answers directly, as it does while the actor is evicted.
         const raw = entry.raw;
         if (raw instanceof AcceptedWebSocket) {

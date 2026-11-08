@@ -245,9 +245,12 @@ function decodeBinary(data: BinaryEnvelope): ArrayBuffer {
   return Uint8Array.from(atob(data.value), (character) => character.charCodeAt(0)).buffer;
 }
 
-function parseFrame(value: unknown): ChromePortFrame | null {
-  if (value === null || typeof value !== "object") return null;
-  const frame = value as Record<string, unknown>;
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function parseFrame(frame: unknown): ChromePortFrame | null {
+  if (!isRecord(frame)) return null;
   const keys = Object.keys(frame).length;
   if ((frame.type === "ping" || frame.type === "pong") && keys === 1) {
     return { type: frame.type };
@@ -265,8 +268,8 @@ function parseFrame(value: unknown): ChromePortFrame | null {
   }
   if (frame.type !== "message" || keys !== 2) return null;
   if (typeof frame.data === "string") return { type: "message", data: frame.data };
-  if (frame.data === null || typeof frame.data !== "object") return null;
-  const data = frame.data as Record<string, unknown>;
+  const data = frame.data;
+  if (!isRecord(data)) return null;
   if (
     Object.keys(data).length !== 2 ||
     data.encoding !== "base64" ||

@@ -10,6 +10,8 @@ describe("OffscreenDocumentCoordinator", () => {
       create,
       exists: vi.fn(async () => false),
       isOccupiedError: vi.fn(() => false),
+      ready: async () => {},
+      replaceUnready: () => false,
     });
 
     const first = coordinator.ensure();
@@ -28,6 +30,8 @@ describe("OffscreenDocumentCoordinator", () => {
       create,
       exists: vi.fn(async () => true),
       isOccupiedError: vi.fn(() => false),
+      ready: async () => {},
+      replaceUnready: () => false,
     });
 
     await coordinator.ensure();
@@ -44,6 +48,8 @@ describe("OffscreenDocumentCoordinator", () => {
       create,
       exists: vi.fn(async () => false),
       isOccupiedError: (error) => error === occupied,
+      ready: async () => {},
+      replaceUnready: () => false,
     });
 
     await coordinator.ensure();
@@ -62,6 +68,8 @@ describe("OffscreenDocumentCoordinator", () => {
       }),
       exists: vi.fn(async () => false),
       isOccupiedError: vi.fn(() => false),
+      ready: async () => {},
+      replaceUnready: () => false,
     });
 
     await expect(coordinator.ensure()).rejects.toBe(failure);
@@ -77,6 +85,7 @@ describe("OffscreenDocumentCoordinator", () => {
       exists: vi.fn(async () => false),
       isOccupiedError: vi.fn(() => false),
       ready,
+      replaceUnready: () => false,
     });
     let settled = false;
     const callers = Promise.all([coordinator.ensure(), coordinator.ensure()]).then(() => {

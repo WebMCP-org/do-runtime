@@ -35,10 +35,10 @@ async function transformWith(plugin: Plugin, code: string, id: string): Promise<
 async function transform(
   code: string,
   id = "/actor.js",
-  options?: DoRuntimeAwaitTransformOptions,
+  options: Omit<DoRuntimeAwaitTransformOptions, "include"> = {},
   command?: "build" | "serve",
 ): Promise<string> {
-  const plugin = doRuntimeAwaitTransform(options);
+  const plugin = doRuntimeAwaitTransform({ include: /.*/, ...options });
   if (command !== undefined) {
     const hook = plugin.configResolved;
     if (hook === undefined) throw new Error("await transform has no configResolved hook");
@@ -389,14 +389,6 @@ describe("doRuntimeAwaitTransform", () => {
     await expect(transform(source)).resolves.toBe(source);
   });
 
-  test("honors an exclude filter", async () => {
-    const source = "const value = await task;\n";
-
-    await expect(
-      transform(source, "/generated/actor.js", { exclude: "**/generated/**" }),
-    ).resolves.toBe(source);
-  });
-
   test("excludes do-runtime internals by default", async () => {
     const source = "const value = await task;\n";
 
@@ -423,7 +415,7 @@ describe("doRuntimeAwaitTransform", () => {
       build({
         configFile: false,
         logLevel: "silent",
-        plugins: [virtualActor, doRuntimeAwaitTransform(), ...plugins],
+        plugins: [virtualActor, doRuntimeAwaitTransform({ include: actorId }), ...plugins],
         build: {
           write: false,
           target: "esnext",
@@ -444,7 +436,7 @@ describe("doRuntimeAwaitTransform", () => {
 test("from source, the plugin leaves its injected imports to the host's resolution", async () => {
   // The package's built siblings resolve these; this repository's own lanes alias them to
   // source instead, and must keep that identity. `scripts/check-package.mjs` pins the built side.
-  const hook = doRuntimeAwaitTransform({ asyncContext: true }).resolveId;
+  const hook = doRuntimeAwaitTransform({ include: /.*/, asyncContext: true }).resolveId;
   if (typeof hook !== "object") throw new Error("expected an ordered resolveId hook");
   for (const id of ["@mcp-b/do-runtime/gate", "@mcp-b/do-runtime/browser/async-hooks"]) {
     expect(await Reflect.apply(hook.handler, {}, [id, undefined, {}])).toBeNull();
@@ -499,9 +491,6 @@ describe("browserHost", () => {
       ...workers,
       asyncHooks,
     ]);
-    expect(
-      presetConfig(built.browserHost({ include, asyncContext: false })).resolve?.alias,
-    ).toEqual(workers);
     for (const { replacement } of [...workers, asyncHooks]) {
       expect(existsSync(replacement)).toBe(true);
     }

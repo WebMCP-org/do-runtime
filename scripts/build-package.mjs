@@ -1,15 +1,20 @@
-import { rm } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import { build } from "vite";
 
 const root = new URL("../", import.meta.url);
-await rm(new URL("dist", root), { recursive: true, force: true });
+const manifest = JSON.parse(await readFile(new URL("package.json", root), "utf8"));
+// Every import of a runtime dependency is its bare package id; a subpath import would be bundled.
+const runtimeDependencies = new Set([
+  ...Object.keys(manifest.dependencies),
+  ...Object.keys(manifest.peerDependencies),
+]);
 
 await build({
   configFile: false,
   logLevel: "warn",
   build: {
     outDir: new URL("dist", root).pathname,
-    emptyOutDir: false,
+    emptyOutDir: true,
     minify: false,
     sourcemap: true,
     target: "es2023",
@@ -43,16 +48,7 @@ await build({
       formats: ["es"],
     },
     rollupOptions: {
-      external: (id) =>
-        id === "capnweb" ||
-        id === "@ungap/structured-clone" ||
-        id === "magic-string" ||
-        id === "@babel/core" ||
-        id === "@babel/plugin-transform-async-generator-functions" ||
-        id === "@babel/plugin-transform-async-to-generator" ||
-        id === "@jridgewell/remapping" ||
-        id === "vite" ||
-        id.startsWith("node:"),
+      external: (id) => runtimeDependencies.has(id) || id.startsWith("node:"),
       output: {
         entryFileNames: "[name].js",
         chunkFileNames: "chunks/[name]-[hash].js",

@@ -13,8 +13,6 @@ export interface MessagePortWebSocketPeer {
   close(): void;
 }
 
-type MessagePortWebSocketReadyMessage = { readonly type: "open" };
-
 /** The part of a MessagePort the socket uses, so another transport can stand in for one. */
 export interface MessagePortWebSocketPort {
   postMessage(message: MessagePortWebSocketWireMessage): void;
@@ -111,10 +109,6 @@ export class MessagePortWebSocket extends EventTarget implements RawWebSocket {
     const message = parseWireMessage(value);
     if (message === null) {
       this.close(1002, "Invalid MessagePort WebSocket message");
-      return;
-    }
-    if (message.type === "open") {
-      this.open();
       return;
     }
     if (message.type === "close") {
@@ -236,12 +230,6 @@ export function bridgeWebSocket(socket: UpgradeWebSocket, bridge: MessagePortWeb
   bridge.open();
 }
 
-type SocketRequest = {
-  readonly type: "connect";
-  readonly url: string;
-  readonly port: MessagePort;
-};
-
 export type MessagePortWebSocketConstructor = {
   new (url: string | URL, protocols?: string | string[]): MessagePortWebSocket;
   readonly CONNECTING: 0;
@@ -250,67 +238,8 @@ export type MessagePortWebSocketConstructor = {
   readonly CLOSED: 3;
 };
 
-/** A browser WebSocket constructor whose sockets cross one broker MessagePort. */
-export function createMessagePortWebSocketConstructor(
-  port: MessagePort,
-): MessagePortWebSocketConstructor {
-  return class BrokeredMessagePortWebSocket extends MessagePortWebSocket {
-    constructor(url: string | URL, _protocols?: string | string[]) {
-      const channel = new MessageChannel();
-      super(String(url), channel.port1, false);
-      port.postMessage(
-        { type: "connect", url: String(url), port: channel.port2 } satisfies SocketRequest,
-        [channel.port2],
-      );
-    }
-  };
-}
-
-/**
- * Serve brokered MessagePort sockets from real in-worker socket endpoints.
- * `connect` bridges each client's server-side endpoint, for example with
- * `connectMessagePortWebSocket()` from `@mcp-b/do-runtime/browser`; once it
- * resolves, the client is told the socket is open. A bridge that `stop()`
- * closed refuses a late socket by closing it with 1001.
- */
-export function serveMessagePortWebSockets(
-  port: MessagePort,
-  connect: (bridge: MessagePortWebSocket, url: string) => Promise<void>,
-): () => void {
-  const bridges = new Set<MessagePortWebSocket>();
-  const listener = (event: MessageEvent<unknown>): void => {
-    const request = parseSocketRequest(event.data);
-    if (request === null) return;
-    const bridge = new MessagePortWebSocket(request.url, request.port, false);
-    bridges.add(bridge);
-    bridge.addEventListener("close", () => bridges.delete(bridge), { once: true });
-    void connect(bridge, request.url)
-      .then(() => {
-        request.port.postMessage({ type: "open" } satisfies MessagePortWebSocketReadyMessage);
-      })
-      .catch((error: unknown) => {
-        bridge.close(1011, "WebSocket connection failed");
-        queueMicrotask(() => {
-          throw error;
-        });
-      });
-  };
-  port.addEventListener("message", listener);
-  port.start();
-
-  return () => {
-    port.removeEventListener("message", listener);
-    for (const bridge of bridges) bridge.close(1001, "host stopped");
-    bridges.clear();
-    port.close();
-  };
-}
-
-function parseWireMessage(
-  value: unknown,
-): MessagePortWebSocketWireMessage | MessagePortWebSocketReadyMessage | null {
+function parseWireMessage(value: unknown): MessagePortWebSocketWireMessage | null {
   if (!isRecord(value)) return null;
-  if (value.type === "open") return { type: "open" };
   if (value.type === "message" && isWebSocketData(value.data)) {
     return { type: "message", data: value.data };
   }
@@ -335,13 +264,6 @@ function isCleanWireClose(code: number, reason: string): boolean {
     ![1004, 1005, 1006, 1015].includes(code) &&
     new TextEncoder().encode(reason).byteLength <= 123
   );
-}
-
-function parseSocketRequest(value: unknown): SocketRequest | null {
-  if (!isRecord(value)) return null;
-  if (value.type !== "connect" || typeof value.url !== "string") return null;
-  if (!(value.port instanceof MessagePort)) return null;
-  return { type: "connect", url: value.url, port: value.port };
 }
 
 function parseMessageData(event: Event): MessagePortWebSocketData | null {

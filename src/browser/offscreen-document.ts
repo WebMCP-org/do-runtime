@@ -9,12 +9,12 @@ export type OffscreenDocumentAdapter = {
    * It must settle, rejecting on its own timeout: every `ensure()` caller
    * shares the flight it runs in.
    */
-  ready?(): Promise<void>;
+  ready(): Promise<void>;
   /**
    * Decides whether a document that failed `ready()` is closed and recreated.
    * The replacement gets one more `ready()`; declining rethrows the failure.
    */
-  replaceUnready?(error: unknown): boolean | Promise<boolean>;
+  replaceUnready(error: unknown): boolean | Promise<boolean>;
 };
 
 /**
@@ -36,11 +36,10 @@ export class OffscreenDocumentCoordinator {
 
   async #ensureOnce(): Promise<void> {
     if (!(await this.adapter.exists())) await this.#create();
-    if (this.adapter.ready === undefined) return;
     try {
       await this.adapter.ready();
     } catch (error) {
-      if (!(await this.adapter.replaceUnready?.(error))) throw error;
+      if (!(await this.adapter.replaceUnready(error))) throw error;
       await this.adapter.close();
       await this.#create();
       await this.adapter.ready();

@@ -7,7 +7,6 @@ import {
   importSqliteWasmPoolSnapshot,
   installSqliteWasmHost,
   SqliteWasmActorStorage,
-  SqliteWasmDatabase,
   SqliteWasmPoolRestoreError,
   SqliteWasmRestoreError,
   validateSqliteWasmPoolSnapshot,
@@ -16,6 +15,7 @@ import {
   type SqliteWasmPoolSnapshot,
   type SqliteWasmStatement,
 } from "./sqlite-wasm";
+import { createNodeSqlProvider } from "./node-sqlite";
 
 /** The real engine over Emscripten's in-memory filesystem; no test here reaches OPFS. */
 const sqlite3 = await sqlite3InitModule();
@@ -36,7 +36,7 @@ class FakeDatabase implements SqliteWasmDatabaseHandle {
 
 test("a column-less statement reports its own changeCount: 0 after DDL, 1 for an FTS5 row", async () => {
   const pool = { ...memoryHost(new Map()).pool, OpfsSAHPoolDb: sqlite3.oo1.DB };
-  const database = new SqliteWasmDatabase({ pool, capi: sqlite3.capi }, "/actor.root.sqlite");
+  const database = await createSqliteWasmProvider({ pool, capi: sqlite3.capi }, { prefix: "/actor" }).open("root");
   database.exec("CREATE TABLE things (id INTEGER PRIMARY KEY)", []);
 
   expect(database.exec("INSERT INTO things VALUES (1), (2), (3)", []).rowsWritten).toBe(3);
@@ -49,7 +49,33 @@ test("a column-less statement reports its own changeCount: 0 after DDL, 1 for an
   database.close();
 });
 
-test("reset fails closed when the SAH pool does not remove the database", () => {
+test("node-sqlite counts parameters the way the SQLite engine does", async () => {
+  const pool = { ...memoryHost(new Map()).pool, OpfsSAHPoolDb: sqlite3.oo1.DB };
+  const engine = await createSqliteWasmProvider({ pool, capi: sqlite3.capi }, { prefix: "/actor" }).open("root");
+  const node = await createNodeSqlProvider().open("root");
+  for (const [sql, count] of [
+    ["SELECT ?2, ?1, :name, :name, '?' AS literal /* ?3, :ignored */", 3],
+    ["SELECT ?5, ?", 6],
+    ["SELECT :a, @a, $a, $a::b(c), $a::b(c)", 4],
+    ['SELECT 1 AS [?], 2 AS `?`, 3 AS "?" -- ?', 0],
+  ] as const) {
+    for (const database of [engine, node]) {
+      const statement = database.prepare(sql);
+      try {
+        expect(statement.parameterCount, sql).toBe(count);
+        expect(() => statement.execute(Array(count + 1).fill(1))).toThrow(
+          "Wrong number of parameter bindings for SQL query.",
+        );
+      } finally {
+        statement.close();
+      }
+    }
+  }
+  engine.close();
+  node.close();
+});
+
+test("reset fails closed when the SAH pool does not remove the database", async () => {
   const opened: string[] = [];
   const host = {
     capi: {
@@ -72,7 +98,7 @@ test("reset fails closed when the SAH pool does not remove the database", () => 
       reserveMinimumCapacity: async (minimum: number) => minimum,
     },
   } satisfies SqliteWasmHost;
-  const database = new SqliteWasmDatabase(host, "/actor.root.sqlite");
+  const database = await createSqliteWasmProvider(host, { prefix: "/actor" }).open("root");
 
   expect(() => database.reset()).toThrow("SAH pool did not unlink /actor.root.sqlite");
   expect(opened).toEqual(["/actor.root.sqlite"]);
@@ -252,7 +278,7 @@ test("a failed growth fails that open with the pool's error and does not hold up
   );
   await expect(provider.open("root")).rejects.toBe(quota);
   full = false;
-  await expect(provider.open("root")).resolves.toBeInstanceOf(SqliteWasmDatabase);
+  expect((await provider.open("root")).inTransaction).toBe(false);
   provider.close();
 });
 
