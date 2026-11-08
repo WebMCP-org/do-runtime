@@ -71,7 +71,7 @@ test("transformed Agent methods retain sync returns and async cold-start admissi
     export function methods() {
       const instance = new Methods();
       return {
-        tags: [instance[methodKey], Methods.value, instance.privateValue, object.value]
+        tags: [instance[methodKey], Methods.value, instance.privateValue, object.value, async () => {}]
           .map(method => Object.prototype.toString.call(method)),
         values: Promise.all([declared(), expressed(), arrow(), instance[methodKey](4),
           Methods.value(5), instance.privateValue(), object.value(6)]),
@@ -129,7 +129,7 @@ test("transformed Agent methods retain sync returns and async cold-start admissi
   );
   const kinds = module.methods();
   await expect(kinds.failure).rejects.toThrow("method failed");
-  expect(kinds.tags).toEqual(Array(4).fill("[object AsyncFunction]"));
+  expect(kinds.tags).toEqual(Array(5).fill("[object AsyncFunction]"));
   expect(await kinds.values).toEqual([1, 2, 3, 7, 5, 2, 6]);
   expect(await kinds.iterator.next()).toEqual({ value: 9, done: false });
   expect(await kinds.iterator.next()).toEqual({ value: undefined, done: true });

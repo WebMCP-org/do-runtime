@@ -74,6 +74,56 @@ export function __gateAwait<T>(
   return resumeAwaitWithContext(context, Promise.resolve(value));
 }
 
+/**
+ * `p.then(f)`, `p.catch(f)` and `p.finally(f)` compile to `__gateThen(p).then(f)`. workerd drains
+ * every reaction inside an IoContext, so a detached reaction can touch storage wherever its
+ * promise settled. A reaction here carries no actor, so one that fires after a promise the runtime
+ * does not own runs lockless. Each callback captures the exact registering context, as
+ * `__gateAwait` does: it runs in place while that context still holds a lock in the captured
+ * section, and otherwise re-enters through a fresh slice. A non-promise receiver (an RPC stub, a
+ * schema's `.catch`) and a registration outside any actor are returned untouched.
+ */
+export function __gateThen<T>(receiver: T): T {
+  // ponytail: native promises only. A thenable's reactions (Cap'n Web stubs) stay unbound.
+  if (!(receiver instanceof Promise)) return receiver;
+  const context = tryCurrentIoContext();
+  if (context === undefined) return receiver;
+  const promise: Promise<unknown> = receiver;
+  const bind = (callback: unknown): unknown =>
+    typeof callback === "function" ? gateReaction(context, callback as never) : callback;
+  return {
+    then: (onFulfilled: unknown, onRejected: unknown) =>
+      promise.then(bind(onFulfilled) as never, bind(onRejected) as never),
+    catch: (onRejected: unknown) => promise.catch(bind(onRejected) as never),
+    finally: (onFinally: unknown) => promise.finally(bind(onFinally) as never),
+  } as T;
+}
+
+function gateReaction(
+  context: IoContext,
+  callback: (...args: unknown[]) => unknown,
+): (...args: unknown[]) => unknown {
+  const criticalSection = context.getCriticalSection();
+  const reenter = context.makeTransformReentryCallback((self: unknown, args: unknown[]) =>
+    apply(callback, self, args),
+  );
+  return function (this: unknown, ...args: unknown[]): unknown {
+    if (
+      context.hasCurrent() &&
+      context.getCriticalSection() === criticalSection &&
+      !context.isAborted()
+    ) {
+      const reservation = reservePublication(context);
+      if (reservation !== undefined) {
+        clearPublication(reservation);
+        context.restoreContinuation();
+        return apply(callback, this, args);
+      }
+    }
+    return reenter(this, args);
+  };
+}
+
 /** Restore the captured actor at the first instruction after a transformed await. */
 export function __resumeAwait<T>(value: T | TransformedAwait<T>): T {
   if (!isTransformedAwait(value)) return value as T;

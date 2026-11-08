@@ -8801,8 +8801,7 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
     }
 
     const attachmentCount = this._activeTurnReplyAttachments.length;
-    const execution = (async () => {
-      await Promise.resolve();
+    const execution = Promise.resolve().then(async () => {
       try {
         const prepared = await runAction();
         const encoded = encodeActionLedgerOutput(prepared);
@@ -8824,7 +8823,7 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
         this._activeTurnReplyAttachments.length = attachmentCount;
         throw error;
       }
-    })();
+    });
     this._activeActionLedgerExecutions.set(ledgerKey, execution);
     try {
       return await execution;
@@ -16990,13 +16989,12 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
     apply: () => Promise<void>
   ): Promise<boolean> {
     const run = async (): Promise<boolean> => {
-      try {
-        await this._interactionApplyTail;
-      } catch {}
       await apply();
       return true;
     };
-    const resultPromise = run();
+    // `.then(run, run)` runs regardless of a predecessor's outcome so one
+    // rejected apply can't poison the rest of the batch.
+    const resultPromise = this._interactionApplyTail.then(run, run);
     this._interactionApplyTail = resultPromise.then(
       () => undefined,
       () => undefined
@@ -17898,22 +17896,13 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
     // marker as an incident's work baseline. A failed read is not cached:
     // the next evaluation retries it instead of failing for the isolate's
     // life on a transient storage error.
-    //
-    // Vendor divergence: the seed runs as a synchronously-started async
-    // function rather than upstream's `.then(...)` pair. `seedProgress()`
-    // WRITES (`cf_agents_chat_progress`), and a detached `.then` continuation
-    // reaches storage without this actor's input lock. Memoization, failure
-    // eviction and ordering are otherwise identical.
-    this._progressSeed ??= (async () => {
-      try {
-        this._resumableStream.seedProgress(
-          await readChatRecoveryProgress(this.ctx.storage)
-        );
-      } catch (error) {
+    this._progressSeed ??= readChatRecoveryProgress(this.ctx.storage).then(
+      (legacy) => this._resumableStream.seedProgress(legacy),
+      (error: unknown) => {
         this._progressSeed = null;
         throw error;
       }
-    })();
+    );
     await this._progressSeed;
     return this._resumableStream.progressMarker();
   }

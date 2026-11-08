@@ -13,7 +13,7 @@ import {
 } from "./vite";
 
 const HEADER =
-  '/* @do-runtime-gated */\nimport { __gateAsyncIterable, __gateAwait, __resumeAwait } from "@mcp-b/do-runtime/gate";\n';
+  '/* @do-runtime-gated */\nimport { __gateAsyncIterable, __gateAwait, __gateThen, __resumeAwait } from "@mcp-b/do-runtime/gate";\n';
 
 async function transformWith(plugin: Plugin, code: string, id: string): Promise<string> {
   const hook = plugin.transform;
@@ -298,7 +298,7 @@ describe("doRuntimeAwaitTransform", () => {
 
   test("lowers async functions and generators for browser context while preserving gates", async () => {
     const output = await transform(
-      "export async function* values() { yield await item; } export const immediate = async () => 1;",
+      "export async function* values() { yield await item; } export const later = async () => await item; export const immediate = async () => 1;",
       "/actor.js",
       { asyncContext: true },
     );
@@ -306,7 +306,9 @@ describe("doRuntimeAwaitTransform", () => {
     expect(output).toContain("_wrapAsyncGenerator");
     expect(output).toContain("_asyncToGenerator");
     expect(output).toContain("__gateAwait");
-    expect(output).not.toMatch(/async (function|\()/);
+    // Only await-free async functions stay native: they have no continuation to bind.
+    expect(output.match(/async (function|\()/g)).toEqual(["async ("]);
+    expect(output).toMatch(/export const immediate = +async \(\) => 1;/);
   });
 
   test("gates a plain await", async () => {
@@ -314,6 +316,20 @@ describe("doRuntimeAwaitTransform", () => {
 
     await expect(transform(source)).resolves.toBe(
       `${HEADER}async function run() { return __resumeAwait((await __gateAwait((task)))); }\n`,
+    );
+  });
+
+  test("binds promise reactions to their registering actor", async () => {
+    const source =
+      "p.then(a).catch(b).finally(c); async function run() { return await p.then(a); }\n" +
+      "async function grouped() { (await p).then(a); }\n" +
+      "a?.b.then(c); a.then?.(c); a[\"then\"](c); x.thenable(c);\n";
+
+    await expect(transform(source)).resolves.toBe(
+      `${HEADER}__gateThen(__gateThen(__gateThen(p).then(a)).catch(b)).finally(c); ` +
+        "async function run() { return __resumeAwait((await __gateAwait((__gateThen(p).then(a))))); }\n" +
+        "async function grouped() { __gateThen((__resumeAwait((await __gateAwait((p)))))).then(a); }\n" +
+        'a?.b.then(c); a.then?.(c); a["then"](c); x.thenable(c);\n',
     );
   });
 
