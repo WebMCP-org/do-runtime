@@ -341,7 +341,7 @@ export class SqliteWasmActorStorage implements SqlDatabaseProvider {
   deleteAll(): void {
     this.close();
     for (const file of prefixFiles(this.#host.pool, this.#prefix)) {
-      if (!this.#host.pool.unlink(file)) throw new Error(`SAH pool did not unlink ${file}`);
+      unlinkPoolFile(this.#host.pool, file);
     }
   }
 
@@ -499,8 +499,7 @@ const queues = new WeakMap<OpfsSahPool, Promise<unknown>>();
  *
  * The queue makes each reservation count every earlier step's files; the driver's
  * reservation is not atomic either. The pool never shrinks, and a growth that
- * fails (a storage quota) fails the step with the driver's error. A
- * `SqliteWasmDatabase` constructed directly is counted but grows nothing. Never
+ * fails (a storage quota) fails the step with the driver's error. Never
  * open through a paused pool: growth gives it handles again, so the driver's
  * `unpauseVfs()` would do nothing.
  */
@@ -750,6 +749,10 @@ function recoveredPoolFiles(pool: OpfsSahPool, action: string): string[] {
   return recovered;
 }
 
+function unlinkPoolFile(pool: OpfsSahPool, file: string): void {
+  if (!pool.unlink(file)) throw new Error(`SAH pool did not unlink ${file}`);
+}
+
 function exportFiles(pool: OpfsSahPool, files: readonly string[]): Promise<PoolFile[]> {
   return Promise.all(files.map(async (name) => ({ name, image: await pool.exportFile(name) })));
 }
@@ -771,7 +774,7 @@ async function replacePoolFiles(
     for (const file of files) {
       // unlink can remove the pool's mapping before a backing-file write fails.
       touched.add(file);
-      if (!pool.unlink(file)) throw new Error(`SAH pool did not unlink ${file}`);
+      unlinkPoolFile(pool, file);
     }
     for (const { name, image } of replacement) {
       touched.add(name);
@@ -784,7 +787,7 @@ async function replacePoolFiles(
     for (const file of pool.getFileNames()) {
       if (!touched.has(file)) continue;
       try {
-        if (!pool.unlink(file)) throw new Error(`SAH pool did not unlink ${file}`);
+        unlinkPoolFile(pool, file);
       } catch (rollbackError) {
         errors.push(rollbackError);
       }
@@ -802,7 +805,7 @@ async function replacePoolFiles(
   }
 }
 
-export class SqliteWasmDatabase implements SqlDatabase {
+class SqliteWasmDatabase implements SqlDatabase {
   readonly #host: SqliteWasmHost;
   readonly #filename: string;
   #database: SqliteWasmDatabaseHandle;
@@ -811,7 +814,7 @@ export class SqliteWasmDatabase implements SqlDatabase {
   constructor(
     host: SqliteWasmHost,
     filename: string,
-    private readonly onClose: () => void = () => {},
+    private readonly onClose: () => void,
   ) {
     this.#host = host;
     this.#filename = filename;
@@ -856,9 +859,7 @@ export class SqliteWasmDatabase implements SqlDatabase {
     // has to be closed first: `unlink`'s results are undefined for a file in
     // active use.
     this.#database.close();
-    if (!this.#host.pool.unlink(this.#filename)) {
-      throw new Error(`SAH pool did not unlink ${this.#filename}`);
-    }
+    unlinkPoolFile(this.#host.pool, this.#filename);
     this.#database = this.#openDatabase();
   }
 

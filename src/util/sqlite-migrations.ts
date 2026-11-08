@@ -61,16 +61,13 @@ const MIGRATIONS: readonly RuntimeMigration[] = [];
  * the SQLite header, big-endian (https://www.sqlite.org/fileformat2.html);
  * callers validate the header shape first (`requireValidSqlDatabaseSnapshot`).
  */
-export function requireImportableRuntimeStorage(
-  snapshot: SqlDatabaseSnapshot,
-  current: number = RUNTIME_STORAGE_VERSION,
-): void {
+export function requireImportableRuntimeStorage(snapshot: SqlDatabaseSnapshot): void {
   for (const { name, image } of snapshot.databases) {
     const stored = new DataView(image.buffer, image.byteOffset, image.byteLength).getInt32(60);
-    if (stored > current) {
+    if (stored > RUNTIME_STORAGE_VERSION) {
       throw new Error(
         `Snapshot database ${JSON.stringify(name)} was written by a newer @mcp-b/do-runtime ` +
-          `(storage version ${stored}; this release supports up to ${current}). ` +
+          `(storage version ${stored}; this release supports up to ${RUNTIME_STORAGE_VERSION}). ` +
           `Upgrade the package to import it.`,
       );
     }
