@@ -148,7 +148,8 @@ function restoreAsyncMethods(source: MagicString, program: ESTree.Program, expec
     const between = code.slice(start + ASYNC_METHOD.length, node.start);
     // Only consume our own compiler metadata immediately before an AST method/function.
     if (!/^\s*$/.test(between)) return;
-    source.remove(start, start + ASYNC_METHOD.length);
+    // The marker separated tokens as a comment; keep that separation in compact output.
+    source.overwrite(start, start + ASYNC_METHOD.length, " ");
     source.appendLeft(
       node.start + (isStatic ? "static".length : 0),
       isStatic ? " async" : "async ",
@@ -162,6 +163,9 @@ function restoreAsyncMethods(source: MagicString, program: ESTree.Program, expec
     Property(node) {
       if (node.method) restore(node);
     },
+    ArrowFunctionExpression: restore,
+    FunctionExpression: restore,
+    FunctionDeclaration: restore,
   }).visit(program);
   if (restored !== expected) {
     throw new Error(
@@ -211,8 +215,43 @@ export function doRuntimeAwaitTransform(options?: DoRuntimeAwaitTransformOptions
           asyncMethods += 1;
         }
       };
+      // An async function without its own await has no continuation to bind, so keep it
+      // native: `Object.getPrototypeOf(async () => {})` must stay the real AsyncFunction.
+      const functions: { node: ESTree.Function | ESTree.ArrowFunctionExpression; awaits: boolean }[] =
+        [];
+      const enterFunction = (node: ESTree.Function | ESTree.ArrowFunctionExpression) => {
+        functions.push({ node, awaits: false });
+      };
+      const exitFunction = () => {
+        const { node, awaits } = functions.pop()!;
+        if (
+          options?.asyncContext &&
+          node.async &&
+          !node.generator &&
+          !awaits &&
+          code.startsWith("async", node.start)
+        ) {
+          source.overwrite(node.start, node.start + "async".length, ASYNC_METHOD, {
+            contentOnly: true,
+          });
+          asyncMethods += 1;
+        }
+      };
+      const awaited = () => {
+        const current = functions.at(-1);
+        if (current) current.awaits = true;
+      };
       const program = this.parse(code);
       new Visitor({
+        ArrowFunctionExpression: enterFunction,
+        "ArrowFunctionExpression:exit": exitFunction,
+        FunctionExpression: enterFunction,
+        "FunctionExpression:exit": exitFunction,
+        FunctionDeclaration: enterFunction,
+        "FunctionDeclaration:exit": exitFunction,
+        VariableDeclaration(node) {
+          if (node.kind === "await using") awaited();
+        },
         MethodDefinition(node) {
           markAsyncMethod(node, node.value);
         },
@@ -220,6 +259,7 @@ export function doRuntimeAwaitTransform(options?: DoRuntimeAwaitTransformOptions
           if (node.method) markAsyncMethod(node, node.value);
         },
         AwaitExpression(node) {
+          awaited();
           source.prependLeft(node.start, "__resumeAwait((");
           source.prependLeft(node.argument.start, "__gateAwait((");
           source.appendRight(node.argument.end, development ? `), ${JSON.stringify(id)})` : "))");
@@ -228,6 +268,7 @@ export function doRuntimeAwaitTransform(options?: DoRuntimeAwaitTransformOptions
         },
         ForOfStatement(node) {
           if (!node.await) return;
+          awaited();
           source.prependLeft(node.right.start, "__gateAsyncIterable((");
           source.appendRight(node.right.end, "))");
           transformed = true;
