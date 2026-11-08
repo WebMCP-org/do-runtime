@@ -51,26 +51,29 @@ use the gates below.
 
 | Package   | Changed source files | Added lines | Removed lines |
 | --------- | -------------------: | ----------: | ------------: |
-| Agents    |                   38 |       3,169 |           663 |
-| AI Chat   |                    1 |         169 |            50 |
-| Think     |                   17 |       3,332 |           839 |
+| Agents    |                   37 |       3,145 |           653 |
+| AI Chat   |                    1 |         153 |            46 |
+| Think     |                   17 |       3,313 |           831 |
 | Voice     |                    0 |           0 |             0 |
-| Shell     |                   17 |       3,114 |           324 |
+| Shell     |                    8 |         340 |           146 |
 | Codemode  |                    3 |         211 |           264 |
-| **Total** |               **76** |   **9,995** |     **2,140** |
+| **Total** |               **66** |   **7,162** |     **1,940** |
 
 Trend per pin, same method: 0.24 (`c076e4c9`) 66 files, 7,995 added / 2,224
 removed; 0.27 (`e3351863`) 68 files, 7,875 / 1,575; 0.32 (`be174922`,
-2026-11-07) 76 files, 9,995 / 2,140, of which 20 fork-only files hold 4,199
-lines. The 0.27 to 0.32 growth is Rook features moved into the fork as new
+2026-11-07) 76 files, 9,995 / 2,140, of which 20 fork-only files held 4,199
+lines; 0.32 after the browser-filesystem extraction (2026-11-08) 66 files,
+7,162 / 1,940, of which 13 fork-only files hold 1,411 lines. The 0.27 to 0.32 growth is Rook features moved into the fork as new
 files (native-directory workspace, `workspace-file-system.ts`, codemode schema
 printer), the `think/src/workspace-read.ts` hand-port, and more `think.ts`
 edits. Edits inside upstream-owned files are the merge surface: `think.ts`
 alone carries about 2,600 changed lines, `agents/src/index.ts` about 1,000.
 
 These are textual differences, not a count of independent patches or removable
-code. Twenty fork-only browser-messenger/OPFS/workspace files account for 4,199 added lines;
-those implementations moved out of Rook and now have one SDK owner. Tests,
+code. Thirteen fork-only browser-messenger/workspace files account for 1,411 added lines;
+those implementations moved out of Rook and now have one SDK owner. The browser
+filesystem (about 3,000 source lines) is `@mcp-b/browser-workspace`, a package the
+fork owns outright, so it is outside this table. Tests,
 fixtures, declarations outside `src`, build scripts, manifests, dependencies and
 documentation are excluded. Removing an unused upstream skill integration also
 counts as a source difference. The six-package build/export configuration

@@ -1,5 +1,7 @@
-import { validateReadRange } from "../fs/read-range";
-import type { FileInfo, Workspace, WorkspaceFsLike } from "../filesystem";
+import type { FileInfo, Workspace } from "@cloudflare/shell";
+import { MAX_SYMLINK_DEPTH } from "./path-utils";
+import { validateReadRange } from "./read-range";
+import type { RangeWorkspaceFsLike } from "./workspace-file-system";
 import {
   MAX_WORKSPACE_PATH_LENGTH,
   fileSystemError as fsError,
@@ -26,7 +28,6 @@ import {
   toArrayBuffer,
   type NativeEntry
 } from "./native-file-system";
-import { MAX_SYMLINK_DEPTH } from "../fs/path-utils";
 
 export interface OpfsWorkspaceOptions {
   /** Dedicated OPFS directory selected by the host. Contains data/ and meta/. */
@@ -94,7 +95,7 @@ const EMPTY_MANIFEST_JSON = canonicalManifestJson(entryDictionary());
  * Web Locks coordinate all instances/workers opening the same directory.
  * File contents commit when native writable streams close; failed writes abort.
  */
-export class OpfsWorkspace implements WorkspaceFsLike {
+export class OpfsWorkspace implements RangeWorkspaceFsLike {
   private readonly root: FileSystemDirectoryHandle;
   private rootsPromise: Promise<WorkspaceRoots> | undefined;
   private lockNamePromise: Promise<string> | undefined;

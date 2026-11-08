@@ -3,4 +3,8 @@ export {
   DirectoryHandleWorkspace,
   type DirectoryHandleWorkspaceOptions
 } from "./directory-handle-workspace";
-export { WorkspaceFileSystem } from "../workspace-file-system";
+export {
+  WorkspaceFileSystem,
+  type RangeWorkspaceFsLike
+} from "./workspace-file-system";
+export { validateReadRange } from "./read-range";

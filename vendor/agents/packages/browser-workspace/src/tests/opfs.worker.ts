@@ -1,6 +1,5 @@
-import { OpfsWorkspace } from "@cloudflare/shell/browser";
-import type { WorkspaceFsLike } from "../filesystem";
-import { InMemoryFs } from "../fs/in-memory-fs";
+import { OpfsWorkspace } from "@mcp-b/browser-workspace";
+import type { WorkspaceFsLike } from "@cloudflare/shell";
 
 async function errorCode(operation: Promise<unknown>): Promise<string> {
   try {
@@ -13,7 +12,7 @@ async function errorCode(operation: Promise<unknown>): Promise<string> {
   }
 }
 
-// The same basic file contract runs on Shell's memory and native implementations.
+// The basic file contract Shell's in-memory and SQLite workspaces also meet.
 async function fileContract(
   fs: Pick<
     WorkspaceFsLike,
@@ -69,10 +68,7 @@ async function run(name: string, operation: string, writer = "") {
       }
     }
     case "contract":
-      return {
-        memory: await fileContract(new InMemoryFs()),
-        opfs: await fileContract(ws)
-      };
+      return fileContract(ws);
     case "read-contract":
       return {
         text: await ws.readFile("/link"),

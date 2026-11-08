@@ -1,7 +1,7 @@
 /** File System Access metadata, ordering, and errno conversion for OPFS. */
 
-import type { FileInfo } from "../filesystem";
-import { MIME_BY_EXTENSION } from "../fs/mime-types";
+import type { FileInfo } from "@cloudflare/shell";
+import { MIME_BY_EXTENSION } from "./mime-types";
 import { fileSystemError, workspaceBasename } from "./paths";
 
 type MovableFileHandle = FileSystemFileHandle & {

@@ -132,7 +132,7 @@
     "publish:dry": "pnpm publish --access public --dry-run",
     "bench:node": "vitest run --config conformance/bench/vitest.node.config.ts",
     "bench:browser": "vitest run --config conformance/bench/vitest.browser.config.ts",
-    "sdk:pack": "pnpm sdk:build && rm -rf .sdk-pack && pnpm --dir vendor/agents --filter agents --filter \"@cloudflare/*\" --fail-if-no-match -r pack --pack-destination \"$PWD/.sdk-pack\""
+    "sdk:pack": "pnpm sdk:build && rm -rf .sdk-pack && pnpm --dir vendor/agents --filter agents --filter \"@cloudflare/*\" --filter \"@mcp-b/*\" --fail-if-no-match -r pack --pack-destination \"$PWD/.sdk-pack\""
   },
   "dependencies": {
     "@babel/core": "8.0.1",

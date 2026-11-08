@@ -38,17 +38,14 @@ afterEach(async () => {
     await root.removeEntry(name, { recursive: true });
 });
 
-it("shares the file contract with Shell memory and persists across Workers", async () => {
+it("meets the basic file contract and persists across Workers", async () => {
   const name = directory();
   const expected = {
     text: "hello 🌍",
     target: "notes.txt",
     bytes: [0, 255, 128]
   };
-  expect(await run(name, "contract")).toEqual({
-    memory: expected,
-    opfs: expected
-  });
+  expect(await run(name, "contract")).toEqual(expected);
   expect(await run(name, "read-contract")).toEqual({
     text: expected.text,
     bytes: expected.bytes

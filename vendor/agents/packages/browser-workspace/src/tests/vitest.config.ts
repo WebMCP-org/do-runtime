@@ -1,10 +1,12 @@
 import { playwright } from "@vitest/browser-playwright";
+import { alias } from "./alias.ts";
 
 export default {
+  resolve: { alias },
   worker: { format: "es" },
   test: {
-    name: "shell-browser",
-    include: ["src/browser-tests/*.test.ts"],
+    name: "browser-workspace-browser",
+    include: ["src/tests/*.browser.test.ts"],
     testTimeout: 30_000,
     browser: {
       enabled: true,

@@ -133,3 +133,5 @@ Do not adopt dofs now. It reverses ADR 0006 and ADR 0010, loses live native fold
 - copies of the four Shell leaves they import
 
 Keep `@cloudflare/shell/browser`, `/paths` and `/browser/native-file-system` as one-release re-exports, so Rook can re-point its imports in its own PR. The package name is open. Then move the two browser tests and update the `fork-diff.md` rows at lines 146-147 and 160-161.
+
+Status, 2026-11-07: done on branch `alex/browser-workspace-package` as `@mcp-b/browser-workspace`. The one deviation from this plan is that Shell's three browser entry points were removed rather than kept as one-release re-exports: Rook takes npm `@mcp-b/do-runtime` and the rook-sdk tarballs from the same main commit together, and re-points its imports in that same bump. The four leaves were copied into the package, which imports only types from Shell, so the browser bundle stays free of Shell's Node-builtin imports. The glob dialect is therefore duplicated between Shell's `helpers.ts` and the package, which is acceptable because Shell is frozen. `fs/mime-types.ts` also stays in Shell because `extras.ts` uses it.

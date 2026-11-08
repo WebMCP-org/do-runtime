@@ -1,8 +1,9 @@
 # Current browser integrations
 
-Keep DO/Agents/Shell behavior and its browser regressions here; keep Rook's
-configuration, UI, workspace identities and Chrome policy in the host. Prefer
-an upstream implementation plus a measured browser shim over a copied runtime.
+Keep DO/Agents/Shell and browser-workspace behavior and its browser regressions
+here; keep Rook's configuration, UI, workspace identities and Chrome policy in
+the host. Prefer an upstream implementation plus a measured browser shim over a
+copied runtime.
 
 ## Channels
 
@@ -61,11 +62,17 @@ and [MCP authorization and PKCE](https://modelcontextprotocol.io/specification/2
 Only the remote provider is a fixture; the SDK client, OAuth provider, actor
 storage, network transport, browser and CSP are real.
 
-## Shell OPFS
+## Browser workspace
 
-`@cloudflare/shell/browser` exports `OpfsWorkspace({ root })` over a host-selected
-native directory. It reuses Shell path/glob/MIME helpers and plugs into the
-existing `WorkspaceFileSystem` and `WorkspaceStateBackend` wrappers.
+The fork-owned `@mcp-b/browser-workspace` package exports
+`OpfsWorkspace({ root })` over a host-selected native directory and
+`DirectoryHandleWorkspace` over an existing directory handle. It carries its own
+copies of Shell's path/glob/MIME helpers, imports only types from
+`@cloudflare/shell`, and plugs into its own `WorkspaceFileSystem` adapter and
+Shell's `WorkspaceStateBackend` wrapper. Its
+`/paths` and `/native-file-system` entry points expose the path and native
+helpers without an actor or Workers bootstrap. Until the move it was Shell's
+`./browser`, `./paths` and `./browser/native-file-system` entry points.
 Mount registries, storage identities and `/mcp` projections remain in Rook.
 
 The Chromium suite runs in dedicated Workers against real OPFS: shared filesystem
@@ -73,8 +80,8 @@ contracts, arbitrary bytes and UTF-8 paging, symlinks, listing/globs, copy/move,
 concurrent writers, malformed metadata, and preservation after failed writes,
 stream cancellation and append failures. Staged native writes replace the old
 synchronous append shortcut, which could leave partially changed bytes after a
-failure. See [Shell usage](../packages/shell/README.md#browser-opfs-workspace).
+failure. See the [package README](../packages/browser-workspace/README.md).
 
-Run `pnpm --dir vendor/agents test:browser` for Think and Shell browser tests,
-and `pnpm test:examples` for the extension integration. Root conformance continues
-to own DO storage, gates and facets.
+Run `pnpm --dir vendor/agents test:browser` for Think and browser-workspace
+browser tests, and `pnpm test:examples` for the extension integration. Root
+conformance continues to own DO storage, gates and facets.

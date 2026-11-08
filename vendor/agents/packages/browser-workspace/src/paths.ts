@@ -1,5 +1,5 @@
-import { createGlobMatcher, getGlobPrefix } from "../helpers";
-import { dirname, normalizePath } from "../fs/path-utils";
+import { createGlobMatcher, getGlobPrefix } from "./glob";
+import { dirname, normalizePath } from "./path-utils";
 
 export const MAX_WORKSPACE_PATH_LENGTH = 4096;
 
@@ -42,4 +42,4 @@ export function fileSystemError(
   return Object.assign(new Error(`${code}: ${message}`), { code });
 }
 
-export { validateReadRange } from "../fs/read-range";
+export { validateReadRange } from "./read-range";
