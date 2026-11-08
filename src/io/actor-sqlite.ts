@@ -72,7 +72,7 @@ import {
   REPLICATION_UNIMPLEMENTED_MESSAGE,
   SHUTDOWN_ERROR_MESSAGE,
 } from "./actor-cache";
-import { atCheckpointEnd } from "./io-context";
+import { TaskSet, atCheckpointEnd } from "./io-context";
 import type { OutputGate } from "./io-gate";
 import { SqliteKv } from "../util/sqlite-kv";
 import { SqliteMetadata } from "../util/sqlite-metadata";
@@ -165,32 +165,6 @@ function evalLater<T>(func: () => Promise<T>): Promise<T> {
   return promise;
 }
 
-/**
- * ← `kj::TaskSet` plus its `ErrorHandler`. `ActorSqlite` owns one of its own,
- * separate from `IoContext`'s, exactly as upstream does.
- */
-class TaskSet {
-  readonly #tasks = new Set<Promise<void>>();
-  readonly #taskFailed: (exception: unknown) => void;
-
-  constructor(taskFailed: (exception: unknown) => void) {
-    this.#taskFailed = taskFailed;
-  }
-
-  add(promise: Promise<void>): void {
-    const task = promise.then(
-      () => {
-        this.#tasks.delete(task);
-      },
-      (exception: unknown) => {
-        this.#tasks.delete(task);
-        this.#taskFailed(exception);
-      },
-    );
-    this.#tasks.add(task);
-  }
-}
-
 // =======================================================================================
 // ActorSqlite
 
@@ -232,7 +206,10 @@ export class ActorSqlite implements ActorCacheInterface {
   readonly db: SqliteDatabase;
   /** Upstream-private; reached by the two transaction classes. */
   readonly outputGate: OutputGate;
-  /** Upstream-private; reached by the two transaction classes. */
+  /**
+   * Upstream-private; reached by the two transaction classes. ← `kj::TaskSet` plus its
+   * `ErrorHandler`: an instance of its own, separate from `IoContext`'s, as upstream.
+   */
   readonly commitTasks: TaskSet;
   readonly #kv: SqliteKv;
   readonly #metadata: SqliteMetadata;

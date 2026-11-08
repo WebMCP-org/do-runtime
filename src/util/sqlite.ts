@@ -78,7 +78,7 @@ export const SQL_WRONG_BINDINGS_MESSAGE = "Wrong number of parameter bindings fo
 /** ← workerd 1b9b6ea02 `MAX_ROW_LENGTH`: 8 MiB plus V8 serialization padding. */
 export const SQLITE_LENGTH_LIMIT = 8 * 1024 * 1024 + 34;
 
-export const SQLITE_TOOBIG_MESSAGE = "string or blob too big: SQLITE_TOOBIG";
+const SQLITE_TOOBIG_MESSAGE = "string or blob too big: SQLITE_TOOBIG";
 
 const textEncoder = new TextEncoder();
 
@@ -93,7 +93,7 @@ export function requireSqliteLength(value: unknown): void {
   if (length > SQLITE_LENGTH_LIMIT) throw new Error(SQLITE_TOOBIG_MESSAGE);
 }
 
-export const SQL_PRELUDE_BINDINGS_MESSAGE =
+const SQL_PRELUDE_BINDINGS_MESSAGE =
   "When executing multiple SQL statements in a single call, only the last statement can have " +
   "parameters.";
 

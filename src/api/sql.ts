@@ -91,7 +91,7 @@ export const CURSOR_NOT_CONSTRUCTIBLE_MESSAGE =
   "Illegal invocation: SqlStorage.Cursor cannot be constructed directly. Use sql.exec().";
 
 /** Same, for the prepared-statement compatibility shim. */
-export const STATEMENT_NOT_CONSTRUCTIBLE_MESSAGE =
+const STATEMENT_NOT_CONSTRUCTIBLE_MESSAGE =
   "Illegal invocation: SqlStorage.Statement cannot be constructed directly. Use sql.prepare().";
 
 /**

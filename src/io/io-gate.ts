@@ -104,7 +104,7 @@ export interface InputGateHooks {
 }
 
 /** ← `InputGate::Hooks::DEFAULT`. */
-export const DEFAULT_INPUT_GATE_HOOKS: InputGateHooks = {
+const DEFAULT_INPUT_GATE_HOOKS: InputGateHooks = {
   inputGateLocked() {},
   inputGateReleased() {},
   inputGateWaiterAdded() {},
@@ -665,7 +665,7 @@ export interface OutputGateHooks {
 }
 
 /** ← `OutputGate::Hooks::DEFAULT`. */
-export const DEFAULT_OUTPUT_GATE_HOOKS: OutputGateHooks = {
+const DEFAULT_OUTPUT_GATE_HOOKS: OutputGateHooks = {
   /** ← `kj::NEVER_DONE`. */
   makeTimeoutPromise: () => new Promise<never>(() => {}),
   outputGateLocked() {},
