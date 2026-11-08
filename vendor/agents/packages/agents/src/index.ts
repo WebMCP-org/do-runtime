@@ -1026,6 +1026,10 @@ export const getCurrentAgent = getCurrentLifecycleAgent as <
   T extends DurableObject = Agent<Cloudflare.Env>
 >() => CurrentAgentContext<T, AgentEmail>;
 
+const AsyncFunction: Function = Object.getPrototypeOf(
+  async () => {}
+).constructor;
+
 /** Functions produced by {@link withAgentContext}, so they are wrapped once. */
 const agentContextWrappers = new WeakSet<Function>();
 
@@ -1072,9 +1076,7 @@ function withAgentContext<T extends (...args: any[]) => any>(
     );
   };
 
-  // A browser build lowers async arrows, so deriving the constructor from an
-  // async-arrow sentinel would also classify synchronous functions as async.
-  if (Object.prototype.toString.call(method) !== "[object AsyncFunction]") {
+  if (!(method instanceof AsyncFunction)) {
     agentContextWrappers.add(enter);
     return enter;
   }

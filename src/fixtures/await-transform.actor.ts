@@ -15,3 +15,18 @@ export async function readAfterForeignAwait(storage: DurableObjectStorage): Prom
   await portHop();
   return await storage.get("key");
 }
+
+/** Detached reactions on promises the runtime does not own; each chain is handed to `settled`. */
+export function writeFromDetachedReactions(
+  storage: DurableObjectStorage,
+  settled: (chain: Promise<unknown>) => void,
+): void {
+  settled(
+    storage.put("held", 1).then(async () => {
+      await portHop();
+      await storage.put("afterAwait", 2);
+    }),
+  );
+  settled(portHop().then(() => portHop()).then(() => storage.put("afterForeign", 3)));
+  settled(Promise.reject(new Error("rejected")).catch(() => portHop()).finally(() => storage.put("afterFinally", 4)));
+}

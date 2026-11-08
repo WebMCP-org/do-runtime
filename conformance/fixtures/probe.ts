@@ -247,6 +247,66 @@ export class Probe extends DurableObject<ProbeEnv> {
     return this.marker;
   }
 
+  // -- §1.2 detached promise reactions ---------------------------------------
+  //
+  // Each method registers a reaction and returns before it runs. A failed write
+  // is journaled in memory, so the reading request reports it.
+  #reactionErrors: string[] = [];
+  #deferred: PromiseWithResolvers<string> | undefined;
+  #noteReaction = (error: unknown): void => {
+    this.#reactionErrors.push(String(error));
+  };
+  detachedStorageReaction(): string {
+    void this.ctx.storage
+      .put("r1", "a")
+      .then(() => this.ctx.storage.put("r2", "b"))
+      .then(() => this.ctx.storage.put("r3", "c"))
+      .catch(this.#noteReaction);
+    return "returned";
+  }
+  detachedTimerReaction(): string {
+    void this.ctx.storage
+      .put("t1", "a")
+      .then(async () => {
+        await scheduler.wait(20);
+        await this.ctx.storage.put("t2", "b");
+      })
+      .catch(this.#noteReaction);
+    return "returned";
+  }
+  detachedSetTimeoutReaction(): string {
+    void new Promise((resolve) => setTimeout(resolve, 10))
+      .then(() => this.ctx.storage.put("s1", "a"))
+      .catch(this.#noteReaction);
+    return "returned";
+  }
+  detachedRejectionReaction(): string {
+    void Promise.reject(new Error("conformance: rejected"))
+      .catch(() => this.ctx.storage.put("j1", "a"))
+      .finally(() => this.ctx.storage.put("j2", "b"))
+      .catch(this.#noteReaction);
+    return "returned";
+  }
+  armDeferredReaction(): string {
+    this.#deferred = Promise.withResolvers<string>();
+    void this.#deferred.promise
+      .then(async (value) => {
+        await this.ctx.storage.put("d1", value);
+        await scheduler.wait(10);
+        await this.ctx.storage.put("d2", value);
+      })
+      .catch(this.#noteReaction);
+    return "armed";
+  }
+  fireDeferredReaction(value: string): string {
+    this.#deferred?.resolve(value);
+    return "fired";
+  }
+  async readReactions(keys: string[]): Promise<{ values: unknown[]; errors: string[] }> {
+    const stored = await this.ctx.storage.get(keys);
+    return { values: keys.map((key) => stored.get(key) ?? null), errors: this.#reactionErrors };
+  }
+
   // -- §1.2 host-provided async primitives resume gated ----------------------
   //
   // Every one of these is an io-context primitive upstream, so "the code after
