@@ -17,7 +17,7 @@ const CLEANUP_SCHEDULE_ID_KEY = "cleanup_schedule_id";
 export class ChatSdkStateAgent extends Agent {
   async onStart(): Promise<void> {
     this.migrate();
-    await this.scheduleNextCleanup({ idempotent: true });
+    await this.scheduleNextCleanup();
   }
 
   subscribe(threadId: string): void {
@@ -449,9 +449,7 @@ export class ChatSdkStateAgent extends Agent {
     await this.ensureCleanupScheduled(expiresAt);
   }
 
-  private async scheduleNextCleanup(options?: {
-    idempotent?: boolean;
-  }): Promise<void> {
+  private async scheduleNextCleanup(): Promise<void> {
     const next = this.nextExpiry();
     if (next === null) {
       const current = this.readCleanupMetadata();
@@ -462,13 +460,10 @@ export class ChatSdkStateAgent extends Agent {
       return;
     }
 
-    await this.ensureCleanupScheduled(next, options);
+    await this.ensureCleanupScheduled(next);
   }
 
-  private async ensureCleanupScheduled(
-    expiresAt: number,
-    options?: { idempotent?: boolean }
-  ): Promise<void> {
+  private async ensureCleanupScheduled(expiresAt: number): Promise<void> {
     const current = this.readCleanupMetadata();
     if (current.nextCleanupAt !== null && current.nextCleanupAt <= expiresAt) {
       return;
@@ -482,12 +477,9 @@ export class ChatSdkStateAgent extends Agent {
       0,
       Math.ceil((expiresAt - Date.now()) / 1000)
     );
-    const schedule = await this.schedule(
-      delaySeconds,
-      "cleanupExpired",
-      { expiresAt },
-      options
-    );
+    const schedule = await this.schedule(delaySeconds, "cleanupExpired", {
+      expiresAt
+    });
     this.writeCleanupMetadata(expiresAt, schedule.id);
   }
 

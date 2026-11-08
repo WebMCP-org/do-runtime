@@ -51,16 +51,25 @@ use the gates below.
 
 | Package   | Changed source files | Added lines | Removed lines |
 | --------- | -------------------: | ----------: | ------------: |
-| Agents    |                   38 |       2,845 |           639 |
-| AI Chat   |                    1 |         164 |            42 |
-| Think     |                   15 |       2,991 |         1,450 |
+| Agents    |                   38 |       3,169 |           663 |
+| AI Chat   |                    1 |         169 |            50 |
+| Think     |                   17 |       3,332 |           839 |
 | Voice     |                    0 |           0 |             0 |
-| Shell     |                   12 |       1,995 |            93 |
-| Codemode  |                    0 |           0 |             0 |
-| **Total** |               **66** |   **7,995** |     **2,224** |
+| Shell     |                   17 |       3,114 |           324 |
+| Codemode  |                    3 |         211 |           264 |
+| **Total** |               **76** |   **9,995** |     **2,140** |
+
+Trend per pin, same method: 0.24 (`c076e4c9`) 66 files, 7,995 added / 2,224
+removed; 0.27 (`e3351863`) 68 files, 7,875 / 1,575; 0.32 (`be174922`,
+2026-11-07) 76 files, 9,995 / 2,140, of which 20 fork-only files hold 4,199
+lines. The 0.27 to 0.32 growth is Rook features moved into the fork as new
+files (native-directory workspace, `workspace-file-system.ts`, codemode schema
+printer), the `think/src/workspace-read.ts` hand-port, and more `think.ts`
+edits. Edits inside upstream-owned files are the merge surface: `think.ts`
+alone carries about 2,600 changed lines, `agents/src/index.ts` about 1,000.
 
 These are textual differences, not a count of independent patches or removable
-code. Thirteen new browser-messenger/OPFS files account for 2,652 added lines;
+code. Twenty fork-only browser-messenger/OPFS/workspace files account for 4,199 added lines;
 those implementations moved out of Rook and now have one SDK owner. Tests,
 fixtures, declarations outside `src`, build scripts, manifests, dependencies and
 documentation are excluded. Removing an unused upstream skill integration also
@@ -68,7 +77,7 @@ counts as a source difference. The six-package build/export configuration
 remains part of the maintained surface even though it is excluded here.
 
 Measured with `git diff --no-index --numstat`, one file at a time, between
-upstream `c076e4c9ff6cfb72931085226edfd3ee7965ac48` and this fork. Include
+upstream `be174922` (Agents 0.32 / Think 0.23) and this fork. Include
 `.ts`, `.tsx`, `.js`, `.jsx`, `.mjs` under the six `packages/*/src` trees;
 exclude paths with `test` or `fixture` in any component and `__mocks__`.
 Count files present on only one side against `/dev/null`. This classification
