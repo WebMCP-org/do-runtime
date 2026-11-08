@@ -13,7 +13,7 @@ import {
 } from "./vite";
 
 const HEADER =
-  '/* @do-runtime-gated */\nimport { __gateAsyncIterable, __gateAwait, __resumeAwait } from "@mcp-b/do-runtime/gate";\n';
+  '/* @do-runtime-gated */\nimport { __gateAsyncIterable, __gateAwait, __gateThen, __resumeAwait } from "@mcp-b/do-runtime/gate";\n';
 
 async function transformWith(plugin: Plugin, code: string, id: string): Promise<string> {
   const hook = plugin.transform;
@@ -316,6 +316,20 @@ describe("doRuntimeAwaitTransform", () => {
 
     await expect(transform(source)).resolves.toBe(
       `${HEADER}async function run() { return __resumeAwait((await __gateAwait((task)))); }\n`,
+    );
+  });
+
+  test("binds promise reactions to their registering actor", async () => {
+    const source =
+      "p.then(a).catch(b).finally(c); async function run() { return await p.then(a); }\n" +
+      "async function grouped() { (await p).then(a); }\n" +
+      "a?.b.then(c); a.then?.(c); a[\"then\"](c); x.thenable(c);\n";
+
+    await expect(transform(source)).resolves.toBe(
+      `${HEADER}__gateThen(__gateThen(__gateThen(p).then(a)).catch(b)).finally(c); ` +
+        "async function run() { return __resumeAwait((await __gateAwait((__gateThen(p).then(a))))); }\n" +
+        "async function grouped() { __gateThen((__resumeAwait((await __gateAwait((p)))))).then(a); }\n" +
+        'a?.b.then(c); a.then?.(c); a["then"](c); x.thenable(c);\n',
     );
   });
 

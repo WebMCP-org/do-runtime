@@ -28,7 +28,7 @@ import { FacetDeletionReceiptStore } from "./facet-deletion";
 import type { ActorClassChannel } from "../io/io-channels";
 import type { IsolateChannelFactory } from "../api/worker-loader";
 import { FacetTreeIndex } from "./facet-tree-index";
-import { readAfterForeignAwait } from "../fixtures/await-transform.actor";
+import { readAfterForeignAwait, writeFromDetachedReactions } from "../fixtures/await-transform.actor";
 import type {
   ActorContainer,
   ActorContainerOptions,
@@ -788,6 +788,28 @@ describe("the composition", () => {
     });
 
     await expect(entry.read()).resolves.toBeUndefined();
+  });
+
+  test("transformed detached reactions re-enter before storage after a foreign promise", async () => {
+    const { container, instance } = await counterContainer();
+    const chains: Promise<unknown>[] = [];
+    const entry = container.entry({
+      write: () => writeFromDetachedReactions(instance.ctx.storage, (chain) => chains.push(chain)),
+      read: () => instance.ctx.storage.get(["held", "afterAwait", "afterForeign", "afterFinally"]),
+    });
+
+    await entry.write();
+    expect((await Promise.allSettled(chains)).map((chain) => chain.status)).toEqual([
+      "fulfilled",
+      "fulfilled",
+      "fulfilled",
+    ]);
+    expect(Object.fromEntries(await entry.read())).toEqual({
+      held: 1,
+      afterAwait: 2,
+      afterForeign: 3,
+      afterFinally: 4,
+    });
   });
 
   test("a lost lock names where the gate was last engaged", async () => {
