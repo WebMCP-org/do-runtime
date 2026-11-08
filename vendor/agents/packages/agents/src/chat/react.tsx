@@ -3059,7 +3059,8 @@ export function useAgentChat<
         processedToolCalls.current.delete(toolCallId);
       }
     }
-  }, [chatMessages, clientToolResults]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chatMessages]);
 
   // Create addToolOutput function for external use
   const addToolOutput = useCallback(
