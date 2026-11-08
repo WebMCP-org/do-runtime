@@ -161,6 +161,9 @@ await is wrapped once at its shared owner with `awaitIo`; it is not repaired
 at every caller or by patching the realm. The await transform's tokenized
 continuation marker is the sole exception: it republishes the context captured
 from the exact slice, and readers ignore it once that context's lock is gone.
+The same transform compiles `p.then|catch|finally(f)` on a native promise to
+bind `f` to the registering context, so a detached reaction runs as workerd
+runs it: in place while that context holds its lock, otherwise re-entered.
 The opt-in browser async-context import patches `Promise.prototype.then` for
 `AsyncLocalStorage` only, not for actor scope.
 
@@ -243,7 +246,8 @@ consumer peer dependencies retain one identity.
    [browser async context](browser-async-context.md) import. The compile-time
    await transform may republish only the exact context it captured, tokenized
    for one checkpoint and valid only while that context still holds an input
-   lock.
+   lock. Promise reactions registered in transformed code capture it the
+   same way.
 9. No stream pump or generic remote-facet protocol in the runtime. Facet
    placement is the host's; direct actor hops use native capabilities.
 10. Store per-connection host bridges by connection id. Never use the

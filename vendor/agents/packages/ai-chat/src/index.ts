@@ -5126,25 +5126,13 @@ export class AIChatAgent<
     // marker as an incident's work baseline. A failed read is not cached:
     // the next evaluation retries it instead of failing for the isolate's
     // life on a transient storage error.
-    // Vendor divergence: upstream runs the seed as a detached
-    // `readChatRecoveryProgress(...).then(...)` continuation. `seedProgress`
-    // writes `cf_agents_chat_progress`, and on `@mcp-b/do-runtime` a `.then`
-    // callback reaches storage without the caller's actor event context — the
-    // context is captured at the first `await` of a synchronously-started
-    // async function. Starting the same work inline keeps the write inside
-    // this evaluation's input lock. Memoization, the retry-on-failed-read
-    // (the write is idempotent by `MAX`, so only the read is guarded) and the
-    // ordering are upstream's.
-    this._progressSeed ??= (async () => {
-      let legacy: number;
-      try {
-        legacy = await readChatRecoveryProgress(this.ctx.storage);
-      } catch (error) {
+    this._progressSeed ??= readChatRecoveryProgress(this.ctx.storage).then(
+      (legacy) => this._resumableStream.seedProgress(legacy),
+      (error: unknown) => {
         this._progressSeed = null;
         throw error;
       }
-      this._resumableStream.seedProgress(legacy);
-    })();
+    );
     await this._progressSeed;
     return this._resumableStream.progressMarker();
   }

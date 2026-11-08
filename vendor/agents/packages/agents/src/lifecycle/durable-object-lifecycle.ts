@@ -844,15 +844,7 @@ export class Lifecycle<
    * calculation from fresher queue state always lands last.
    */
   #serializeAlarmWrite(write: () => Promise<void>): Promise<void> {
-    const prior = this.#alarmRearmQueue;
-    const next = (async () => {
-      // Vendor divergence: wait for the queue inside the caller's own async
-      // function. A detached `.then(write)` runs the write in whichever
-      // continuation settled `prior`, not the caller's, so on do-runtime it
-      // can reach storage without the caller's input lock.
-      await prior.catch(() => {});
-      await write();
-    })();
+    const next = this.#alarmRearmQueue.catch(() => {}).then(write);
     this.#alarmRearmQueue = next;
     return next;
   }

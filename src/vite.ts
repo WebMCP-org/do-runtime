@@ -21,7 +21,9 @@ import { ACTOR_SCOPE_GLOBALS } from "./api/actor-scope-globals.js";
 const MARKER = "/* @do-runtime-gated */";
 const ASYNC_METHOD = "/*! @do-runtime-async-method */";
 const IMPORT =
-  'import { __gateAsyncIterable, __gateAwait, __resumeAwait } from "@mcp-b/do-runtime/gate";';
+  'import { __gateAsyncIterable, __gateAwait, __gateThen, __resumeAwait } from "@mcp-b/do-runtime/gate";';
+const REACTIONS = new Set(["then", "catch", "finally"]);
+const REACTION_CALL = /\.\s*(?:then|catch|finally)\b/;
 
 function bindOptionalSuperCalls(): PluginObject {
   return {
@@ -195,7 +197,9 @@ export function doRuntimeAwaitTransform(options?: DoRuntimeAwaitTransformOptions
     },
     async transform(code, id) {
       if (
-        (!code.includes("await") && !(options?.asyncContext && code.includes("async"))) ||
+        (!code.includes("await") &&
+          !REACTION_CALL.test(code) &&
+          !(options?.asyncContext && code.includes("async"))) ||
         code.includes(MARKER) ||
         !filter(id)
       )
@@ -242,6 +246,7 @@ export function doRuntimeAwaitTransform(options?: DoRuntimeAwaitTransformOptions
         if (current) current.awaits = true;
       };
       const program = this.parse(code);
+      const chains: ESTree.Node[] = [];
       new Visitor({
         ArrowFunctionExpression: enterFunction,
         "ArrowFunctionExpression:exit": exitFunction,
@@ -264,6 +269,29 @@ export function doRuntimeAwaitTransform(options?: DoRuntimeAwaitTransformOptions
           source.prependLeft(node.argument.start, "__gateAwait((");
           source.appendRight(node.argument.end, development ? `), ${JSON.stringify(id)})` : "))");
           source.appendRight(node.end, "))");
+          transformed = true;
+        },
+        ChainExpression(node) {
+          chains.push(node);
+        },
+        // `p.then(f)` -> `__gateThen(p).then(f)`. Optional chains stay native: wrapping the
+        // receiver would turn a short circuit into a call on undefined.
+        // ponytail: named calls only; `p["then"](f)`, `p.then?.(f)`, `.call` and reactions in
+        // untransformed modules keep native, identity-free reactions.
+        CallExpression(node) {
+          const callee = node.callee;
+          if (
+            callee.type !== "MemberExpression" ||
+            callee.computed ||
+            callee.optional ||
+            callee.object.type === "Super" ||
+            callee.property.type !== "Identifier" ||
+            !REACTIONS.has(callee.property.name) ||
+            chains.some((chain) => chain.start <= node.start && node.end <= chain.end)
+          )
+            return;
+          source.prependRight(node.start, "__gateThen(");
+          source.appendLeft(code.lastIndexOf(".", callee.property.start), ")");
           transformed = true;
         },
         ForOfStatement(node) {

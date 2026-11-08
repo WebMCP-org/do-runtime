@@ -234,18 +234,10 @@ export class JobDriver {
     if (!scope) return false;
     if (this.#outstandingAlarmWork.has(work)) return true;
     this.#outstandingAlarmWork.add(work);
-    // Vendor divergence: start the settle synchronously and await the tracked
-    // work inside it. A detached `.then(...)` continuation enters the strike
-    // storage without the dispatching alarm's input lock.
-    void (async () => {
-      let failure: unknown;
-      try {
-        await work;
-      } catch (error) {
-        failure = error;
-      }
-      await this.#settleAlarmWork(work, failure, scope.executing);
-    })();
+    void work.then(
+      () => this.#settleAlarmWork(work, undefined, scope.executing),
+      (error) => this.#settleAlarmWork(work, error, scope.executing)
+    );
     return true;
   }
 
