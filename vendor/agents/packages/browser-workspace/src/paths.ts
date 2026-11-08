@@ -9,7 +9,10 @@ export function normalizeWorkspacePath(path: string): string {
   }
   const normalized = normalizePath(path);
   if (normalized.length > MAX_WORKSPACE_PATH_LENGTH) {
-    throw fileSystemError("ENAMETOOLONG", "path exceeds 4096 characters");
+    throw fileSystemError(
+      "ENAMETOOLONG",
+      `path exceeds ${MAX_WORKSPACE_PATH_LENGTH} characters`
+    );
   }
   return normalized;
 }

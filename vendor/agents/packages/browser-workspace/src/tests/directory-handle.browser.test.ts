@@ -123,6 +123,21 @@ it("copies trees, atomically replaces files, and rejects overlapping copies and 
   expect(await workspace.exists("/link")).toBe(false);
 });
 
+it("reports a quota failure during a copy as ENOSPC", async () => {
+  await workspace.writeFile("/source/file.txt", "source");
+  const createWritable = FileSystemFileHandle.prototype.createWritable;
+  FileSystemFileHandle.prototype.createWritable = async function () {
+    throw new DOMException("simulated disk quota", "QuotaExceededError");
+  };
+  try {
+    await expect(
+      workspace.cp("/source", "/copy", { recursive: true })
+    ).rejects.toMatchObject({ code: "ENOSPC" });
+  } finally {
+    FileSystemFileHandle.prototype.createWritable = createWritable;
+  }
+});
+
 it("moves directory trees and reports entries below a missing or file parent", async () => {
   await workspace.writeFile("/tree/nested/file.txt", "value");
   await workspace.mv("/tree", "/moved");

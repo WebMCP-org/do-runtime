@@ -96,6 +96,7 @@ it("copies directories and symlinks, replaces files natively and rejects overlap
     copy: "new",
     copiedLink: false,
     movedLink: "nested/file.txt",
+    movedLinkKeptCreatedAt: true,
     replaced: "new",
     source: false,
     overlap: "EINVAL",
@@ -118,7 +119,7 @@ it("preserves existing bytes after native write, append, stream and abort failur
   });
 });
 
-it("rejects corrupt symlink metadata unchanged and removes empty metadata directories", async () => {
+it("rejects a symlink record that collides with a native file and removes empty metadata directories", async () => {
   const result = await run(directory(), "metadata");
   expect(result).toMatchObject({
     rejected: "EIO",
@@ -133,6 +134,23 @@ it("rejects corrupt symlink metadata unchanged and removes empty metadata direct
   )
     throw new Error("Missing metadata");
   expect(result.after).toBe(result.before);
+});
+
+it("reports a quota failure during a copy as ENOSPC", async () => {
+  expect(await run(directory(), "failed-copy")).toBe("ENOSPC");
+});
+
+it("rejects every malformed symlink manifest with EIO and leaves it unchanged", async () => {
+  const results = await run(directory(), "corrupt-manifests");
+  if (!Array.isArray(results)) throw new Error("Missing manifest results");
+  expect(results).toHaveLength(7);
+  for (const result of results) {
+    expect(result).toEqual({
+      body: result.body,
+      code: "EIO",
+      stored: result.body
+    });
+  }
 });
 
 it("serializes appends from separate Workers using the same OPFS root", async () => {
