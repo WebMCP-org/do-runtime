@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.14.0
+
+### Minor Changes
+
+- c98b0ca: `ActorGlobalScopeOptions.crypto` is removed. An actor's gated `crypto` always delegates to the platform's WebCrypto, captured when the module loads.
+- c98b0ca: `HibernationHost.autoResponsePair` and `HibernationHost.autoResponseTimestamp` are now required. A custom host must restore the retained auto-response pair (or report `null`) and record auto-response timestamps, so `getWebSocketAutoResponseTimestamp()` survives hibernation. `HibernationMirror` already does both.
+- 3adbf04: `serveMessagePortWebSockets` and `createMessagePortWebSocketConstructor` are removed from `@mcp-b/do-runtime/browser/message-port-websocket`, and `MessagePortWebSocket` no longer accepts the private `{ type: "open" }` frame, which a peer now receives as an invalid message (close 1002). Route sockets with `connectMessagePortWebSocket()` from `serveBrowserWorker`'s `connect` and open the client end yourself, as a default `MessagePortWebSocket` does.
+- 6d6f8f7: `NodeSqlDatabase` (`@mcp-b/do-runtime/backends/node-sqlite`) and `SqliteWasmDatabase` (`@mcp-b/do-runtime/backends/sqlite-wasm`) are no longer exported. Open databases through `createNodeSqlProvider()` or `createSqliteWasmProvider(host, { prefix })`, which track every handle they open for `close()` and snapshots, and reserve pool headroom before a SAH-pool database opens.
+- 3adbf04: `doRuntimeAwaitTransform()` from `@mcp-b/do-runtime/vite` now requires `include`, and its `exclude` option is removed. `browserHost()` no longer takes `asyncContext`: it always aliases `async_hooks` to the browser shim and lowers async functions for it.
+
 ## 0.13.1
 
 ### Patch Changes
