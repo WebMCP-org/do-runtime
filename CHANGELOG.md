@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.13.1
+
+### Patch Changes
+
+- 37f830e: Bind `then`/`catch`/`finally` reactions in transformed code to the actor that registered them, so detached storage writes keep the input lock as they do on workerd.
+- 925c249: Keep async functions without their own `await` native when lowering browser awaits, so `Object.getPrototypeOf(async () => {}).constructor` stays the real `AsyncFunction`.
+
 ## 0.13.0
 
 ### Minor Changes
