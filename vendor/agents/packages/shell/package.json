@@ -20,10 +20,6 @@
   },
   "types": "dist/index.d.ts",
   "exports": {
-    "./browser": {
-      "types": "./dist/browser/index.d.ts",
-      "import": "./dist/browser/index.js"
-    },
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
@@ -43,19 +39,10 @@
       "types": "./dist/git/index.d.ts",
       "import": "./dist/git/index.js",
       "require": "./dist/git/index.js"
-    },
-    "./paths": {
-      "types": "./dist/browser/paths.d.ts",
-      "import": "./dist/browser/paths.js"
-    },
-    "./browser/native-file-system": {
-      "types": "./dist/browser/native-file-system.d.ts",
-      "import": "./dist/browser/native-file-system.js"
     }
   },
   "scripts": {
     "build": "tsx ./scripts/build.ts",
-    "test:browser": "vitest run -c src/browser-tests/vitest.config.ts --retry=0",
     "test": "vitest run",
     "test:watch": "vitest"
   },

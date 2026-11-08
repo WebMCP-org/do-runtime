@@ -11,9 +11,6 @@ async function main() {
       "src/index.ts",
       "src/workers.ts",
       "src/state-methods.ts",
-      "src/browser/index.ts",
-      "src/browser/paths.ts",
-      "src/browser/native-file-system.ts",
       "src/git/index.ts"
     ],
     deps: { neverBundle: true },

@@ -1,0 +1,39 @@
+{
+  "name": "@mcp-b/browser-workspace",
+  "version": "0.1.0",
+  "description": "Workspace filesystems over OPFS and File System Access directory handles, plus the FileSystem adapter, for browser-hosted agents",
+  "repository": {
+    "directory": "vendor/agents/packages/browser-workspace",
+    "type": "git",
+    "url": "git+https://github.com/WebMCP-org/do-runtime.git"
+  },
+  "dependencies": {
+    "@cloudflare/shell": "workspace:^"
+  },
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./paths": {
+      "types": "./dist/paths.d.ts",
+      "import": "./dist/paths.js"
+    },
+    "./native-file-system": {
+      "types": "./dist/native-file-system.d.ts",
+      "import": "./dist/native-file-system.js"
+    }
+  },
+  "scripts": {
+    "build": "tsx ./scripts/build.ts",
+    "test": "vitest run -c src/tests/vitest.node.config.ts --retry=0",
+    "test:browser": "vitest run -c src/tests/vitest.config.ts --retry=0"
+  },
+  "license": "MIT",
+  "type": "module",
+  "files": [
+    "dist",
+    "README.md"
+  ]
+}
