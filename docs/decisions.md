@@ -286,9 +286,11 @@ consumer peer dependencies retain one identity.
     `_ensureSchema` and Drizzle's `durable-sqlite` migrator run unchanged.
 20. Treat `MessagePortWebSocketWireMessage` as a published wire format with
     two frames, `message` and `close`. Embedders relay it verbatim to extension
-    clients, so a new frame type breaks them. `connectMessagePortWebSocket`
-    therefore sends no `open` frame; only `serveMessagePortWebSockets` sends
-    one, to its own clients.
+    clients, so a new frame type breaks them, and `connectMessagePortWebSocket`
+    sends no `open` frame: each host opens its own end. The brokered API that
+    once sent a private `open` frame (`serveMessagePortWebSockets` and
+    `createMessagePortWebSocketConstructor`) was removed once the example moved
+    to `serveBrowserWorker`'s `connect` and no consumer remained.
 21. Lower only async functions and generators for browser async context with
     Babel's targeted plugins. Preserve optional calls on callable capabilities:
     a compiler-generated `.call()` would traverse a remote property. Delegate

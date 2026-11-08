@@ -8,14 +8,12 @@ import {
 } from "./message-port-websocket";
 import {
   BrowserWorkerSupervisor,
-  type BrowserWorkerHostContext,
-} from "./worker-supervisor";
-import {
   serveBrowserWorker,
   type BrowserWorkerEvent,
+  type BrowserWorkerHostContext,
   type BrowserWorkerScope,
   type WorkerHibernationSnapshot,
-} from "./worker-protocol";
+} from "./worker-supervisor";
 
 type Configuration = { key: string; fail?: boolean };
 

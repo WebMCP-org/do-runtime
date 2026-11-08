@@ -82,7 +82,7 @@ popup.html ──sendMessage──▶ service worker ──chrome.offscreen.crea
 - **A hibernatable `AgentClient` connection across container eviction.** The
   offscreen page opens the SDK client over a `MessagePort`-backed WebSocket,
   while the actor receives the server half through `ctx.acceptWebSocket()`. The
-  worker's `serveMessagePortWebSockets` connects each socket through
+  worker's `serveBrowserWorker` `connect` hook routes each socket through
   `connectMessagePortWebSocket()` and `routeAgentRequest()`, which close an
   unrouted socket with 1011 and a refused upgrade with 1008 and the Agent's
   reason. The e2e replaces only the root actor container and proves that the

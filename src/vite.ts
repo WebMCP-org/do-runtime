@@ -73,8 +73,7 @@ const { ${ACTOR_SCOPE_GLOBALS.join(", ")} } = __facetScope;`;
 }
 
 export interface DoRuntimeAwaitTransformOptions {
-  include?: FilterPattern;
-  exclude?: FilterPattern;
+  include: FilterPattern;
   /** Lower async functions/generators so the browser async_hooks shim can bind continuations. */
   asyncContext?: boolean;
 }
@@ -93,11 +92,6 @@ const INJECTED_MODULES = new Map(
       }).map(([id, path]): [string, string] => [id, fileURLToPath(new URL(path, import.meta.url))])
     : [],
 );
-
-function patterns(pattern: FilterPattern | undefined): readonly (string | RegExp)[] {
-  if (pattern === undefined || pattern === null) return [];
-  return typeof pattern === "string" || pattern instanceof RegExp ? [pattern] : pattern;
-}
 
 type AwaitCoverage = {
   readonly total: number;
@@ -177,11 +171,10 @@ function restoreAsyncMethods(source: MagicString, program: ESTree.Program, expec
 }
 
 /** Rewrite syntactic awaits in selected actor-bundled modules to re-enter their input gate. */
-export function doRuntimeAwaitTransform(options?: DoRuntimeAwaitTransformOptions): Plugin {
-  const filter = createFilter(options?.include, [
+export function doRuntimeAwaitTransform(options: DoRuntimeAwaitTransformOptions): Plugin {
+  const filter = createFilter(options.include, [
     "**/node_modules/@mcp-b/do-runtime/**",
     "**/@mcp-b/do-runtime/gate",
-    ...patterns(options?.exclude),
   ]);
   let development = false;
   const loweredCoverage = new Map<string, AwaitCoverage>();
@@ -199,7 +192,7 @@ export function doRuntimeAwaitTransform(options?: DoRuntimeAwaitTransformOptions
       if (
         (!code.includes("await") &&
           !REACTION_CALL.test(code) &&
-          !(options?.asyncContext && code.includes("async"))) ||
+          !(options.asyncContext && code.includes("async"))) ||
         code.includes(MARKER) ||
         !filter(id)
       )
@@ -210,7 +203,7 @@ export function doRuntimeAwaitTransform(options?: DoRuntimeAwaitTransformOptions
       let asyncMethods = 0;
       const markAsyncMethod = (node: ESTree.Node, value: ESTree.Node) => {
         if (
-          options?.asyncContext &&
+          options.asyncContext &&
           value.type === "FunctionExpression" &&
           value.async &&
           !value.generator
@@ -229,7 +222,7 @@ export function doRuntimeAwaitTransform(options?: DoRuntimeAwaitTransformOptions
       const exitFunction = () => {
         const { node, awaits } = functions.pop()!;
         if (
-          options?.asyncContext &&
+          options.asyncContext &&
           node.async &&
           !node.generator &&
           !awaits &&
@@ -302,11 +295,11 @@ export function doRuntimeAwaitTransform(options?: DoRuntimeAwaitTransformOptions
           transformed = true;
         },
       }).visit(program);
-      if (!transformed && !options?.asyncContext) return null;
+      if (!transformed && !options.asyncContext) return null;
 
       const insertionPoint = code.startsWith("#!") ? code.indexOf("\n") + 1 : 0;
       source.appendLeft(insertionPoint, `${MARKER}\n${IMPORT}\n`);
-      if (options?.asyncContext) {
+      if (options.asyncContext) {
         const coverage = countAwaitCoverage(this.parse(source.toString()));
         if (coverage.total !== coverage.transformed) {
           this.error(
@@ -421,8 +414,6 @@ export function workersModuleAliases(): Alias[] {
 export interface BrowserHostOptions {
   /** Actor and SDK modules whose awaits must re-enter the actor's input gate. */
   include: FilterPattern;
-  /** Alias `async_hooks` to the browser shim and lower async functions for it (default true). */
-  asyncContext?: boolean;
   /**
    * One self-contained bundle per facet realm: a chunk it imports would bind that chunk's free
    * `WebSocketPair`, streams and timers to the root actor's scope. Worker bundles build without
@@ -449,8 +440,7 @@ export interface BrowserHostOptions {
  */
 export function browserHost(options: BrowserHostOptions): Plugin[] {
   const { facets } = options;
-  const asyncContext = options.asyncContext ?? true;
-  const transform = () => doRuntimeAwaitTransform({ include: options.include, asyncContext });
+  const transform = () => doRuntimeAwaitTransform({ include: options.include, asyncContext: true });
   return [
     {
       name: "do-runtime-browser-host",
@@ -458,9 +448,7 @@ export function browserHost(options: BrowserHostOptions): Plugin[] {
         resolve: {
           alias: [
             ...workersModuleAliases(),
-            ...packageAliases(
-              asyncContext ? [[/^(node:)?async_hooks$/, "./browser/async-hooks.js"]] : [],
-            ),
+            ...packageAliases([[/^(node:)?async_hooks$/, "./browser/async-hooks.js"]]),
           ],
         },
         worker: {
