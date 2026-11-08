@@ -298,7 +298,7 @@ describe("doRuntimeAwaitTransform", () => {
 
   test("lowers async functions and generators for browser context while preserving gates", async () => {
     const output = await transform(
-      "export async function* values() { yield await item; } export const immediate = async () => 1;",
+      "export async function* values() { yield await item; } export const later = async () => await item; export const immediate = async () => 1;",
       "/actor.js",
       { asyncContext: true },
     );
@@ -306,7 +306,9 @@ describe("doRuntimeAwaitTransform", () => {
     expect(output).toContain("_wrapAsyncGenerator");
     expect(output).toContain("_asyncToGenerator");
     expect(output).toContain("__gateAwait");
-    expect(output).not.toMatch(/async (function|\()/);
+    // Only await-free async functions stay native: they have no continuation to bind.
+    expect(output.match(/async (function|\()/g)).toEqual(["async ("]);
+    expect(output).toMatch(/export const immediate = +async \(\) => 1;/);
   });
 
   test("gates a plain await", async () => {
