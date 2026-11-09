@@ -949,10 +949,36 @@ export class ThinkMessengerRuntime {
     definition: NormalizedMessengerDefinition,
     input: ChatSdkMessengerEventInput
   ): Promise<MessengerEvent> {
+    await fetchChannelName(input.thread);
     return (
       (await definition.toEvent?.(input)) ??
       defaultChatSdkEvent(definition, input)
     );
+  }
+}
+
+/**
+ * Channel names by chat-sdk channel id, filled by {@link fetchChannelName}.
+ *
+ * chat-sdk builds a fresh `Thread` (and a nameless `Channel`) for every
+ * inbound event and fills `channel.name` only on `fetchMetadata()`, one REST
+ * call to the provider. Nothing on the ingest path calls it, so without this
+ * every {@link MessengerThread} reached the host without a `channelName`.
+ */
+// ponytail: per-isolate cache, so a busy channel costs one lookup rather than
+// one per message; a failed lookup is retried on the next event.
+const channelNames = new Map<string, string>();
+
+export async function fetchChannelName(thread: ChatThread): Promise<void> {
+  if (thread.isDM || thread.channel.name != null) return;
+  if (channelNames.has(thread.channelId)) return;
+  try {
+    await thread.channel.fetchMetadata();
+  } catch {
+    return;
+  }
+  if (thread.channel.name != null) {
+    channelNames.set(thread.channelId, thread.channel.name);
   }
 }
 
@@ -1129,7 +1155,8 @@ export function toMessengerAction(action: ChatActionEvent): MessengerAction {
 export function toMessengerThread(thread: ChatThread): MessengerThread {
   return {
     channelId: thread.channelId,
-    channelName: thread.channel.name ?? undefined,
+    channelName:
+      thread.channel.name ?? channelNames.get(thread.channelId) ?? undefined,
     id: thread.id,
     isDirectMessage: thread.isDM,
     providerThreadId: thread.id
