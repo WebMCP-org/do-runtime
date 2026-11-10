@@ -160,7 +160,8 @@ one root (`installActorScope`). A raw host promise that application code must
 await is wrapped once at its shared owner with `awaitIo`; it is not repaired
 at every caller or by patching the realm. The await transform's tokenized
 continuation marker is the sole exception: it republishes the context captured
-from the exact slice, and readers ignore it once that context's lock is gone.
+from the exact slice, and readers ignore it once that context's lock is gone or
+the task that restored it has ended.
 The same transform compiles `p.then|catch|finally(f)` on a native promise to
 bind `f` to the registering context, so a detached reaction runs as workerd
 runs it: in place while that context holds its lock, otherwise re-entered.

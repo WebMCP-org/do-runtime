@@ -75,7 +75,12 @@ breaks the actor.
 The tokenized actor identity is realm-shared so separately bundled actor and host
 copies agree. It exists only while the captured context still holds its input
 lock, the synchronous current slice always wins, and the marker clears at that
-context's checkpoint boundary. One actor's continuations own a checkpoint, so two
+context's checkpoint boundary. It is readable only inside the task that restored
+it: it expires after 256 turns of the microtask queue in which nothing read it,
+and microtasks cannot outlive their task. A task the platform queued before the
+hand-off, such as a Web Lock grant or an OPFS resolution, therefore sees no actor
+and a transformed await in it fails open, as does one that follows a longer
+untransformed chain. One actor's continuations own a checkpoint, so two
 actors' promises settling in the same checkpoint cannot overwrite each other's
 identity. The other actor's continuation waits for a later task; if it had its
 lock, it keeps holding it, so none of that actor's other events can run first. Its

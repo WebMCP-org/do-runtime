@@ -288,6 +288,40 @@ describe("transformed await resume", () => {
     expect(ambient).toBe(owner);
   });
 
+  test("hides the continuation from a task that runs before its checkpoint ends", async () => {
+    const context = newContext();
+    const outside = Promise.resolve("outside");
+
+    const fresh = await context.run(async () => {
+      // Posted before the slice's own hand-off, so this task runs first, lock still held.
+      const task = new Promise<unknown>((resolve) => {
+        const channel = new MessageChannel();
+        channel.port1.onmessage = () => {
+          channel.port1.close();
+          channel.port2.close();
+          resolve([context.hasCurrent(), tryCurrentIoContext(), __gateAwait(outside) === outside]);
+        };
+        channel.port2.postMessage(undefined);
+      });
+      __resumeAwait(await __gateAwait(Promise.resolve()));
+      return task;
+    });
+
+    expect(fresh).toEqual([true, undefined, true]);
+  });
+
+  test("stops carrying context through an untransformed chain longer than the idle limit", async () => {
+    const context = newContext();
+    const outside = Promise.resolve("outside");
+
+    await context.run(async () => {
+      __resumeAwait(await __gateAwait(Promise.resolve()));
+      for (let turn = 0; turn < 300; turn++) await Promise.resolve();
+      expect(context.hasCurrent()).toBe(true);
+      expect(__gateAwait(outside)).toBe(outside);
+    });
+  });
+
   test.each(["fulfillment", "rejection"])("stays busy through a foreign await and queued %s", async (outcome) => {
     const actor = new TestActor();
     const context = new IoContext(actor, timer);

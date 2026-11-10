@@ -364,7 +364,22 @@ const CURRENT_CONTINUATION = Symbol.for("@mcp-b/do-runtime/current-continuation"
 
 type CurrentContinuation = {
   readonly context: IoContext;
+  /** Turns of the microtask queue since the marker was last restored or read. */
+  idleTurns: number;
 };
+
+/**
+ * How long the marker stays readable without being read. The marker's owner keeps the checkpoint
+ * until `atCheckpointEnd`, a later task, and any task the platform queued first runs in between
+ * with the lock still held: a Web Lock grant, an OPFS resolution, another actor's admitted
+ * resumption. Code resuming there is not this actor's, so it must not read this actor. Microtasks
+ * cannot outlive their task, so counting them down is the one clock that always stops in time.
+ *
+ * ponytail: a fixed count, since nothing in JS reports an empty microtask queue. An untransformed
+ * chain of more than this many turns between two transformed awaits fails open, as it already does
+ * after any resumption the transform did not make. 256 turns cost about 15 microseconds.
+ */
+const CONTINUATION_IDLE_TURNS = 256;
 
 function currentSlice(): IoContext | undefined {
   return Reflect.get(globalThis, CURRENT_SLICE) as IoContext | undefined;
@@ -379,7 +394,10 @@ export function tryCurrentSlice(): IoContext | undefined {
   return currentSlice();
 }
 
-/** The actor continuation restored by the await transform, if one is running. */
+/**
+ * The actor whose transformed continuation owns this checkpoint, until `atCheckpointEnd`. It
+ * decides who may publish next, not who is calling: see `tryCurrentIoContext`.
+ */
 export function tryCurrentContinuation(): IoContext | undefined {
   const context = currentContinuation()?.context;
   return context?.hasCurrent() === true ? context : undefined;
@@ -387,7 +405,13 @@ export function tryCurrentContinuation(): IoContext | undefined {
 
 /** The exact actor calling now, across both a synchronous slice and a transformed continuation. */
 export function tryCurrentIoContext(): IoContext | undefined {
-  return currentSlice() ?? tryCurrentContinuation();
+  const slice = currentSlice();
+  if (slice !== undefined) return slice;
+  const current = currentContinuation();
+  if (current === undefined || current.idleTurns > CONTINUATION_IDLE_TURNS) return undefined;
+  if (!current.context.hasCurrent()) return undefined;
+  current.idleTurns = 0;
+  return current.context;
 }
 
 /**
@@ -891,8 +915,13 @@ export class IoContext {
 
   /** Publish this transformed continuation through the same checkpoint queue as its lock. */
   restoreContinuation(): void {
-    const current: CurrentContinuation = { context: this };
+    const current: CurrentContinuation = { context: this, idleTurns: 0 };
     Reflect.set(globalThis, CURRENT_CONTINUATION, current);
+    const turn = (): void => {
+      if (currentContinuation() !== current) return;
+      if (++current.idleTurns <= CONTINUATION_IDLE_TURNS) queueMicrotask(turn);
+    };
+    queueMicrotask(turn);
     atCheckpointEnd(() => {
       if (currentContinuation() === current) {
         Reflect.deleteProperty(globalThis, CURRENT_CONTINUATION);
