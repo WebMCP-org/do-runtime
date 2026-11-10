@@ -2,7 +2,7 @@
 
 import {
   atCheckpointEnd,
-  tryCurrentContinuation,
+  tryCheckpointContinuation,
   tryCurrentIoContext,
   type IoContext,
 } from "./io/io-context";
@@ -144,7 +144,7 @@ function currentPublication(): PublicationReservation | undefined {
 
 /** One actor owns a checkpoint's ambient: refuse only another actor's continuation or publication. */
 function reservePublication(context: IoContext): PublicationReservation | undefined {
-  const continuation = tryCurrentContinuation();
+  const continuation = tryCheckpointContinuation();
   const publication = currentPublication();
   if ((continuation ?? context) !== context || (publication?.context ?? context) !== context) {
     return undefined;
