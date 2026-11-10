@@ -28,6 +28,7 @@ import {
   TextStreamCallback,
   ThinkMessengerRuntime,
   toMessengerAttachment,
+  toMessengerThread,
   toMessengerUserMessage,
   type MessengerEvent,
   type MessengerMessage,
@@ -35,7 +36,11 @@ import {
   type MessengerThinkTarget,
   type NormalizedMessengerDefinition
 } from "../messengers";
-import { mentionsBot, withMessengerQueueTtl } from "../messengers/chat-sdk";
+import {
+  fetchChannelName,
+  mentionsBot,
+  withMessengerQueueTtl
+} from "../messengers/chat-sdk";
 import telegramMessenger, {
   isExpectedTelegramFinalEditNoop,
   isTelegramIgnorableDeliveryError,
@@ -321,6 +326,80 @@ describe("think messengers core", () => {
         ].join("\n")
       }
     ]);
+  });
+
+  describe("channel names", () => {
+    it("fetches a channel's name once and reuses it for later threads", async () => {
+      let fetches = 0;
+      const thread = (name: string | null) =>
+        ({
+          channel: {
+            name,
+            fetchMetadata() {
+              fetches += 1;
+              this.name = "#finance";
+              return Promise.resolve({ id: "slack:C9", metadata: {} });
+            }
+          },
+          channelId: "slack:C9",
+          id: "slack:C9:1",
+          isDM: false
+        }) as never;
+
+      const first = thread(null);
+      await fetchChannelName(first);
+      expect(toMessengerThread(first).channelName).toBe("#finance");
+
+      const later = thread(null);
+      await fetchChannelName(later);
+      expect(toMessengerThread(later).channelName).toBe("#finance");
+      expect(fetches).toBe(1);
+    });
+
+    it("leaves a direct message unnamed and retries after a failed lookup", async () => {
+      const failing = {
+        channel: {
+          name: null,
+          fetchMetadata: () => Promise.reject(new Error("ratelimited"))
+        },
+        channelId: "slack:C404",
+        id: "slack:C404:1",
+        isDM: false
+      } as never;
+      await fetchChannelName(failing);
+      expect(toMessengerThread(failing).channelName).toBeUndefined();
+
+      const recovered = {
+        channel: {
+          name: null,
+          fetchMetadata() {
+            this.name = "#ops";
+            return Promise.resolve({ id: "slack:C404", metadata: {} });
+          }
+        },
+        channelId: "slack:C404",
+        id: "slack:C404:2",
+        isDM: false
+      } as never;
+      await fetchChannelName(recovered);
+      expect(toMessengerThread(recovered).channelName).toBe("#ops");
+
+      let fetched = false;
+      const dm = {
+        channel: {
+          name: null,
+          fetchMetadata: () => {
+            fetched = true;
+            return Promise.resolve({ id: "slack:D1", metadata: {} });
+          }
+        },
+        channelId: "slack:D1",
+        id: "slack:D1",
+        isDM: true
+      } as never;
+      await fetchChannelName(dm);
+      expect(fetched).toBe(false);
+    });
   });
 
   describe("messages folded by the concurrency strategy (#2312)", () => {
