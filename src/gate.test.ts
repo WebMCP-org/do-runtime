@@ -239,6 +239,23 @@ describe("transformed await resume", () => {
     expect(order).toEqual(["first:start", "first:resumed", "queued"]);
   });
 
+  test("a continuation's actor is not current in a task that runs before its checkpoint ends", async () => {
+    await portHop();
+    const context = newContext();
+    const foreign = Promise.withResolvers<IoContext | undefined>();
+    let resumed: IoContext | undefined;
+    await context.run(async () => {
+      // Two hops: the slice has given its lock back, so the continuation gets a slice of its own.
+      __resumeAwait(await __gateAwait(portHop().then(portHop)));
+      resumed = tryCurrentIoContext();
+      // A Web Locks grant or an OPFS settlement is a task of another source, free to run before
+      // the MessageChannel task that ends this checkpoint. setImmediate is Node's.
+      setImmediate(() => foreign.resolve(tryCurrentIoContext()));
+    });
+    expect(resumed).toBe(context);
+    expect(await foreign.promise).toBeUndefined();
+  });
+
   test("waits out a critical section that settles an await captured outside it", async () => {
     await portHop();
     const context = newContext();

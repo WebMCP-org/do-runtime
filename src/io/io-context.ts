@@ -364,7 +364,25 @@ const CURRENT_CONTINUATION = Symbol.for("@mcp-b/do-runtime/current-continuation"
 
 type CurrentContinuation = {
   readonly context: IoContext;
+  /** Microtask turns left in which this actor is still the caller. */
+  turns: number;
 };
+
+/**
+ * How many microtask turns a restored continuation's actor stays the caller.
+ *
+ * The actor belongs to the checkpoint it resumed in, and JS cannot observe a
+ * checkpoint ending. The checkpoint queue's own end is a MessageChannel task,
+ * which a task of another source (a Web Locks grant, an OPFS settlement) can run
+ * ahead of, and untransformed code resuming there would read a neighbour as its
+ * caller. Microtasks never outlive their task, so a chain of them is a bound
+ * that cannot cross one.
+ *
+ * ponytail: a fixed budget, one turn per native await. A native promise chain
+ * deeper than this inside one checkpoint resumes with no caller and its
+ * transformed awaits fail open. Raise it if a real chain gets there.
+ */
+const CONTINUATION_TURNS = 32;
 
 function currentSlice(): IoContext | undefined {
   return Reflect.get(globalThis, CURRENT_SLICE) as IoContext | undefined;
@@ -381,6 +399,16 @@ export function tryCurrentSlice(): IoContext | undefined {
 
 /** The actor continuation restored by the await transform, if one is running. */
 export function tryCurrentContinuation(): IoContext | undefined {
+  const continuation = currentContinuation();
+  return continuation !== undefined && continuation.turns > 0 ? tryCheckpointContinuation() : undefined;
+}
+
+/**
+ * The actor whose continuation last ran in this checkpoint. It owns the
+ * checkpoint for publication until `atCheckpointEnd`, which can be after it has
+ * stopped being the caller.
+ */
+export function tryCheckpointContinuation(): IoContext | undefined {
   const context = currentContinuation()?.context;
   return context?.hasCurrent() === true ? context : undefined;
 }
@@ -891,8 +919,14 @@ export class IoContext {
 
   /** Publish this transformed continuation through the same checkpoint queue as its lock. */
   restoreContinuation(): void {
-    const current: CurrentContinuation = { context: this };
+    const current: CurrentContinuation = { context: this, turns: CONTINUATION_TURNS };
     Reflect.set(globalThis, CURRENT_CONTINUATION, current);
+    const turn = (): void => {
+      // A later continuation in this checkpoint runs its own chain.
+      if (currentContinuation() !== current) current.turns = 0;
+      else if (--current.turns > 0) queueMicrotask(turn);
+    };
+    queueMicrotask(turn);
     atCheckpointEnd(() => {
       if (currentContinuation() === current) {
         Reflect.deleteProperty(globalThis, CURRENT_CONTINUATION);
