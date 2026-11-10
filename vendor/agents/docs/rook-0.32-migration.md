@@ -39,7 +39,10 @@ These have landed in the refresh tree:
 Still to do before Rook can start:
 
 - **Tarballs.** Done: `rook-sdk-1d0ad5194176` for rows 1-24, then
-  `rook-sdk-576d9f3fe35a` with npm `@mcp-b/do-runtime@0.13.1` for rows 25-33.
+  `rook-sdk-576d9f3fe35a` with npm `@mcp-b/do-runtime@0.13.1` for rows 25-33,
+  then `rook-sdk-19cd4c3db334` with npm `@mcp-b/do-runtime@0.14.0` and
+  `@mcp-b/browser-workspace@0.2.0`, which adds messenger channel names (#126).
+  Rook needed no source change for that one beyond the pins.
   Keep the old `rook-*` tags, because they back Rook releases.
 - **Computer source.** `@cloudflare/computer` comes from npm. 0.8.0 is npm
   `latest`, even though its `publishConfig.tag` says `unreleased`. The fork
