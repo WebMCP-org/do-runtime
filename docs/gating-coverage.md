@@ -72,16 +72,23 @@ outside the section only after the section ends, where workerd resumes it inside
 a section that waits on that continuation stalls until its 30-second deadline
 breaks the actor.
 
-The tokenized actor identity is realm-shared so separately bundled actor and host
-copies agree. It exists only while the captured context still holds its input
-lock, the synchronous current slice always wins, and the marker clears at that
-context's checkpoint boundary. One actor's continuations own a checkpoint, so two
-actors' promises settling in the same checkpoint cannot overwrite each other's
-identity. The other actor's continuation waits for a later task; if it had its
-lock, it keeps holding it, so none of that actor's other events can run first. Its
-implicit transaction still commits at the hand-off. It happens whenever another
-actor's continuation ran earlier in the same task, with or without a call between
-them.
+The tokenized actor identity is realm-shared so separately bundled actor and
+host copies agree. It exists only while the captured context still holds its
+input lock, and the synchronous current slice always wins. It names the caller
+only inside the microtask checkpoint that restored it. The hand-off that ends
+the checkpoint is a task, and a task of another source (a Web Locks grant, an
+OPFS settlement) can run before it; untransformed code resuming there would read
+a neighbouring actor as its caller and gate its awaits on that actor. JS cannot
+observe a microtask drain, so 32 microtask turns bound the marker instead, one
+per native await. A native promise chain deeper than that inside one checkpoint
+resumes with no caller and its transformed awaits fail open. Ownership of the
+checkpoint for publication still clears at the hand-off. One actor's
+continuations own a checkpoint, so two actors' promises settling in the same
+checkpoint cannot overwrite each other's identity. The other actor's
+continuation waits for a later task; if it had its lock, it keeps holding it, so
+none of that actor's other events can run first. Its implicit transaction still
+commits at the hand-off. It happens whenever another actor's continuation ran
+earlier in the same task, with or without a call between them.
 
 At build end the plugin reads the final Rollup module graph, after later
 transforms, and compares fully wrapped awaits with total awaits per included
