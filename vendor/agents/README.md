@@ -38,7 +38,7 @@ passed with serial file execution; retries remain disabled.
 - `@cloudflare/voice@0.5.0`
 - `@cloudflare/shell@0.5.0`
 - `@cloudflare/codemode@0.5.6`
-- `@mcp-b/browser-workspace@0.2.0` (fork-owned, no upstream counterpart; 0.1.0 shipped in `rook-sdk-576d9f3fe35a`, 0.2.0 in `rook-sdk-19cd4c3db334`)
+- `@mcp-b/browser-workspace@0.2.0` (fork-owned, no upstream counterpart; 0.1.0 shipped in `rook-sdk-576d9f3fe35a`, 0.2.0 from `rook-sdk-19cd4c3db334` on)
 
 Rook consumes these built packages. `@mcp-b/do-runtime` remains a lower
 layer and has no dependency on the SDK.
