@@ -44,7 +44,7 @@
  * docs/decisions.md.
  */
 
-import { INVALID_SPAN_CONTEXT, type SpanContext } from "@opentelemetry/api";
+import { INVALID_SPAN_CONTEXT, isSpanContextValid, type SpanContext } from "@opentelemetry/api";
 import { globalErrorHandler, parseTraceParent } from "@opentelemetry/core";
 import { asyncContext, withAsyncContext } from "../util/async-context";
 
@@ -512,7 +512,7 @@ const spanRealm = (spanRealms[SPAN_REALM] ??= {
 
 // ← Workerd's AsyncContextFrame::StorageScope. Browser continuations use
 // the runtime's await transform, while Node has native AsyncLocalStorage.
-type TraceScope = { readonly span: Span } | { readonly parent: SpanContext };
+type TraceScope = { readonly span?: Span; readonly parent: SpanContext | undefined };
 const TRACE_SCOPE = Symbol.for("@mcp-b/do-runtime/trace-scope");
 type AsyncScope<T> = {
   getStore(): T | undefined;
@@ -543,19 +543,19 @@ function runInTraceScope<T>(scope: TraceScope, run: () => T): T {
 }
 
 function getActiveSpan(): Span | undefined {
-  const scope = currentTraceScope();
-  if (scope && "span" in scope) return scope.span;
+  return currentTraceScope()?.span;
 }
 
 function currentParent(): SpanContext | undefined {
   const scope = currentTraceScope();
-  if (scope) return "span" in scope ? scope.span.spanContext() : scope.parent;
+  const active = scope?.span?.spanContext();
+  return active && isSpanContextValid(active) ? active : scope?.parent;
 }
 
-function startSpan(name: string): Span {
+function createSpan(name: string, parent: SpanContext | undefined): Span {
   let recorder: WorkerSpanRecorder | undefined;
   try {
-    recorder = recording[RECORD_SPAN]?.(name, currentParent());
+    recorder = recording[RECORD_SPAN]?.(name, parent);
   } catch {
     reportWorkerRecorderFailure();
   }
@@ -567,8 +567,9 @@ function startActiveSpan<T, A extends unknown[]>(
   run: (span: Span, ...args: A) => T,
   ...args: A
 ): T {
-  const span = startSpan(name);
-  return runInTraceScope({ span }, () => run(span, ...args));
+  const parent = currentParent();
+  const span = createSpan(name, parent);
+  return runInTraceScope({ span, parent }, () => run(span, ...args));
 }
 
 /** Capture W3C trace context for a trusted runtime handoff. */
@@ -599,7 +600,7 @@ export function withWorkerTraceparent<T>(value: unknown, run: (attached: boolean
 
 export const tracing: Tracing = {
   Span: spanRealm.Span,
-  startSpan,
+  startSpan: (name) => createSpan(name, currentParent()),
   startActiveSpan,
   getActiveSpan,
   enterSpan(name, run, ...args) {

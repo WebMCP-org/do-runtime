@@ -121,6 +121,24 @@ test("a recorder start failure leaves the operation runnable", () => {
   expect(observeWorkerOperation("do_runtime.actor.rpc", () => 42)).toBe(42);
 });
 
+test("a failed recorder preserves the incoming parent through the operation", async () => {
+  const parent = { traceId: "3".repeat(32), spanId: "4".repeat(16), traceFlags: 1 };
+  const carrier = `00-${parent.traceId}-${parent.spanId}-01`;
+  startSpan.mockImplementationOnce(() => {
+    throw new Error("recorder could not start");
+  });
+
+  await withWorkerTraceparent(carrier, () =>
+    observeWorkerOperation("intermediate", async (span) => {
+      expect(span?.isTraced).toBe(false);
+      await Promise.resolve();
+      expect(captureWorkerTraceparent()).toBe(carrier);
+      tracing.startSpan("nested").end();
+      expect(startSpan).toHaveBeenLastCalledWith("nested", { ...parent, isRemote: true });
+    }),
+  );
+});
+
 test.each([
   ["marking an error", setStatus],
   ["ending the span", end],
