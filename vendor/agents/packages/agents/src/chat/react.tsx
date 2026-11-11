@@ -759,6 +759,8 @@ export function useAgentChat<
    */
   isToolContinuation: boolean;
   connectionError: AgentConnectionErrorLike | null;
+  /** Whether this chat still has a request it can replay after reconnect. */
+  hasUnacknowledgedRequest: () => boolean;
 } {
   const {
     agent,
@@ -2552,7 +2554,7 @@ export function useAgentChat<
                 streamStateRef.current = { status: "idle" };
                 setIsServerStreaming(false);
               }
-              customTransport.handleServerTurnCompleted(data.id);
+              customTransport.handleServerTurnCompleted(data.id, data);
               restoreProtectedStreamingAssistant(localResponseIds.get(data.id));
               localResponseIds.delete(data.id);
               localRequestIdsRef.current.delete(data.id);
@@ -2586,14 +2588,14 @@ export function useAgentChat<
             observedToolContinuationRequestIdRef.current !== data.id
           ) {
             customTransport.appliedChunks.forget(data.id);
-            customTransport.handleServerTurnCompleted(data.id);
+            customTransport.handleServerTurnCompleted(data.id, data);
             fallbackAckedResumeRequestIdsRef.current.delete(data.id);
             break;
           }
           if (data.error) {
             pendingReplayResumeRequestIdsRef.current.delete(data.id);
             customTransport.appliedChunks.forget(data.id);
-            customTransport.handleServerTurnCompleted(data.id);
+            customTransport.handleServerTurnCompleted(data.id, data);
             fallbackAckedResumeRequestIdsRef.current.delete(data.id);
             setIsRecovering(false);
 
@@ -2672,7 +2674,7 @@ export function useAgentChat<
             pendingReplayResumeRequestIdsRef.current.delete(data.id);
           }
           if (data.done) {
-            customTransport.handleServerTurnCompleted(data.id);
+            customTransport.handleServerTurnCompleted(data.id, data);
             fallbackAckedResumeRequestIdsRef.current.delete(data.id);
             // A terminal turn outcome resolves any in-progress recovery (#1620).
             if (data.outcome !== "recovering") setIsRecovering(false);
@@ -3151,6 +3153,8 @@ export function useAgentChat<
     isRecovering,
     isToolContinuation,
     connectionError: agent.connectionError ?? null,
+    hasUnacknowledgedRequest: () =>
+      customTransport.hasUnacknowledgedRequest(stableChatIdRef.current),
     sendMessage: sendMessageWithStreamingProtection,
     stop: stopWithToolContinuationAbort,
     /**

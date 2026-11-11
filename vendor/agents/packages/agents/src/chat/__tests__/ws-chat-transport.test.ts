@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { UIMessage, UIMessageChunk } from "ai";
 import {
   WebSocketChatTransport,
@@ -258,4 +258,105 @@ describe("WebSocketChatTransport unacknowledged request replay", () => {
     finalTransport.handleStreamResumeNone({ probeId: finalProbe.probeId });
     await expect(finalReconnect).resolves.toBeNull();
   });
+
+  it("acknowledges a persisted receipt after the replacement stream starts", async () => {
+    const chatId = `late-receipt-${crypto.randomUUID()}`;
+    const oldAgent = new FakeAgent();
+    const onRequestAcknowledged = vi.fn();
+    const oldTransport = new WebSocketChatTransport({
+      agent: oldAgent,
+      onRequestAcknowledged
+    });
+    const oldStream = await oldTransport.sendMessages({
+      chatId,
+      messages: [userMessage],
+      abortSignal: undefined,
+      trigger: "submit-message",
+      headers: {
+        traceparent: "00-00000000000000000000000000000001-0000000000000001-01"
+      }
+    });
+    const originalFrame = requestFrame(oldAgent);
+    const requestId = (JSON.parse(originalFrame) as { id: string }).id;
+    oldAgent.close();
+    await expect(oldStream.getReader().read()).rejects.toThrow(
+      "before the chat request was acknowledged"
+    );
+
+    const agent = new FakeAgent();
+    const transport = new WebSocketChatTransport({ agent });
+    const reconnect = transport.reconnectToStream({ chatId });
+    expect(requestFrame(agent)).toBe(originalFrame);
+    expect(transport.handleStreamResuming({ id: requestId })).toBe(true);
+
+    const receipt = {
+      type: MessageType.CF_AGENT_STREAM_PENDING,
+      id: requestId,
+      persisted: true
+    } as const;
+    transport.handleStreamPending({ ...receipt, id: "other-request" });
+    await Promise.resolve();
+    expect(onRequestAcknowledged).not.toHaveBeenCalled();
+
+    transport.handleStreamPending(receipt);
+    await Promise.resolve();
+    expect(onRequestAcknowledged).toHaveBeenCalledExactlyOnceWith(
+      userMessage.id
+    );
+
+    transport.handleStreamPending(receipt);
+    agent.message({
+      type: MessageType.CF_AGENT_USE_CHAT_RESPONSE,
+      id: requestId,
+      body: "",
+      done: true
+    });
+    const stream = await reconnect;
+    expect(stream).not.toBeNull();
+    await expect(stream!.getReader().read()).resolves.toEqual({
+      done: true,
+      value: undefined
+    });
+    expect(onRequestAcknowledged).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    { name: "error", response: { body: "Admission rejected", error: true } },
+    { name: "skipped", response: { body: "", outcome: "skipped" } }
+  ])(
+    "does not acknowledge a pre-admission $name frame",
+    async ({ response }) => {
+      const chatId = `rejected-${crypto.randomUUID()}`;
+      const agent = new FakeAgent();
+      const onRequestAcknowledged = vi.fn();
+      const transport = new WebSocketChatTransport({
+        agent,
+        onRequestAcknowledged
+      });
+      const stream = await transport.sendMessages({
+        chatId,
+        messages: [userMessage],
+        abortSignal: undefined,
+        trigger: "submit-message"
+      });
+      const { id: requestId } = JSON.parse(requestFrame(agent)) as {
+        id: string;
+      };
+
+      agent.message({
+        type: MessageType.CF_AGENT_USE_CHAT_RESPONSE,
+        id: requestId,
+        done: true,
+        ...response
+      });
+      const read = stream.getReader().read();
+      if (response.error) {
+        await expect(read).rejects.toThrow(response.body);
+      } else {
+        await expect(read).resolves.toEqual({ done: true, value: undefined });
+      }
+      expect(onRequestAcknowledged).not.toHaveBeenCalled();
+      expect(transport.hasUnacknowledgedRequest(chatId)).toBe(false);
+    }
+  );
 });

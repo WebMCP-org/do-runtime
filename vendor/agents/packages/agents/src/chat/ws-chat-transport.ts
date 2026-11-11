@@ -65,6 +65,23 @@ type StreamPendingFrame = Extract<
   { type: MessageType.CF_AGENT_STREAM_PENDING }
 >;
 
+type ChatResponseReceipt = Pick<
+  Extract<
+    OutgoingMessage<UIMessage>,
+    { type: MessageType.CF_AGENT_USE_CHAT_RESPONSE }
+  >,
+  "error" | "outcome"
+>;
+
+function isChatReceipt({ error, outcome }: ChatResponseReceipt): boolean {
+  return (
+    !error &&
+    (outcome === undefined ||
+      outcome === "completed" ||
+      outcome === "recovering")
+  );
+}
+
 const pendingChatRequests = new Map<string, PendingChatRequest>();
 
 function rememberPendingChatRequest(
@@ -389,9 +406,12 @@ export class WebSocketChatTransport<
    * after the short window). Returns true if a waiting path consumed it.
    */
   handleStreamPending(data: StreamPendingFrame): boolean {
-    if (!this._onStreamPending) return false;
-    this._onStreamPending(data);
-    return true;
+    const handler = this._onStreamPending;
+    handler?.(data);
+    if (data.persisted === true && data.id) {
+      forgetPendingChatRequestById(data.id)?.acknowledge?.();
+    }
+    return handler !== null;
   }
 
   /**
@@ -399,9 +419,14 @@ export class WebSocketChatTransport<
    * outside the currently attached transport stream, such as after local-only
    * client cleanup.
    */
-  handleServerTurnCompleted(requestId: string) {
-    forgetPendingChatRequestById(requestId)?.acknowledge?.();
+  handleServerTurnCompleted(requestId: string, response?: ChatResponseReceipt) {
+    const pending = forgetPendingChatRequestById(requestId);
+    if (response && isChatReceipt(response)) pending?.acknowledge?.();
     this.clearActiveServerTurn(requestId);
+  }
+
+  hasUnacknowledgedRequest(chatId: string): boolean {
+    return pendingChatRequests.has(chatId);
   }
 
   /**
@@ -538,7 +563,8 @@ export class WebSocketChatTransport<
             if (data.type !== MessageType.CF_AGENT_USE_CHAT_RESPONSE) return;
             if (data.id !== requestId) return;
             requestAcknowledged = true;
-            forgetPendingChatRequest(chatId, requestId)?.acknowledge?.();
+            const pending = forgetPendingChatRequest(chatId, requestId);
+            if (isChatReceipt(data)) pending?.acknowledge?.();
 
             if (data.error) {
               finish(() =>
@@ -627,14 +653,13 @@ export class WebSocketChatTransport<
         ...(userMessageId
           ? {
               acknowledge: () => {
-                try {
-                  this.onRequestAcknowledged?.(userMessageId);
-                } catch (error) {
-                  console.error(
-                    "Chat request acknowledgement observer failed",
-                    error
+                void Promise.resolve()
+                  .then(() => this.onRequestAcknowledged?.(userMessageId))
+                  .catch(() =>
+                    console.error(
+                      "Chat request acknowledgement observer failed"
+                    )
                   );
-                }
               }
             }
           : {})
@@ -1162,7 +1187,8 @@ export class WebSocketChatTransport<
 
             if (data.type !== MessageType.CF_AGENT_USE_CHAT_RESPONSE) return;
             if (data.id !== requestId) return;
-            forgetPendingChatRequestById(requestId)?.acknowledge?.();
+            const pending = forgetPendingChatRequestById(requestId);
+            if (isChatReceipt(data)) pending?.acknowledge?.();
 
             if (data.error) {
               transport.appliedChunks.forget(requestId);
