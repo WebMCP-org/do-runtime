@@ -45,7 +45,7 @@
  */
 
 import { INVALID_SPAN_CONTEXT, type SpanContext } from "@opentelemetry/api";
-import { parseTraceParent } from "@opentelemetry/core";
+import { globalErrorHandler, parseTraceParent } from "@opentelemetry/core";
 import { asyncContext, withAsyncContext } from "../util/async-context";
 
 // =======================================================================================
@@ -429,6 +429,11 @@ export function installWorkerTracing(startSpan: StartWorkerSpan): void {
   recording[RECORD_SPAN] = startSpan;
 }
 
+function reportWorkerRecorderFailure(): void {
+  // Recorder errors can contain operation data. Report only the failure.
+  globalErrorHandler(new Error("Worker span recorder failed"));
+}
+
 class Span {
   #ended = false;
 
@@ -437,16 +442,16 @@ class Span {
   }
 
   get isTraced(): boolean {
-    return !this.#ended && (this.recorder?.isTraced ?? false);
+    return !this.#ended && (this.#record((recorder) => recorder.isTraced) ?? false);
   }
 
   // ← workerd ec93d7032: identity is returned by value and survives end().
   spanContext(): TracingSpanContext {
-    return { ...(this.recorder?.spanContext() ?? INVALID_SPAN_CONTEXT) };
+    return { ...(this.#record((recorder) => recorder.spanContext()) ?? INVALID_SPAN_CONTEXT) };
   }
 
   setAttribute(key: string, value: boolean | number | string): this {
-    if (!this.#ended) this.recorder?.setAttribute(key, value);
+    if (!this.#ended) this.#record((recorder) => recorder.setAttribute(key, value));
     return this;
   }
 
@@ -459,7 +464,7 @@ class Span {
   }
 
   updateName(name: string): this {
-    if (!this.#ended) this.recorder?.updateName(name);
+    if (!this.#ended) this.#record((recorder) => recorder.updateName(name));
     return this;
   }
 
@@ -469,18 +474,27 @@ class Span {
     if (code !== "unset" && code !== "ok" && code !== "error") {
       throw new TypeError("Span status code must be 'unset', 'ok', or 'error'.");
     }
-    if (!this.#ended) this.recorder?.setStatus(status);
+    if (!this.#ended) this.#record((recorder) => recorder.setStatus(status));
     return this;
   }
 
   recordException(exception: unknown): void {
-    if (!this.#ended) this.recorder?.recordException(exception);
+    if (!this.#ended) this.#record((recorder) => recorder.recordException(exception));
   }
 
   end(): void {
     if (this.#ended) return;
     this.#ended = true;
-    this.recorder?.end();
+    this.#record((recorder) => recorder.end());
+  }
+
+  #record<T>(run: (recorder: WorkerSpanRecorder) => T): T | undefined {
+    if (!this.recorder) return;
+    try {
+      return run(this.recorder);
+    } catch {
+      reportWorkerRecorderFailure();
+    }
   }
 }
 
@@ -539,7 +553,13 @@ function currentParent(): SpanContext | undefined {
 }
 
 function startSpan(name: string): Span {
-  return spanRealm.create(recording[RECORD_SPAN]?.(name, currentParent()));
+  let recorder: WorkerSpanRecorder | undefined;
+  try {
+    recorder = recording[RECORD_SPAN]?.(name, currentParent());
+  } catch {
+    reportWorkerRecorderFailure();
+  }
+  return spanRealm.create(recorder);
 }
 
 function startActiveSpan<T, A extends unknown[]>(
@@ -566,14 +586,15 @@ export function captureWorkerTraceparent(): string | undefined {
   if (parseTraceParent(value)) return value;
 }
 
-/** Resume trace context at a trusted runtime handoff, including after a restart. */
-export function withWorkerTraceparent<T>(
-  value: string | null | undefined,
-  run: () => T,
-): T {
-  // Workerd accepts the exact version-00 carrier at this boundary.
-  const parent = value?.length === 55 && value.startsWith("00-") ? parseTraceParent(value) : null;
-  return parent ? runInTraceScope({ parent: { ...parent, isRemote: true } }, run) : run();
+/** Resume a validated version-00 carrier at a trusted handoff. */
+export function withWorkerTraceparent<T>(value: unknown, run: (attached: boolean) => T): T {
+  if (typeof value !== "string" || value.length !== 55 || !value.startsWith("00-")) {
+    return run(false);
+  }
+  const parent = parseTraceParent(value);
+  return parent
+    ? runInTraceScope({ parent: { ...parent, isRemote: true } }, () => run(true))
+    : run(false);
 }
 
 export const tracing: Tracing = {

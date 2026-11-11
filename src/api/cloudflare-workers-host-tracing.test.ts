@@ -64,7 +64,8 @@ test("a serialized parent survives a detached handoff and restores the caller's 
   const parent = { traceId: "3".repeat(32), spanId: "4".repeat(16), traceFlags: 1 };
   const carrier = JSON.parse(JSON.stringify("00-" + parent.traceId + "-" + parent.spanId + "-01"));
   await tracing.enterSpan("unrelated", async (active) => {
-    await withWorkerTraceparent(carrier, async () => {
+    await withWorkerTraceparent(carrier, async (attached) => {
+      expect(attached).toBe(true);
       await Promise.resolve();
       tracing.startSpan("delivered").end();
       expect(startSpan).toHaveBeenLastCalledWith("delivered", { ...parent, isRemote: true });
@@ -89,11 +90,13 @@ test.each([
   "00-" + "3".repeat(32) + "-" + "4".repeat(16) + "-zz",
   "01-" + "3".repeat(32) + "-" + "4".repeat(16) + "-01",
   "00-" + "3".repeat(32) + "-" + "4".repeat(16) + "-01\n",
+  new Uint8Array(55),
 ])("invalid trace context preserves the active caller (%s)", (value) => {
   exportedTracing.enterSpan("caller", (caller) => {
     let invoked = 0;
-    const result = withWorkerTraceparent(value, () => {
+    const result = withWorkerTraceparent(value, (attached) => {
       invoked += 1;
+      expect(attached).toBe(false);
       expect(tracing.getActiveSpan()).toBe(caller);
       return 42;
     });
@@ -109,4 +112,24 @@ test("runtime observations preserve the failure and record an error outcome", as
     throw failure;
   })).rejects.toBe(failure);
   expect(setStatus).toHaveBeenLastCalledWith({ code: "error" });
+});
+
+test("a recorder start failure leaves the operation runnable", () => {
+  startSpan.mockImplementationOnce(() => {
+    throw new Error("recorder could not start");
+  });
+  expect(observeWorkerOperation("do_runtime.actor.rpc", () => 42)).toBe(42);
+});
+
+test.each([
+  ["marking an error", setStatus],
+  ["ending the span", end],
+] as const)("a recorder failure while %s preserves the original error", async (_operation, record) => {
+  record.mockImplementationOnce(() => {
+    throw new Error("recorder could not complete");
+  });
+  const error = new Error("actor RPC failed");
+  await expect(observeWorkerOperation("do_runtime.actor.rpc", async () => {
+    throw error;
+  })).rejects.toBe(error);
 });
