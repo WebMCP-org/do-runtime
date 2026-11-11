@@ -74,7 +74,16 @@ type StreamResumeNone = Pick<
   "probeId" | "reason"
 >;
 
+type StreamResumeOffer = Pick<
+  Extract<
+    OutgoingMessage<UIMessage>,
+    { type: MessageType.CF_AGENT_STREAM_RESUMING }
+  >,
+  "id" | "probeId"
+>;
+
 interface ResumeHandshake {
+  readonly probeId: string;
   cancel(): void;
   retry(): void;
   resume(data: { id: string }): void;
@@ -341,10 +350,15 @@ export class WebSocketChatTransport<
   }
 
   /**
-   * True when the transport is waiting for a resume handshake.
+   * True when the transport is waiting for a resume handshake. If supplied,
+   * the probe ID must match that handshake.
    */
-  isAwaitingResume(): boolean {
-    return this._resumeHandshake !== null;
+  isAwaitingResume(probeId?: string): boolean {
+    const handshake = this._resumeHandshake;
+    return (
+      handshake !== null &&
+      (probeId === undefined || handshake.probeId === probeId)
+    );
   }
 
   /**
@@ -386,10 +400,11 @@ export class WebSocketChatTransport<
    * (ACK + stream creation) and returns true. Otherwise returns false
    * so the caller can use its own fallback path.
    */
-  handleStreamResuming(data: { id: string }): boolean {
+  handleStreamResuming(data: StreamResumeOffer): boolean {
     const handshake = this._resumeHandshake;
     if (!handshake) return false;
-    handshake.resume(data);
+    // Consume an obsolete reply so it cannot attach through the fallback path.
+    if (this.isAwaitingResume(data.probeId)) handshake.resume(data);
     return true;
   }
 
@@ -821,6 +836,7 @@ export class WebSocketChatTransport<
       };
 
       const handshake: ResumeHandshake = {
+        probeId,
         cancel: () => done(null),
         retry: retryResumeProbe,
         resume: onResume,
@@ -979,6 +995,7 @@ export class WebSocketChatTransport<
         };
 
         handshake = {
+          probeId,
           cancel: close,
           retry: retryResumeProbe,
           resume: onResume,

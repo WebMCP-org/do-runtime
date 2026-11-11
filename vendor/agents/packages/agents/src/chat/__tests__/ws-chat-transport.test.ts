@@ -79,6 +79,50 @@ describe("WebSocketChatTransport unacknowledged request replay", () => {
     });
   });
 
+  it("keeps waiting for the current probe after an obsolete stream offer", async () => {
+    const agent = new FakeAgent();
+    const transport = new WebSocketChatTransport({ agent });
+    const chatId = "obsolete-resume-offer";
+    const previous = transport.reconnectToStream({ chatId });
+    const previousProbe = JSON.parse(agent.sent[0]) as { probeId: string };
+    transport.cancelPendingResume();
+    await expect(previous).resolves.toBeNull();
+
+    const current = transport.reconnectToStream({ chatId });
+    const currentProbe = JSON.parse(agent.sent[1]) as { probeId: string };
+    try {
+      transport.handleStreamResuming({
+        id: "obsolete-turn",
+        probeId: previousProbe.probeId
+      });
+      expect(transport.isAwaitingResume()).toBe(true);
+      expect(agent.sent).toHaveLength(2);
+
+      transport.handleStreamResuming({
+        id: "current-turn",
+        probeId: currentProbe.probeId
+      });
+      expect(JSON.parse(agent.sent[2])).toEqual({
+        type: MessageType.CF_AGENT_STREAM_RESUME_ACK,
+        id: "current-turn"
+      });
+      agent.message({
+        type: MessageType.CF_AGENT_USE_CHAT_RESPONSE,
+        id: "current-turn",
+        body: "",
+        done: true
+      });
+      const stream = await current;
+      await expect(stream?.getReader().read()).resolves.toEqual({
+        done: true,
+        value: undefined
+      });
+    } finally {
+      transport.cancelPendingResume();
+      agent.close();
+    }
+  });
+
   it("survives transport replacement, replays byte-identically, and waits for durable ACK", async () => {
     const chatId = `cross-instance-${crypto.randomUUID()}`;
     const oldAgent = new FakeAgent();

@@ -2344,18 +2344,22 @@ export function useAgentChat<
           break;
 
         case MessageType.CF_AGENT_STREAM_RESUMING: {
+          const awaitingResume = customTransport.isAwaitingResume();
+          const answersIdleProbe =
+            idleProbeId !== null && data.probeId === idleProbeId;
+          const matchesProbe = awaitingResume
+            ? customTransport.isAwaitingResume(data.probeId)
+            : answersIdleProbe;
+          if (answersIdleProbe) idleProbeId = null;
+          if (data.probeId !== undefined && !matchesProbe) return;
           // Server turns are serialized: an offer for another request means
           // the turn we still hold for a missed terminal frame is over.
           setUnresolvedObservedRequestId((current) =>
             current === data.id ? current : null
           );
-          if (data.probeId !== undefined && data.probeId === idleProbeId) {
-            idleProbeId = null;
-          }
           const isEarlyToolContinuation =
-            resumingToolContinuationRef.current &&
-            !customTransport.isAwaitingResume();
-          if (!resume && !customTransport.isAwaitingResume()) {
+            resumingToolContinuationRef.current && !awaitingResume;
+          if (!resume && !awaitingResume) {
             if (!isEarlyToolContinuation) {
               // An offer without a probe id announces a live stream, which
               // the server withholds from us until its terminal frame; hold
