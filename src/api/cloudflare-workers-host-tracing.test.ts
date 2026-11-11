@@ -1,20 +1,28 @@
 import { expect, test, vi } from "vitest";
-import { installWorkerTracing, tracing } from "./cloudflare-workers";
+import {
+  captureWorkerTraceparent,
+  installWorkerTracing,
+  observeWorkerOperation,
+  tracing,
+  withWorkerTraceparent,
+} from "./cloudflare-workers";
+
+const end = vi.fn();
+const setStatus = vi.fn();
+const recordedContext = { traceId: "1".repeat(32), spanId: "2".repeat(16), traceFlags: 1 };
+const startSpan = vi.fn(() => ({
+  isTraced: true,
+  spanContext: () => recordedContext,
+  setAttribute() {},
+  recordException() {},
+  updateName() {},
+  setStatus,
+  end,
+}));
+const exportedTracing = tracing;
+installWorkerTracing(startSpan);
 
 test("a host recorder follows Workerd's automatic and manual span lifetimes", async () => {
-  const end = vi.fn();
-  const startSpan = vi.fn(() => ({
-    isTraced: true,
-    spanContext: () => ({ traceId: "1".repeat(32), spanId: "2".repeat(16), traceFlags: 1 }),
-    setAttribute() {},
-    recordException() {},
-    updateName() {},
-    setStatus() {},
-    end,
-  }));
-  const exportedTracing = tracing;
-  installWorkerTracing(startSpan);
-
   const manual = exportedTracing.startActiveSpan("manual", (span) => span);
   const error = new Error("rejected callback");
   const failed = exportedTracing.enterSpan("auto", async (span) => {
@@ -38,10 +46,62 @@ test("a host recorder follows Workerd's automatic and manual span lifetimes", as
 
   vi.resetModules();
   const facet = await import("./cloudflare-workers");
+  expect(facet.tracing.Span).toBe(exportedTracing.Span);
   await exportedTracing.enterSpan("outer", async (outer) => {
     await Promise.resolve();
     expect(facet.tracing.getActiveSpan()).toBe(outer);
     facet.tracing.startSpan("facet").end();
     expect(startSpan).toHaveBeenLastCalledWith("facet", outer.spanContext());
   });
+});
+
+test("a serialized parent survives a detached handoff and restores the caller's scope", async () => {
+  expect(captureWorkerTraceparent()).toBeUndefined();
+  expect(tracing.enterSpan("capture", captureWorkerTraceparent)).toBe(
+    "00-" + recordedContext.traceId + "-" + recordedContext.spanId + "-01",
+  );
+
+  const parent = { traceId: "3".repeat(32), spanId: "4".repeat(16), traceFlags: 1 };
+  const carrier = JSON.parse(JSON.stringify("00-" + parent.traceId + "-" + parent.spanId + "-01"));
+  await tracing.enterSpan("unrelated", async (active) => {
+    await withWorkerTraceparent(carrier, async () => {
+      await Promise.resolve();
+      tracing.startSpan("delivered").end();
+      expect(startSpan).toHaveBeenLastCalledWith("delivered", { ...parent, isRemote: true });
+    });
+    expect(tracing.getActiveSpan()).toBe(active);
+    const invalid = "00-" + "0".repeat(32) + "-" + parent.spanId + "-01";
+    withWorkerTraceparent(invalid, () => expect(tracing.getActiveSpan()).toBe(active));
+  });
+});
+
+test.each([
+  undefined,
+  null,
+  "",
+  "00-" + "0".repeat(32) + "-" + "4".repeat(16) + "-01",
+  "00-" + "3".repeat(32) + "-" + "0".repeat(16) + "-01",
+  "00-" + "3".repeat(32) + "-" + "4".repeat(16) + "-zz",
+  "01-" + "3".repeat(32) + "-" + "4".repeat(16) + "-01",
+  "00-" + "3".repeat(32) + "-" + "4".repeat(16) + "-01\n",
+])("invalid trace context preserves the active caller (%s)", (value) => {
+  exportedTracing.enterSpan("caller", (caller) => {
+    let invoked = 0;
+    const result = withWorkerTraceparent(value, () => {
+      invoked += 1;
+      expect(tracing.getActiveSpan()).toBe(caller);
+      return 42;
+    });
+    expect(result).toBe(42);
+    expect(invoked).toBe(1);
+  });
+});
+
+test("runtime observations preserve the failure and record an error outcome", async () => {
+  const failure = new Error("actor failed");
+  setStatus.mockClear();
+  await expect(observeWorkerOperation("do_runtime.actor.rpc", async () => {
+    throw failure;
+  })).rejects.toBe(failure);
+  expect(setStatus).toHaveBeenLastCalledWith({ code: "error" });
 });

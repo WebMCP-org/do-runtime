@@ -1,4 +1,9 @@
-import { RpcTarget } from "../api/cloudflare-workers";
+import {
+  RpcTarget,
+  captureWorkerTraceparent,
+  tracing,
+  withWorkerTraceparent,
+} from "../api/cloudflare-workers";
 import type { RehydratedWebSocket } from "../api/web-socket";
 import type { FacetStartRequest } from "../server/actor-container";
 import type { HibernationAutoResponse } from "../server/hibernation-mirror";
@@ -51,6 +56,7 @@ export type BrowserWorkerMessage<Configuration> =
       readonly agentPort: MessagePort;
       readonly hostPort: MessagePort;
       readonly rehydration?: WorkerRehydrationSnapshot;
+      readonly traceparent?: string;
     }
   | {
       readonly type: "connect";
@@ -176,6 +182,7 @@ function parseBrowserWorkerMessage<Configuration>(
       configuration: parseConfiguration(value.configuration),
       agentPort: value.agentPort,
       hostPort: value.hostPort,
+      ...(typeof value.traceparent === "string" ? { traceparent: value.traceparent } : {}),
       ...(rehydration === undefined ? {} : { rehydration }),
     };
   }
@@ -246,7 +253,9 @@ export function serveBrowserWorker<Configuration, Host>(
     initialized = true;
     try {
       const host = sessions.use(newRpcSession<Host>(message.hostPort));
-      const target = await options.initialize(message.configuration, host, message.rehydration);
+      const target = await withWorkerTraceparent(message.traceparent, () =>
+        options.initialize(message.configuration, host, message.rehydration),
+      );
       if (disposed) throw new Error("Browser worker bootstrap was disposed");
       sessions.use(newRpcSession(message.agentPort, target));
       ready.resolve();
@@ -598,6 +607,27 @@ export class BrowserWorkerSupervisor<
   }
 
   #spawn(configuration: Configuration, key: string): Placement<Configuration, Service> {
+    return tracing.startActiveSpan("do_runtime.worker.start", (span) => {
+      try {
+        const placement = this.#spawnPlacement(configuration, key, captureWorkerTraceparent());
+        // Sockets can buffer immediately. The span ends at the readiness acknowledgement.
+        void placement.ready.then(
+          () => span.end(),
+          () => span.setStatus({ code: "error" }).end(),
+        );
+        return placement;
+      } catch (error) {
+        span.setStatus({ code: "error" }).end();
+        throw error;
+      }
+    });
+  }
+
+  #spawnPlacement(
+    configuration: Configuration,
+    key: string,
+    traceparent: string | undefined,
+  ): Placement<Configuration, Service> {
     const worker = this.#options.createWorker(configuration);
     const host = new MessageChannel();
     const agent = new MessageChannel();
@@ -666,6 +696,7 @@ export class BrowserWorkerSupervisor<
           configuration,
           agentPort: agent.port2,
           hostPort: host.port2,
+          ...(traceparent === undefined ? {} : { traceparent }),
           ...(restored ? { rehydration: restored.snapshot } : {}),
         } satisfies BrowserWorkerMessage<Configuration>,
         [agent.port2, host.port2, ...(restored?.ports ?? [])],

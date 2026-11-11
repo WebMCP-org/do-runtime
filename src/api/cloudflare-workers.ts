@@ -413,7 +413,8 @@ export interface WorkerSpanRecorder {
   end(): void;
 }
 
-type StartWorkerSpan = (name: string, parent?: TracingSpanContext) => WorkerSpanRecorder | undefined;
+type WorkerSpanParent = TracingSpanContext & { readonly isRemote?: true };
+type StartWorkerSpan = (name: string, parent?: WorkerSpanParent) => WorkerSpanRecorder | undefined;
 
 const SPAN_CONSTRUCTION = Symbol("Span");
 const RECORD_SPAN = Symbol.for("@mcp-b/do-runtime/record-worker-span");
@@ -452,6 +453,7 @@ class Span {
   }
 
   setAttributes(attributes: Record<string, boolean | number | string | undefined>): this {
+    if (this.#ended || !this.recorder) return this;
     for (const [key, value] of Object.entries(attributes)) {
       if (value !== undefined) this.setAttribute(key, value);
     }
@@ -484,15 +486,28 @@ class Span {
   }
 }
 
+// Facet bundles share the constructor and its private creation capability.
+const SPAN_REALM = Symbol.for("@mcp-b/do-runtime/span-realm");
+type SpanRealm = {
+  readonly Span: typeof Span;
+  readonly create: (recorder?: WorkerSpanRecorder) => Span;
+};
+const spanRealms = globalThis as typeof globalThis & { [SPAN_REALM]?: SpanRealm };
+const spanRealm = (spanRealms[SPAN_REALM] ??= {
+  Span,
+  create: (recorder) => new Span(SPAN_CONSTRUCTION, recorder),
+});
+
 // ← Workerd's AsyncContextFrame::StorageScope. Browser continuations use
 // the runtime's await transform, while Node has native AsyncLocalStorage.
-const ACTIVE_SPAN = Symbol.for("@mcp-b/do-runtime/active-span");
+type TraceScope = { readonly span: Span } | { readonly parent: WorkerSpanParent };
+const TRACE_SCOPE = Symbol.for("@mcp-b/do-runtime/trace-scope");
 type AsyncScope<T> = {
   getStore(): T | undefined;
   run<Result>(store: T, run: () => Result): Result;
 };
 type NativeAsyncHooks = { AsyncLocalStorage: new <T>() => AsyncScope<T> };
-const nodeScopes = globalThis as typeof globalThis & { [ACTIVE_SPAN]?: AsyncScope<Span> };
+const nodeScopes = globalThis as typeof globalThis & { [TRACE_SCOPE]?: AsyncScope<TraceScope> };
 const nodeHost = globalThis as {
   process?: { getBuiltinModule?: (name: string) => unknown };
 };
@@ -500,17 +515,33 @@ const nodeAsyncHooks = nodeHost.process?.getBuiltinModule?.("node:async_hooks") 
   | NativeAsyncHooks
   | undefined;
 const nodeScope = nodeAsyncHooks
-  ? (nodeScopes[ACTIVE_SPAN] ??= new nodeAsyncHooks.AsyncLocalStorage<Span>())
+  ? (nodeScopes[TRACE_SCOPE] ??= new nodeAsyncHooks.AsyncLocalStorage<TraceScope>())
   : undefined;
 
-function getActiveSpan(): Span | undefined {
+function currentTraceScope(): TraceScope | undefined {
   if (nodeScope) return nodeScope.getStore();
-  return asyncContext.current.get(ACTIVE_SPAN) as Span | undefined;
+  return asyncContext.current.get(TRACE_SCOPE) as TraceScope | undefined;
+}
+
+function runInTraceScope<T>(scope: TraceScope, run: () => T): T {
+  if (nodeScope) return nodeScope.run(scope, run);
+  const context = new Map(asyncContext.current);
+  context.set(TRACE_SCOPE, scope);
+  return withAsyncContext(context, run);
+}
+
+function getActiveSpan(): Span | undefined {
+  const scope = currentTraceScope();
+  if (scope && "span" in scope) return scope.span;
+}
+
+function currentParent(): WorkerSpanParent | undefined {
+  const scope = currentTraceScope();
+  if (scope) return "span" in scope ? scope.span.spanContext() : scope.parent;
 }
 
 function startSpan(name: string): Span {
-  const recorder = recording[RECORD_SPAN]?.(name, getActiveSpan()?.spanContext());
-  return new Span(SPAN_CONSTRUCTION, recorder);
+  return spanRealm.create(recording[RECORD_SPAN]?.(name, currentParent()));
 }
 
 function startActiveSpan<T, A extends unknown[]>(
@@ -519,14 +550,46 @@ function startActiveSpan<T, A extends unknown[]>(
   ...args: A
 ): T {
   const span = startSpan(name);
-  if (nodeScope) return nodeScope.run(span, () => run(span, ...args));
-  const context = new Map(asyncContext.current);
-  context.set(ACTIVE_SPAN, span);
-  return withAsyncContext(context, () => run(span, ...args));
+  return runInTraceScope({ span }, () => run(span, ...args));
+}
+
+const TRACEPARENT = /^00-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$/;
+
+function parseTraceparent(value: string | null | undefined): WorkerSpanParent | undefined {
+  // Match Workerd's version-00 field widths. All-zero identities are invalid.
+  if (value?.length !== 55) return;
+  const [, traceId, spanId, flags] = TRACEPARENT.exec(value) ?? [];
+  if (!traceId || !spanId || !flags || !/[1-9a-f]/.test(traceId) || !/[1-9a-f]/.test(spanId)) {
+    return;
+  }
+  return { traceId, spanId, traceFlags: Number.parseInt(flags, 16), isRemote: true };
+}
+
+/** Capture W3C trace context for a trusted runtime handoff. */
+export function captureWorkerTraceparent(): string | undefined {
+  const parent = currentParent();
+  if (
+    !parent || !Number.isInteger(parent.traceFlags) ||
+    parent.traceFlags < 0 || parent.traceFlags > 255
+  ) {
+    return;
+  }
+  const flags = parent.traceFlags.toString(16).padStart(2, "0");
+  const value = "00-" + parent.traceId + "-" + parent.spanId + "-" + flags;
+  if (parseTraceparent(value)) return value;
+}
+
+/** Resume trace context at a trusted runtime handoff, including after a restart. */
+export function withWorkerTraceparent<T>(
+  value: string | null | undefined,
+  run: () => T,
+): T {
+  const parent = parseTraceparent(value);
+  return parent ? runInTraceScope({ parent }, run) : run();
 }
 
 export const tracing: Tracing = {
-  Span,
+  Span: spanRealm.Span,
   startSpan,
   startActiveSpan,
   getActiveSpan,
@@ -547,6 +610,27 @@ export const tracing: Tracing = {
     });
   },
 };
+
+/** Observe a runtime-owned operation without allocating a span on unconfigured hosts. */
+export function observeWorkerOperation<T>(
+  name: string,
+  run: (span?: ReturnType<Tracing["startSpan"]>) => T,
+): T {
+  if (!recording[RECORD_SPAN]) return run();
+  return tracing.enterSpan(name, (span) => {
+    const fail = (error: unknown): never => {
+      span.setStatus({ code: "error" });
+      throw error;
+    };
+    try {
+      const result = run(span);
+      if (result instanceof Promise) return result.catch(fail) as typeof result;
+      return result;
+    } catch (error) {
+      return fail(error);
+    }
+  });
+}
 
 // =======================================================================================
 // The Workflow types
