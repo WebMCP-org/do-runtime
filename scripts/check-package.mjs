@@ -45,6 +45,7 @@ const chromePortWebSocket = modules.get("./browser/chrome-port-websocket");
 const nodeBackend = modules.get("./backends/node-sqlite");
 const gate = modules.get("./gate");
 const vite = modules.get("./vite");
+const workers = modules.get("./cloudflare-workers");
 if (typeof runtime.createActorContainer !== "function") {
   throw new Error("packed root entry does not export createActorContainer");
 }
@@ -80,6 +81,11 @@ if (
   typeof chromePortWebSocket.createChromePortWebSocketConstructor !== "function"
 ) {
   throw new Error("packed Chrome runtime.Port WebSocket entry does not export its client and server");
+}
+for (const name of ["installWorkerTracing", "captureWorkerTraceparent", "withWorkerTraceparent", "observeWorkerOperation"]) {
+  if (typeof workers[name] !== "function") {
+    throw new Error(`packed cloudflare-workers entry does not export ${name}`);
+  }
 }
 if (typeof nodeBackend.createNodeSqlProvider !== "function") {
   throw new Error("packed Node backend does not export createNodeSqlProvider");
