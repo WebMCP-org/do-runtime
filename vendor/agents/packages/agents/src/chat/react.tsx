@@ -759,8 +759,8 @@ export function useAgentChat<
    */
   isToolContinuation: boolean;
   connectionError: AgentConnectionErrorLike | null;
-  /** Whether this chat still has a request it can replay after reconnect. */
-  hasUnacknowledgedRequest: () => boolean;
+  /** Whether this chat still owns a turn that can resume after reconnect. */
+  canRecoverCurrentTurn: () => boolean;
 } {
   const {
     agent,
@@ -3153,8 +3153,16 @@ export function useAgentChat<
     isRecovering,
     isToolContinuation,
     connectionError: agent.connectionError ?? null,
-    hasUnacknowledgedRequest: () =>
-      customTransport.hasUnacknowledgedRequest(stableChatIdRef.current),
+    canRecoverCurrentTurn: () => {
+      if (!resume) return false;
+      const chatId = stableChatIdRef.current;
+      return (
+        (chatId !== null && customTransport.hasUnacknowledgedRequest(chatId)) ||
+        customTransport.activeServerTurnId !== null ||
+        unresolvedObservedRequestIdRef.current !== null ||
+        recoveringRequestIdRef.current !== null
+      );
+    },
     sendMessage: sendMessageWithStreamingProtection,
     stop: stopWithToolContinuationAbort,
     /**
