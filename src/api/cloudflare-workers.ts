@@ -487,10 +487,18 @@ class Span {
 // ← Workerd's AsyncContextFrame::StorageScope. Browser continuations use
 // the runtime's await transform, while Node has native AsyncLocalStorage.
 const ACTIVE_SPAN = Symbol.for("@mcp-b/do-runtime/active-span");
-const nodeScopes = globalThis as typeof globalThis & {
-  [ACTIVE_SPAN]?: import("node:async_hooks").AsyncLocalStorage<Span>;
+type AsyncScope<T> = {
+  getStore(): T | undefined;
+  run<Result>(store: T, run: () => Result): Result;
 };
-const nodeAsyncHooks = globalThis.process?.getBuiltinModule?.("node:async_hooks");
+type NativeAsyncHooks = { AsyncLocalStorage: new <T>() => AsyncScope<T> };
+const nodeScopes = globalThis as typeof globalThis & { [ACTIVE_SPAN]?: AsyncScope<Span> };
+const nodeHost = globalThis as {
+  process?: { getBuiltinModule?: (name: string) => unknown };
+};
+const nodeAsyncHooks = nodeHost.process?.getBuiltinModule?.("node:async_hooks") as
+  | NativeAsyncHooks
+  | undefined;
 const nodeScope = nodeAsyncHooks
   ? (nodeScopes[ACTIVE_SPAN] ??= new nodeAsyncHooks.AsyncLocalStorage<Span>())
   : undefined;
@@ -511,7 +519,7 @@ function startActiveSpan<T, A extends unknown[]>(
   ...args: A
 ): T {
   const span = startSpan(name);
-  if (nodeScope) return nodeScope.run(span, run, span, ...args);
+  if (nodeScope) return nodeScope.run(span, () => run(span, ...args));
   const context = new Map(asyncContext.current);
   context.set(ACTIVE_SPAN, span);
   return withAsyncContext(context, () => run(span, ...args));
