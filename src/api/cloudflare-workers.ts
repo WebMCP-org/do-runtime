@@ -418,17 +418,6 @@ export interface WorkerSpanRecorder {
 type StartWorkerSpan = (name: string, parent?: SpanContext) => WorkerSpanRecorder | undefined;
 
 const SPAN_CONSTRUCTION = Symbol("Span");
-const RECORD_SPAN = Symbol.for("@mcp-b/do-runtime/record-worker-span");
-const recording = globalThis as typeof globalThis & { [RECORD_SPAN]?: StartWorkerSpan };
-
-/** Install one recorder for this worker realm, including any separately bundled facets. */
-export function installWorkerTracing(startSpan: StartWorkerSpan): void {
-  if (recording[RECORD_SPAN] && recording[RECORD_SPAN] !== startSpan) {
-    throw new TypeError("Worker tracing already has a recorder");
-  }
-  recording[RECORD_SPAN] = startSpan;
-}
-
 function reportWorkerRecorderFailure(): void {
   // Recorder errors can contain operation data. Report only the failure.
   globalErrorHandler(new Error("Worker span recorder failed"));
@@ -498,18 +487,6 @@ class Span {
   }
 }
 
-// Facet bundles share the constructor and its private creation capability.
-const SPAN_REALM = Symbol.for("@mcp-b/do-runtime/span-realm");
-type SpanRealm = {
-  readonly Span: typeof Span;
-  readonly create: (recorder?: WorkerSpanRecorder) => Span;
-};
-const spanRealms = globalThis as typeof globalThis & { [SPAN_REALM]?: SpanRealm };
-const spanRealm = (spanRealms[SPAN_REALM] ??= {
-  Span,
-  create: (recorder) => new Span(SPAN_CONSTRUCTION, recorder),
-});
-
 // ← Workerd's AsyncContextFrame::StorageScope. Browser continuations use
 // the runtime's await transform, while Node has native AsyncLocalStorage.
 type TraceScope = { readonly span?: Span; readonly parent: SpanContext | undefined };
@@ -519,31 +496,46 @@ type AsyncScope<T> = {
   run<Result>(store: T, run: () => Result): Result;
 };
 type NativeAsyncHooks = { AsyncLocalStorage: new <T>() => AsyncScope<T> };
-const nodeScopes = globalThis as typeof globalThis & { [TRACE_SCOPE]?: AsyncScope<TraceScope> };
 const nodeHost = globalThis as {
   process?: { getBuiltinModule?: (name: string) => unknown };
 };
 const nodeAsyncHooks = nodeHost.process?.getBuiltinModule?.("node:async_hooks") as
   | NativeAsyncHooks
   | undefined;
-const nodeScope = nodeAsyncHooks
-  ? (nodeScopes[TRACE_SCOPE] ??= new nodeAsyncHooks.AsyncLocalStorage<TraceScope>())
-  : undefined;
+
+// Separately bundled facets share a constructor, recorder, and native scope.
+const TRACING_REALM = Symbol.for("@mcp-b/do-runtime/tracing-realm");
+type TracingRealm = {
+  readonly Span: typeof Span;
+  readonly create: (recorder?: WorkerSpanRecorder) => Span;
+  readonly nodeScope: AsyncScope<TraceScope> | undefined;
+  startRecordingSpan?: StartWorkerSpan;
+};
+const tracingGlobals = globalThis as typeof globalThis & { [TRACING_REALM]?: TracingRealm };
+const realm = (tracingGlobals[TRACING_REALM] ??= {
+  Span,
+  create: (recorder) => new Span(SPAN_CONSTRUCTION, recorder),
+  nodeScope: nodeAsyncHooks && new nodeAsyncHooks.AsyncLocalStorage<TraceScope>(),
+});
+
+/** Install one recorder for this worker realm, including any separately bundled facets. */
+export function installWorkerTracing(startSpan: StartWorkerSpan): void {
+  if (realm.startRecordingSpan && realm.startRecordingSpan !== startSpan) {
+    throw new TypeError("Worker tracing already has a recorder");
+  }
+  realm.startRecordingSpan = startSpan;
+}
 
 function currentTraceScope(): TraceScope | undefined {
-  if (nodeScope) return nodeScope.getStore();
+  if (realm.nodeScope) return realm.nodeScope.getStore();
   return asyncContext.current.get(TRACE_SCOPE) as TraceScope | undefined;
 }
 
 function runInTraceScope<T>(scope: TraceScope, run: () => T): T {
-  if (nodeScope) return nodeScope.run(scope, run);
+  if (realm.nodeScope) return realm.nodeScope.run(scope, run);
   const context = new Map(asyncContext.current);
   context.set(TRACE_SCOPE, scope);
   return withAsyncContext(context, run);
-}
-
-function getActiveSpan(): Span | undefined {
-  return currentTraceScope()?.span;
 }
 
 function currentParent(): SpanContext | undefined {
@@ -555,11 +547,11 @@ function currentParent(): SpanContext | undefined {
 function createSpan(name: string, parent: SpanContext | undefined): Span {
   let recorder: WorkerSpanRecorder | undefined;
   try {
-    recorder = recording[RECORD_SPAN]?.(name, parent);
+    recorder = realm.startRecordingSpan?.(name, parent);
   } catch {
     reportWorkerRecorderFailure();
   }
-  return spanRealm.create(recorder);
+  return realm.create(recorder);
 }
 
 function startActiveSpan<T, A extends unknown[]>(
@@ -598,26 +590,37 @@ export function withWorkerTraceparent<T>(value: unknown, run: (attached: boolean
     : run(false);
 }
 
-export const tracing: Tracing = {
-  Span: spanRealm.Span,
-  startSpan: (name) => createSpan(name, currentParent()),
-  startActiveSpan,
-  getActiveSpan,
-  enterSpan(name, run, ...args) {
-    // Workerd owns the lifetime for enterSpan and defers ending until a
-    // returned Promise settles. startActiveSpan leaves ending to the caller.
-    return startActiveSpan(name, (span) => {
-      let result;
-      try {
-        result = run(span, ...args);
-      } catch (error) {
-        span.end();
-        throw error;
+// Workerd defers automatic span completion until a returned Promise settles.
+function enterWorkerSpan<T>(name: string, run: (span: Span) => T, markFailure: boolean): T {
+  return startActiveSpan(name, (span) => {
+    const fail = (error: unknown): never => {
+      if (markFailure) span.setStatus({ code: "error" });
+      span.end();
+      throw error;
+    };
+    try {
+      const result = run(span);
+      if (result instanceof Promise) {
+        return result.then((value) => {
+          span.end();
+          return value;
+        }, fail) as typeof result;
       }
-      if (result instanceof Promise) return result.finally(() => span.end()) as typeof result;
       span.end();
       return result;
-    });
+    } catch (error) {
+      return fail(error);
+    }
+  });
+}
+
+export const tracing: Tracing = {
+  Span: realm.Span,
+  startSpan: (name) => createSpan(name, currentParent()),
+  startActiveSpan,
+  getActiveSpan: () => currentTraceScope()?.span,
+  enterSpan(name, run, ...args) {
+    return enterWorkerSpan(name, (span) => run(span, ...args), false);
   },
 };
 
@@ -626,20 +629,7 @@ export function observeWorkerOperation<T>(
   name: string,
   run: (span?: ReturnType<Tracing["startSpan"]>) => T,
 ): T {
-  if (!recording[RECORD_SPAN]) return run();
-  return tracing.enterSpan(name, (span) => {
-    const fail = (error: unknown): never => {
-      span.setStatus({ code: "error" });
-      throw error;
-    };
-    try {
-      const result = run(span);
-      if (result instanceof Promise) return result.catch(fail) as typeof result;
-      return result;
-    } catch (error) {
-      return fail(error);
-    }
-  });
+  return realm.startRecordingSpan ? enterWorkerSpan(name, run, true) : run();
 }
 
 // =======================================================================================

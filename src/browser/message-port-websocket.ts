@@ -248,7 +248,7 @@ function parseWireMessage(value: unknown): MessagePortWebSocketWireMessage | nul
     return {
       type: "message",
       data: value.data,
-      ...(typeof traceparent === "string" && traceparent.length === 55 ? { traceparent } : {}),
+      ...(typeof traceparent === "string" ? { traceparent } : {}),
     };
   }
   if (
