@@ -280,6 +280,29 @@ test("tracing scopes restore active spans and forward callback arguments", () =>
   expect(tracing.getActiveSpan()).toBeUndefined();
 });
 
+// Workerd's tracing helpers retain the active span across async continuations.
+test("overlapping tracing scopes keep their own active span across await", async () => {
+  const release = Promise.withResolvers<void>();
+  const run = (name: string) =>
+    tracing.enterSpan(name, async (span) => {
+      await release.promise;
+      expect(tracing.getActiveSpan()).toBe(span);
+      await tracing.startActiveSpan("nested", async (child) => {
+        await Promise.resolve();
+        expect(tracing.getActiveSpan()).toBe(child);
+        child.end();
+      });
+      expect(tracing.getActiveSpan()).toBe(span);
+    });
+
+  const first = run("first");
+  const second = run("second");
+  expect(tracing.getActiveSpan()).toBeUndefined();
+  release.resolve();
+  await Promise.all([first, second]);
+  expect(tracing.getActiveSpan()).toBeUndefined();
+});
+
 test("the four RPC stub types refuse construction and point at the transport", () => {
   expect(() => new RpcStub({})).toThrow(RPC_STUB_UNIMPLEMENTED_MESSAGE);
   expect(() => new RpcPromise()).toThrow(RPC_STUB_UNIMPLEMENTED_MESSAGE);

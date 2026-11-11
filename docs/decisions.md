@@ -312,7 +312,7 @@ consumer peer dependencies retain one identity.
 | The `SQLITE_FUNCTION` allowlist is not ported | Every function the backend compiled is callable, where workerd denies all but 138 names — including build-detail readers such as `sqlite_version()` |
 | The pinned SQLite engines lack workerd's default-expression and internal-function patches | Native callbacks alone cannot enforce these new restrictions; the [sync audit](workerd-sync.md#sqlite-engine-work-still-required) records observed engine behavior and the required follow-up |
 | A native outbound WebSocket handshake cannot wait for storage confirmation | Actor-global `new WebSocket(url)` throws before opening the connection; pairs and host-owned transports, opened with `platformWebSocket`, remain supported |
-| No tracing observer or generic async span context | Spans are no-ops; active identity is scoped to the synchronous callback and is restored on return or throw |
+| No native tracing observer | The default recorder is untraced. A host can install a recorder for its realm. Active spans follow native Node async context or transformed browser continuations. |
 | `node:sqlite` exposes no `sqlite3_limit()` | Bound and returned strings and blobs enforce workerd's 8 MiB plus 34-byte limit; SQL-computed values that are never returned may exceed it. The browser backend sets the native limit. |
 | A response BYOB reader cannot be re-gated after `read(view)` | BYOB readers throw; callers use a default reader or `arrayBuffer()` |
 | A workerd facet alarm appears to schedule and then breaks asynchronously ([workerd#6810](https://github.com/cloudflare/workerd/issues/6810)) | This runtime refuses facet `setAlarm()` synchronously |
