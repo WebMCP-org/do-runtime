@@ -44,6 +44,8 @@
  * docs/decisions.md.
  */
 
+import { asyncContext, withAsyncContext } from "../util/async-context";
+
 // =======================================================================================
 // Boundary messages
 
@@ -400,89 +402,141 @@ function boundaryObject<T extends object>(message: string): T {
 
 export const cache: CacheContext = boundaryObject(CACHE_UNIMPLEMENTED_MESSAGE);
 
-/**
- * ← `export const tracing = innerTracing`.
- *
- * This one is NOT a boundary. The workerd oracle establishes (§1.12) that
- * `tracing` is an
- * object, `startActiveSpan(name, run)` calls `run` and returns its result, and
- * the span it hands over reports `isTraced: false` with working no-op
- * `setAttribute` and `end`. Untraced is workerd's ORDINARY state when nothing is
- * collecting, not an error — so a `Span` here is a permanently untraced one, which
- * is the same observable behaviour through the only mechanism this package has.
- *
- * A throwing proxy was worse than strict, it was wrong: `agents`' tracing runtime
- * feature-detects with `cloudflareWorkers.tracing ?? noopRuntime`, so a present
- * object that throws on use took down every `new Agent(...)` in the extension —
- * where an absent one would have degraded exactly as that code intends.
- */
+/** The host owns sampling and recording. The runtime owns span lifetimes and scope. */
+export interface WorkerSpanRecorder {
+  readonly isTraced: boolean;
+  spanContext(): TracingSpanContext;
+  setAttribute(key: string, value: boolean | number | string): void;
+  setStatus(status: TracingSpanStatus): void;
+  updateName(name: string): void;
+  recordException(exception: unknown): void;
+  end(): void;
+}
+
+type StartWorkerSpan = (name: string, parent?: TracingSpanContext) => WorkerSpanRecorder | undefined;
+
 const SPAN_CONSTRUCTION = Symbol("Span");
+const RECORD_SPAN = Symbol.for("@mcp-b/do-runtime/record-worker-span");
+const recording = globalThis as typeof globalThis & { [RECORD_SPAN]?: StartWorkerSpan };
+
+/** Install one recorder for this worker realm, including any separately bundled facets. */
+export function installWorkerTracing(startSpan: StartWorkerSpan): void {
+  if (recording[RECORD_SPAN] && recording[RECORD_SPAN] !== startSpan) {
+    throw new TypeError("Worker tracing already has a recorder");
+  }
+  recording[RECORD_SPAN] = startSpan;
+}
 
 class Span {
-  /** Always false: nothing in this package collects spans, so no span is sampled. */
-  readonly isTraced = false;
+  #ended = false;
 
-  constructor(token?: typeof SPAN_CONSTRUCTION) {
+  constructor(token?: typeof SPAN_CONSTRUCTION, private readonly recorder?: WorkerSpanRecorder) {
     if (token !== SPAN_CONSTRUCTION) throw new TypeError("Illegal constructor");
   }
 
-  // ← workerd ec93d7032: a no-op span has no identity, so it answers the all-zero
-  // (invalid, never propagated) context, as a fresh object that survives end().
-  spanContext(): TracingSpanContext {
-    return { traceId: "0".repeat(32), spanId: "0".repeat(16), traceFlags: 0 };
+  get isTraced(): boolean {
+    return !this.#ended && (this.recorder?.isTraced ?? false);
   }
 
-  setAttribute(_name: string, _value: unknown): this {
+  // ← workerd ec93d7032: identity is returned by value and survives end().
+  spanContext(): TracingSpanContext {
+    const context = this.recorder?.spanContext();
+    return context
+      ? { ...context }
+      : { traceId: "0".repeat(32), spanId: "0".repeat(16), traceFlags: 0 };
+  }
+
+  setAttribute(key: string, value: boolean | number | string): this {
+    if (!this.#ended) this.recorder?.setAttribute(key, value);
     return this;
   }
-  setAttributes(_attributes: Record<string, boolean | number | string | undefined>): this {
+
+  setAttributes(attributes: Record<string, boolean | number | string | undefined>): this {
+    for (const [key, value] of Object.entries(attributes)) {
+      if (value !== undefined) this.setAttribute(key, value);
+    }
     return this;
   }
-  // ← workerd 1f6faa79b: even untraced/ended spans validate status and return themselves.
-  updateName(_name: string): this {
+
+  updateName(name: string): this {
+    if (!this.#ended) this.recorder?.updateName(name);
     return this;
   }
+
+  // ← workerd 1f6faa79b: validation also applies to untraced and ended spans.
   setStatus(status: TracingSpanStatus): this {
     const code = status.code;
     if (code !== "unset" && code !== "ok" && code !== "error") {
       throw new TypeError("Span status code must be 'unset', 'ok', or 'error'.");
     }
+    if (!this.#ended) this.recorder?.setStatus(status);
     return this;
   }
-  recordException(_exception: unknown): void {}
-  end(): void {}
+
+  recordException(exception: unknown): void {
+    if (!this.#ended) this.recorder?.recordException(exception);
+  }
+
+  end(): void {
+    if (this.#ended) return;
+    this.#ended = true;
+    this.recorder?.end();
+  }
 }
 
-let activeSpan: Span | undefined;
+// ← Workerd's AsyncContextFrame::StorageScope. Browser continuations use
+// the runtime's await transform, while Node has native AsyncLocalStorage.
+const ACTIVE_SPAN = Symbol.for("@mcp-b/do-runtime/active-span");
+const nodeScopes = globalThis as typeof globalThis & {
+  [ACTIVE_SPAN]?: import("node:async_hooks").AsyncLocalStorage<Span>;
+};
+const nodeAsyncHooks = globalThis.process?.getBuiltinModule?.("node:async_hooks");
+const nodeScope = nodeAsyncHooks
+  ? (nodeScopes[ACTIVE_SPAN] ??= new nodeAsyncHooks.AsyncLocalStorage<Span>())
+  : undefined;
 
-/**
- * ← `runSpan`: with no observer, auto-end and manual-end have the same effect.
- * ponytail: scope is synchronous, like withEnv; async identity needs host AsyncContext support.
- */
-function runInSpan<T, A extends unknown[]>(
-  _name: string,
+function getActiveSpan(): Span | undefined {
+  if (nodeScope) return nodeScope.getStore();
+  return asyncContext.current.get(ACTIVE_SPAN) as Span | undefined;
+}
+
+function startSpan(name: string): Span {
+  const recorder = recording[RECORD_SPAN]?.(name, getActiveSpan()?.spanContext());
+  return new Span(SPAN_CONSTRUCTION, recorder);
+}
+
+function startActiveSpan<T, A extends unknown[]>(
+  name: string,
   run: (span: Span, ...args: A) => T,
   ...args: A
 ): T {
-  const previous = activeSpan;
-  const span = new Span(SPAN_CONSTRUCTION);
-  activeSpan = span;
-  try {
-    return run(span, ...args);
-  } finally {
-    activeSpan = previous;
-  }
+  const span = startSpan(name);
+  if (nodeScope) return nodeScope.run(span, run, span, ...args);
+  const context = new Map(asyncContext.current);
+  context.set(ACTIVE_SPAN, span);
+  return withAsyncContext(context, () => run(span, ...args));
 }
 
 export const tracing: Tracing = {
   Span,
-  enterSpan: runInSpan,
-  startActiveSpan: runInSpan,
-  startSpan(_name: string): Span {
-    return new Span(SPAN_CONSTRUCTION);
-  },
-  getActiveSpan(): Span | undefined {
-    return activeSpan;
+  startSpan,
+  startActiveSpan,
+  getActiveSpan,
+  enterSpan(name, run, ...args) {
+    // Workerd owns the lifetime for enterSpan and defers ending until a
+    // returned Promise settles. startActiveSpan leaves ending to the caller.
+    return startActiveSpan(name, (span) => {
+      let result;
+      try {
+        result = run(span, ...args);
+      } catch (error) {
+        span.end();
+        throw error;
+      }
+      if (result instanceof Promise) return result.finally(() => span.end()) as typeof result;
+      span.end();
+      return result;
+    });
   },
 };
 
