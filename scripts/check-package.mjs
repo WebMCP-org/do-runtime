@@ -46,6 +46,13 @@ const nodeBackend = modules.get("./backends/node-sqlite");
 const gate = modules.get("./gate");
 const vite = modules.get("./vite");
 const workers = modules.get("./cloudflare-workers");
+const telemetry = modules.get("./telemetry");
+if (
+  typeof telemetry.createOtlpTelemetry !== "function" ||
+  typeof telemetry.readOtlpConfiguration !== "function"
+) {
+  throw new Error("packed telemetry entry does not export its SDK setup and configuration reader");
+}
 if (typeof runtime.createActorContainer !== "function") {
   throw new Error("packed root entry does not export createActorContainer");
 }

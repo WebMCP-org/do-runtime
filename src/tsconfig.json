@@ -11,6 +11,8 @@
     "browser/message-port-websocket.ts",
     "browser/offscreen-document.ts",
     "index.ts",
+    "telemetry.ts",
+    "telemetry/otlp-http.ts",
     "gate.ts",
     "vite.ts"
   ],

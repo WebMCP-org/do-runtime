@@ -84,6 +84,7 @@ port and is not affiliated with or endorsed by Cloudflare.
 - [Durable Object semantics](#durable-object-semantics)
 - [Minimal host](#minimal-host)
 - [Hosting an actor](#hosting-an-actor)
+- [OpenTelemetry](#opentelemetry)
 - [Storage, alarms, facets, I/O](#storage)
 - [Migrations](#migrations)
 - [What is not supported, and stability](#what-is-not-supported)
@@ -513,6 +514,42 @@ database a terminated worker left with a hot rollback journal, so SQLite rolls
 back its uncommitted transaction, and refuse any sidecar that remains. Export
 does not run storage migrations and remains available for a database stamped by
 a newer runtime.
+
+## OpenTelemetry
+
+The `@mcp-b/do-runtime/telemetry` entry point sets up the OpenTelemetry SDK
+and sends OTLP/HTTP JSON using the platform timer and fetch. Install the
+worker recorder once per realm. The host chooses the names and attributes
+its worker spans may export.
+
+```ts
+import { createOtlpTelemetry } from "@mcp-b/do-runtime/telemetry";
+
+const configuration = {
+  endpoint: "http://127.0.0.1:4318/v1/traces",
+  metrics: true,
+  logs: false,
+};
+const { tracerProvider } = await createOtlpTelemetry({
+  configuration,
+  readConfiguration: async () => configuration,
+  resourceAttributes: { "service.name": "example-worker" },
+  scope: "example.worker",
+  workerSpans: {
+    describe: () => ({ name: "worker.operation", scope: "example.worker" }),
+    attribute: (key, value) => key === "error.type" ? value : undefined,
+  },
+});
+```
+
+The exporter reads the current configuration before each batch. Return
+`null` to revoke exports. When metrics or logs are enabled, the exporter
+uses the corresponding `/v1/metrics` or `/v1/logs` path beside
+`/v1/traces`. Use `observeSpans` to record metrics or logs from completed
+spans. Call `scheduleMetrics()` after recording metrics outside that
+callback. The returned tracer provider exposes `forceFlush()`
+and `shutdown()` for the host lifecycle.
+[OTLP/HTTP](https://opentelemetry.io/docs/specs/otlp/#otlphttp)
 
 ## What is not supported
 
