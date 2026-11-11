@@ -88,11 +88,13 @@ function forgetPendingChatRequest(
   }
 }
 
-function forgetPendingChatRequestById(requestId: string): void {
+function forgetPendingChatRequestById(
+  requestId: string
+): PendingChatRequest | undefined {
   for (const [chatId, request] of pendingChatRequests) {
     if (request.requestId === requestId) {
       pendingChatRequests.delete(chatId);
-      return;
+      return request;
     }
   }
 }
@@ -398,7 +400,7 @@ export class WebSocketChatTransport<
    * client cleanup.
    */
   handleServerTurnCompleted(requestId: string) {
-    forgetPendingChatRequestById(requestId);
+    forgetPendingChatRequestById(requestId)?.acknowledge?.();
     this.clearActiveServerTurn(requestId);
   }
 
@@ -1160,7 +1162,7 @@ export class WebSocketChatTransport<
 
             if (data.type !== MessageType.CF_AGENT_USE_CHAT_RESPONSE) return;
             if (data.id !== requestId) return;
-            forgetPendingChatRequestById(requestId);
+            forgetPendingChatRequestById(requestId)?.acknowledge?.();
 
             if (data.error) {
               transport.appliedChunks.forget(requestId);

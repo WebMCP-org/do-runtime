@@ -227,6 +227,25 @@ export function splitCallOptions(
       };
 }
 
+/** @internal Serialize before either client queues the request for reconnect. */
+export function serializeRpcRequest(
+  id: string,
+  method: string,
+  args: unknown[],
+  options?: CallOptions | StreamOptions
+): string {
+  const traceparent =
+    options && "traceparent" in options ? options.traceparent : undefined;
+  const request: RPCRequest = {
+    args,
+    id,
+    method,
+    type: MessageType.RPC,
+    ...(traceparent ? { traceparent } : {})
+  };
+  return JSON.stringify(request);
+}
+
 /**
  * One native call on the Cap'n Web transport, with the timeout and
  * stream-callback contract `call()` has on the JSON wire. The timeout
@@ -920,17 +939,7 @@ export class AgentClient<
         transmitted: this.readyState === this.OPEN
       });
 
-      const traceparent =
-        options && "traceparent" in options ? options.traceparent : undefined;
-      const request: RPCRequest = {
-        args,
-        id,
-        method,
-        type: MessageType.RPC,
-        ...(traceparent ? { traceparent } : {})
-      };
-
-      this.send(JSON.stringify(request));
+      this.send(serializeRpcRequest(id, method, args, options));
     });
   }
 }
