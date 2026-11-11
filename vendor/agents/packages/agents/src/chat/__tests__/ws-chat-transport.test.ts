@@ -4,6 +4,7 @@ import {
   WebSocketChatTransport,
   type AgentConnection
 } from "../ws-chat-transport";
+import { STREAM_RESUME_NONE_REASONS } from "../protocol";
 import { MessageType } from "../wire-types";
 
 class FakeAgent implements AgentConnection {
@@ -318,6 +319,87 @@ describe("WebSocketChatTransport unacknowledged request replay", () => {
       value: undefined
     });
     expect(onRequestAcknowledged).toHaveBeenCalledTimes(1);
+  });
+
+  it("releases an acknowledged turn when its reconnect probe reports idle", async () => {
+    const chatId = `idle-after-close-${crypto.randomUUID()}`;
+    const agent = new FakeAgent();
+    const transport = new WebSocketChatTransport({ agent });
+    const stream = await transport.sendMessages({
+      chatId,
+      messages: [userMessage],
+      abortSignal: undefined,
+      trigger: "submit-message"
+    });
+    const { id: requestId } = JSON.parse(requestFrame(agent)) as {
+      id: string;
+    };
+    agent.message({
+      type: MessageType.CF_AGENT_STREAM_PENDING,
+      id: requestId,
+      persisted: true
+    });
+    agent.close();
+    await expect(stream.getReader().read()).resolves.toEqual({
+      done: false,
+      value: { type: "error", errorText: "WebSocket closed mid-stream" }
+    });
+    expect(transport.activeServerTurnId).toBe(requestId);
+
+    const replacement = new FakeAgent();
+    transport.setAgent(replacement);
+    const resumed = transport.reconnectToStream({ chatId });
+    const { probeId } = JSON.parse(replacement.sent[0]) as { probeId: string };
+    expect(
+      transport.handleStreamResumeNone({
+        probeId: "obsolete-probe",
+        reason: STREAM_RESUME_NONE_REASONS.IDLE
+      })
+    ).toBe(false);
+    expect(transport.activeServerTurnId).toBe(requestId);
+    transport.handleStreamResumeNone({
+      probeId,
+      reason: STREAM_RESUME_NONE_REASONS.IDLE
+    });
+    await expect(resumed).resolves.toBeNull();
+    expect(transport.activeServerTurnId).toBeNull();
+  });
+
+  it("cancels the old handshake without discarding its replay on socket replacement", async () => {
+    const chatId = `replace-during-replay-${crypto.randomUUID()}`;
+    const original = new FakeAgent();
+    const transport = new WebSocketChatTransport({ agent: original });
+    const stream = await transport.sendMessages({
+      chatId,
+      messages: [userMessage],
+      abortSignal: undefined,
+      trigger: "submit-message"
+    });
+    const frame = requestFrame(original);
+    original.close();
+    await expect(stream.getReader().read()).rejects.toThrow(
+      "before the chat request was acknowledged"
+    );
+
+    const replay = new FakeAgent();
+    transport.setAgent(replay);
+    const obsoleteHandshake = transport.reconnectToStream({ chatId });
+    expect(requestFrame(replay)).toBe(frame);
+
+    const replacement = new FakeAgent();
+    try {
+      transport.setAgent(replacement);
+      expect(transport.isAwaitingResume()).toBe(false);
+      await expect(obsoleteHandshake).resolves.toBeNull();
+      expect(transport.hasUnacknowledgedRequest(chatId)).toBe(true);
+
+      const currentHandshake = transport.reconnectToStream({ chatId });
+      expect(requestFrame(replacement)).toBe(frame);
+      transport.cancelPendingResume();
+      await expect(currentHandshake).resolves.toBeNull();
+    } finally {
+      transport.discardPendingRequest(chatId);
+    }
   });
 
   it.each([

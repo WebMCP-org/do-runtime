@@ -7,6 +7,7 @@
 
 import type { ChatTransport, UIMessage, UIMessageChunk } from "ai";
 import { nanoid } from "nanoid";
+import { STREAM_RESUME_NONE_REASONS } from "./protocol";
 import {
   applyChatResponseFrame,
   failChatStream,
@@ -64,6 +65,22 @@ type StreamPendingFrame = Extract<
   OutgoingMessage<UIMessage>,
   { type: MessageType.CF_AGENT_STREAM_PENDING }
 >;
+
+type StreamResumeNone = Pick<
+  Extract<
+    OutgoingMessage<UIMessage>,
+    { type: MessageType.CF_AGENT_STREAM_RESUME_NONE }
+  >,
+  "probeId" | "reason"
+>;
+
+interface ResumeHandshake {
+  cancel(): void;
+  retry(): void;
+  resume(data: { id: string }): void;
+  none(data: StreamResumeNone): boolean;
+  pending(data: StreamPendingFrame): void;
+}
 
 type ChatResponseReceipt = Pick<
   Extract<
@@ -199,27 +216,13 @@ export class WebSocketChatTransport<
   private onRequestBuffered?: WebSocketChatTransportOptions<ChatMessage>["onRequestBuffered"];
   private onRequestAcknowledged?: WebSocketChatTransportOptions<ChatMessage>["onRequestAcknowledged"];
 
-  // Pending resume resolver — set by reconnectToStream, called by
-  // handleStreamResuming when onAgentMessage sees CF_AGENT_STREAM_RESUMING.
-  private _resumeResolver: ((data: { id: string }) => void) | null = null;
   /**
    * Continuation chunks this client applied, shared with the hook's fallback
    * observer so a replay after reconnect skips them on either path (#1951).
    */
   readonly appliedChunks = new AppliedChunkLedger();
-  // Pending "no stream" resolver — called by handleStreamResumeNone
-  // when onAgentMessage sees CF_AGENT_STREAM_RESUME_NONE.
-  private _resumeNoneResolver:
-    | ((data: { probeId?: string }) => boolean)
-    | null = null;
-  // Keep-waiting hook (#1784) — set by whichever resume path is currently
-  // awaiting, called by handleStreamPending when onAgentMessage sees
-  // CF_AGENT_STREAM_PENDING. Extends the path's probe timeout so a slow
-  // pre-stream window (queue / MCP / model latency) does not resolve early.
-  private _onStreamPending: ((data: StreamPendingFrame) => void) | null = null;
-  // Retransmits the current handshake on a replacement socket without starting
-  // a second AI SDK resume request. Set only while a resolver is active.
-  private _retryResumeProbe: (() => void) | null = null;
+  // Only the pending handshake consumes replies from the shared handler.
+  private _resumeHandshake: ResumeHandshake | null = null;
   // Set when a client-side tool result/approval is expected to trigger
   // a new continuation stream. In this mode reconnectToStream() returns
   // a deferred ReadableStream immediately so AI SDK status can transition
@@ -341,7 +344,7 @@ export class WebSocketChatTransport<
    * True when the transport is waiting for a resume handshake.
    */
   isAwaitingResume(): boolean {
-    return this._resumeResolver !== null || this._resumeNoneResolver !== null;
+    return this._resumeHandshake !== null;
   }
 
   /**
@@ -349,9 +352,10 @@ export class WebSocketChatTransport<
    * server-idle response. Used when the owning hook/agent generation changes.
    */
   cancelPendingResume(): boolean {
-    const resolveNone = this._resumeNoneResolver;
-    if (!resolveNone) return false;
-    return resolveNone({});
+    const handshake = this._resumeHandshake;
+    if (!handshake) return false;
+    handshake.cancel();
+    return true;
   }
 
   /**
@@ -370,9 +374,9 @@ export class WebSocketChatTransport<
    * with the previous WebSocket.
    */
   retryPendingResume(): boolean {
-    const retry = this._retryResumeProbe;
-    if (!retry) return false;
-    retry();
+    const handshake = this._resumeHandshake;
+    if (!handshake) return false;
+    handshake.retry();
     return true;
   }
 
@@ -383,8 +387,9 @@ export class WebSocketChatTransport<
    * so the caller can use its own fallback path.
    */
   handleStreamResuming(data: { id: string }): boolean {
-    if (!this._resumeResolver) return false;
-    this._resumeResolver(data);
+    const handshake = this._resumeHandshake;
+    if (!handshake) return false;
+    handshake.resume(data);
     return true;
   }
 
@@ -393,9 +398,8 @@ export class WebSocketChatTransport<
    * If reconnectToStream is waiting, resolves the promise with null
    * immediately (no 5-second timeout). Returns true if handled.
    */
-  handleStreamResumeNone(data: { probeId?: string } = {}): boolean {
-    if (!this._resumeNoneResolver) return false;
-    return this._resumeNoneResolver(data);
+  handleStreamResumeNone(data: StreamResumeNone = {}): boolean {
+    return this._resumeHandshake?.none(data) ?? false;
   }
 
   /**
@@ -406,12 +410,12 @@ export class WebSocketChatTransport<
    * after the short window). Returns true if a waiting path consumed it.
    */
   handleStreamPending(data: StreamPendingFrame): boolean {
-    const handler = this._onStreamPending;
-    handler?.(data);
+    const handshake = this._resumeHandshake;
+    handshake?.pending(data);
     if (data.persisted === true && data.id) {
       forgetPendingChatRequestById(data.id)?.acknowledge?.();
     }
-    return handler !== null;
+    return handshake !== null;
   }
 
   /**
@@ -710,33 +714,11 @@ export class WebSocketChatTransport<
     const activeIds = this.activeRequestIds;
     const probeId = nanoid(8);
     const pendingRequest = pendingChatRequests.get(options.chatId);
+    const previousTurnId = this._activeServerTurnId;
 
     return new Promise<ReadableStream<UIMessageChunk> | null>((resolve) => {
       let resolved = false;
       let timeout: ReturnType<typeof setTimeout> | undefined;
-      let resumeResolver: ((data: { id: string }) => void) | null = null;
-      let resumeNoneResolver: ((data: { probeId?: string }) => boolean) | null =
-        null;
-      let onStreamPending: ((data: StreamPendingFrame) => void) | null = null;
-      let retryResumeProbe: (() => void) | null = null;
-
-      const clearOwnedCallbacks = () => {
-        if (resumeResolver && this._resumeResolver === resumeResolver) {
-          this._resumeResolver = null;
-        }
-        if (
-          resumeNoneResolver &&
-          this._resumeNoneResolver === resumeNoneResolver
-        ) {
-          this._resumeNoneResolver = null;
-        }
-        if (onStreamPending && this._onStreamPending === onStreamPending) {
-          this._onStreamPending = null;
-        }
-        if (retryResumeProbe && this._retryResumeProbe === retryResumeProbe) {
-          this._retryResumeProbe = null;
-        }
-      };
 
       const done = (
         value:
@@ -746,7 +728,7 @@ export class WebSocketChatTransport<
       ) => {
         if (resolved) return;
         resolved = true;
-        clearOwnedCallbacks();
+        if (this._resumeHandshake === handshake) this._resumeHandshake = null;
         if (timeout) clearTimeout(timeout);
         resolve(value);
       };
@@ -758,7 +740,7 @@ export class WebSocketChatTransport<
 
       // Keep-waiting (#1784): the server says a turn is accepted but its stream
       // has not started. Extend this operation's own timeout only.
-      onStreamPending = (data) => {
+      const onStreamPending = (data: StreamPendingFrame) => {
         if (resolved) return;
         armTimeout(RESUME_PENDING_TIMEOUT_MS);
         if (
@@ -776,7 +758,7 @@ export class WebSocketChatTransport<
         }
       };
 
-      resumeNoneResolver = (data) => {
+      const onResumeNone = (data: StreamResumeNone) => {
         if (data.probeId && data.probeId !== probeId) return false;
         if (
           pendingRequest &&
@@ -789,11 +771,18 @@ export class WebSocketChatTransport<
           armTimeout(RESUME_PENDING_TIMEOUT_MS);
           return true;
         }
+        if (
+          previousTurnId &&
+          data.probeId === probeId &&
+          data.reason === STREAM_RESUME_NONE_REASONS.IDLE
+        ) {
+          this.clearActiveServerTurn(previousTurnId);
+        }
         done(null);
         return true;
       };
 
-      resumeResolver = (data: { id: string }) => {
+      const onResume = (data: { id: string }) => {
         const requestId = data.id;
         activeIds?.add(requestId);
         const stream = this._createResumeStream(requestId, true);
@@ -810,7 +799,7 @@ export class WebSocketChatTransport<
 
       // Re-arm both the request and timeout on each replacement socket. This is
       // a retransmission of this resolver's handshake, not a second Chat resume.
-      retryResumeProbe = () => {
+      const retryResumeProbe = () => {
         if (resolved) return;
         armTimeout(RESUME_PROBE_TIMEOUT_MS);
         try {
@@ -831,10 +820,14 @@ export class WebSocketChatTransport<
         }
       };
 
-      this._onStreamPending = onStreamPending;
-      this._resumeNoneResolver = resumeNoneResolver;
-      this._resumeResolver = resumeResolver;
-      this._retryResumeProbe = retryResumeProbe;
+      const handshake: ResumeHandshake = {
+        cancel: () => done(null),
+        retry: retryResumeProbe,
+        resume: onResume,
+        none: onResumeNone,
+        pending: onStreamPending
+      };
+      this._resumeHandshake = handshake;
       retryResumeProbe();
     });
   }
@@ -859,30 +852,14 @@ export class WebSocketChatTransport<
     // content before they close the stream.
     let replayBatch: ReplayChunkBatch | null = null;
     const probeId = nanoid(8);
-    let onResumeRef: ((data: { id: string }) => void) | null = null;
-    let onResumeNoneRef: ((data: { probeId?: string }) => boolean) | null =
-      null;
-    let onStreamPendingRef: ((data: StreamPendingFrame) => void) | null = null;
-    let retryResumeProbeRef: (() => void) | null = null;
+    let handshake: ResumeHandshake | null = null;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
     let abortToolContinuationRef: (() => boolean) | null = null;
     let detachResumeStreamRef: (() => boolean) | null = null;
 
     const clearOwnedHandshake = () => {
-      if (onResumeRef && this._resumeResolver === onResumeRef) {
-        this._resumeResolver = null;
-      }
-      if (onResumeNoneRef && this._resumeNoneResolver === onResumeNoneRef) {
-        this._resumeNoneResolver = null;
-      }
-      if (onStreamPendingRef && this._onStreamPending === onStreamPendingRef) {
-        this._onStreamPending = null;
-      }
-      if (
-        retryResumeProbeRef &&
-        this._retryResumeProbe === retryResumeProbeRef
-      ) {
-        this._retryResumeProbe = null;
-      }
+      if (this._resumeHandshake === handshake) this._resumeHandshake = null;
+      if (timeout) clearTimeout(timeout);
     };
 
     const finish = (action: () => void, keepRequestId = false) => {
@@ -953,16 +930,16 @@ export class WebSocketChatTransport<
             type: MessageType.CF_AGENT_USE_CHAT_RESPONSE;
           }
         > | null = null;
-        let timeout: ReturnType<typeof setTimeout> | undefined;
-
         const armTimeout = (delay: number) => {
           if (timeout) clearTimeout(timeout);
           timeout = setTimeout(() => finish(() => controller.close()), delay);
         };
 
-        const onResumeNone = (data: { probeId?: string }) => {
+        const close = () => finish(() => controller.close());
+
+        const onResumeNone = (data: StreamResumeNone) => {
           if (data.probeId && data.probeId !== probeId) return false;
-          finish(() => controller.close());
+          close();
           return true;
         };
 
@@ -972,7 +949,6 @@ export class WebSocketChatTransport<
           requestId = data.id;
           activeIds?.add(requestId);
           clearOwnedHandshake();
-          if (timeout) clearTimeout(timeout);
 
           agent.send(
             JSON.stringify({
@@ -1002,14 +978,14 @@ export class WebSocketChatTransport<
           }
         };
 
-        onResumeRef = onResume;
-        onResumeNoneRef = onResumeNone;
-        onStreamPendingRef = onStreamPending;
-        retryResumeProbeRef = retryResumeProbe;
-        transport._resumeResolver = onResume;
-        transport._resumeNoneResolver = onResumeNone;
-        transport._onStreamPending = onStreamPending;
-        transport._retryResumeProbe = retryResumeProbe;
+        handshake = {
+          cancel: close,
+          retry: retryResumeProbe,
+          resume: onResume,
+          none: onResumeNone,
+          pending: onStreamPending
+        };
+        transport._resumeHandshake = handshake;
 
         const onMessage = (event: MessageEvent) => {
           try {
