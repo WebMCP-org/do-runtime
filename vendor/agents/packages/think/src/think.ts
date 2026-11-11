@@ -2198,8 +2198,6 @@ export type TurnTrigger =
   | "recovery-continue"
   | "recovery-retry";
 
-type TurnAdmission = "queue" | "submit" | "execute-submission";
-
 type AdmittedQueueResult<T> =
   | { status: "completed"; value: T }
   | { status: "stale" };
@@ -2226,11 +2224,13 @@ type QueueTurnSpec<T> = {
 };
 
 type NonQueueTurnSpec<T> = {
-  admission: Exclude<TurnAdmission, "queue">;
   trigger: TurnTrigger;
   channel?: string;
   execute: () => Promise<T>;
-};
+} & (
+  | { admission: "submit" }
+  | { admission: "execute-submission"; traceparent: string | null }
+);
 
 type TurnSpec<T> = QueueTurnSpec<T> | NonQueueTurnSpec<T>;
 
@@ -2925,6 +2925,7 @@ type ThinkSubmissionRow = {
   status: ThinkSubmissionStatus;
   messages_json: string;
   metadata_json: string | null;
+  traceparent: string | null;
   error_message: string | null;
   created_at: number;
   messages_applied_at: number | null;
@@ -9532,32 +9533,31 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
       // The non-queue (submit/execute-submission) path runs `execute()` here
       // directly — it does NOT pass through `_runInsideAdmittedTurnBody`, so the
       // channel context must be set here too.
-      return withAgentSpan(
-        this,
-        "chat_submission",
-        "submission",
-        {
-          "cloudflare.agents.component": "think",
-          "cloudflare.agents.turn.trigger": spec.trigger,
-          "cloudflare.agents.turn.admission": spec.admission,
-          "cloudflare.agents.turn.channel": spec.channel
-        },
-        () =>
+      const attributes = {
+        "cloudflare.agents.component": "think",
+        "cloudflare.agents.turn.trigger": spec.trigger,
+        "cloudflare.agents.turn.admission": spec.admission,
+        "cloudflare.agents.turn.channel": spec.channel
+      };
+      const run = () =>
+        withAgentSpan(this, "chat_submission", "submission", attributes, () =>
           withAgentSpan(
             this,
             spec.admission === "submit"
               ? "accept_chat_submission"
               : "execute_chat_submission",
             "submission",
-            {
-              "cloudflare.agents.component": "think",
-              "cloudflare.agents.turn.trigger": spec.trigger,
-              "cloudflare.agents.turn.admission": spec.admission,
-              "cloudflare.agents.turn.channel": spec.channel
-            },
+            attributes,
             () => this._withChannelContext(spec.channel, () => spec.execute())
           )
-      );
+        );
+      if (
+        spec.admission === "execute-submission" &&
+        workerTracing.withWorkerTraceparent
+      ) {
+        return workerTracing.withWorkerTraceparent(spec.traceparent, run);
+      }
+      return run();
     }
 
     if (!spec.allowNested) {
@@ -12285,19 +12285,23 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
         message_id TEXT
       )
     `;
-    // This table is unversioned. Add nullable columns for existing objects,
-    // preserving unstamped rows for the legacy stream-evidence fallback.
-    for (const statement of [
-      "ALTER TABLE cf_think_submissions ADD COLUMN result_status TEXT",
-      "ALTER TABLE cf_think_submissions ADD COLUMN output_json TEXT",
-      "ALTER TABLE cf_think_submissions ADD COLUMN message_id TEXT",
-      "ALTER TABLE cf_think_submissions ADD COLUMN traceparent TEXT"
-    ]) {
-      try {
-        this.ctx.storage.sql.exec(statement);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        if (!message.toLowerCase().includes("duplicate column")) throw error;
+    // Existing objects need nullable columns for the legacy stream fallback
+    // and for submissions accepted before trace propagation was enabled.
+    const columns = new Set(
+      this.sql<{ name: string }>`
+        SELECT name FROM pragma_table_info('cf_think_submissions')
+      `.map((row) => row.name)
+    );
+    for (const column of [
+      "result_status",
+      "output_json",
+      "message_id",
+      "traceparent"
+    ] satisfies (keyof ThinkSubmissionRow)[]) {
+      if (!columns.has(column)) {
+        this.ctx.storage.sql.exec(
+          `ALTER TABLE cf_think_submissions ADD COLUMN ${column} TEXT`
+        );
       }
     }
     this.sql`
@@ -12315,14 +12319,10 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
     this._submissionTableEnsured = true;
   }
 
-  private _readSubmission(submissionId: string) {
+  private _readSubmission(submissionId: string): ThinkSubmissionRow | null {
     this._ensureSubmissionTable();
-    const rows = this.sql<ThinkSubmissionRow & { traceparent: string | null }>`
-      SELECT submission_id, idempotency_key, request_id, stream_id, status,
-             messages_json, metadata_json, error_message, created_at,
-             messages_applied_at, started_at, completed_at, result_status, output_json,
-             message_id, traceparent
-      FROM cf_think_submissions
+    const rows = this.sql<ThinkSubmissionRow>`
+      SELECT * FROM cf_think_submissions
       WHERE submission_id = ${submissionId}
       LIMIT 1
     `;
@@ -12334,11 +12334,7 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
   ): ThinkSubmissionRow | null {
     this._ensureSubmissionTable();
     const rows = this.sql<ThinkSubmissionRow>`
-      SELECT submission_id, idempotency_key, request_id, stream_id, status,
-             messages_json, metadata_json, error_message, created_at,
-             messages_applied_at, started_at, completed_at, result_status, output_json,
-             message_id
-      FROM cf_think_submissions
+      SELECT * FROM cf_think_submissions
       WHERE idempotency_key = ${idempotencyKey}
       LIMIT 1
     `;
@@ -12370,11 +12366,7 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
     }
 
     const rows = this.sql<ThinkSubmissionRow>`
-      SELECT submission_id, idempotency_key, request_id, stream_id, status,
-             messages_json, metadata_json, error_message, created_at,
-             messages_applied_at, started_at, completed_at, result_status, output_json,
-             message_id
-      FROM cf_think_submissions
+      SELECT * FROM cf_think_submissions
       ORDER BY created_at DESC, submission_id DESC
       LIMIT ${limit}
     `;
@@ -12386,11 +12378,7 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
     limit: number
   ): ThinkSubmissionRow[] {
     return this.sql<ThinkSubmissionRow>`
-      SELECT submission_id, idempotency_key, request_id, stream_id, status,
-             messages_json, metadata_json, error_message, created_at,
-             messages_applied_at, started_at, completed_at, result_status, output_json,
-             message_id
-      FROM cf_think_submissions
+      SELECT * FROM cf_think_submissions
       WHERE status = ${status}
       ORDER BY created_at DESC, submission_id DESC
       LIMIT ${limit}
@@ -12919,11 +12907,7 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
   ): ThinkSubmissionRow[] {
     if (completedBefore === undefined) {
       return this.sql<ThinkSubmissionRow>`
-        SELECT submission_id, idempotency_key, request_id, stream_id, status,
-               messages_json, metadata_json, error_message, created_at,
-               messages_applied_at, started_at, completed_at, result_status, output_json,
-               message_id
-        FROM cf_think_submissions
+        SELECT * FROM cf_think_submissions
         WHERE status = ${status}
         ORDER BY completed_at ASC, created_at ASC
         LIMIT ${limit}
@@ -12931,11 +12915,7 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
     }
 
     return this.sql<ThinkSubmissionRow>`
-      SELECT submission_id, idempotency_key, request_id, stream_id, status,
-             messages_json, metadata_json, error_message, created_at,
-             messages_applied_at, started_at, completed_at, result_status, output_json,
-             message_id
-      FROM cf_think_submissions
+      SELECT * FROM cf_think_submissions
       WHERE status = ${status}
         AND completed_at IS NOT NULL
         AND completed_at < ${completedBefore}
@@ -13171,17 +13151,14 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
    * @internal Queue callback.
    */
   async _cfRunSubmission(payload: { submissionId: string }): Promise<void> {
-    this._ensureSubmissionTable();
     const row = this._readSubmission(payload.submissionId);
     if (!row || row.status !== "pending") return;
-    const run = () =>
-      this._admitTurn({
-        admission: "execute-submission",
-        trigger: "submission",
-        execute: () => this._executeSubmission(row)
-      });
-    const resume = workerTracing.withWorkerTraceparent;
-    await (resume ? resume(row.traceparent, run) : run());
+    await this._admitTurn({
+      admission: "execute-submission",
+      trigger: "submission",
+      traceparent: row.traceparent,
+      execute: () => this._executeSubmission(row)
+    });
   }
 
   private async _executeSubmission(row: ThinkSubmissionRow): Promise<void> {
@@ -13341,12 +13318,8 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
     includeUnappliedRunning = false
   ): ThinkSubmissionRow[] {
     this._ensureSubmissionTable();
-    const pending = this.sql<ThinkSubmissionRow>`
-      SELECT submission_id, idempotency_key, request_id, stream_id, status,
-             messages_json, metadata_json, error_message, created_at,
-             messages_applied_at, started_at, completed_at, result_status, output_json,
-             message_id
-      FROM cf_think_submissions
+    const pending = this.sql<Pick<ThinkSubmissionRow, "submission_id">>`
+      SELECT submission_id FROM cf_think_submissions
       WHERE status = 'pending'
         OR (${Number(includeUnappliedRunning)} = 1 AND status = 'running' AND messages_applied_at IS NULL)
     `;
@@ -13411,11 +13384,7 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
     this._ensureSubmissionTable();
 
     const running = this.sql<ThinkSubmissionRow>`
-      SELECT submission_id, idempotency_key, request_id, stream_id, status,
-             messages_json, metadata_json, error_message, created_at,
-             messages_applied_at, started_at, completed_at, result_status, output_json,
-             message_id
-      FROM cf_think_submissions
+      SELECT * FROM cf_think_submissions
       WHERE status = 'running'
     `;
 
@@ -19421,11 +19390,7 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
   ): ThinkSubmissionRow | null {
     this._ensureSubmissionTable();
     const rows = this.sql<ThinkSubmissionRow>`
-      SELECT submission_id, idempotency_key, request_id, stream_id, status,
-             messages_json, metadata_json, error_message, created_at,
-             messages_applied_at, started_at, completed_at, result_status, output_json,
-             message_id
-      FROM cf_think_submissions
+      SELECT * FROM cf_think_submissions
       WHERE submission_id = ${recoveredRequestId}
          OR (request_id = ${recoveredRequestId} AND status = 'running')
       ORDER BY (submission_id = ${recoveredRequestId}) DESC
