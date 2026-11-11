@@ -75,6 +75,11 @@ test("a serialized parent survives a detached handoff and restores the caller's 
   });
 });
 
+test("trusted handoffs preserve both digits of the trace flags", () => {
+  const carrier = "00-" + recordedContext.traceId + "-" + recordedContext.spanId + "-81";
+  expect(withWorkerTraceparent(carrier, captureWorkerTraceparent)).toBe(carrier);
+});
+
 test.each([
   undefined,
   null,

@@ -44,6 +44,8 @@
  * docs/decisions.md.
  */
 
+import { INVALID_SPAN_CONTEXT, type SpanContext } from "@opentelemetry/api";
+import { parseTraceParent } from "@opentelemetry/core";
 import { asyncContext, withAsyncContext } from "../util/async-context";
 
 // =======================================================================================
@@ -405,7 +407,7 @@ export const cache: CacheContext = boundaryObject(CACHE_UNIMPLEMENTED_MESSAGE);
 /** The host owns sampling and recording. The runtime owns span lifetimes and scope. */
 export interface WorkerSpanRecorder {
   readonly isTraced: boolean;
-  spanContext(): TracingSpanContext;
+  spanContext(): SpanContext;
   setAttribute(key: string, value: boolean | number | string): void;
   setStatus(status: TracingSpanStatus): void;
   updateName(name: string): void;
@@ -413,8 +415,7 @@ export interface WorkerSpanRecorder {
   end(): void;
 }
 
-type WorkerSpanParent = TracingSpanContext & { readonly isRemote?: true };
-type StartWorkerSpan = (name: string, parent?: WorkerSpanParent) => WorkerSpanRecorder | undefined;
+type StartWorkerSpan = (name: string, parent?: SpanContext) => WorkerSpanRecorder | undefined;
 
 const SPAN_CONSTRUCTION = Symbol("Span");
 const RECORD_SPAN = Symbol.for("@mcp-b/do-runtime/record-worker-span");
@@ -441,10 +442,7 @@ class Span {
 
   // ← workerd ec93d7032: identity is returned by value and survives end().
   spanContext(): TracingSpanContext {
-    const context = this.recorder?.spanContext();
-    return context
-      ? { ...context }
-      : { traceId: "0".repeat(32), spanId: "0".repeat(16), traceFlags: 0 };
+    return { ...(this.recorder?.spanContext() ?? INVALID_SPAN_CONTEXT) };
   }
 
   setAttribute(key: string, value: boolean | number | string): this {
@@ -500,7 +498,7 @@ const spanRealm = (spanRealms[SPAN_REALM] ??= {
 
 // ← Workerd's AsyncContextFrame::StorageScope. Browser continuations use
 // the runtime's await transform, while Node has native AsyncLocalStorage.
-type TraceScope = { readonly span: Span } | { readonly parent: WorkerSpanParent };
+type TraceScope = { readonly span: Span } | { readonly parent: SpanContext };
 const TRACE_SCOPE = Symbol.for("@mcp-b/do-runtime/trace-scope");
 type AsyncScope<T> = {
   getStore(): T | undefined;
@@ -535,7 +533,7 @@ function getActiveSpan(): Span | undefined {
   if (scope && "span" in scope) return scope.span;
 }
 
-function currentParent(): WorkerSpanParent | undefined {
+function currentParent(): SpanContext | undefined {
   const scope = currentTraceScope();
   if (scope) return "span" in scope ? scope.span.spanContext() : scope.parent;
 }
@@ -553,18 +551,6 @@ function startActiveSpan<T, A extends unknown[]>(
   return runInTraceScope({ span }, () => run(span, ...args));
 }
 
-const TRACEPARENT = /^00-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$/;
-
-function parseTraceparent(value: string | null | undefined): WorkerSpanParent | undefined {
-  // Match Workerd's version-00 field widths. All-zero identities are invalid.
-  if (value?.length !== 55) return;
-  const [, traceId, spanId, flags] = TRACEPARENT.exec(value) ?? [];
-  if (!traceId || !spanId || !flags || !/[1-9a-f]/.test(traceId) || !/[1-9a-f]/.test(spanId)) {
-    return;
-  }
-  return { traceId, spanId, traceFlags: Number.parseInt(flags, 16), isRemote: true };
-}
-
 /** Capture W3C trace context for a trusted runtime handoff. */
 export function captureWorkerTraceparent(): string | undefined {
   const parent = currentParent();
@@ -574,9 +560,10 @@ export function captureWorkerTraceparent(): string | undefined {
   ) {
     return;
   }
+  // Core 3.1.1's injector prefixes a zero even when the flags already use two digits.
   const flags = parent.traceFlags.toString(16).padStart(2, "0");
   const value = "00-" + parent.traceId + "-" + parent.spanId + "-" + flags;
-  if (parseTraceparent(value)) return value;
+  if (parseTraceParent(value)) return value;
 }
 
 /** Resume trace context at a trusted runtime handoff, including after a restart. */
@@ -584,8 +571,9 @@ export function withWorkerTraceparent<T>(
   value: string | null | undefined,
   run: () => T,
 ): T {
-  const parent = parseTraceparent(value);
-  return parent ? runInTraceScope({ parent }, run) : run();
+  // Workerd accepts the exact version-00 carrier at this boundary.
+  const parent = value?.length === 55 && value.startsWith("00-") ? parseTraceParent(value) : null;
+  return parent ? runInTraceScope({ parent: { ...parent, isRemote: true } }, run) : run();
 }
 
 export const tracing: Tracing = {
