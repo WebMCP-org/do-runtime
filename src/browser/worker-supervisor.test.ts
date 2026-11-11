@@ -1,5 +1,5 @@
 import { afterEach, expect, test, vi } from "vitest";
-import { RpcTarget } from "../api/cloudflare-workers";
+import { captureWorkerTraceparent, RpcTarget } from "../api/cloudflare-workers";
 import { bindChromePortWebSocket, type ChromeRuntimePort } from "./chrome-port-websocket";
 import {
   MessagePortWebSocket,
@@ -28,6 +28,7 @@ class Host extends RpcTarget {
 
 class Service extends RpcTarget {
   readonly sockets = new Map<string, MessagePortWebSocket>();
+  initializationTraceparent: string | undefined;
   /** Omit the first socket from the next snapshot. */
   invalidSnapshot = false;
   readonly snapshotStarted = Promise.withResolvers<void>();
@@ -115,6 +116,7 @@ class TestWorker extends EventTarget implements Worker {
       initialize: async (configuration, host, rehydration) => {
         if (configuration.fail) throw new Error("actor construction failed");
         await host.beforeReady();
+        this.service.initializationTraceparent = captureWorkerTraceparent();
         for (const placement of rehydration ? [rehydration.root, ...rehydration.facets] : []) {
           for (const { id, url, port } of placement.sockets) this.service.attach(id, url, port);
         }
@@ -207,6 +209,14 @@ async function connected(
 const workerError = (message: string) => Object.assign(new Event("error"), { message });
 const configuration: Configuration = { key: "employee/thread" };
 const url = "ws://host/agents/test/thread";
+
+test("forwards the placement parent when the supervisor has no recorder", async () => {
+  const { supervisor, workers } = fixture();
+  const parent = "00-" + "1".repeat(32) + "-" + "2".repeat(16) + "-01";
+  using service = await supervisor.reference(configuration).resolve(parent);
+  expect(await service.identity()).toBe(1);
+  expect(workers[0]!.service.initializationTraceparent).toBe(parent);
+});
 
 test("an initialization failure rejects the caller and discards the worker", async () => {
   const { supervisor, workers } = fixture();

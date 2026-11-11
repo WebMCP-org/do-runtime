@@ -613,17 +613,20 @@ export class BrowserWorkerSupervisor<
   }
 
   #spawn(configuration: Configuration, key: string): Placement<Configuration, Service> {
+    const parent = captureWorkerTraceparent();
     return tracing.startActiveSpan("do_runtime.worker.start", (span) => {
+      const fail = () => span.setStatus({ code: "error" }).end();
       try {
-        const placement = this.#spawnPlacement(configuration, key, captureWorkerTraceparent());
-        // Sockets can buffer immediately. The span ends at the readiness acknowledgement.
-        void placement.ready.then(
-          () => span.end(),
-          () => span.setStatus({ code: "error" }).end(),
+        const placement = this.#spawnPlacement(
+          configuration,
+          key,
+          captureWorkerTraceparent() ?? parent,
         );
+        // Sockets can buffer immediately. The span ends at the readiness acknowledgement.
+        void placement.ready.then(() => span.end(), fail);
         return placement;
       } catch (error) {
-        span.setStatus({ code: "error" }).end();
+        fail();
         throw error;
       }
     });
