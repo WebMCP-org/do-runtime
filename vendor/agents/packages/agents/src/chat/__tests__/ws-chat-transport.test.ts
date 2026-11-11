@@ -79,6 +79,41 @@ describe("WebSocketChatTransport unacknowledged request replay", () => {
     });
   });
 
+  it.each(["reconnect", "tool continuation"] as const)(
+    "settles %s when the socket cannot acknowledge a replay",
+    async (mode) => {
+      const agent = new FakeAgent();
+      const send = agent.send.bind(agent);
+      vi.spyOn(agent, "send").mockImplementation((frame) => {
+        if (JSON.parse(frame).type === MessageType.CF_AGENT_STREAM_RESUME_ACK) {
+          throw new Error("Socket is closed");
+        }
+        send(frame);
+      });
+      const activeRequestIds = new Set<string>();
+      const transport = new WebSocketChatTransport({ agent, activeRequestIds });
+      if (mode === "tool continuation") transport.expectToolContinuation();
+      const resumed = transport.reconnectToStream({ chatId: mode });
+      if (mode === "tool continuation") {
+        await expect(resumed).resolves.toBeInstanceOf(ReadableStream);
+      }
+      const { probeId } = JSON.parse(agent.sent[0]);
+      expect(transport.handleStreamResuming({ id: "replay", probeId })).toBe(
+        true
+      );
+      const stream = await resumed;
+      const reader = stream!.getReader();
+      await expect(reader.read()).resolves.toEqual({
+        done: false,
+        value: { type: "error", errorText: "WebSocket closed mid-stream" }
+      });
+      await expect(reader.read()).resolves.toMatchObject({ done: true });
+      expect(activeRequestIds.size).toBe(0);
+      expect(transport.retryPendingResume()).toBe(false);
+      expect(transport.abortActiveToolContinuation()).toBe(false);
+    }
+  );
+
   it("keeps waiting for the current probe after an obsolete stream offer", async () => {
     const agent = new FakeAgent();
     const transport = new WebSocketChatTransport({ agent });
