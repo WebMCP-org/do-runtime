@@ -15552,13 +15552,6 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
               messagesPersisted: true,
               error: streamError
             });
-            this._broadcastChat({
-              type: MSG_CHAT_RESPONSE,
-              id: requestId,
-              body: action.error,
-              done: false,
-              error: true
-            });
             break;
           }
 
@@ -15655,9 +15648,10 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
       this._broadcastChat({
         type: MSG_CHAT_RESPONSE,
         id: requestId,
-        body: "",
+        body: streamError ?? "",
         done: true,
-        outcome: response.status
+        outcome: response.status,
+        ...(streamError !== undefined && { error: true })
       });
       doneSent = true;
       // A stripped/empty response still records its outcome with settlement.
@@ -16170,14 +16164,6 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
               messagesPersisted: true,
               error: streamError
             });
-            this._broadcastChat({
-              type: MSG_CHAT_RESPONSE,
-              id: requestId,
-              body: action.error,
-              done: false,
-              error: true,
-              ...(continuation && { continuation: true })
-            });
             break;
           }
 
@@ -16253,16 +16239,20 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
           streamAborted ? "aborted" : "completed"
         );
       }
+      // An abort can still win before this terminal is sent. Its frame has no
+      // error flag, which would take precedence over the aborted outcome.
+      const terminalError = abortSignal?.aborted ? undefined : streamError;
       terminalFrame = {
         type: MSG_CHAT_RESPONSE,
         id: requestId,
-        body: "",
+        body: terminalError ?? "",
         done: true,
         outcome: streamError
           ? "error"
           : streamAborted
             ? "aborted"
             : "completed",
+        ...(terminalError !== undefined && { error: true }),
         ...(continuation && { continuation: true })
       };
       doneSent = true;
@@ -16465,7 +16455,10 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
               ? e.message
               : "Assistant message persistence failed";
           this._errorResumableStream(streamId, requestId);
-          if (terminalFrame && !terminalFrame.error) {
+          if (
+            terminalFrame &&
+            (!terminalFrame.error || terminalFrame.outcome === "error")
+          ) {
             terminalFrame = {
               ...terminalFrame,
               body: streamError,

@@ -8,3 +8,4 @@ first server receipt for a submitted message. Record queue wait and terminal
 outcome on durable Think submissions. Settle obsolete reconnect handshakes
 without losing buffered requests, and release acknowledged turns after an
 authoritative idle reply. Ignore stream offers addressed to an earlier probe.
+Think sends a provider stream error in the terminal frame after publishing the saved transcript.
