@@ -57,6 +57,7 @@ function interruptChatStream(
 interface PendingChatRequest {
   readonly requestId: string;
   readonly frame: string;
+  readonly acknowledge?: () => void;
 }
 
 type StreamPendingFrame = Extract<
@@ -76,9 +77,14 @@ function rememberPendingChatRequest(
   pendingChatRequests.set(chatId, request);
 }
 
-function forgetPendingChatRequest(chatId: string, requestId: string): void {
-  if (pendingChatRequests.get(chatId)?.requestId === requestId) {
+function forgetPendingChatRequest(
+  chatId: string,
+  requestId: string
+): PendingChatRequest | undefined {
+  const pending = pendingChatRequests.get(chatId);
+  if (pending?.requestId === requestId) {
     pendingChatRequests.delete(chatId);
+    return pending;
   }
 }
 
@@ -88,6 +94,13 @@ function forgetPendingChatRequestById(requestId: string): void {
       pendingChatRequests.delete(chatId);
       return;
     }
+  }
+}
+
+function lastUserMessageId(messages: readonly UIMessage[]): string | undefined {
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index];
+    if (message?.role === "user") return message.id;
   }
 }
 
@@ -144,6 +157,8 @@ export type WebSocketChatTransportOptions<
    * reconnect transcript replay. `messageId` is the submitted user message's id.
    */
   onRequestBuffered?: (messageId: string | undefined) => void;
+  /** Reports the first server receipt for a submitted user message. */
+  onRequestAcknowledged?: (messageId: string) => void;
 };
 
 /**
@@ -163,6 +178,7 @@ export class WebSocketChatTransport<
   private activeRequestIds?: Set<string>;
   private cancelOnClientAbort: boolean;
   private onRequestBuffered?: WebSocketChatTransportOptions<ChatMessage>["onRequestBuffered"];
+  private onRequestAcknowledged?: WebSocketChatTransportOptions<ChatMessage>["onRequestAcknowledged"];
 
   // Pending resume resolver — set by reconnectToStream, called by
   // handleStreamResuming when onAgentMessage sees CF_AGENT_STREAM_RESUMING.
@@ -203,6 +219,7 @@ export class WebSocketChatTransport<
     this.activeRequestIds = options.activeRequestIds;
     this.cancelOnClientAbort = options.cancelOnClientAbort ?? false;
     this.onRequestBuffered = options.onRequestBuffered;
+    this.onRequestAcknowledged = options.onRequestAcknowledged;
   }
 
   /**
@@ -513,13 +530,13 @@ export class WebSocketChatTransport<
               data.persisted === true
             ) {
               requestAcknowledged = true;
-              forgetPendingChatRequest(chatId, requestId);
+              forgetPendingChatRequest(chatId, requestId)?.acknowledge?.();
               return;
             }
             if (data.type !== MessageType.CF_AGENT_USE_CHAT_RESPONSE) return;
             if (data.id !== requestId) return;
             requestAcknowledged = true;
-            forgetPendingChatRequest(chatId, requestId);
+            forgetPendingChatRequest(chatId, requestId)?.acknowledge?.();
 
             if (data.error) {
               finish(() =>
@@ -582,18 +599,43 @@ export class WebSocketChatTransport<
       return stream;
     }
 
+    const traceparent =
+      options.headers instanceof Headers
+        ? options.headers.get("traceparent")
+        : Object.entries(options.headers ?? {}).find(
+            ([name]) => name.toLowerCase() === "traceparent"
+          )?.[1];
     const requestFrame = JSON.stringify({
       id: requestId,
       init: {
         method: "POST",
-        body: bodyPayload
+        body: bodyPayload,
+        ...(traceparent ? { headers: { traceparent } } : {})
       },
       type: MessageType.CF_AGENT_USE_CHAT_REQUEST
     });
+    const userMessageId =
+      options.trigger === "submit-message" && this.onRequestAcknowledged
+        ? lastUserMessageId(options.messages)
+        : undefined;
     try {
       rememberPendingChatRequest(chatId, {
         requestId,
-        frame: requestFrame
+        frame: requestFrame,
+        ...(userMessageId
+          ? {
+              acknowledge: () => {
+                try {
+                  this.onRequestAcknowledged?.(userMessageId);
+                } catch (error) {
+                  console.error(
+                    "Chat request acknowledgement observer failed",
+                    error
+                  );
+                }
+              }
+            }
+          : {})
       });
     } catch (error) {
       finish(() =>
@@ -612,10 +654,9 @@ export class WebSocketChatTransport<
     requestSent = true;
     const sent = agent.send(requestFrame);
     if (sent === false && options.trigger === "submit-message") {
-      const lastUserMessage = [...options.messages]
-        .reverse()
-        .find((message) => message.role === "user");
-      this.onRequestBuffered?.(lastUserMessage?.id);
+      this.onRequestBuffered?.(
+        userMessageId ?? lastUserMessageId(options.messages)
+      );
     }
 
     return stream;
@@ -699,7 +740,10 @@ export class WebSocketChatTransport<
           data.persisted === true &&
           data.id === pendingRequest.requestId
         ) {
-          forgetPendingChatRequest(options.chatId, pendingRequest.requestId);
+          forgetPendingChatRequest(
+            options.chatId,
+            pendingRequest.requestId
+          )?.acknowledge?.();
           activeIds?.add(pendingRequest.requestId);
           done(this._createResumeStream(pendingRequest.requestId));
         }

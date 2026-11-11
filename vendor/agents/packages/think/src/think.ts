@@ -171,6 +171,14 @@ import {
 const workerTracing = workerRuntime as {
   captureWorkerTraceparent?: () => string | undefined;
   withWorkerTraceparent?: <T>(value: string | null, run: () => T) => T;
+  tracing?: {
+    getActiveSpan?():
+      | {
+          setAttribute(key: string, value: string | number | boolean): void;
+          setStatus(status: { code: "error" }): void;
+        }
+      | undefined;
+  };
 };
 
 const agentToolChunkEncoder = new TextEncoder();
@@ -13188,6 +13196,11 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
   private async _executeSubmission(row: ThinkSubmissionRow): Promise<void> {
     const requestId = row.request_id ?? row.submission_id;
     const startedAt = Date.now();
+    const span = workerTracing.tracing?.getActiveSpan?.();
+    span?.setAttribute(
+      "do_runtime.submission.queue_wait_ms",
+      Math.max(0, startedAt - row.created_at)
+    );
     this.sql`
       UPDATE cf_think_submissions
       SET status = 'running',
@@ -13312,6 +13325,10 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
       this._submissionAbortControllers.delete(row.submission_id);
       this._submissionsApplyingMessages.delete(row.submission_id);
       const updated = this._readSubmission(row.submission_id);
+      if (updated) {
+        span?.setAttribute("do_runtime.submission.outcome", updated.status);
+        if (updated.status === "error") span?.setStatus({ code: "error" });
+      }
       if (
         finalizedHere &&
         updated &&

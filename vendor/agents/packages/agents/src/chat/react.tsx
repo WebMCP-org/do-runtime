@@ -488,6 +488,8 @@ export type UseAgentChatOptions<
    * settled, so it can call `sendMessage`.
    */
   onTurnEnd?: (event: ChatTurnEndEvent) => void;
+  /** Reports the first server receipt for a submitted user message. */
+  onRequestAcknowledged?: (messageId: string) => void;
   /**
    * @deprecated Use `onToolCall` callback instead for automatic tool execution.
    * @description Whether to automatically resolve tool calls that do not require human interaction.
@@ -764,6 +766,7 @@ export function useAgentChat<
     messages: optionsInitialMessages,
     onToolCall,
     onTurnEnd,
+    onRequestAcknowledged,
     onData,
     experimental_automaticToolResolution,
     tools,
@@ -821,6 +824,8 @@ export function useAgentChat<
   onToolCallRef.current = onToolCall;
   const onTurnEndRef = useRef(onTurnEnd);
   onTurnEndRef.current = onTurnEnd;
+  const onRequestAcknowledgedRef = useRef(onRequestAcknowledged);
+  onRequestAcknowledgedRef.current = onRequestAcknowledged;
   const turnErrorsRef = useRef(new Map<string, string>());
   const endedTurnIdsRef = useRef(new Set<string>());
   const pendingTurnEndsRef = useRef<ChatTurnEndEvent[]>([]);
@@ -1119,6 +1124,8 @@ export function useAgentChat<
           pendingBufferedSendIdsRef.current.add(messageId);
         }
       },
+      onRequestAcknowledged: (messageId) =>
+        onRequestAcknowledgedRef.current?.(messageId),
       prepareBody: async ({ messages: msgs, trigger, messageId }) => {
         // Start with the top-level body option (static or dynamic)
         let extraBody: Record<string, unknown> = {};

@@ -201,6 +201,8 @@ export type CallOptions = {
   timeout?: number;
   /** Streaming options for handling streaming responses */
   stream?: StreamOptions;
+  /** W3C parent context for a JSON WebSocket call. The host decides whether to use it. */
+  traceparent?: string;
 };
 
 /**
@@ -918,11 +920,14 @@ export class AgentClient<
         transmitted: this.readyState === this.OPEN
       });
 
+      const traceparent =
+        options && "traceparent" in options ? options.traceparent : undefined;
       const request: RPCRequest = {
         args,
         id,
         method,
-        type: MessageType.RPC
+        type: MessageType.RPC,
+        ...(traceparent ? { traceparent } : {})
       };
 
       this.send(JSON.stringify(request));

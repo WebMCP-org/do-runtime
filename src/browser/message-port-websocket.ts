@@ -1,10 +1,11 @@
 import type { RawWebSocket } from "../api/web-socket";
 import type { UpgradeWebSocket } from "../browser";
+import { withWorkerTraceparent } from "../api/cloudflare-workers";
 
 export type MessagePortWebSocketData = string | ArrayBuffer | ArrayBufferView;
 
 export type MessagePortWebSocketWireMessage =
-  | { readonly type: "message"; readonly data: MessagePortWebSocketData }
+  | { readonly type: "message"; readonly data: MessagePortWebSocketData; readonly traceparent?: string }
   | { readonly type: "close"; readonly code: number; readonly reason: string };
 
 /** The far end of a socket the host owns; it absorbs an already-disconnected transport, so callers never retry sends. */
@@ -128,9 +129,11 @@ export class MessagePortWebSocket extends EventTarget implements RawWebSocket {
       return;
     }
     if (this.readyState !== MessagePortWebSocket.OPEN) return;
-    this.#emit(
-      new MessageEvent<MessagePortWebSocketData>("message", { data: message.data }),
-      this.onmessage,
+    withWorkerTraceparent(message.traceparent, () =>
+      this.#emit(
+        new MessageEvent<MessagePortWebSocketData>("message", { data: message.data }),
+        this.onmessage,
+      ),
     );
   }
 
@@ -241,7 +244,12 @@ export type MessagePortWebSocketConstructor = {
 function parseWireMessage(value: unknown): MessagePortWebSocketWireMessage | null {
   if (!isRecord(value)) return null;
   if (value.type === "message" && isWebSocketData(value.data)) {
-    return { type: "message", data: value.data };
+    const traceparent = value.traceparent;
+    return {
+      type: "message",
+      data: value.data,
+      ...(typeof traceparent === "string" && traceparent.length === 55 ? { traceparent } : {}),
+    };
   }
   if (
     value.type === "close" &&

@@ -377,12 +377,14 @@ type Close = Extract<MessagePortWebSocketWireMessage, { type: "close" }>;
 /** A logical capability survives worker eviction, but never deletion of its configuration. */
 export class BrowserWorkerReference<Service> extends RpcTarget {
   constructor(
-    private readonly resolveCurrent: () => Promise<ReturnType<typeof newRpcSession<Service>>>,
+    private readonly resolveCurrent: (
+      traceparent?: string,
+    ) => Promise<ReturnType<typeof newRpcSession<Service>>>,
   ) {
     super();
   }
-  resolve(): Promise<ReturnType<typeof newRpcSession<Service>>> {
-    return this.resolveCurrent();
+  resolve(traceparent?: string): Promise<ReturnType<typeof newRpcSession<Service>>> {
+    return this.resolveCurrent(traceparent);
   }
 }
 
@@ -431,10 +433,14 @@ export class BrowserWorkerSupervisor<
   reference(configuration: Configuration): BrowserWorkerReference<Service> {
     const identity = this.#identity(configuration);
     const epoch = identity.epoch;
-    return new BrowserWorkerReference(() =>
-      this.#resolve(configuration, () => {
-        if (identity.epoch !== epoch) throw new Error("Worker reference is stale after deletion");
-      }),
+    return new BrowserWorkerReference((traceparent) =>
+      this.#resolve(
+        configuration,
+        () => {
+          if (identity.epoch !== epoch) throw new Error("Worker reference is stale after deletion");
+        },
+        traceparent,
+      ),
     );
   }
 
@@ -713,11 +719,12 @@ export class BrowserWorkerSupervisor<
   async #resolve(
     configuration: Configuration,
     assertCurrent: () => void,
+    traceparent?: string,
   ): Promise<ReturnType<typeof newRpcSession<Service>>> {
     assertCurrent();
     await this.waitForDeletion(configuration);
     assertCurrent();
-    const placement = this.#ensure(configuration);
+    const placement = withWorkerTraceparent(traceparent, () => this.#ensure(configuration));
     await placement.ready;
     assertCurrent();
     return placement.service.dup();
