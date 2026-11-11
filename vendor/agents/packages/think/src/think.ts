@@ -168,17 +168,9 @@ import {
 } from "agents";
 
 // The browser runtime can resume a W3C parent after the submission alarm fires.
-const workerTracing = workerRuntime as {
+const workerTracing = workerRuntime as typeof workerRuntime & {
   captureWorkerTraceparent?: () => string | undefined;
   withWorkerTraceparent?: <T>(value: string | null, run: () => T) => T;
-  tracing?: {
-    getActiveSpan?():
-      | {
-          setAttribute(key: string, value: string | number | boolean): void;
-          setStatus(status: { code: "error" }): void;
-        }
-      | undefined;
-  };
 };
 
 const agentToolChunkEncoder = new TextEncoder();
@@ -2933,7 +2925,6 @@ type ThinkSubmissionRow = {
   status: ThinkSubmissionStatus;
   messages_json: string;
   metadata_json: string | null;
-  traceparent: string | null;
   error_message: string | null;
   created_at: number;
   messages_applied_at: number | null;
@@ -12324,9 +12315,9 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
     this._submissionTableEnsured = true;
   }
 
-  private _readSubmission(submissionId: string): ThinkSubmissionRow | null {
+  private _readSubmission(submissionId: string) {
     this._ensureSubmissionTable();
-    const rows = this.sql<ThinkSubmissionRow>`
+    const rows = this.sql<ThinkSubmissionRow & { traceparent: string | null }>`
       SELECT submission_id, idempotency_key, request_id, stream_id, status,
              messages_json, metadata_json, error_message, created_at,
              messages_applied_at, started_at, completed_at, result_status, output_json,
@@ -12346,7 +12337,7 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
       SELECT submission_id, idempotency_key, request_id, stream_id, status,
              messages_json, metadata_json, error_message, created_at,
              messages_applied_at, started_at, completed_at, result_status, output_json,
-             message_id, traceparent
+             message_id
       FROM cf_think_submissions
       WHERE idempotency_key = ${idempotencyKey}
       LIMIT 1
@@ -12382,7 +12373,7 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
       SELECT submission_id, idempotency_key, request_id, stream_id, status,
              messages_json, metadata_json, error_message, created_at,
              messages_applied_at, started_at, completed_at, result_status, output_json,
-             message_id, traceparent
+             message_id
       FROM cf_think_submissions
       ORDER BY created_at DESC, submission_id DESC
       LIMIT ${limit}
@@ -12398,7 +12389,7 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
       SELECT submission_id, idempotency_key, request_id, stream_id, status,
              messages_json, metadata_json, error_message, created_at,
              messages_applied_at, started_at, completed_at, result_status, output_json,
-             message_id, traceparent
+             message_id
       FROM cf_think_submissions
       WHERE status = ${status}
       ORDER BY created_at DESC, submission_id DESC
@@ -12931,7 +12922,7 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
         SELECT submission_id, idempotency_key, request_id, stream_id, status,
                messages_json, metadata_json, error_message, created_at,
                messages_applied_at, started_at, completed_at, result_status, output_json,
-             message_id, traceparent
+               message_id
         FROM cf_think_submissions
         WHERE status = ${status}
         ORDER BY completed_at ASC, created_at ASC
@@ -12943,7 +12934,7 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
       SELECT submission_id, idempotency_key, request_id, stream_id, status,
              messages_json, metadata_json, error_message, created_at,
              messages_applied_at, started_at, completed_at, result_status, output_json,
-             message_id, traceparent
+             message_id
       FROM cf_think_submissions
       WHERE status = ${status}
         AND completed_at IS NOT NULL
@@ -13327,7 +13318,7 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
       const updated = this._readSubmission(row.submission_id);
       if (updated) {
         span?.setAttribute("do_runtime.submission.outcome", updated.status);
-        if (updated.status === "error") span?.setStatus({ code: "error" });
+        if (updated.status === "error") span?.setStatus?.({ code: "error" });
       }
       if (
         finalizedHere &&
@@ -13354,7 +13345,7 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
       SELECT submission_id, idempotency_key, request_id, stream_id, status,
              messages_json, metadata_json, error_message, created_at,
              messages_applied_at, started_at, completed_at, result_status, output_json,
-             message_id, traceparent
+             message_id
       FROM cf_think_submissions
       WHERE status = 'pending'
         OR (${Number(includeUnappliedRunning)} = 1 AND status = 'running' AND messages_applied_at IS NULL)
@@ -13423,7 +13414,7 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
       SELECT submission_id, idempotency_key, request_id, stream_id, status,
              messages_json, metadata_json, error_message, created_at,
              messages_applied_at, started_at, completed_at, result_status, output_json,
-             message_id, traceparent
+             message_id
       FROM cf_think_submissions
       WHERE status = 'running'
     `;
@@ -19433,7 +19424,7 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
       SELECT submission_id, idempotency_key, request_id, stream_id, status,
              messages_json, metadata_json, error_message, created_at,
              messages_applied_at, started_at, completed_at, result_status, output_json,
-             message_id, traceparent
+             message_id
       FROM cf_think_submissions
       WHERE submission_id = ${recoveredRequestId}
          OR (request_id = ${recoveredRequestId} AND status = 'running')
