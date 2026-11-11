@@ -8284,14 +8284,22 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
       crossMajorOptions[agentsAISDKInvocationBounded] = true;
     }
 
-    const boundStreamTextOptions = bindInferenceContext(streamTextOptions);
-    const inferenceStreamText = wrapAISDK(aiSdk, {
-      storeMessages: this.storeMessages,
-      storeTools: this.storeTools
-    }).streamText;
+    // Bind the callbacks after instrumentation wraps them. Then the turn
+    // snapshot is restored before each tool opens its own active span.
+    const inferenceStreamText = wrapAISDK(
+      {
+        streamText: (options: Parameters<typeof aiSdk.streamText>[0]) =>
+          aiSdk.streamText(bindInferenceContext(options)),
+        wrapLanguageModel: aiSdk.wrapLanguageModel
+      },
+      {
+        storeMessages: this.storeMessages,
+        storeTools: this.storeTools
+      }
+    ).streamText;
 
     return () => {
-      const result = inferenceStreamText(boundStreamTextOptions);
+      const result = inferenceStreamText(streamTextOptions);
 
       const outputPromise = wantsStructuredOutput
         ? // Structured workflow result = the `final_answer` tool call's INPUT
