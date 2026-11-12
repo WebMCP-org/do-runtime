@@ -378,8 +378,18 @@ export function configureOtlpTelemetry({
     : undefined;
 
   const onSpanEnd = observeSpans?.({ meter, logger });
+  const workerRecordings = new WeakSet<Span>();
   const spanProcessor: SpanProcessor = {
     onStart() {},
+    onEnding(span) {
+      if (!workerRecordings.has(span)) return;
+      try {
+        workerSpans?.finalizeAttributes?.(span.attributes);
+      } catch {
+        for (const key of Object.keys(span.attributes)) delete span.attributes[key];
+        globalErrorHandler(new Error("OTLP worker attribute policy failed"));
+      }
+    },
     onEnd(span) {
       traces.add(span);
       if (!onSpanEnd) return;
@@ -407,7 +417,9 @@ export function configureOtlpTelemetry({
           : ROOT_CONTEXT;
       const tracer = tracerProvider.getTracer(span.scope);
       const options = span.kind === undefined ? undefined : { kind: span.kind };
-      return new OtelWorkerSpan(tracer.startSpan(span.name, options, context), workerSpans);
+      const recording = tracer.startSpan(span.name, options, context);
+      if (workerSpans.finalizeAttributes) workerRecordings.add(recording);
+      return new OtelWorkerSpan(recording, workerSpans);
     });
   }
   return { tracerProvider, logger, meter, scheduleMetrics: () => reader?.schedule() };

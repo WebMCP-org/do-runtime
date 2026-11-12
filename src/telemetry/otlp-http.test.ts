@@ -4,6 +4,7 @@ import { text } from "node:stream/consumers";
 import { expect, it } from "vitest";
 import { tracing, withWorkerTraceparent } from "../api/cloudflare-workers";
 import {
+  createGenAiInferenceMetrics,
   createOtlpTelemetry,
   type OtlpExportNotice,
   type OtlpHttpConfiguration,
@@ -145,7 +146,11 @@ it("records worker spans under the host policy and rechecks the destination befo
     scope: "test",
     workerSpans: {
       describe: () => ({ name: "worker-operation", scope: "test-worker" }),
-      attribute: (key, value) => key === "operation.count" || key === "error.type" ? value : undefined,
+      attribute: (key, value) =>
+        ["operation.count", "operation.detail", "error.type"].includes(key) ? value : undefined,
+      finalizeAttributes(attributes) {
+        if (attributes["operation.count"] === 1) delete attributes["operation.detail"];
+      },
     },
   });
   const traceId = "1234567890abcdef1234567890abcdef";
@@ -154,6 +159,7 @@ it("records worker spans under the host policy and rechecks the destination befo
     withWorkerTraceparent(`00-${traceId}-${spanId}-01`, (attached) => {
       expect(attached).toBe(true);
       tracing.enterSpan("private operation", (span) => {
+        span.setAttribute("operation.detail", "private in this combination");
         span.setAttribute("operation.count", 1);
         span.setAttribute("private.attribute", "private value");
         span.recordException(new Error("private exception"));
@@ -182,6 +188,57 @@ it("records worker spans under the host policy and rechecks the destination befo
     current = null;
     await tracerProvider.forceFlush();
     expect(received).toHaveLength(1);
+  } finally {
+    await tracerProvider.shutdown();
+    await server.close();
+  }
+});
+
+it("exports inference measurements independently of recorded spans", async () => {
+  const received = new Map<string, string>();
+  const server = await receiver((path, body) => {
+    received.set(path, body);
+    return {};
+  });
+  const configuration = { endpoint: server.endpoint, metrics: true, logs: false };
+  const { tracerProvider, meter } = await createOtlpTelemetry({
+    configuration,
+    readConfiguration: async () => configuration,
+    resourceAttributes: {},
+    scope: "test",
+  });
+  try {
+    if (!meter) throw new Error("Expected enabled metrics");
+    const record = createGenAiInferenceMetrics(meter);
+    record({ provider: "unknown", durationMs: 2_000, firstOutputMs: 500, inputTokens: 8, outputTokens: 5 });
+    record({ provider: "unknown", durationMs: 1_000 });
+    await tracerProvider.forceFlush();
+    expect([...received.keys()]).toEqual(["/v1/metrics"]);
+    expect(JSON.parse(received.get("/v1/metrics") ?? "{}")).toMatchObject({
+      resourceMetrics: [{
+        scopeMetrics: [{
+          metrics: expect.arrayContaining([
+            expect.objectContaining({
+              name: "gen_ai.client.inference.duration",
+              unit: "s",
+              histogram: { aggregationTemporality: 2, dataPoints: [expect.objectContaining({ count: 2, sum: 3 })] },
+            }),
+            expect.objectContaining({
+              name: "gen_ai.client.inference.time_to_first_chunk",
+              unit: "s",
+              histogram: { aggregationTemporality: 2, dataPoints: [expect.objectContaining({ count: 1, sum: 0.5 })] },
+            }),
+            ...(["input", "output"] as const).map((direction) => expect.objectContaining({
+              name: `gen_ai.client.inference.usage.${direction}_tokens`,
+              unit: "{token}",
+              sum: { aggregationTemporality: 2, isMonotonic: true, dataPoints: [expect.objectContaining({
+                asInt: direction === "input" ? 8 : 5,
+              })] },
+            })),
+          ]),
+        }],
+      }],
+    });
   } finally {
     await tracerProvider.shutdown();
     await server.close();

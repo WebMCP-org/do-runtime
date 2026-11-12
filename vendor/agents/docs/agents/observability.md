@@ -311,11 +311,12 @@ Span names use `{operation} {target}` and fall back to the bare operation past
 64 UTF-8 bytes; the full target remains on its semantic attribute. A model
 object is wrapped with the SDK's `wrapLanguageModel` helper, so provider work is
 a `chat {model}` child of the `invoke_agent {agent}` operation span. Tool
-execution is wrapped as `execute_tool {tool}`. Approval lifecycle segments
-appear as bounded `tool_approval {tool}` children of an `execute_tool {tool}`
-span, correlated by `gen_ai.tool.call.id` and carrying
+execution is wrapped as `execute_tool {tool}`. Requested and denied
+`tool_approval {tool}` spans are children of the agent invocation. An approval
+that leads to execution appears under the actual tool span. The approval
+records carry `gen_ai.tool.call.id` and
 `cloudflare.agents.tool.approval.state` (`requested`, `approved`, or `denied`).
-They never remain open while waiting for a human across invocations. Stream
+They close as soon as the approval state is recorded. Stream
 spans close on completion, cancellation, an in-band error, or early consumer
 return. Async-generator tools stay open until iteration ends.
 

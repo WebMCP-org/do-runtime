@@ -4,6 +4,8 @@ import type { ReadableSpan, TracerProvider } from "@opentelemetry/sdk-trace";
 import type { WorkerSpanRecorder } from "./api/cloudflare-workers";
 import { platformTimer } from "./api/platform";
 
+export { createGenAiInferenceMetrics } from "./telemetry/gen-ai";
+
 export interface OtlpHttpConfiguration {
   readonly endpoint: string;
   readonly metrics: boolean;
@@ -18,6 +20,8 @@ type WorkerAttribute = Parameters<WorkerSpanRecorder["setAttribute"]>[1];
 export interface WorkerSpanPolicy {
   describe(name: string): { name: string; scope: string; kind?: SpanKind };
   attribute(key: string, value: WorkerAttribute): WorkerAttribute | undefined;
+  /** Remove individually valid attributes that may only be exported together. */
+  finalizeAttributes?(attributes: Attributes): void;
 }
 
 export interface OtlpExportNotice {

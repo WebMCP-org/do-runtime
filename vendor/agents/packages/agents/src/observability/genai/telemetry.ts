@@ -80,6 +80,8 @@ function normalizeProviderName(
     ["google-vertex", "gcp.vertex_ai"],
     ["amazon-bedrock", "aws.bedrock"],
     ["azure-openai", "azure.ai.openai"],
+    ["openai.compatible", "openai-compatible"],
+    ["openai-compatible", "openai-compatible"],
     ["anthropic", "anthropic"],
     ["openai", "openai"],
     ["azure", "azure.ai.inference"],
@@ -316,8 +318,6 @@ export function toolApprovalSpan(input: {
       [TraceAttribute.Cloudflare.OperationName]: "tool.approval",
       [TraceAttribute.Cloudflare.ToolApprovalState]: input.state,
       ...semanticContextAttributes(input.context),
-      [TraceAttribute.GenAI.OperationName]:
-        TraceAttribute.GenAI.OperationNameValueExecuteTool,
       [TraceAttribute.GenAI.ToolCallID]: input.toolCallId,
       [TraceAttribute.GenAI.ToolName]: input.toolName,
       [TraceAttribute.GenAI.ToolType]: "function"
