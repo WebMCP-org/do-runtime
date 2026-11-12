@@ -12,6 +12,7 @@
     "browser/offscreen-document.ts",
     "index.ts",
     "telemetry.ts",
+    "telemetry/gen-ai.ts",
     "telemetry/otlp-http.ts",
     "gate.ts",
     "vite.ts"
