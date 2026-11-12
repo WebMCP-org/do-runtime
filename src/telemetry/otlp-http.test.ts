@@ -43,10 +43,12 @@ it("reports partial OTLP rejection counts without sending a batch twice", async 
     ["/v1/metrics", { rejectedDataPoints: "2" }],
   ]);
   const requests = new Map<string, number>();
+  const metricBodies: string[] = [];
   const remoteDiagnostic = "private-collector-diagnostic";
-  const server = await receiver((path) => {
+  const server = await receiver((path, body) => {
     const attempt = (requests.get(path) ?? 0) + 1;
     requests.set(path, attempt);
+    if (path === "/v1/metrics") metricBodies.push(body);
     const partialSuccess =
       attempt === 1
         ? rejected.get(path)
@@ -77,7 +79,7 @@ it("reports partial OTLP rejection counts without sending a batch twice", async 
     for (const [signal, dropped] of [
       ["traces", 1],
       ["logs", 3],
-      ["metrics", 0],
+      ["metrics", 2],
     ] as const) {
       expect(notices).toContainEqual(
         expect.objectContaining({ signal, outcome: "rejected", dropped, failures: 1 }),
@@ -86,6 +88,22 @@ it("reports partial OTLP rejection counts without sending a batch twice", async 
     expect(notices).toContainEqual(
       expect.objectContaining({ signal: "metrics", outcome: "recovered", failures: 1 }),
     );
+    expect(JSON.parse(metricBodies[1] ?? "{}")).toMatchObject({
+      resourceMetrics: [{
+        scopeMetrics: [{
+          metrics: expect.arrayContaining([expect.objectContaining({
+            name: "do_runtime.telemetry.export.dropped",
+            sum: expect.objectContaining({ dataPoints: expect.arrayContaining([expect.objectContaining({
+              asDouble: 2,
+              attributes: expect.arrayContaining([
+                { key: "signal", value: { stringValue: "metrics" } },
+                { key: "reason", value: { stringValue: "rejected" } },
+              ]),
+            })]) }),
+          })]),
+        }],
+      }],
+    });
     expect(JSON.stringify(notices)).not.toContain(remoteDiagnostic);
   } finally {
     await tracerProvider.shutdown();

@@ -228,7 +228,13 @@ export function configureOtlpTelemetry({
         const result = await deliver("metrics", () =>
           JsonMetricsSerializer.serializeRequest(metrics),
         );
-        recordDelivery("metrics", result, 0);
+        let pointCount = 0;
+        if (result.outcome !== "accepted") {
+          for (const scope of metrics.scopeMetrics) {
+            for (const metric of scope.metrics) pointCount += metric.dataPoints.length;
+          }
+        }
+        recordDelivery("metrics", result, pointCount);
       })
     : undefined;
   const meter = reader
@@ -264,7 +270,8 @@ export function configureOtlpTelemetry({
   function recordDrop(signal: Signal, reason: DropReason, count: number) {
     health[signal].dropped += count;
     drops?.add(count, { signal, reason });
-    reader?.schedule();
+    // Report metric drops on the next collection to avoid an export loop.
+    if (signal !== "metrics") reader?.schedule();
   }
 
   function recordDelivery(signal: Signal, result: DeliveryResult, count: number) {
