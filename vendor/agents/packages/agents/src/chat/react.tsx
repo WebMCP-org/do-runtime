@@ -383,6 +383,8 @@ export type ChatTurnEndEvent = {
    * end with a user message, or the server no longer has a record of it.
    */
   messageIds?: string[];
+  /** The assistant reply persisted and broadcast before successful completion. */
+  assistantMessageId?: string;
   outcome: Exclude<ChatTurnOutcome, "recovering">;
   /** The error message, when `outcome` is `"error"`. */
   error?: string;
@@ -2134,6 +2136,9 @@ export function useAgentChat<
       const event: ChatTurnEndEvent = {
         requestId: frame.id,
         ...(frame.messageIds ? { messageIds: frame.messageIds } : {}),
+        ...(frame.assistantMessageId !== undefined && {
+          assistantMessageId: frame.assistantMessageId
+        }),
         outcome,
         ...(outcome === "error" && error ? { error } : {}),
         replay: frame.replay === true

@@ -238,7 +238,7 @@ describe("Think — core", () => {
     }
   });
 
-  it("should broadcast RPC chat stream chunks to connected clients", async () => {
+  it("broadcasts the persisted RPC reply before naming it in the terminal frame", async () => {
     const room = "chat-rpc-stream-broadcast";
     const agent = await freshAgent(room);
     await agent.setMultiChunkResponse(["first ", "second"]);
@@ -259,21 +259,26 @@ describe("Think — core", () => {
         };
         return chunk.type === "text-delta" && chunk.delta === "first ";
       });
-      const assistantBroadcast = waitForProtocolMessage(ws, (message) => {
-        const messages = message.messages as UIMessage[] | undefined;
-        return (
+      let persistedReply: UIMessage<ThinkMessageMetadata> | undefined;
+      const terminal = waitForProtocolMessage(ws, (message) => {
+        if (
           message.type === MSG_CHAT_MESSAGES &&
-          Array.isArray(messages) &&
-          messages.length === 2 &&
-          messages[1].role === "assistant"
-        );
+          Array.isArray(message.messages)
+        ) {
+          persistedReply = (
+            message.messages as UIMessage<ThinkMessageMetadata>[]
+          ).find((item) => item.role === "assistant");
+        }
+        return message.type === MSG_CHAT_RESPONSE && message.done === true;
       });
 
       const chat = agent.testChat("Hello from RPC");
 
       await expect(streamChunk).resolves.toBeTruthy();
       await expect(chat).resolves.toMatchObject({ done: true });
-      await expect(assistantBroadcast).resolves.toBeTruthy();
+      const frame = await terminal;
+      expect(persistedReply?.metadata?.status).toBe("completed");
+      expect(frame.assistantMessageId).toBe(persistedReply?.id);
     } finally {
       await closeWS(ws);
     }

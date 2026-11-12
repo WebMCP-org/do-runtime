@@ -15651,6 +15651,10 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
         body: streamError ?? "",
         done: true,
         outcome: response.status,
+        ...(response.status === "completed" &&
+          persistedAssistantId !== undefined && {
+            assistantMessageId: persistedAssistantId
+          }),
         ...(streamError !== undefined && { error: true })
       });
       doneSent = true;
@@ -16434,6 +16438,9 @@ import { createAITools } from "@cloudflare/computer/tools/ai-sdk";
               !streamAborted &&
               persistedMessageId !== undefined
             ) {
+              if (terminalFrame) {
+                terminalFrame.assistantMessageId = persistedMessageId;
+              }
               const capture = waitTurnResultContext.getStore();
               if (capture?.agent === this) {
                 capture.messageIds.set(requestId, persistedMessageId);

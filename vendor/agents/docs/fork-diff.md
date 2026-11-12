@@ -55,6 +55,12 @@ records the decision and scope.
   `terminal-frame-order.test.ts` holds the real assistant cutover and verifies
   that reconnect replay ends with `replayComplete`, then canonical history, then
   `done`; the regression failed before wiring the shared terminal-hold hook.
+- Successful live terminals carry `assistantMessageId` when Think persisted an
+  assistant reply. Agents forwards it on `onTurnEnd`. Rook uses the ID and the
+  stored completion metadata to wait for the reply's React commit before closing
+  a visible chat trace. The RPC chat test verifies the snapshot precedes the
+  matching receipt. Retire the field when the SDK provides a terminal callback
+  synchronized with the rendered transcript for observed turns.
 - No new storage shape, migration, timer, or recovery protocol. The existing
   `discard: false` cutover and start-time reclaim bound retention to the previous
   turn, as already used for agent-tool tailing and reconnect replay.
