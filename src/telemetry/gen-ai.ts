@@ -39,12 +39,14 @@ export function createGenAiInferenceMetrics(meter: Meter) {
 
   // Record once per provider result. The SDK does not report token modality.
   return (measurement: GenAiInferenceMeasurement): void => {
-    const attributes = {
+    const attributes: Record<string, string> = {
       [ATTR_GEN_AI_OPERATION_NAME]: GEN_AI_OPERATION_NAME_VALUE_CHAT,
       [ATTR_GEN_AI_PROVIDER_NAME]: measurement.provider,
-      [ATTR_GEN_AI_RESPONSE_MODEL]: measurement.responseModel,
-      [ATTR_ERROR_TYPE]: measurement.failed ? "_OTHER" : undefined,
     };
+    if (measurement.responseModel !== undefined) {
+      attributes[ATTR_GEN_AI_RESPONSE_MODEL] = measurement.responseModel;
+    }
+    if (measurement.failed) attributes[ATTR_ERROR_TYPE] = "_OTHER";
     if (Number.isFinite(measurement.durationMs) && measurement.durationMs >= 0) {
       duration.record(measurement.durationMs / 1_000, attributes);
     }

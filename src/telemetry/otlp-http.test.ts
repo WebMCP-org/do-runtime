@@ -214,6 +214,10 @@ it("exports inference measurements independently of recorded spans", async () =>
     record({ provider: "unknown", durationMs: 1_000 });
     await tracerProvider.forceFlush();
     expect([...received.keys()]).toEqual(["/v1/metrics"]);
+    const attributes = [
+      { key: "gen_ai.operation.name", value: { stringValue: "chat" } },
+      { key: "gen_ai.provider.name", value: { stringValue: "unknown" } },
+    ];
     expect(JSON.parse(received.get("/v1/metrics") ?? "{}")).toMatchObject({
       resourceMetrics: [{
         scopeMetrics: [{
@@ -221,17 +225,22 @@ it("exports inference measurements independently of recorded spans", async () =>
             expect.objectContaining({
               name: "gen_ai.client.inference.duration",
               unit: "s",
-              histogram: { aggregationTemporality: 2, dataPoints: [expect.objectContaining({ count: 2, sum: 3 })] },
+              histogram: { aggregationTemporality: 2, dataPoints: [expect.objectContaining({
+                attributes, count: 2, sum: 3,
+              })] },
             }),
             expect.objectContaining({
               name: "gen_ai.client.inference.time_to_first_chunk",
               unit: "s",
-              histogram: { aggregationTemporality: 2, dataPoints: [expect.objectContaining({ count: 1, sum: 0.5 })] },
+              histogram: { aggregationTemporality: 2, dataPoints: [expect.objectContaining({
+                attributes, count: 1, sum: 0.5,
+              })] },
             }),
             ...(["input", "output"] as const).map((direction) => expect.objectContaining({
               name: `gen_ai.client.inference.usage.${direction}_tokens`,
               unit: "{token}",
               sum: { aggregationTemporality: 2, isMonotonic: true, dataPoints: [expect.objectContaining({
+                attributes: [...attributes, { key: "gen_ai.token.modality", value: { stringValue: "unknown" } }],
                 asInt: direction === "input" ? 8 : 5,
               })] },
             })),
