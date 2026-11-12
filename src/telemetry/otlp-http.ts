@@ -1,7 +1,6 @@
 import {
   ROOT_CONTEXT,
   SpanStatusCode,
-  isSpanContextValid,
   trace,
   type Span,
 } from "@opentelemetry/api";
@@ -421,10 +420,7 @@ export function configureOtlpTelemetry({
   if (workerSpans) {
     installWorkerTracing((name, parent) => {
       const span = workerSpans.describe(name);
-      const context =
-        parent && isSpanContextValid(parent)
-          ? trace.setSpanContext(ROOT_CONTEXT, parent)
-          : ROOT_CONTEXT;
+      const context = parent ? trace.setSpanContext(ROOT_CONTEXT, parent) : ROOT_CONTEXT;
       const tracer = tracerProvider.getTracer(span.scope);
       const options = span.kind === undefined ? undefined : { kind: span.kind };
       const recording = tracer.startSpan(span.name, options, context);
