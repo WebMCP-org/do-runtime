@@ -9,6 +9,7 @@ import {
   JsonLogsSerializer,
   JsonMetricsSerializer,
   JsonTraceSerializer,
+  MetricsExporterMetricsHelper,
 } from "@opentelemetry/otlp-transformer";
 import { resourceFromAttributes } from "@opentelemetry/resources";
 import { LoggerProvider, type ReadableLogRecord } from "@opentelemetry/sdk-logs";
@@ -228,12 +229,9 @@ export function configureOtlpTelemetry({
         const result = await deliver("metrics", () =>
           JsonMetricsSerializer.serializeRequest(metrics),
         );
-        let pointCount = 0;
-        if (result.outcome !== "accepted") {
-          for (const scope of metrics.scopeMetrics) {
-            for (const metric of scope.metrics) pointCount += metric.dataPoints.length;
-          }
-        }
+        const pointCount = result.outcome === "accepted"
+          ? 0
+          : MetricsExporterMetricsHelper.countItems(metrics);
         recordDelivery("metrics", result, pointCount);
       })
     : undefined;
