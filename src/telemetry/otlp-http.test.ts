@@ -1,6 +1,7 @@
 import { once } from "node:events";
 import { createServer } from "node:http";
 import { text } from "node:stream/consumers";
+import { ValueType, type Attributes } from "@opentelemetry/api";
 import { expect, it } from "vitest";
 import { tracing, withWorkerTraceparent } from "../api/cloudflare-workers";
 import {
@@ -131,6 +132,93 @@ it("flushes the current batch and drains later queued spans on shutdown", async 
   expect(received[1]).toContain('"name":"queued-behind-first"');
 });
 
+it.each(["forceFlush", "shutdown"] as const)("exports final batch drops during %s", async (finish) => {
+  const metrics: string[] = [];
+  const server = await receiver((path, body) => {
+    if (path === "/v1/traces") return { partialSuccess: { rejectedSpans: "1" } };
+    if (path === "/v1/metrics") metrics.push(body);
+    return {};
+  });
+  const configuration = { endpoint: server.endpoint, metrics: true, logs: false };
+  const { tracerProvider } = await createOtlpTelemetry({
+    configuration,
+    readConfiguration: async () => configuration,
+    resourceAttributes: {},
+    scope: "test",
+  });
+  try {
+    tracerProvider.getTracer("test").startSpan("operation").end();
+    await tracerProvider[finish]();
+    expect(metrics).toHaveLength(1);
+    expect(JSON.parse(metrics[0] ?? "{}")).toMatchObject({
+      resourceMetrics: [{
+        scopeMetrics: [{
+          metrics: expect.arrayContaining(["dropped", "failures"].map((instrument) =>
+            expect.objectContaining({
+              name: `do_runtime.telemetry.export.${instrument}`,
+              sum: expect.objectContaining({ dataPoints: [expect.objectContaining({ asDouble: 1 })] }),
+            }),
+          )),
+        }],
+      }],
+    });
+  } finally {
+    if (finish === "forceFlush") await tracerProvider.shutdown();
+    await server.close();
+  }
+}, 12_000);
+
+it("flushes measurements recorded during an in-flight metric export", async () => {
+  const firstReceived = Promise.withResolvers<void>();
+  const releaseFirst = Promise.withResolvers<void>();
+  const received: string[] = [];
+  const server = await receiver(async (path, body) => {
+    if (path === "/v1/metrics") {
+      received.push(body);
+      if (received.length === 1) {
+        firstReceived.resolve();
+        await releaseFirst.promise;
+      }
+    }
+    return {};
+  });
+  const configuration = { endpoint: server.endpoint, metrics: true, logs: false };
+  const { meter, tracerProvider } = await createOtlpTelemetry({
+    configuration,
+    readConfiguration: async () => configuration,
+    resourceAttributes: {},
+    scope: "test",
+  });
+  try {
+    if (!meter) throw new Error("Expected enabled metrics");
+    const count = meter.createCounter("test.measurements", { valueType: ValueType.INT });
+    count.add(1);
+    const first = tracerProvider.forceFlush();
+    await firstReceived.promise;
+    count.add(2);
+    const second = tracerProvider.forceFlush();
+    releaseFirst.resolve();
+    await Promise.all([first, second]);
+    expect(received).toHaveLength(2);
+    expect(JSON.parse(received[1] ?? "{}")).toMatchObject({
+      resourceMetrics: [{
+        scopeMetrics: [{
+          metrics: expect.arrayContaining([
+            expect.objectContaining({
+              name: "test.measurements",
+              sum: expect.objectContaining({ dataPoints: [expect.objectContaining({ asInt: 3 })] }),
+            }),
+          ]),
+        }],
+      }],
+    });
+  } finally {
+    releaseFirst.resolve();
+    await tracerProvider.shutdown();
+    await server.close();
+  }
+});
+
 it("records worker spans under the host policy and rechecks the destination before export", async () => {
   const received: string[] = [];
   const server = await receiver((_path, body) => {
@@ -139,6 +227,8 @@ it("records worker spans under the host policy and rechecks the destination befo
   });
   const configuration = { endpoint: server.endpoint, metrics: false, logs: false };
   let current: OtlpHttpConfiguration | null = configuration;
+  let finalized: Attributes | undefined;
+  let observed: Attributes | undefined;
   const { tracerProvider } = await createOtlpTelemetry({
     configuration,
     readConfiguration: async () => current,
@@ -150,7 +240,12 @@ it("records worker spans under the host policy and rechecks the destination befo
         ["operation.count", "operation.detail", "error.type"].includes(key) ? value : undefined,
       finalizeAttributes(attributes) {
         if (attributes["operation.count"] === 1) delete attributes["operation.detail"];
+        attributes["operation.count"] = "private replacement";
+        finalized = attributes;
       },
+    },
+    observeSpans: () => (span) => {
+      observed = span.attributes;
     },
   });
   const traceId = "1234567890abcdef1234567890abcdef";
@@ -165,6 +260,9 @@ it("records worker spans under the host policy and rechecks the destination befo
         span.recordException(new Error("private exception"));
       });
     });
+    if (!finalized || !observed) throw new Error("Expected finalized and observed attributes");
+    finalized["operation.detail"] = "private late attribute";
+    Reflect.set(observed, "private.attribute", "private observed attribute");
     await tracerProvider.forceFlush();
     expect(received).toHaveLength(1);
     expect(JSON.parse(received[0] ?? "{}")).toMatchObject({
@@ -176,12 +274,14 @@ it("records worker spans under the host policy and rechecks the destination befo
             traceId,
             parentSpanId: spanId,
             status: { code: 2 },
+            attributes: [
+              { key: "operation.count", value: { intValue: 1 } },
+              { key: "error.type", value: { stringValue: "error" } },
+            ],
           }],
         }],
       }],
     });
-    expect(received[0]).toContain('"key":"operation.count"');
-    expect(received[0]).toContain('"key":"error.type"');
     expect(received[0]).not.toContain("private");
 
     tracing.startSpan("revoked").end();

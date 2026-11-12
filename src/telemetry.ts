@@ -20,7 +20,7 @@ type WorkerAttribute = Parameters<WorkerSpanRecorder["setAttribute"]>[1];
 export interface WorkerSpanPolicy {
   describe(name: string): { name: string; scope: string; kind?: SpanKind };
   attribute(key: string, value: WorkerAttribute): WorkerAttribute | undefined;
-  /** Remove individually valid attributes that may only be exported together. */
+  /** Delete attributes from this copy to omit them from the span. */
   finalizeAttributes?(attributes: Attributes): void;
 }
 

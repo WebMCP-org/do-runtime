@@ -90,10 +90,10 @@ function wrapTool(
   ) => unknown;
 
   wrappedTool.execute = (...args) => {
+    const toolCallId = extractToolCallId(args[1]);
     const span = toolCallSpan({
       context,
-      operation: "tool.execute",
-      toolCallId: extractToolCallId(args[1]),
+      toolCallId,
       toolName
     });
     const attributes = {
@@ -110,7 +110,6 @@ function wrapTool(
         // the consumer's next() call sites) can be re-entered into the tool
         // span's async context.
         const inSpanContext = AsyncLocalStorage.snapshot() as ContextSnapshot;
-        const toolCallId = extractToolCallId(args[1]);
         const approval = approvalResponseForOptions(args[1], toolCallId);
         if (
           approval?.approved === true ||

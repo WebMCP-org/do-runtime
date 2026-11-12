@@ -81,9 +81,8 @@ function exportHealth() {
 }
 
 class PlatformMetricReader extends MetricReader {
-  private pending: Promise<void> | undefined;
-  private sending: Promise<void> | undefined;
-  private dirty = false;
+  private timer: ReturnType<typeof platform.setTimeout> | undefined;
+  private sending = Promise.resolve();
   private closed = false;
 
   constructor(private readonly send: (metrics: ResourceMetrics) => Promise<void>) {
@@ -91,35 +90,32 @@ class PlatformMetricReader extends MetricReader {
   }
 
   schedule(): void {
-    if (this.closed) return;
-    this.dirty = true;
-    this.pending ??= platformTimer
-      .afterDelay(metricsDelayMs)
-      .then(() => this.onForceFlush())
-      .catch(() => undefined)
-      .finally(() => {
-        this.pending = undefined;
-        if (this.dirty) this.schedule();
+    if (this.closed || this.timer !== undefined) return;
+    const timer = platform.setTimeout(() => {
+      void this.onForceFlush(timer).catch(() => {
+        globalErrorHandler(new Error("OTLP metric collection failed"));
       });
+    }, metricsDelayMs);
+    this.timer = timer;
   }
 
-  protected onForceFlush(): Promise<void> {
-    if (this.sending) return this.sending;
-    this.dirty = false;
-    this.sending = this.collect()
-      .then(async ({ resourceMetrics }) => {
-        if (resourceMetrics.scopeMetrics.length) await this.send(resourceMetrics);
-      })
-      .finally(() => {
-        this.sending = undefined;
-      });
-    return this.sending;
+  protected onForceFlush(scheduled?: ReturnType<typeof platform.setTimeout>): Promise<void> {
+    const collect = async () => {
+      // An explicit flush can consume the work of a timer queued behind another export.
+      if (scheduled !== undefined && (this.closed || this.timer !== scheduled)) return;
+      if (this.timer !== undefined) {
+        platform.clearTimeout(this.timer);
+        this.timer = undefined;
+      }
+      const { resourceMetrics } = await this.collect();
+      if (resourceMetrics.scopeMetrics.length) await this.send(resourceMetrics);
+    };
+    return (this.sending = this.sending.then(collect, collect));
   }
 
-  protected async onShutdown(): Promise<void> {
+  protected onShutdown(): Promise<void> {
     this.closed = true;
-    await this.pending;
-    await this.sending;
+    return this.onForceFlush();
   }
 }
 
@@ -379,18 +375,29 @@ export function configureOtlpTelemetry({
 
   const onSpanEnd = observeSpans?.({ meter, logger });
   const workerRecordings = new WeakSet<Span>();
+  let stopping: Promise<void> | undefined;
   const spanProcessor: SpanProcessor = {
     onStart() {},
     onEnding(span) {
       if (!workerRecordings.has(span)) return;
-      try {
-        workerSpans?.finalizeAttributes?.(span.attributes);
-      } catch {
-        for (const key of Object.keys(span.attributes)) delete span.attributes[key];
-        globalErrorHandler(new Error("OTLP worker attribute policy failed"));
+      const { attributes } = span;
+      if (workerSpans?.finalizeAttributes) {
+        // The host can remove attributes without rewriting the values the policy admitted.
+        const finalized = { ...attributes };
+        try {
+          workerSpans.finalizeAttributes(finalized);
+          for (const key of Object.keys(attributes)) {
+            if (!Object.hasOwn(finalized, key)) delete attributes[key];
+          }
+        } catch {
+          for (const key of Object.keys(attributes)) delete attributes[key];
+          globalErrorHandler(new Error("OTLP worker attribute policy failed"));
+        }
       }
+      Object.freeze(attributes);
     },
     onEnd(span) {
+      if (stopping) return;
       traces.add(span);
       if (!onSpanEnd) return;
       try {
@@ -401,10 +408,13 @@ export function configureOtlpTelemetry({
       reader?.schedule();
     },
     async forceFlush() {
-      await Promise.all([traces.forceFlush(), logs?.forceFlush(), reader?.forceFlush()]);
+      await Promise.all([traces.forceFlush(), logs?.forceFlush()]);
+      await (stopping ?? reader?.forceFlush());
     },
-    async shutdown() {
-      await Promise.all([traces.shutdown(), logs?.shutdown(), reader?.shutdown()]);
+    shutdown() {
+      return (stopping ??= Promise.all([traces.shutdown(), logs?.shutdown()]).then(() =>
+        reader?.shutdown(),
+      ));
     },
   };
   const tracerProvider = new TracerProvider({ resource, spanProcessors: [spanProcessor] });
@@ -418,7 +428,7 @@ export function configureOtlpTelemetry({
       const tracer = tracerProvider.getTracer(span.scope);
       const options = span.kind === undefined ? undefined : { kind: span.kind };
       const recording = tracer.startSpan(span.name, options, context);
-      if (workerSpans.finalizeAttributes) workerRecordings.add(recording);
+      workerRecordings.add(recording);
       return new OtelWorkerSpan(recording, workerSpans);
     });
   }
