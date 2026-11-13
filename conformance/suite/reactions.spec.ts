@@ -3,8 +3,8 @@
  *
  * workerd runs every reaction inside the IoContext that drains it, so a
  * `.then(...)` registered by an event and left unawaited can touch storage
- * after that event returned. The reading request is a separate event; what it
- * sees shows where the gate opened.
+ * after that event returned. An overlapping read can see a prefix while the
+ * workerd test pool dispatches both RPCs. A separate read observes completion.
  */
 
 import { expect, it } from "vitest";
@@ -12,12 +12,19 @@ import { host } from "conformance:host";
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 80));
 
-it("§1.2 a detached reaction chain on storage promises runs before the next event", async () => {
+it("§1.2 a detached reaction chain on storage promises writes in order", async () => {
   const probe = await host.spawn("reaction-storage");
+  const keys = ["r1", "r2", "r3"];
+  const complete = { values: ["a", "b", "c"], errors: [] };
   const first = probe.post("detachedStorageReaction");
-  const read = probe.post("readReactions", ["r1", "r2", "r3"]);
+  const read = probe.post("readReactions", keys);
   expect(await first.settled).toBe("returned");
-  expect(await read.settled).toEqual({ values: ["a", "b", "c"], errors: [] });
+  expect([
+    { values: ["a", null, null], errors: [] },
+    { values: ["a", "b", null], errors: [] },
+    complete,
+  ]).toContainEqual(await read.settled);
+  await expect.poll(() => probe.call("readReactions", keys)).toEqual(complete);
 });
 
 it("§1.2 a detached reaction that awaits a timer releases the gate and resumes gated", async () => {
@@ -37,12 +44,15 @@ it("§1.2 a reaction on a setTimeout promise runs gated", async () => {
   expect(await probe.call("readReactions", ["s1"])).toEqual({ values: ["a"], errors: [] });
 });
 
-it("§1.2 catch and finally reactions on a rejected promise run before the next event", async () => {
+it("§1.2 detached catch and finally reactions on a rejected promise write in order", async () => {
   const probe = await host.spawn("reaction-rejection");
+  const keys = ["j1", "j2"];
+  const complete = { values: ["a", "b"], errors: [] };
   const first = probe.post("detachedRejectionReaction");
-  const read = probe.post("readReactions", ["j1", "j2"]);
-  await first.settled;
-  expect(await read.settled).toEqual({ values: ["a", "b"], errors: [] });
+  const read = probe.post("readReactions", keys);
+  expect(await first.settled).toBe("returned");
+  expect([{ values: ["a", null], errors: [] }, complete]).toContainEqual(await read.settled);
+  await expect.poll(() => probe.call("readReactions", keys)).toEqual(complete);
 });
 
 it("§1.2 a reaction registered by one event and resolved by another runs in the resolving event", async () => {

@@ -1,4 +1,9 @@
-import { RpcTarget } from "../api/cloudflare-workers";
+import {
+  RpcTarget,
+  captureWorkerTraceparent,
+  tracing,
+  withWorkerTraceparent,
+} from "../api/cloudflare-workers";
 import type { RehydratedWebSocket } from "../api/web-socket";
 import type { FacetStartRequest } from "../server/actor-container";
 import type { HibernationAutoResponse } from "../server/hibernation-mirror";
@@ -51,6 +56,7 @@ export type BrowserWorkerMessage<Configuration> =
       readonly agentPort: MessagePort;
       readonly hostPort: MessagePort;
       readonly rehydration?: WorkerRehydrationSnapshot;
+      readonly traceparent?: string;
     }
   | {
       readonly type: "connect";
@@ -176,6 +182,7 @@ function parseBrowserWorkerMessage<Configuration>(
       configuration: parseConfiguration(value.configuration),
       agentPort: value.agentPort,
       hostPort: value.hostPort,
+      ...(typeof value.traceparent === "string" ? { traceparent: value.traceparent } : {}),
       ...(rehydration === undefined ? {} : { rehydration }),
     };
   }
@@ -246,7 +253,9 @@ export function serveBrowserWorker<Configuration, Host>(
     initialized = true;
     try {
       const host = sessions.use(newRpcSession<Host>(message.hostPort));
-      const target = await options.initialize(message.configuration, host, message.rehydration);
+      const target = await withWorkerTraceparent(message.traceparent, () =>
+        options.initialize(message.configuration, host, message.rehydration),
+      );
       if (disposed) throw new Error("Browser worker bootstrap was disposed");
       sessions.use(newRpcSession(message.agentPort, target));
       ready.resolve();
@@ -368,12 +377,14 @@ type Close = Extract<MessagePortWebSocketWireMessage, { type: "close" }>;
 /** A logical capability survives worker eviction, but never deletion of its configuration. */
 export class BrowserWorkerReference<Service> extends RpcTarget {
   constructor(
-    private readonly resolveCurrent: () => Promise<ReturnType<typeof newRpcSession<Service>>>,
+    private readonly resolveCurrent: (
+      traceparent?: string,
+    ) => Promise<ReturnType<typeof newRpcSession<Service>>>,
   ) {
     super();
   }
-  resolve(): Promise<ReturnType<typeof newRpcSession<Service>>> {
-    return this.resolveCurrent();
+  resolve(traceparent?: string): Promise<ReturnType<typeof newRpcSession<Service>>> {
+    return this.resolveCurrent(traceparent);
   }
 }
 
@@ -422,10 +433,14 @@ export class BrowserWorkerSupervisor<
   reference(configuration: Configuration): BrowserWorkerReference<Service> {
     const identity = this.#identity(configuration);
     const epoch = identity.epoch;
-    return new BrowserWorkerReference(() =>
-      this.#resolve(configuration, () => {
-        if (identity.epoch !== epoch) throw new Error("Worker reference is stale after deletion");
-      }),
+    return new BrowserWorkerReference((traceparent) =>
+      this.#resolve(
+        configuration,
+        () => {
+          if (identity.epoch !== epoch) throw new Error("Worker reference is stale after deletion");
+        },
+        traceparent,
+      ),
     );
   }
 
@@ -598,95 +613,108 @@ export class BrowserWorkerSupervisor<
   }
 
   #spawn(configuration: Configuration, key: string): Placement<Configuration, Service> {
-    const worker = this.#options.createWorker(configuration);
-    const host = new MessageChannel();
-    const agent = new MessageChannel();
-    const readiness = Promise.withResolvers<void>();
-    void readiness.promise.catch(() => undefined);
-    let placement: Placement<Configuration, Service>;
-    try {
-      placement = {
-        configuration,
-        key,
-        worker,
-        readiness,
-        ready: readiness.promise,
-        readyNow: false,
-        idle: false,
-        hostSession: newRpcSession(
-          host.port1,
-          this.#options.hostExports(configuration, {
-            reportLifecycle: (state) => {
-              if (placement) this.#reportLifecycle(placement, state);
-            },
-          }),
-        ),
-        service: newRpcSession<Service>(agent.port1),
-      };
-    } catch (error) {
-      host.port1.close();
-      host.port2.close();
-      agent.port1.close();
-      agent.port2.close();
-      worker.terminate();
-      throw error;
-    }
-    this.#workers.set(key, placement);
-    worker.addEventListener("message", (event: MessageEvent<unknown>) => {
-      if (!this.#isCurrent(placement)) return;
-      const message = parseBrowserWorkerEvent(event.data);
-      if (!message) {
-        console.warn(`Worker ${key} sent an invalid event`, describeWorkerEvent(event.data));
-        return;
-      }
-      if (message.type === "failed") this.#discard(placement, message.message, false);
-      else {
-        placement.readyNow = true;
-        readiness.resolve();
-        this.#flush(placement);
+    return tracing.startActiveSpan("do_runtime.worker.start", (span) => {
+      const fail = () => span.setStatus({ code: "error" }).end();
+      try {
+        const traceparent = captureWorkerTraceparent();
+        const worker = this.#options.createWorker(configuration);
+        const host = new MessageChannel();
+        const agent = new MessageChannel();
+        const readiness = Promise.withResolvers<void>();
+        void readiness.promise.catch(() => undefined);
+        let placement: Placement<Configuration, Service>;
+        try {
+          placement = {
+            configuration,
+            key,
+            worker,
+            readiness,
+            ready: readiness.promise,
+            readyNow: false,
+            idle: false,
+            hostSession: newRpcSession(
+              host.port1,
+              this.#options.hostExports(configuration, {
+                reportLifecycle: (state) => {
+                  if (placement) this.#reportLifecycle(placement, state);
+                },
+              }),
+            ),
+            service: newRpcSession<Service>(agent.port1),
+          };
+        } catch (error) {
+          host.port1.close();
+          host.port2.close();
+          agent.port1.close();
+          agent.port2.close();
+          worker.terminate();
+          throw error;
+        }
+        this.#workers.set(key, placement);
+        worker.addEventListener("message", (event: MessageEvent<unknown>) => {
+          if (!this.#isCurrent(placement)) return;
+          const message = parseBrowserWorkerEvent(event.data);
+          if (!message) {
+            console.warn(`Worker ${key} sent an invalid event`, describeWorkerEvent(event.data));
+            return;
+          }
+          if (message.type === "failed") this.#discard(placement, message.message, false);
+          else {
+            placement.readyNow = true;
+            readiness.resolve();
+            this.#flush(placement);
+          }
+        });
+        worker.addEventListener("error", (event) =>
+          this.#discard(placement, event.message || `Worker ${key} failed`, false),
+        );
+        worker.addEventListener("messageerror", () =>
+          this.#discard(placement, `Worker ${key} could not deserialize a message`, false),
+        );
+        const snapshot = this.#hibernated.get(key);
+        this.#hibernated.delete(key);
+        try {
+          let restored: { snapshot: WorkerRehydrationSnapshot; ports: MessagePort[] } | undefined;
+          if (snapshot) {
+            if (this.#describesLiveSockets(key, snapshot)) restored = this.#rehydrate(key, snapshot);
+            else this.#endSockets(key, 1011, "Worker snapshot no longer matches its transports");
+          }
+          worker.postMessage(
+            {
+              type: "initialize",
+              configuration,
+              agentPort: agent.port2,
+              hostPort: host.port2,
+              ...(traceparent === undefined ? {} : { traceparent }),
+              ...(restored ? { rehydration: restored.snapshot } : {}),
+            } satisfies BrowserWorkerMessage<Configuration>,
+            [agent.port2, host.port2, ...(restored?.ports ?? [])],
+          );
+        } catch (error) {
+          agent.port2.close();
+          host.port2.close();
+          this.#discard(placement, String(error), false);
+          throw error;
+        }
+        // Sockets can buffer while startup is waiting for the worker's acknowledgement.
+        void readiness.promise.then(() => span.end(), fail);
+        return placement;
+      } catch (error) {
+        fail();
+        throw error;
       }
     });
-    worker.addEventListener("error", (event) =>
-      this.#discard(placement, event.message || `Worker ${key} failed`, false),
-    );
-    worker.addEventListener("messageerror", () =>
-      this.#discard(placement, `Worker ${key} could not deserialize a message`, false),
-    );
-    const snapshot = this.#hibernated.get(key);
-    this.#hibernated.delete(key);
-    try {
-      let restored: { snapshot: WorkerRehydrationSnapshot; ports: MessagePort[] } | undefined;
-      if (snapshot) {
-        if (this.#describesLiveSockets(key, snapshot)) restored = this.#rehydrate(key, snapshot);
-        else this.#endSockets(key, 1011, "Worker snapshot no longer matches its transports");
-      }
-      worker.postMessage(
-        {
-          type: "initialize",
-          configuration,
-          agentPort: agent.port2,
-          hostPort: host.port2,
-          ...(restored ? { rehydration: restored.snapshot } : {}),
-        } satisfies BrowserWorkerMessage<Configuration>,
-        [agent.port2, host.port2, ...(restored?.ports ?? [])],
-      );
-    } catch (error) {
-      agent.port2.close();
-      host.port2.close();
-      this.#discard(placement, String(error), false);
-      throw error;
-    }
-    return placement;
   }
 
   async #resolve(
     configuration: Configuration,
     assertCurrent: () => void,
+    traceparent?: string,
   ): Promise<ReturnType<typeof newRpcSession<Service>>> {
     assertCurrent();
     await this.waitForDeletion(configuration);
     assertCurrent();
-    const placement = this.#ensure(configuration);
+    const placement = withWorkerTraceparent(traceparent, () => this.#ensure(configuration));
     await placement.ready;
     assertCurrent();
     return placement.service.dup();

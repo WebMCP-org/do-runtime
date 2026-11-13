@@ -44,6 +44,8 @@
  * docs/decisions.md.
  */
 
+import { INVALID_SPAN_CONTEXT, isSpanContextValid, type SpanContext } from "@opentelemetry/api";
+import { globalErrorHandler, parseTraceParent } from "@opentelemetry/core";
 import { asyncContext, withAsyncContext } from "../util/async-context";
 
 // =======================================================================================
@@ -405,7 +407,7 @@ export const cache: CacheContext = boundaryObject(CACHE_UNIMPLEMENTED_MESSAGE);
 /** The host owns sampling and recording. The runtime owns span lifetimes and scope. */
 export interface WorkerSpanRecorder {
   readonly isTraced: boolean;
-  spanContext(): TracingSpanContext;
+  spanContext(): SpanContext;
   setAttribute(key: string, value: boolean | number | string): void;
   setStatus(status: TracingSpanStatus): void;
   updateName(name: string): void;
@@ -413,18 +415,12 @@ export interface WorkerSpanRecorder {
   end(): void;
 }
 
-type StartWorkerSpan = (name: string, parent?: TracingSpanContext) => WorkerSpanRecorder | undefined;
+type StartWorkerSpan = (name: string, parent?: SpanContext) => WorkerSpanRecorder | undefined;
 
 const SPAN_CONSTRUCTION = Symbol("Span");
-const RECORD_SPAN = Symbol.for("@mcp-b/do-runtime/record-worker-span");
-const recording = globalThis as typeof globalThis & { [RECORD_SPAN]?: StartWorkerSpan };
-
-/** Install one recorder for this worker realm, including any separately bundled facets. */
-export function installWorkerTracing(startSpan: StartWorkerSpan): void {
-  if (recording[RECORD_SPAN] && recording[RECORD_SPAN] !== startSpan) {
-    throw new TypeError("Worker tracing already has a recorder");
-  }
-  recording[RECORD_SPAN] = startSpan;
+function reportWorkerRecorderFailure(): void {
+  // Recorder errors can contain operation data. Report only the failure.
+  globalErrorHandler(new Error("Worker span recorder failed"));
 }
 
 class Span {
@@ -435,23 +431,21 @@ class Span {
   }
 
   get isTraced(): boolean {
-    return !this.#ended && (this.recorder?.isTraced ?? false);
+    return !this.#ended && (this.#record((recorder) => recorder.isTraced) ?? false);
   }
 
   // ← workerd ec93d7032: identity is returned by value and survives end().
   spanContext(): TracingSpanContext {
-    const context = this.recorder?.spanContext();
-    return context
-      ? { ...context }
-      : { traceId: "0".repeat(32), spanId: "0".repeat(16), traceFlags: 0 };
+    return { ...(this.#record((recorder) => recorder.spanContext()) ?? INVALID_SPAN_CONTEXT) };
   }
 
   setAttribute(key: string, value: boolean | number | string): this {
-    if (!this.#ended) this.recorder?.setAttribute(key, value);
+    if (!this.#ended) this.#record((recorder) => recorder.setAttribute(key, value));
     return this;
   }
 
   setAttributes(attributes: Record<string, boolean | number | string | undefined>): this {
+    if (this.#ended || !this.recorder) return this;
     for (const [key, value] of Object.entries(attributes)) {
       if (value !== undefined) this.setAttribute(key, value);
     }
@@ -459,7 +453,7 @@ class Span {
   }
 
   updateName(name: string): this {
-    if (!this.#ended) this.recorder?.updateName(name);
+    if (!this.#ended) this.#record((recorder) => recorder.updateName(name));
     return this;
   }
 
@@ -469,48 +463,98 @@ class Span {
     if (code !== "unset" && code !== "ok" && code !== "error") {
       throw new TypeError("Span status code must be 'unset', 'ok', or 'error'.");
     }
-    if (!this.#ended) this.recorder?.setStatus(status);
+    if (!this.#ended) this.#record((recorder) => recorder.setStatus(status));
     return this;
   }
 
   recordException(exception: unknown): void {
-    if (!this.#ended) this.recorder?.recordException(exception);
+    if (!this.#ended) this.#record((recorder) => recorder.recordException(exception));
   }
 
   end(): void {
     if (this.#ended) return;
     this.#ended = true;
-    this.recorder?.end();
+    this.#record((recorder) => recorder.end());
+  }
+
+  #record<T>(run: (recorder: WorkerSpanRecorder) => T): T | undefined {
+    if (!this.recorder) return;
+    try {
+      return run(this.recorder);
+    } catch {
+      reportWorkerRecorderFailure();
+    }
   }
 }
 
 // ← Workerd's AsyncContextFrame::StorageScope. Browser continuations use
 // the runtime's await transform, while Node has native AsyncLocalStorage.
-const ACTIVE_SPAN = Symbol.for("@mcp-b/do-runtime/active-span");
+type TraceScope = { readonly span?: Span; readonly parent: SpanContext | undefined };
+const TRACE_SCOPE = Symbol.for("@mcp-b/do-runtime/trace-scope");
 type AsyncScope<T> = {
   getStore(): T | undefined;
   run<Result>(store: T, run: () => Result): Result;
 };
 type NativeAsyncHooks = { AsyncLocalStorage: new <T>() => AsyncScope<T> };
-const nodeScopes = globalThis as typeof globalThis & { [ACTIVE_SPAN]?: AsyncScope<Span> };
 const nodeHost = globalThis as {
   process?: { getBuiltinModule?: (name: string) => unknown };
 };
 const nodeAsyncHooks = nodeHost.process?.getBuiltinModule?.("node:async_hooks") as
   | NativeAsyncHooks
   | undefined;
-const nodeScope = nodeAsyncHooks
-  ? (nodeScopes[ACTIVE_SPAN] ??= new nodeAsyncHooks.AsyncLocalStorage<Span>())
-  : undefined;
 
-function getActiveSpan(): Span | undefined {
-  if (nodeScope) return nodeScope.getStore();
-  return asyncContext.current.get(ACTIVE_SPAN) as Span | undefined;
+// Separately bundled facets share a constructor, recorder, and native scope.
+const TRACING_REALM = Symbol.for("@mcp-b/do-runtime/tracing-realm");
+type TracingRealm = {
+  readonly Span: typeof Span;
+  readonly create: (recorder?: WorkerSpanRecorder) => Span;
+  readonly nodeScope: AsyncScope<TraceScope> | undefined;
+  startRecordingSpan?: StartWorkerSpan;
+};
+const tracingGlobals = globalThis as typeof globalThis & { [TRACING_REALM]?: TracingRealm };
+const realm = (tracingGlobals[TRACING_REALM] ??= {
+  Span,
+  create: (recorder) => new Span(SPAN_CONSTRUCTION, recorder),
+  nodeScope: nodeAsyncHooks && new nodeAsyncHooks.AsyncLocalStorage<TraceScope>(),
+});
+
+/** Install one recorder for this worker realm, including any separately bundled facets. */
+export function installWorkerTracing(startSpan: StartWorkerSpan): () => void {
+  if (realm.startRecordingSpan && realm.startRecordingSpan !== startSpan) {
+    throw new TypeError("Worker tracing already has a recorder");
+  }
+  realm.startRecordingSpan = startSpan;
+  return () => {
+    if (realm.startRecordingSpan === startSpan) delete realm.startRecordingSpan;
+  };
 }
 
-function startSpan(name: string): Span {
-  const recorder = recording[RECORD_SPAN]?.(name, getActiveSpan()?.spanContext());
-  return new Span(SPAN_CONSTRUCTION, recorder);
+function currentTraceScope(): TraceScope | undefined {
+  if (realm.nodeScope) return realm.nodeScope.getStore();
+  return asyncContext.current.get(TRACE_SCOPE) as TraceScope | undefined;
+}
+
+function runInTraceScope<T>(scope: TraceScope, run: () => T): T {
+  if (realm.nodeScope) return realm.nodeScope.run(scope, run);
+  const context = new Map(asyncContext.current);
+  context.set(TRACE_SCOPE, scope);
+  return withAsyncContext(context, run);
+}
+
+function currentParent(): SpanContext | undefined {
+  const scope = currentTraceScope();
+  const active = scope?.span?.spanContext();
+  return active && isSpanContextValid(active) ? active : scope?.parent;
+}
+
+function createSpan(name: string, parent: SpanContext | undefined): Span {
+  let recorder: WorkerSpanRecorder | undefined;
+  try {
+    recorder = realm.startRecordingSpan?.(name, parent);
+  } catch {
+    reportWorkerRecorderFailure();
+  }
+  return realm.create(recorder);
 }
 
 function startActiveSpan<T, A extends unknown[]>(
@@ -518,35 +562,78 @@ function startActiveSpan<T, A extends unknown[]>(
   run: (span: Span, ...args: A) => T,
   ...args: A
 ): T {
-  const span = startSpan(name);
-  if (nodeScope) return nodeScope.run(span, () => run(span, ...args));
-  const context = new Map(asyncContext.current);
-  context.set(ACTIVE_SPAN, span);
-  return withAsyncContext(context, () => run(span, ...args));
+  const parent = currentParent();
+  const span = createSpan(name, parent);
+  return runInTraceScope({ span, parent }, () => run(span, ...args));
+}
+
+/** Capture W3C trace context for a trusted runtime handoff. */
+export function captureWorkerTraceparent(): string | undefined {
+  const parent = currentParent();
+  if (
+    !parent || !Number.isInteger(parent.traceFlags) ||
+    parent.traceFlags < 0 || parent.traceFlags > 255
+  ) {
+    return;
+  }
+  // Core 3.1.1's injector prefixes a zero even when the flags already use two digits.
+  const flags = parent.traceFlags.toString(16).padStart(2, "0");
+  const value = "00-" + parent.traceId + "-" + parent.spanId + "-" + flags;
+  if (parseTraceParent(value)) return value;
+}
+
+/** Resume a validated version-00 carrier at a trusted handoff. */
+export function withWorkerTraceparent<T>(value: unknown, run: (attached: boolean) => T): T {
+  if (typeof value !== "string" || value.length !== 55 || !value.startsWith("00-")) {
+    return run(false);
+  }
+  const parent = parseTraceParent(value);
+  return parent
+    ? runInTraceScope({ parent: { ...parent, isRemote: true } }, () => run(true))
+    : run(false);
+}
+
+// Workerd defers automatic span completion until a returned Promise settles.
+function enterWorkerSpan<T>(name: string, run: (span: Span) => T, markFailure: boolean): T {
+  return startActiveSpan(name, (span) => {
+    const fail = (error: unknown): never => {
+      if (markFailure) span.setStatus({ code: "error" });
+      span.end();
+      throw error;
+    };
+    try {
+      const result = run(span);
+      if (result instanceof Promise) {
+        return result.then((value) => {
+          span.end();
+          return value;
+        }, fail) as typeof result;
+      }
+      span.end();
+      return result;
+    } catch (error) {
+      return fail(error);
+    }
+  });
 }
 
 export const tracing: Tracing = {
-  Span,
-  startSpan,
+  Span: realm.Span,
+  startSpan: (name) => createSpan(name, currentParent()),
   startActiveSpan,
-  getActiveSpan,
+  getActiveSpan: () => currentTraceScope()?.span,
   enterSpan(name, run, ...args) {
-    // Workerd owns the lifetime for enterSpan and defers ending until a
-    // returned Promise settles. startActiveSpan leaves ending to the caller.
-    return startActiveSpan(name, (span) => {
-      let result;
-      try {
-        result = run(span, ...args);
-      } catch (error) {
-        span.end();
-        throw error;
-      }
-      if (result instanceof Promise) return result.finally(() => span.end()) as typeof result;
-      span.end();
-      return result;
-    });
+    return enterWorkerSpan(name, (span) => run(span, ...args), false);
   },
 };
+
+/** Observe a runtime-owned operation without allocating a span on unconfigured hosts. */
+export function observeWorkerOperation<T>(
+  name: string,
+  run: (span?: ReturnType<Tracing["startSpan"]>) => T,
+): T {
+  return realm.startRecordingSpan ? enterWorkerSpan(name, run, true) : run();
+}
 
 // =======================================================================================
 // The Workflow types

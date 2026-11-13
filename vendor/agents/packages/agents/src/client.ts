@@ -201,6 +201,8 @@ export type CallOptions = {
   timeout?: number;
   /** Streaming options for handling streaming responses */
   stream?: StreamOptions;
+  /** W3C parent context for a JSON WebSocket call. The host decides whether to use it. */
+  traceparent?: string;
 };
 
 /**
@@ -223,6 +225,25 @@ export function splitCallOptions(
         stream: (options as CallOptions | undefined)?.stream,
         timeout: (options as CallOptions | undefined)?.timeout
       };
+}
+
+/** @internal Serialize before either client queues the request for reconnect. */
+export function serializeRpcRequest(
+  id: string,
+  method: string,
+  args: unknown[],
+  options?: CallOptions | StreamOptions
+): string {
+  const traceparent =
+    options && "traceparent" in options ? options.traceparent : undefined;
+  const request: RPCRequest = {
+    args,
+    id,
+    method,
+    type: MessageType.RPC,
+    ...(traceparent ? { traceparent } : {})
+  };
+  return JSON.stringify(request);
 }
 
 /**
@@ -918,14 +939,7 @@ export class AgentClient<
         transmitted: this.readyState === this.OPEN
       });
 
-      const request: RPCRequest = {
-        args,
-        id,
-        method,
-        type: MessageType.RPC
-      };
-
-      this.send(JSON.stringify(request));
+      this.send(serializeRpcRequest(id, method, args, options));
     });
   }
 }
