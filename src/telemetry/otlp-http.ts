@@ -162,6 +162,7 @@ export function configureOtlpTelemetry({
   readConfiguration,
   resourceAttributes,
   scope,
+  signal: lifetime,
   exportMetricPrefix = "do_runtime.telemetry.export",
   onExportNotice,
   observeSpans,
@@ -188,8 +189,13 @@ export function configureOtlpTelemetry({
     signal: Signal,
     serialize: () => Uint8Array | undefined,
   ): Promise<DeliveryResult> {
+    if (lifetime?.aborted) return { outcome: "policy" };
     const current = await readConfiguration();
-    if (current?.endpoint !== endpoint || (signal !== "traces" && !current[signal])) {
+    if (
+      lifetime?.aborted ||
+      current?.endpoint !== endpoint ||
+      (signal !== "traces" && !current[signal])
+    ) {
       return { outcome: "policy" };
     }
     let bytes: Uint8Array | undefined;
@@ -211,7 +217,7 @@ export function configureOtlpTelemetry({
         credentials: "omit",
         redirect: "error",
         referrerPolicy: "no-referrer",
-        signal: deadline,
+        signal: lifetime ? AbortSignal.any([lifetime, deadline]) : deadline,
       });
       if (!response.ok) {
         await response.body?.cancel().catch(() => undefined);
@@ -220,6 +226,7 @@ export function configureOtlpTelemetry({
       const rejected = await readRejectedRecords(signal, response.body);
       return rejected > 0 ? { outcome: "rejected", rejected } : { outcome: "accepted" };
     } catch {
+      if (lifetime?.aborted) return { outcome: "policy" };
       return { outcome: deadline.aborted ? "timeout" : "network" };
     }
   }
@@ -379,6 +386,7 @@ export function configureOtlpTelemetry({
 
   const onSpanEnd = observeSpans?.({ meter, logger });
   const workerRecordings = new WeakSet<Span>();
+  let uninstall: (() => void) | undefined;
   let stopping: Promise<void> | undefined;
   const spanProcessor: SpanProcessor = {
     onStart() {},
@@ -416,14 +424,20 @@ export function configureOtlpTelemetry({
       await (stopping ?? reader?.forceFlush());
     },
     shutdown() {
+      uninstall?.();
+      lifetime?.removeEventListener("abort", revoke);
       return (stopping ??= Promise.all([traces.shutdown(), logs?.shutdown()]).then(() =>
         reader?.shutdown(),
       ));
     },
   };
   const tracerProvider = new TracerProvider({ resource, spanProcessors: [spanProcessor] });
-  if (workerSpans) {
-    installWorkerTracing((name, parent) => {
+  function revoke() {
+    uninstall?.();
+    void tracerProvider.shutdown().catch(globalErrorHandler);
+  }
+  if (workerSpans && !lifetime?.aborted) {
+    uninstall = installWorkerTracing((name, parent) => {
       const span = workerSpans.describe(name);
       const context = parent ? trace.setSpanContext(ROOT_CONTEXT, parent) : ROOT_CONTEXT;
       const tracer = tracerProvider.getTracer(span.scope);
@@ -433,5 +447,7 @@ export function configureOtlpTelemetry({
       return new OtelWorkerSpan(recording, workerSpans);
     });
   }
+  if (lifetime?.aborted) revoke();
+  else lifetime?.addEventListener("abort", revoke, { once: true });
   return { tracerProvider, logger, meter, scheduleMetrics: () => reader?.schedule() };
 }

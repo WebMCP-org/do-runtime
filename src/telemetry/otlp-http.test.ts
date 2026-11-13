@@ -12,11 +12,13 @@ import {
 } from "../telemetry";
 
 async function receiver(
-  receive: (path: string, body: string) => Promise<object> | object,
+  receive: (path: string, body: string, disconnected: Promise<void>) => Promise<object> | object,
 ) {
   const server = createServer(async (request, response) => {
+    const disconnected = Promise.withResolvers<void>();
+    response.once("close", () => disconnected.resolve());
     try {
-      const result = await receive(request.url ?? "", await text(request));
+      const result = await receive(request.url ?? "", await text(request), disconnected.promise);
       response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(result));
     } catch {
       if (!response.destroyed) response.writeHead(503).end();
@@ -368,6 +370,63 @@ it("exports inference measurements independently of recorded spans", async () =>
     });
   } finally {
     await tracerProvider.shutdown();
+    await server.close();
+  }
+});
+
+it("revokes a live export and lets the same worker start a fresh recording session", async () => {
+  const firstRequest = Promise.withResolvers<void>();
+  let disconnected = false;
+  const received: string[] = [];
+  const server = await receiver(async (_path, body, closed) => {
+    received.push(body);
+    if (received.length === 1) {
+      firstRequest.resolve();
+      await closed;
+      disconnected = true;
+    }
+    return {};
+  });
+  const configuration = { endpoint: server.endpoint, metrics: false, logs: false };
+  const install = (signal: AbortSignal) =>
+    createOtlpTelemetry({
+      configuration,
+      readConfiguration: async () => configuration,
+      resourceAttributes: {},
+      scope: "test",
+      signal,
+      workerSpans: {
+        describe: (name) => ({ name, scope: "test" }),
+        attribute: () => undefined,
+      },
+    });
+  const lifetime = new AbortController();
+  const first = await install(lifetime.signal);
+  try {
+    tracing.startSpan("already sent").end();
+    await firstRequest.promise;
+    const revokedSpan = tracing.startSpan("queued before revocation");
+    lifetime.abort();
+    const stopped = first.tracerProvider.shutdown();
+    await expect.poll(() => disconnected, { timeout: 1_000 }).toBe(true);
+    const disabledSpan = tracing.startSpan("while disabled");
+    expect(disabledSpan.isTraced).toBe(false);
+    disabledSpan.end();
+    const second = await install(new AbortController().signal);
+    try {
+      revokedSpan.end();
+      tracing.startSpan("new session").end();
+      await Promise.all([stopped, second.tracerProvider.forceFlush()]);
+      expect(received).toHaveLength(2);
+      expect(received[1]).toContain("new session");
+      expect(received[1]).not.toContain("queued before revocation");
+      expect(received[1]).not.toContain("while disabled");
+    } finally {
+      await second.tracerProvider.shutdown();
+    }
+  } finally {
+    lifetime.abort();
+    await first.tracerProvider.shutdown();
     await server.close();
   }
 });

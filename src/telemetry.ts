@@ -50,6 +50,8 @@ export interface OtlpTelemetryOptions {
   readConfiguration: OtlpConfigurationReader;
   resourceAttributes: Attributes;
   scope: string;
+  /** Revokes recording and cancels any pending delivery for this session. */
+  signal?: AbortSignal;
   exportMetricPrefix?: string;
   onExportNotice?(notice: OtlpExportNotice): void;
   workerSpans?: WorkerSpanPolicy;
@@ -62,9 +64,9 @@ export interface OtlpTelemetry extends OtlpInstruments {
 }
 
 /** A stalled or failed destination lookup disables this export attempt. */
-export async function readOtlpConfiguration(
-  read: OtlpConfigurationReader,
-): Promise<OtlpHttpConfiguration | null> {
+export async function readOtlpConfiguration<Configuration extends OtlpHttpConfiguration>(
+  read: () => Promise<Configuration | null>,
+): Promise<Configuration | null> {
   const timeout = new AbortController();
   try {
     return await Promise.race([

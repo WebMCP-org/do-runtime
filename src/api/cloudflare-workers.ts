@@ -519,11 +519,14 @@ const realm = (tracingGlobals[TRACING_REALM] ??= {
 });
 
 /** Install one recorder for this worker realm, including any separately bundled facets. */
-export function installWorkerTracing(startSpan: StartWorkerSpan): void {
+export function installWorkerTracing(startSpan: StartWorkerSpan): () => void {
   if (realm.startRecordingSpan && realm.startRecordingSpan !== startSpan) {
     throw new TypeError("Worker tracing already has a recorder");
   }
   realm.startRecordingSpan = startSpan;
+  return () => {
+    if (realm.startRecordingSpan === startSpan) delete realm.startRecordingSpan;
+  };
 }
 
 function currentTraceScope(): TraceScope | undefined {
