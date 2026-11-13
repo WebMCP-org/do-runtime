@@ -163,6 +163,7 @@ export function configureOtlpTelemetry({
   resourceAttributes,
   scope,
   signal: lifetime,
+  requestTimeoutMs = 2_000,
   exportMetricPrefix = "do_runtime.telemetry.export",
   onExportNotice,
   observeSpans,
@@ -205,7 +206,7 @@ export function configureOtlpTelemetry({
       return { outcome: "serialization" };
     }
     if (!bytes) return { outcome: "serialization" };
-    const deadline = AbortSignal.timeout(2_000);
+    const deadline = AbortSignal.timeout(requestTimeoutMs);
     try {
       const url = new URL(endpoint);
       if (signal !== "traces")

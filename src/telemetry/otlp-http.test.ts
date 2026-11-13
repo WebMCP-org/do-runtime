@@ -430,3 +430,28 @@ it("revokes a live export and lets the same worker start a fresh recording sessi
     await server.close();
   }
 });
+
+it("allows an explicitly configured deadline for a slow collector", async () => {
+  const server = await receiver(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 2_150));
+    return {};
+  });
+  const notices: OtlpExportNotice[] = [];
+  const configuration = { endpoint: server.endpoint, metrics: false, logs: false };
+  const { tracerProvider } = await createOtlpTelemetry({
+    configuration,
+    readConfiguration: async () => configuration,
+    resourceAttributes: {},
+    scope: "test",
+    requestTimeoutMs: 5_000,
+    onExportNotice: (notice) => notices.push(notice),
+  });
+  try {
+    tracerProvider.getTracer("test").startSpan("slow receiver").end();
+    await tracerProvider.forceFlush();
+    expect(notices).toEqual([]);
+  } finally {
+    await tracerProvider.shutdown();
+    await server.close();
+  }
+});

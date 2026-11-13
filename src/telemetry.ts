@@ -52,6 +52,8 @@ export interface OtlpTelemetryOptions {
   scope: string;
   /** Revokes recording and cancels any pending delivery for this session. */
   signal?: AbortSignal;
+  /** Time allowed for a single export request. Defaults to 2,000 ms. */
+  requestTimeoutMs?: number;
   exportMetricPrefix?: string;
   onExportNotice?(notice: OtlpExportNotice): void;
   workerSpans?: WorkerSpanPolicy;
