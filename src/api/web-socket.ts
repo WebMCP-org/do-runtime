@@ -10,6 +10,7 @@
 import { atCheckpointEnd, type IoContext } from "../io/io-context";
 import type { CriticalSection } from "../io/io-gate";
 import { deserializeValue, serializeValue } from "./actor-state";
+import { observeWorkerOperation } from "./cloudflare-workers";
 
 export interface RawWebSocket {
   addEventListener(type: string, listener: (event: Event) => void): void;
@@ -837,24 +838,24 @@ export class HibernatableWebSocketRegistry {
       if (message instanceof Blob) {
         this.#ctx.addWaitUntil(
           message.arrayBuffer().then((buffer) => {
-            this.#schedule(entry, () => this.#dispatch.message(socket, buffer));
+            this.#schedule(entry, "message", () => this.#dispatch.message(socket, buffer));
           }),
         );
         return;
       }
-      this.#schedule(entry, () => this.#dispatch.message(socket, message));
+      this.#schedule(entry, "message", () => this.#dispatch.message(socket, message));
       return;
     }
     if (type === "close") {
       const close = event as CloseEvent;
       this.#schedule(
         entry,
+        "close",
         () => this.#dispatch.close(socket, close.code, close.reason, close.wasClean),
-        true,
       );
       return;
     }
-    if (type === "error") this.#schedule(entry, () => this.#dispatch.error(socket, event));
+    if (type === "error") this.#schedule(entry, "error", () => this.#dispatch.error(socket, event));
   }
 
   /**
@@ -871,7 +872,8 @@ export class HibernatableWebSocketRegistry {
    *
    * A close that never reaches a handler (an aborted context) still leaves the list.
    */
-  #schedule(entry: RegistryEntry, handler: () => unknown, isClose = false): void {
+  #schedule(entry: RegistryEntry, type: SocketEvent, handler: () => unknown): void {
+    const isClose = type === "close";
     const state = socketMetadata(entry.raw);
     let settled = false;
     const settle = (): void => {
@@ -881,14 +883,20 @@ export class HibernatableWebSocketRegistry {
       if (state.ownCloseCompletion !== undefined) completeOwnClose(state);
     };
     let entered = false;
-    const run = this.#ctx.run(() => {
-      entered = true;
-      if (isClose) state.closeDispatched = true;
-      try {
-        return handler();
-      } finally {
-        if (isClose || state.ownCloseCompletion !== undefined) atCheckpointEnd(settle);
-      }
+    const run = observeWorkerOperation("do_runtime.actor.websocket_" + type, (span) => {
+      const queuedAt = span?.isTraced ? performance.now() : undefined;
+      return this.#ctx.run(() => {
+        if (queuedAt !== undefined) {
+          span?.setAttribute("do_runtime.actor.input_wait_ms", performance.now() - queuedAt);
+        }
+        entered = true;
+        if (isClose) state.closeDispatched = true;
+        try {
+          return handler();
+        } finally {
+          if (isClose || state.ownCloseCompletion !== undefined) atCheckpointEnd(settle);
+        }
+      });
     });
     this.#ctx.addWaitUntil(
       run.then(

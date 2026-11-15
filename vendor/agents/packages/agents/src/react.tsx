@@ -1,7 +1,7 @@
 import type { PartySocket } from "partysocket";
 import { usePartySocket } from "partysocket/react";
 import { useCallback, useRef, use, useMemo, useState, useEffect } from "react";
-import type { MCPServersState, RPCRequest, RPCResponse } from "./";
+import type { MCPServersState, RPCResponse } from "./";
 import type {
   AgentConnectionError,
   AgentPromiseReturnType,
@@ -20,6 +20,7 @@ import {
   createCloseClassifier,
   nativeCall,
   NativeCallQueue,
+  serializeRpcRequest,
   splitCallOptions
 } from "./client";
 import {
@@ -1268,13 +1269,7 @@ export function useAgent<State>(options: UseAgentOptions<unknown>): Omit<
           }, effectiveTimeout);
         }
 
-        const rpcRequest: RPCRequest = {
-          args,
-          id,
-          method,
-          type: MessageType.RPC
-        };
-        const request = JSON.stringify(rpcRequest);
+        const request = serializeRpcRequest(id, method, args, options);
 
         pendingCallsRef.current.set(id, {
           reject,

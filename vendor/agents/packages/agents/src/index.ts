@@ -273,6 +273,7 @@ export type RPCRequest = {
   id: string;
   method: string;
   args: unknown[];
+  traceparent?: string;
 };
 
 /**

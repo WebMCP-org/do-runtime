@@ -383,6 +383,8 @@ export type ChatTurnEndEvent = {
    * end with a user message, or the server no longer has a record of it.
    */
   messageIds?: string[];
+  /** The assistant reply persisted and broadcast before successful completion. */
+  assistantMessageId?: string;
   outcome: Exclude<ChatTurnOutcome, "recovering">;
   /** The error message, when `outcome` is `"error"`. */
   error?: string;
@@ -488,6 +490,8 @@ export type UseAgentChatOptions<
    * settled, so it can call `sendMessage`.
    */
   onTurnEnd?: (event: ChatTurnEndEvent) => void;
+  /** Reports the first server receipt for a submitted user message. */
+  onRequestAcknowledged?: (messageId: string) => void;
   /**
    * @deprecated Use `onToolCall` callback instead for automatic tool execution.
    * @description Whether to automatically resolve tool calls that do not require human interaction.
@@ -757,6 +761,8 @@ export function useAgentChat<
    */
   isToolContinuation: boolean;
   connectionError: AgentConnectionErrorLike | null;
+  /** Whether this chat still owns a turn that can resume after reconnect. */
+  canRecoverCurrentTurn: () => boolean;
 } {
   const {
     agent,
@@ -764,6 +770,7 @@ export function useAgentChat<
     messages: optionsInitialMessages,
     onToolCall,
     onTurnEnd,
+    onRequestAcknowledged,
     onData,
     experimental_automaticToolResolution,
     tools,
@@ -821,6 +828,8 @@ export function useAgentChat<
   onToolCallRef.current = onToolCall;
   const onTurnEndRef = useRef(onTurnEnd);
   onTurnEndRef.current = onTurnEnd;
+  const onRequestAcknowledgedRef = useRef(onRequestAcknowledged);
+  onRequestAcknowledgedRef.current = onRequestAcknowledged;
   const turnErrorsRef = useRef(new Map<string, string>());
   const endedTurnIdsRef = useRef(new Set<string>());
   const pendingTurnEndsRef = useRef<ChatTurnEndEvent[]>([]);
@@ -1119,6 +1128,8 @@ export function useAgentChat<
           pendingBufferedSendIdsRef.current.add(messageId);
         }
       },
+      onRequestAcknowledged: (messageId) =>
+        onRequestAcknowledgedRef.current?.(messageId),
       prepareBody: async ({ messages: msgs, trigger, messageId }) => {
         // Start with the top-level body option (static or dynamic)
         let extraBody: Record<string, unknown> = {};
@@ -2125,6 +2136,9 @@ export function useAgentChat<
       const event: ChatTurnEndEvent = {
         requestId: frame.id,
         ...(frame.messageIds ? { messageIds: frame.messageIds } : {}),
+        ...(frame.assistantMessageId !== undefined && {
+          assistantMessageId: frame.assistantMessageId
+        }),
         outcome,
         ...(outcome === "error" && error ? { error } : {}),
         replay: frame.replay === true
@@ -2335,18 +2349,22 @@ export function useAgentChat<
           break;
 
         case MessageType.CF_AGENT_STREAM_RESUMING: {
+          const awaitingResume = customTransport.isAwaitingResume();
+          const answersIdleProbe =
+            idleProbeId !== null && data.probeId === idleProbeId;
+          const matchesProbe = awaitingResume
+            ? customTransport.isAwaitingResume(data.probeId)
+            : answersIdleProbe;
+          if (answersIdleProbe) idleProbeId = null;
+          if (data.probeId !== undefined && !matchesProbe) return;
           // Server turns are serialized: an offer for another request means
           // the turn we still hold for a missed terminal frame is over.
           setUnresolvedObservedRequestId((current) =>
             current === data.id ? current : null
           );
-          if (data.probeId !== undefined && data.probeId === idleProbeId) {
-            idleProbeId = null;
-          }
           const isEarlyToolContinuation =
-            resumingToolContinuationRef.current &&
-            !customTransport.isAwaitingResume();
-          if (!resume && !customTransport.isAwaitingResume()) {
+            resumingToolContinuationRef.current && !awaitingResume;
+          if (!resume && !awaitingResume) {
             if (!isEarlyToolContinuation) {
               // An offer without a probe id announces a live stream, which
               // the server withholds from us until its terminal frame; hold
@@ -2545,7 +2563,7 @@ export function useAgentChat<
                 streamStateRef.current = { status: "idle" };
                 setIsServerStreaming(false);
               }
-              customTransport.handleServerTurnCompleted(data.id);
+              customTransport.handleServerTurnCompleted(data.id, data);
               restoreProtectedStreamingAssistant(localResponseIds.get(data.id));
               localResponseIds.delete(data.id);
               localRequestIdsRef.current.delete(data.id);
@@ -2579,14 +2597,14 @@ export function useAgentChat<
             observedToolContinuationRequestIdRef.current !== data.id
           ) {
             customTransport.appliedChunks.forget(data.id);
-            customTransport.handleServerTurnCompleted(data.id);
+            customTransport.handleServerTurnCompleted(data.id, data);
             fallbackAckedResumeRequestIdsRef.current.delete(data.id);
             break;
           }
           if (data.error) {
             pendingReplayResumeRequestIdsRef.current.delete(data.id);
             customTransport.appliedChunks.forget(data.id);
-            customTransport.handleServerTurnCompleted(data.id);
+            customTransport.handleServerTurnCompleted(data.id, data);
             fallbackAckedResumeRequestIdsRef.current.delete(data.id);
             setIsRecovering(false);
 
@@ -2665,7 +2683,7 @@ export function useAgentChat<
             pendingReplayResumeRequestIdsRef.current.delete(data.id);
           }
           if (data.done) {
-            customTransport.handleServerTurnCompleted(data.id);
+            customTransport.handleServerTurnCompleted(data.id, data);
             fallbackAckedResumeRequestIdsRef.current.delete(data.id);
             // A terminal turn outcome resolves any in-progress recovery (#1620).
             if (data.outcome !== "recovering") setIsRecovering(false);
@@ -3144,6 +3162,16 @@ export function useAgentChat<
     isRecovering,
     isToolContinuation,
     connectionError: agent.connectionError ?? null,
+    canRecoverCurrentTurn: () => {
+      if (!resume) return false;
+      const chatId = stableChatIdRef.current;
+      return (
+        (chatId !== null && customTransport.hasUnacknowledgedRequest(chatId)) ||
+        customTransport.activeServerTurnId !== null ||
+        unresolvedObservedRequestIdRef.current !== null ||
+        recoveringRequestIdRef.current !== null
+      );
+    },
     sendMessage: sendMessageWithStreamingProtection,
     stop: stopWithToolContinuationAbort,
     /**

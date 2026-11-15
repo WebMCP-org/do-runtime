@@ -78,6 +78,20 @@ facets. The snapshot contains native mirror facts: tags, serialized attachment
 bytes, auto-response timestamps and pairs, plus canonical facet start requests.
 The application supplies each socket's transport ID when taking its snapshot.
 
+## Tracing worker startup and actor events
+
+Install a span recorder with `installWorkerTracing()` from
+`@mcp-b/do-runtime/cloudflare-workers` in the supervisor and actor workers.
+The recorder receives the operation name and parent span context. It owns
+sampling, attribute policy, and export. The runtime keeps active spans scoped
+to transformed browser continuations or native Node async context.
+
+The supervisor times worker creation through the readiness acknowledgement.
+Its trusted bootstrap message carries a W3C `traceparent` so the destination
+can time its own initialization as a child. Actor RPCs and hibernatable
+WebSocket events have invocation spans. WebSocket spans include the wait for
+the actor input gate in milliseconds. [Workerd async tracing](https://github.com/cloudflare/workerd/blob/b78126e488f94e3a244eaff2f016b092c58b5371/docs/async-trace.md) · [W3C Trace Context](https://www.w3.org/TR/trace-context/#traceparent-header)
+
 ## Facet placement and activity
 
 `BrowserActorTree` implements `FacetHost` over a backend storage factory and a

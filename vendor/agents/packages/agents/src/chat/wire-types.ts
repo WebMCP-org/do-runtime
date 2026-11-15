@@ -116,6 +116,8 @@ export type OutgoingMessage<ChatMessage extends UIMessage = UIMessage> =
        * cancellation belongs to.
        */
       messageIds?: string[];
+      /** The assistant reply persisted and broadcast before successful completion. */
+      assistantMessageId?: string;
       /**
        * How the request ended, on its terminal `done` frame. Absent means
        * `"error"` when the frame (or an earlier frame for the request) carried

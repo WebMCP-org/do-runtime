@@ -1705,6 +1705,22 @@ describe("reconnect-driven stream resume", () => {
       probeId: requests[1].probeId
     });
     await current;
+
+    dispatch(target, {
+      type: RESUMING,
+      id: "retired-turn",
+      probeId: requests[1].probeId
+    });
+    expect(countType(sentMessages, RESUME_ACK)).toBe(0);
+
+    dispatch(target, { type: RESUMING, id: "live-turn" });
+    expect(lastFrameOfType(sentMessages, RESUME_ACK).id).toBe("live-turn");
+    dispatch(target, {
+      type: CHAT_RESPONSE,
+      id: "live-turn",
+      body: "",
+      done: true
+    });
   });
 
   it("single-flights the public resume helper with reconnect-driven resumes", async () => {

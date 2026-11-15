@@ -313,6 +313,11 @@ describe("wrapAISDK with the real AI SDK v7", () => {
       model: textModel("denied"),
       tools: { deploy }
     });
+    expect(
+      deniedTracing.spans.filter(
+        (span) => span.attributes["gen_ai.operation.name"] === "execute_tool"
+      )
+    ).toHaveLength(0);
     expectApproval(deniedTracing, "denied");
     expect(executions).toBe(1);
   });
@@ -524,9 +529,6 @@ describe("wrapAISDK with the real AI SDK v7", () => {
     );
     // ...but not passed off as part of an invocation that had already ended.
     expect(approval?.attributes["cloudflare.agents.span.truncated"]).toBe(true);
-    expect(
-      approval?.parent?.attributes["cloudflare.agents.span.truncated"]
-    ).toBe(true);
   });
 
   it("marks top-level approval spans decided after the invocation ended", async () => {
@@ -559,9 +561,6 @@ describe("wrapAISDK with the real AI SDK v7", () => {
       "requested"
     );
     expect(approval?.attributes["cloudflare.agents.span.truncated"]).toBe(true);
-    expect(
-      approval?.parent?.attributes["cloudflare.agents.span.truncated"]
-    ).toBe(true);
   });
 
   it("leaves approval spans decided inside the invocation unmarked", async () => {
@@ -708,11 +707,9 @@ function expectApproval(
     "cloudflare.agents.tool.approval.state": state,
     "gen_ai.tool.call.id": "deploy-1"
   });
+  expect(approval?.attributes["gen_ai.operation.name"]).toBeUndefined();
   expect(approval?.parent?.attributes["gen_ai.operation.name"]).toBe(
-    "execute_tool"
-  );
-  expect(approval?.parent?.parent?.attributes["gen_ai.operation.name"]).toBe(
-    "invoke_agent"
+    state === "approved" ? "execute_tool" : "invoke_agent"
   );
 }
 

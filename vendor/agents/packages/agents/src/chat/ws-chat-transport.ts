@@ -7,6 +7,7 @@
 
 import type { ChatTransport, UIMessage, UIMessageChunk } from "ai";
 import { nanoid } from "nanoid";
+import { STREAM_RESUME_NONE_REASONS } from "./protocol";
 import {
   applyChatResponseFrame,
   failChatStream,
@@ -57,12 +58,53 @@ function interruptChatStream(
 interface PendingChatRequest {
   readonly requestId: string;
   readonly frame: string;
+  readonly acknowledge?: () => void;
 }
 
 type StreamPendingFrame = Extract<
   OutgoingMessage<UIMessage>,
   { type: MessageType.CF_AGENT_STREAM_PENDING }
 >;
+
+type StreamResumeNone = Pick<
+  Extract<
+    OutgoingMessage<UIMessage>,
+    { type: MessageType.CF_AGENT_STREAM_RESUME_NONE }
+  >,
+  "probeId" | "reason"
+>;
+
+type StreamResumeOffer = Pick<
+  Extract<
+    OutgoingMessage<UIMessage>,
+    { type: MessageType.CF_AGENT_STREAM_RESUMING }
+  >,
+  "id" | "probeId"
+>;
+
+interface ResumeHandshake {
+  readonly probeId: string;
+  cancel(): void;
+  retry(): void;
+  resume(requestId: string): void;
+  none(data: StreamResumeNone): boolean;
+  pending(receipt: PendingChatRequest | undefined): void;
+}
+
+type ChatResponseFrame = Extract<
+  OutgoingMessage<UIMessage>,
+  { type: MessageType.CF_AGENT_USE_CHAT_RESPONSE }
+>;
+type ChatResponseReceipt = Pick<ChatResponseFrame, "error" | "outcome">;
+
+function isChatReceipt({ error, outcome }: ChatResponseReceipt): boolean {
+  return (
+    !error &&
+    (outcome === undefined ||
+      outcome === "completed" ||
+      outcome === "recovering")
+  );
+}
 
 const pendingChatRequests = new Map<string, PendingChatRequest>();
 
@@ -76,18 +118,32 @@ function rememberPendingChatRequest(
   pendingChatRequests.set(chatId, request);
 }
 
-function forgetPendingChatRequest(chatId: string, requestId: string): void {
-  if (pendingChatRequests.get(chatId)?.requestId === requestId) {
+function forgetPendingChatRequest(
+  chatId: string,
+  requestId: string
+): PendingChatRequest | undefined {
+  const pending = pendingChatRequests.get(chatId);
+  if (pending?.requestId === requestId) {
     pendingChatRequests.delete(chatId);
+    return pending;
   }
 }
 
-function forgetPendingChatRequestById(requestId: string): void {
+function forgetPendingChatRequestById(
+  requestId: string
+): PendingChatRequest | undefined {
   for (const [chatId, request] of pendingChatRequests) {
     if (request.requestId === requestId) {
       pendingChatRequests.delete(chatId);
-      return;
+      return request;
     }
+  }
+}
+
+function lastUserMessageId(messages: readonly UIMessage[]): string | undefined {
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index];
+    if (message?.role === "user") return message.id;
   }
 }
 
@@ -144,6 +200,8 @@ export type WebSocketChatTransportOptions<
    * reconnect transcript replay. `messageId` is the submitted user message's id.
    */
   onRequestBuffered?: (messageId: string | undefined) => void;
+  /** Reports the first server receipt for a submitted user message. */
+  onRequestAcknowledged?: (messageId: string) => void;
 };
 
 /**
@@ -163,28 +221,15 @@ export class WebSocketChatTransport<
   private activeRequestIds?: Set<string>;
   private cancelOnClientAbort: boolean;
   private onRequestBuffered?: WebSocketChatTransportOptions<ChatMessage>["onRequestBuffered"];
+  private onRequestAcknowledged?: WebSocketChatTransportOptions<ChatMessage>["onRequestAcknowledged"];
 
-  // Pending resume resolver — set by reconnectToStream, called by
-  // handleStreamResuming when onAgentMessage sees CF_AGENT_STREAM_RESUMING.
-  private _resumeResolver: ((data: { id: string }) => void) | null = null;
   /**
    * Continuation chunks this client applied, shared with the hook's fallback
    * observer so a replay after reconnect skips them on either path (#1951).
    */
   readonly appliedChunks = new AppliedChunkLedger();
-  // Pending "no stream" resolver — called by handleStreamResumeNone
-  // when onAgentMessage sees CF_AGENT_STREAM_RESUME_NONE.
-  private _resumeNoneResolver:
-    | ((data: { probeId?: string }) => boolean)
-    | null = null;
-  // Keep-waiting hook (#1784) — set by whichever resume path is currently
-  // awaiting, called by handleStreamPending when onAgentMessage sees
-  // CF_AGENT_STREAM_PENDING. Extends the path's probe timeout so a slow
-  // pre-stream window (queue / MCP / model latency) does not resolve early.
-  private _onStreamPending: ((data: StreamPendingFrame) => void) | null = null;
-  // Retransmits the current handshake on a replacement socket without starting
-  // a second AI SDK resume request. Set only while a resolver is active.
-  private _retryResumeProbe: (() => void) | null = null;
+  // Only the pending handshake consumes replies from the shared handler.
+  private _resumeHandshake: ResumeHandshake | null = null;
   // Set when a client-side tool result/approval is expected to trigger
   // a new continuation stream. In this mode reconnectToStream() returns
   // a deferred ReadableStream immediately so AI SDK status can transition
@@ -203,6 +248,7 @@ export class WebSocketChatTransport<
     this.activeRequestIds = options.activeRequestIds;
     this.cancelOnClientAbort = options.cancelOnClientAbort ?? false;
     this.onRequestBuffered = options.onRequestBuffered;
+    this.onRequestAcknowledged = options.onRequestAcknowledged;
   }
 
   /**
@@ -257,9 +303,9 @@ export class WebSocketChatTransport<
     return this._activeServerTurnId;
   }
 
-  private sendCancelFrame(requestId: string) {
+  private sendCancelFrame(requestId: string, agent = this.agent) {
     try {
-      this.agent.send(
+      agent.send(
         JSON.stringify({
           id: requestId,
           type: MessageType.CF_AGENT_CHAT_REQUEST_CANCEL
@@ -302,10 +348,15 @@ export class WebSocketChatTransport<
   }
 
   /**
-   * True when the transport is waiting for a resume handshake.
+   * True when the transport is waiting for a resume handshake. If supplied,
+   * the probe ID must match that handshake.
    */
-  isAwaitingResume(): boolean {
-    return this._resumeResolver !== null || this._resumeNoneResolver !== null;
+  isAwaitingResume(probeId?: string): boolean {
+    const handshake = this._resumeHandshake;
+    return (
+      handshake !== null &&
+      (probeId === undefined || handshake.probeId === probeId)
+    );
   }
 
   /**
@@ -313,9 +364,10 @@ export class WebSocketChatTransport<
    * server-idle response. Used when the owning hook/agent generation changes.
    */
   cancelPendingResume(): boolean {
-    const resolveNone = this._resumeNoneResolver;
-    if (!resolveNone) return false;
-    return resolveNone({});
+    const handshake = this._resumeHandshake;
+    if (!handshake) return false;
+    handshake.cancel();
+    return true;
   }
 
   /**
@@ -334,9 +386,9 @@ export class WebSocketChatTransport<
    * with the previous WebSocket.
    */
   retryPendingResume(): boolean {
-    const retry = this._retryResumeProbe;
-    if (!retry) return false;
-    retry();
+    const handshake = this._resumeHandshake;
+    if (!handshake) return false;
+    handshake.retry();
     return true;
   }
 
@@ -346,9 +398,11 @@ export class WebSocketChatTransport<
    * (ACK + stream creation) and returns true. Otherwise returns false
    * so the caller can use its own fallback path.
    */
-  handleStreamResuming(data: { id: string }): boolean {
-    if (!this._resumeResolver) return false;
-    this._resumeResolver(data);
+  handleStreamResuming(data: StreamResumeOffer): boolean {
+    const handshake = this._resumeHandshake;
+    if (!handshake) return false;
+    // Consume an obsolete reply so it cannot attach through the fallback path.
+    if (this.isAwaitingResume(data.probeId)) handshake.resume(data.id);
     return true;
   }
 
@@ -357,9 +411,8 @@ export class WebSocketChatTransport<
    * If reconnectToStream is waiting, resolves the promise with null
    * immediately (no 5-second timeout). Returns true if handled.
    */
-  handleStreamResumeNone(data: { probeId?: string } = {}): boolean {
-    if (!this._resumeNoneResolver) return false;
-    return this._resumeNoneResolver(data);
+  handleStreamResumeNone(data: StreamResumeNone = {}): boolean {
+    return this._resumeHandshake?.none(data) ?? false;
   }
 
   /**
@@ -370,9 +423,14 @@ export class WebSocketChatTransport<
    * after the short window). Returns true if a waiting path consumed it.
    */
   handleStreamPending(data: StreamPendingFrame): boolean {
-    if (!this._onStreamPending) return false;
-    this._onStreamPending(data);
-    return true;
+    const handshake = this._resumeHandshake;
+    const receipt =
+      data.persisted === true && data.id
+        ? forgetPendingChatRequestById(data.id)
+        : undefined;
+    receipt?.acknowledge?.();
+    handshake?.pending(receipt);
+    return handshake !== null;
   }
 
   /**
@@ -380,9 +438,14 @@ export class WebSocketChatTransport<
    * outside the currently attached transport stream, such as after local-only
    * client cleanup.
    */
-  handleServerTurnCompleted(requestId: string) {
-    forgetPendingChatRequestById(requestId);
+  handleServerTurnCompleted(requestId: string, response?: ChatResponseReceipt) {
+    const pending = forgetPendingChatRequestById(requestId);
+    if (response && isChatReceipt(response)) pending?.acknowledge?.();
     this.clearActiveServerTurn(requestId);
+  }
+
+  hasUnacknowledgedRequest(chatId: string): boolean {
+    return pendingChatRequests.has(chatId);
   }
 
   /**
@@ -513,13 +576,14 @@ export class WebSocketChatTransport<
               data.persisted === true
             ) {
               requestAcknowledged = true;
-              forgetPendingChatRequest(chatId, requestId);
+              forgetPendingChatRequest(chatId, requestId)?.acknowledge?.();
               return;
             }
             if (data.type !== MessageType.CF_AGENT_USE_CHAT_RESPONSE) return;
             if (data.id !== requestId) return;
             requestAcknowledged = true;
-            forgetPendingChatRequest(chatId, requestId);
+            const pending = forgetPendingChatRequest(chatId, requestId);
+            if (isChatReceipt(data)) pending?.acknowledge?.();
 
             if (data.error) {
               finish(() =>
@@ -582,18 +646,42 @@ export class WebSocketChatTransport<
       return stream;
     }
 
+    const traceparent =
+      options.headers instanceof Headers
+        ? options.headers.get("traceparent")
+        : Object.entries(options.headers ?? {}).find(
+            ([name]) => name.toLowerCase() === "traceparent"
+          )?.[1];
     const requestFrame = JSON.stringify({
       id: requestId,
       init: {
         method: "POST",
-        body: bodyPayload
+        body: bodyPayload,
+        ...(traceparent ? { headers: { traceparent } } : {})
       },
       type: MessageType.CF_AGENT_USE_CHAT_REQUEST
     });
+    const userMessageId =
+      options.trigger === "submit-message" && this.onRequestAcknowledged
+        ? lastUserMessageId(options.messages)
+        : undefined;
     try {
       rememberPendingChatRequest(chatId, {
         requestId,
-        frame: requestFrame
+        frame: requestFrame,
+        ...(userMessageId
+          ? {
+              acknowledge: () => {
+                void Promise.resolve()
+                  .then(() => this.onRequestAcknowledged?.(userMessageId))
+                  .catch(() =>
+                    console.error(
+                      "Chat request acknowledgement observer failed"
+                    )
+                  );
+              }
+            }
+          : {})
       });
     } catch (error) {
       finish(() =>
@@ -612,140 +700,216 @@ export class WebSocketChatTransport<
     requestSent = true;
     const sent = agent.send(requestFrame);
     if (sent === false && options.trigger === "submit-message") {
-      const lastUserMessage = [...options.messages]
-        .reverse()
-        .find((message) => message.role === "user");
-      this.onRequestBuffered?.(lastUserMessage?.id);
+      this.onRequestBuffered?.(
+        userMessageId ?? lastUserMessageId(options.messages)
+      );
     }
 
     return stream;
   }
 
-  async reconnectToStream(options: {
+  async reconnectToStream({
+    chatId
+  }: {
     chatId: string;
   }): Promise<ReadableStream<UIMessageChunk> | null> {
-    // A transport has one handshake slot. Returning null for an unexpected
-    // concurrent caller is safer than overwriting callbacks owned by the first
-    // AI SDK request (StrictMode/manual overlap); the hook serializes its normal
-    // mount, tool, public, and reconnect entry points.
-    if (this.isAwaitingResume()) return null;
+    // One handshake per transport. The hook serializes its normal entry points.
+    if (this._resumeHandshake) return null;
 
-    if (this._expectToolContinuation) {
-      this._expectToolContinuation = false;
-      return this._createToolContinuationStream();
-    }
-
-    // Detect whether the server has an active stream for this chat.
-    // Instead of registering another message listener (which races with the
-    // hook), expose identity-owned callbacks consumed synchronously by the
-    // shared handler.
-    const activeIds = this.activeRequestIds;
+    const toolContinuation = this._expectToolContinuation;
+    this._expectToolContinuation = false;
+    const pendingRequest = toolContinuation
+      ? undefined
+      : pendingChatRequests.get(chatId);
+    const previousTurnId = this._activeServerTurnId;
     const probeId = nanoid(8);
-    const pendingRequest = pendingChatRequests.get(options.chatId);
+    const listenerAbort = new AbortController();
+    const abortError = new Error("Aborted");
+    abortError.name = "AbortError";
+    let agent = this.agent;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    let completed = false;
+    let attachment: {
+      requestId: string;
+      replayFilter: ContinuationReplayFilter<ChatResponseFrame>;
+      ackSent: boolean;
+    } | null = null;
 
-    return new Promise<ReadableStream<UIMessageChunk> | null>((resolve) => {
-      let resolved = false;
-      let timeout: ReturnType<typeof setTimeout> | undefined;
-      let resumeResolver: ((data: { id: string }) => void) | null = null;
-      let resumeNoneResolver: ((data: { probeId?: string }) => boolean) | null =
-        null;
-      let onStreamPending: ((data: StreamPendingFrame) => void) | null = null;
-      let retryResumeProbe: (() => void) | null = null;
-
-      const clearOwnedCallbacks = () => {
-        if (resumeResolver && this._resumeResolver === resumeResolver) {
-          this._resumeResolver = null;
+    let resolveResume!: (stream: ReadableStream<UIMessageChunk> | null) => void;
+    const resumed = new Promise<ReadableStream<UIMessageChunk> | null>(
+      (resolve) => {
+        resolveResume = resolve;
+      }
+    );
+    let controller!: ReadableStreamDefaultController<UIMessageChunk>;
+    const stream = new ReadableStream<UIMessageChunk>({
+      start(reader) {
+        controller = reader;
+      },
+      cancel: () => {
+        if (attachment && this.cancelOnClientAbort) {
+          if (!toolContinuation)
+            forgetPendingChatRequestById(attachment.requestId);
+          this.sendCancelFrame(attachment.requestId);
+          finish(() => {}, true);
+        } else {
+          finish(() => {}, false, true);
         }
-        if (
-          resumeNoneResolver &&
-          this._resumeNoneResolver === resumeNoneResolver
-        ) {
-          this._resumeNoneResolver = null;
-        }
-        if (onStreamPending && this._onStreamPending === onStreamPending) {
-          this._onStreamPending = null;
-        }
-        if (retryResumeProbe && this._retryResumeProbe === retryResumeProbe) {
-          this._retryResumeProbe = null;
-        }
-      };
+      }
+    });
+    const batch = new ReplayChunkBatch(controller);
 
-      const done = (
-        value:
-          | ReadableStream<UIMessageChunk>
-          | Promise<ReadableStream<UIMessageChunk>>
-          | null
-      ) => {
-        if (resolved) return;
-        resolved = true;
-        clearOwnedCallbacks();
-        if (timeout) clearTimeout(timeout);
-        resolve(value);
-      };
-
-      const armTimeout = (delay: number) => {
-        if (timeout) clearTimeout(timeout);
-        timeout = setTimeout(() => done(null), delay);
-      };
-
-      // Keep-waiting (#1784): the server says a turn is accepted but its stream
-      // has not started. Extend this operation's own timeout only.
-      onStreamPending = (data) => {
-        if (resolved) return;
-        armTimeout(RESUME_PENDING_TIMEOUT_MS);
-        if (
-          pendingRequest &&
-          pendingChatRequests.get(options.chatId) === pendingRequest &&
-          data.persisted === true &&
-          data.id === pendingRequest.requestId
-        ) {
-          forgetPendingChatRequest(options.chatId, pendingRequest.requestId);
-          activeIds?.add(pendingRequest.requestId);
-          done(this._createResumeStream(pendingRequest.requestId));
-        }
-      };
-
-      resumeNoneResolver = (data) => {
-        if (data.probeId && data.probeId !== probeId) return false;
-        if (
-          pendingRequest &&
-          pendingChatRequests.get(options.chatId)?.requestId ===
-            pendingRequest.requestId
-        ) {
-          // The replay and probe share a socket but their server handlers may
-          // race. NONE only answers the probe; it cannot reject a retained chat
-          // request that is still awaiting its persistence receipt.
-          armTimeout(RESUME_PENDING_TIMEOUT_MS);
-          return true;
-        }
-        done(null);
-        return true;
-      };
-
-      resumeResolver = (data: { id: string }) => {
-        const requestId = data.id;
-        activeIds?.add(requestId);
-        const stream = this._createResumeStream(requestId, true);
-
-        this.agent.send(
+    const clearHandshake = () => {
+      if (this._resumeHandshake === handshake) this._resumeHandshake = null;
+      clearTimeout(timeout);
+    };
+    const finish = (
+      action: () => void,
+      keepRequestId = false,
+      keepServerTurn = false
+    ): boolean => {
+      if (completed) return false;
+      completed = true;
+      clearHandshake();
+      if (this._detachResumeStream === detach) this._detachResumeStream = null;
+      if (this._abortToolContinuation === abortToolContinuation)
+        this._abortToolContinuation = null;
+      try {
+        action();
+      } catch {
+        // The reader may already be closed.
+      }
+      batch.discard();
+      if (attachment) {
+        if (!toolContinuation && !keepServerTurn)
+          this.clearActiveServerTurn(attachment.requestId);
+        if (!keepRequestId) this.activeRequestIds?.delete(attachment.requestId);
+      }
+      listenerAbort.abort();
+      resolveResume(attachment ? stream : null);
+      return true;
+    };
+    const close = () => finish(() => controller.close());
+    const detach = () =>
+      finish(() => {
+        batch.flush();
+        controller.close();
+      });
+    const cancelAttached = () =>
+      finish(() => controller.error(abortError), true);
+    const abortToolContinuation = () => {
+      if (completed) return false;
+      if (attachment) {
+        this.sendCancelFrame(attachment.requestId, agent);
+        return cancelAttached();
+      }
+      return finish(() => controller.error(abortError));
+    };
+    const onClose = () => {
+      if (attachment) {
+        finish(() => interruptChatStream(controller, batch), false, true);
+      } else {
+        // A tool continuation's deferred stream has no server turn to interrupt yet.
+        close();
+      }
+    };
+    const sendResumeAck = () => {
+      if (!attachment || attachment.ackSent) return;
+      attachment.ackSent = true;
+      try {
+        agent.send(
           JSON.stringify({
             type: MessageType.CF_AGENT_STREAM_RESUME_ACK,
-            id: requestId
+            id: attachment.requestId
           })
         );
-
-        done(stream);
+      } catch {
+        onClose();
+      }
+    };
+    const onMessage = (event: MessageEvent) => {
+      if (!attachment) return;
+      const { requestId, replayFilter } = attachment;
+      try {
+        const data = JSON.parse(
+          event.data as string
+        ) as OutgoingMessage<UIMessage>;
+        if (
+          data.type === MessageType.CF_AGENT_STREAM_RESUMING &&
+          data.id === requestId
+        ) {
+          sendResumeAck();
+          return;
+        }
+        if (
+          data.type !== MessageType.CF_AGENT_USE_CHAT_RESPONSE ||
+          data.id !== requestId
+        )
+          return;
+        if (!toolContinuation) {
+          const pending = forgetPendingChatRequestById(requestId);
+          if (isChatReceipt(data)) pending?.acknowledge?.();
+        }
+        if (data.error) {
+          this.appliedChunks.forget(requestId);
+          finish(() => failChatStream(batch, data.body || "Stream error"));
+          return;
+        }
+        for (const frame of replayFilter.frames(data)) {
+          applyChatResponseFrame(batch, frame);
+        }
+        // The hook can clear a hydrated assistant on replay chunk zero before
+        // the AI SDK takes its snapshot after reconnectToStream resolves.
+        resolveResume(stream);
+        if (data.done) {
+          this.appliedChunks.forget(requestId);
+          close();
+        }
+      } catch {
+        // Ignore non-JSON messages.
+      }
+    };
+    const listen = () => {
+      agent.addEventListener("message", onMessage, {
+        signal: listenerAbort.signal
+      });
+      agent.addEventListener("close", onClose, {
+        signal: listenerAbort.signal
+      });
+    };
+    const attach = (requestId: string, offer: boolean) => {
+      clearHandshake();
+      attachment = {
+        requestId,
+        replayFilter: new ContinuationReplayFilter(
+          this.appliedChunks,
+          requestId
+        ),
+        ackSent: false
       };
-
-      // Re-arm both the request and timeout on each replacement socket. This is
-      // a retransmission of this resolver's handshake, not a second Chat resume.
-      retryResumeProbe = () => {
-        if (resolved) return;
+      this.activeRequestIds?.add(requestId);
+      this._detachResumeStream = detach;
+      if (!toolContinuation) {
+        this.setActiveServerTurn(requestId, cancelAttached);
+        // A probe may survive a replacement socket. Attach on the latest one.
+        agent = this.agent;
+        listen();
+      }
+      if (offer) sendResumeAck();
+    };
+    const armTimeout = (delay: number) => {
+      clearTimeout(timeout);
+      timeout = setTimeout(close, delay);
+    };
+    const handshake: ResumeHandshake = {
+      probeId,
+      cancel: close,
+      retry: () => {
         armTimeout(RESUME_PROBE_TIMEOUT_MS);
         try {
           if (
             pendingRequest &&
-            pendingChatRequests.get(options.chatId) === pendingRequest
+            pendingChatRequests.get(chatId) === pendingRequest
           ) {
             this.agent.send(pendingRequest.frame);
           }
@@ -756,409 +920,49 @@ export class WebSocketChatTransport<
             })
           );
         } catch {
-          // The next socket open retries again; the timeout remains a backstop.
+          // The next socket open can retry this same handshake.
         }
-      };
-
-      this._onStreamPending = onStreamPending;
-      this._resumeNoneResolver = resumeNoneResolver;
-      this._resumeResolver = resumeResolver;
-      this._retryResumeProbe = retryResumeProbe;
-      retryResumeProbe();
-    });
-  }
-
-  /**
-   * Creates a deferred ReadableStream for client-side tool continuations.
-   * The stream is returned immediately so AI SDK status becomes "submitted"
-   * right after addToolOutput()/addToolApprovalResponse(), then it waits for
-   * the server to announce the continuation via STREAM_RESUMING.
-   */
-  private _createToolContinuationStream(): ReadableStream<UIMessageChunk> {
-    const agent = this.agent;
-    const activeIds = this.activeRequestIds;
-    const streamController = new AbortController();
-    const abortError = new Error("Aborted");
-    abortError.name = "AbortError";
-    let completed = false;
-    let requestId: string | null = null;
-    let readerController: ReadableStreamDefaultController<UIMessageChunk> | null =
-      null;
-    // Held outside start() so the close and detach paths can flush replayed
-    // content before they close the stream.
-    let replayBatch: ReplayChunkBatch | null = null;
-    const probeId = nanoid(8);
-    let onResumeRef: ((data: { id: string }) => void) | null = null;
-    let onResumeNoneRef: ((data: { probeId?: string }) => boolean) | null =
-      null;
-    let onStreamPendingRef: ((data: StreamPendingFrame) => void) | null = null;
-    let retryResumeProbeRef: (() => void) | null = null;
-    let abortToolContinuationRef: (() => boolean) | null = null;
-    let detachResumeStreamRef: (() => boolean) | null = null;
-
-    const clearOwnedHandshake = () => {
-      if (onResumeRef && this._resumeResolver === onResumeRef) {
-        this._resumeResolver = null;
-      }
-      if (onResumeNoneRef && this._resumeNoneResolver === onResumeNoneRef) {
-        this._resumeNoneResolver = null;
-      }
-      if (onStreamPendingRef && this._onStreamPending === onStreamPendingRef) {
-        this._onStreamPending = null;
-      }
-      if (
-        retryResumeProbeRef &&
-        this._retryResumeProbe === retryResumeProbeRef
-      ) {
-        this._retryResumeProbe = null;
-      }
-    };
-
-    const finish = (action: () => void, keepRequestId = false) => {
-      if (completed) return;
-      completed = true;
-      if (this._abortToolContinuation === abortToolContinuationRef) {
-        this._abortToolContinuation = null;
-      }
-      if (this._detachResumeStream === detachResumeStreamRef) {
-        this._detachResumeStream = null;
-      }
-      clearOwnedHandshake();
-      try {
-        action();
-      } catch {
-        // Stream may already be closed
-      }
-      if (requestId && !keepRequestId) {
-        activeIds?.delete(requestId);
-      }
-      streamController.abort();
-    };
-
-    const transport = this;
-
-    abortToolContinuationRef = () => {
-      if (completed) return false;
-
-      if (requestId === null) {
-        finish(() => readerController?.error(abortError));
-        return true;
-      }
-
-      try {
-        agent.send(
-          JSON.stringify({
-            type: MessageType.CF_AGENT_CHAT_REQUEST_CANCEL,
-            id: requestId
-          })
-        );
-      } catch {
-        // Ignore failures (e.g. agent already disconnected)
-      }
-
-      // Keep the ID so the shared message handler ignores in-flight chunks
-      // until the server's terminal frame performs its normal cleanup.
-      finish(() => readerController?.error(abortError), true);
-      return true;
-    };
-    this._abortToolContinuation = abortToolContinuationRef;
-    detachResumeStreamRef = () => {
-      if (completed) return false;
-      finish(() => {
-        replayBatch?.flush();
-        readerController?.close();
-      });
-      return true;
-    };
-    this._detachResumeStream = detachResumeStreamRef;
-
-    return new ReadableStream<UIMessageChunk>({
-      start(controller) {
-        readerController = controller;
-        const batch = new ReplayChunkBatch(controller);
-        replayBatch = batch;
-        let replayFilter: ContinuationReplayFilter<
-          OutgoingMessage<UIMessage> & {
-            type: MessageType.CF_AGENT_USE_CHAT_RESPONSE;
-          }
-        > | null = null;
-        let timeout: ReturnType<typeof setTimeout> | undefined;
-
-        const armTimeout = (delay: number) => {
-          if (timeout) clearTimeout(timeout);
-          timeout = setTimeout(() => finish(() => controller.close()), delay);
-        };
-
-        const onResumeNone = (data: { probeId?: string }) => {
-          if (data.probeId && data.probeId !== probeId) return false;
-          finish(() => controller.close());
-          return true;
-        };
-
-        const onResume = (data: { id: string }) => {
-          if (requestId) return;
-
-          requestId = data.id;
-          activeIds?.add(requestId);
-          clearOwnedHandshake();
-          if (timeout) clearTimeout(timeout);
-
-          agent.send(
-            JSON.stringify({
-              type: MessageType.CF_AGENT_STREAM_RESUME_ACK,
-              id: requestId
-            })
-          );
-        };
-
-        const onStreamPending = () => {
-          if (completed) return;
+      },
+      resume: (requestId) => attach(requestId, true),
+      none: (data) => {
+        if (data.probeId && data.probeId !== probeId) return false;
+        if (
+          pendingRequest &&
+          pendingChatRequests.get(chatId) === pendingRequest
+        ) {
+          // NONE answers the probe, not the retained request's persistence receipt.
           armTimeout(RESUME_PENDING_TIMEOUT_MS);
-        };
-
-        const retryResumeProbe = () => {
-          if (completed || requestId !== null) return;
-          armTimeout(RESUME_PROBE_TIMEOUT_MS);
-          try {
-            transport.agent.send(
-              JSON.stringify({
-                type: MessageType.CF_AGENT_STREAM_RESUME_REQUEST,
-                probeId
-              })
-            );
-          } catch {
-            // A later socket open can retry this same deferred handshake.
-          }
-        };
-
-        onResumeRef = onResume;
-        onResumeNoneRef = onResumeNone;
-        onStreamPendingRef = onStreamPending;
-        retryResumeProbeRef = retryResumeProbe;
-        transport._resumeResolver = onResume;
-        transport._resumeNoneResolver = onResumeNone;
-        transport._onStreamPending = onStreamPending;
-        transport._retryResumeProbe = retryResumeProbe;
-
-        const onMessage = (event: MessageEvent) => {
-          try {
-            const data = JSON.parse(
-              event.data as string
-            ) as OutgoingMessage<UIMessage>;
-
-            if (
-              data.type !== MessageType.CF_AGENT_USE_CHAT_RESPONSE ||
-              requestId == null ||
-              data.id !== requestId
-            ) {
-              return;
-            }
-
-            if (data.error) {
-              transport.appliedChunks.forget(requestId);
-              finish(() => failChatStream(batch, data.body || "Stream error"));
-              return;
-            }
-
-            replayFilter ??= new ContinuationReplayFilter(
-              transport.appliedChunks,
-              requestId
-            );
-            for (const frame of replayFilter.frames(data)) {
-              applyChatResponseFrame(batch, frame);
-            }
-
-            if (data.done) {
-              transport.appliedChunks.forget(requestId);
-              finish(() => controller.close());
-            }
-          } catch {
-            // Ignore non-JSON messages
-          }
-        };
-
-        // Before the resume handshake there is no server turn to interrupt;
-        // closing cleanly lets the hook re-probe on the next open.
-        const onClose = () =>
-          finish(() =>
-            requestId === null
-              ? controller.close()
-              : interruptChatStream(controller, batch)
-          );
-
-        agent.addEventListener("message", onMessage, {
-          signal: streamController.signal
-        });
-        agent.addEventListener("close", onClose, {
-          signal: streamController.signal
-        });
-
-        retryResumeProbe();
+          return true;
+        }
+        if (
+          !toolContinuation &&
+          previousTurnId &&
+          data.probeId === probeId &&
+          data.reason === STREAM_RESUME_NONE_REASONS.IDLE
+        ) {
+          this.clearActiveServerTurn(previousTurnId);
+        }
+        close();
+        return true;
       },
-      cancel() {
-        if (requestId && transport.cancelOnClientAbort) {
-          transport.sendCancelFrame(requestId);
-          finish(() => {}, true);
+      pending: (receipt) => {
+        if (receipt && receipt === pendingRequest) {
+          // This receipt attaches the retained request. ACK only once the
+          // server offers a replay for it.
+          attach(receipt.requestId, false);
         } else {
-          finish(() => {});
+          armTimeout(RESUME_PENDING_TIMEOUT_MS);
         }
       }
-    });
-  }
-
-  /**
-   * Creates a ReadableStream that receives resumed stream chunks
-   * and forwards them to useChat as UIMessageChunk objects.
-   */
-  private _createResumeStream(
-    requestId: string,
-    resumeAcknowledged = false
-  ): Promise<ReadableStream<UIMessageChunk>> {
-    // AI SDK snapshots the hydrated assistant after reconnectToStream resolves.
-    // Wait for the first frame so the hook can clear a matching chunk-0 replay
-    // before that snapshot; clearing the visible messages later cannot reset
-    // AI SDK's private streaming buffer.
-    let resolveReady: (stream: ReadableStream<UIMessageChunk>) => void;
-    const ready = new Promise<ReadableStream<UIMessageChunk>>((resolve) => {
-      resolveReady = resolve;
-    });
-    // Read agent at resolve time (not when reconnectToStream was called)
-    // so chunk listener attaches to the latest socket after _pk changes.
-    const agent = this.agent;
-    const activeIds = this.activeRequestIds;
-    const chunkController = new AbortController();
-    const abortError = new Error("Aborted");
-    abortError.name = "AbortError";
-    let completed = false;
-    let detachResumeStream: (() => boolean) | null = null;
-    let resumeAckSent = resumeAcknowledged;
-
-    const finish = (
-      action: () => void,
-      keepId = false,
-      clearServerTurn = true
-    ) => {
-      if (completed) return;
-      completed = true;
-      if (clearServerTurn) {
-        this.clearActiveServerTurn(requestId);
-      }
-      if (this._detachResumeStream === detachResumeStream) {
-        this._detachResumeStream = null;
-      }
-      try {
-        action();
-      } catch {
-        // Stream may already be closed
-      }
-      if (!keepId) {
-        activeIds?.delete(requestId);
-      }
-      chunkController.abort();
-      resolveReady(stream);
     };
-
-    let streamController: ReadableStreamDefaultController<UIMessageChunk> | null =
-      null;
-    // Held outside start() so the close and detach paths can flush replayed
-    // content before they close the stream.
-    let replayBatch: ReplayChunkBatch | null = null;
-    const cancelActiveRequest = () => {
-      if (completed) return false;
-      finish(() => streamController?.error(abortError), true);
-      return true;
-    };
-    this.setActiveServerTurn(requestId, cancelActiveRequest);
-
-    const transport = this;
-    detachResumeStream = () => {
-      if (completed) return false;
-      finish(() => {
-        replayBatch?.flush();
-        streamController?.close();
-      });
-      return true;
-    };
-    this._detachResumeStream = detachResumeStream;
-
-    const stream = new ReadableStream<UIMessageChunk>({
-      start(controller) {
-        streamController = controller;
-        const batch = new ReplayChunkBatch(controller);
-        replayBatch = batch;
-        const replayFilter = new ContinuationReplayFilter<
-          OutgoingMessage<UIMessage> & {
-            type: MessageType.CF_AGENT_USE_CHAT_RESPONSE;
-          }
-        >(transport.appliedChunks, requestId);
-
-        const onMessage = (event: MessageEvent) => {
-          try {
-            const data = JSON.parse(
-              event.data as string
-            ) as OutgoingMessage<UIMessage>;
-
-            if (
-              data.type === MessageType.CF_AGENT_STREAM_RESUMING &&
-              data.id === requestId
-            ) {
-              if (!resumeAckSent) {
-                resumeAckSent = true;
-                agent.send(
-                  JSON.stringify({
-                    type: MessageType.CF_AGENT_STREAM_RESUME_ACK,
-                    id: requestId
-                  })
-                );
-              }
-              return;
-            }
-
-            if (data.type !== MessageType.CF_AGENT_USE_CHAT_RESPONSE) return;
-            if (data.id !== requestId) return;
-            forgetPendingChatRequestById(requestId);
-
-            if (data.error) {
-              transport.appliedChunks.forget(requestId);
-              finish(() => failChatStream(batch, data.body || "Stream error"));
-              return;
-            }
-
-            for (const frame of replayFilter.frames(data)) {
-              applyChatResponseFrame(batch, frame);
-            }
-            resolveReady(stream);
-
-            if (data.done) {
-              transport.appliedChunks.forget(requestId);
-              finish(() => controller.close());
-            }
-          } catch {
-            // Ignore non-JSON messages
-          }
-        };
-
-        const onClose = () => {
-          finish(() => interruptChatStream(controller, batch), false, false);
-        };
-
-        agent.addEventListener("message", onMessage, {
-          signal: chunkController.signal
-        });
-        agent.addEventListener("close", onClose, {
-          signal: chunkController.signal
-        });
-      },
-      cancel() {
-        if (transport.cancelOnClientAbort) {
-          forgetPendingChatRequestById(requestId);
-          transport.sendCancelFrame(requestId);
-          finish(() => {}, true);
-        } else {
-          finish(() => {}, false, false);
-        }
-      }
-    });
-    return ready;
+    if (toolContinuation) {
+      this._abortToolContinuation = abortToolContinuation;
+      this._detachResumeStream = detach;
+      listen();
+    }
+    this._resumeHandshake = handshake;
+    handshake.retry();
+    // Tool output puts the AI SDK into "submitted" before the server streams.
+    return toolContinuation ? stream : resumed;
   }
 }

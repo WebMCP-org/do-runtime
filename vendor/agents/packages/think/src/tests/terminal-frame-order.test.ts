@@ -19,7 +19,8 @@ const MSG_CHAT_MESSAGES = "cf_agent_chat_messages";
 
 type Frame =
   | { kind: "messages"; messages: UIMessage[] }
-  | { kind: "done"; error: boolean };
+  | { kind: "early-error" }
+  | { kind: "done"; error: boolean; frame: Record<string, unknown> };
 
 async function freshAgent() {
   const room = crypto.randomUUID();
@@ -53,14 +54,37 @@ function recordUntilDone(ws: WebSocket, timeout = 10_000): Promise<Frame[]> {
           messages: msg.messages as UIMessage[]
         });
       } else if (msg.type === MSG_CHAT_RESPONSE && msg.done === true) {
-        frames.push({ kind: "done", error: msg.error === true });
+        frames.push({ kind: "done", error: msg.error === true, frame: msg });
         clearTimeout(timer);
         ws.removeEventListener("message", handler);
         resolve(frames);
+      } else if (msg.type === MSG_CHAT_RESPONSE && msg.error === true) {
+        frames.push({ kind: "early-error" });
       }
     };
     ws.addEventListener("message", handler);
   });
+}
+
+function sendChatRequest(ws: WebSocket, messageId: string): void {
+  ws.send(
+    JSON.stringify({
+      type: MSG_CHAT_REQUEST,
+      id: crypto.randomUUID(),
+      init: {
+        method: "POST",
+        body: JSON.stringify({
+          messages: [
+            {
+              id: messageId,
+              role: "user",
+              parts: [{ type: "text", text: "hello" }]
+            }
+          ]
+        })
+      }
+    })
+  );
 }
 
 /** Lets the connect-time frames arrive before recording starts. */
@@ -142,28 +166,11 @@ describe("Think — terminal frame ordering (#2119)", () => {
     await settle();
 
     const frames = recordUntilDone(ws);
-    ws.send(
-      JSON.stringify({
-        type: MSG_CHAT_REQUEST,
-        id: crypto.randomUUID(),
-        init: {
-          method: "POST",
-          body: JSON.stringify({
-            messages: [
-              {
-                id: crypto.randomUUID(),
-                role: "user",
-                parts: [{ type: "text", text: "hello" }]
-              }
-            ]
-          })
-        }
-      })
-    );
+    sendChatRequest(ws, crypto.randomUUID());
 
     const recorded = await frames;
     expectTranscriptBeforeDone(recorded, "Persisted before done");
-    expect(recorded.at(-1)).toEqual({ kind: "done", error: false });
+    expect(recorded.at(-1)).toMatchObject({ kind: "done", error: false });
     ws.close();
   });
 
@@ -179,9 +186,44 @@ describe("Think — terminal frame ordering (#2119)", () => {
 
     const recorded = await frames;
     expectTranscriptBeforeDone(recorded, "RPC persisted before done");
-    expect(recorded.at(-1)).toEqual({ kind: "done", error: false });
+    expect(recorded.at(-1)).toMatchObject({ kind: "done", error: false });
     ws.close();
   });
+
+  it.each(["WebSocket", "RPC"])(
+    "publishes one terminal provider error after the persisted %s transcript",
+    async (transport) => {
+      const { agent, ws } = await freshAgent();
+      await agent.setInBandErrorResponse("provider failed", ["Partial answer"]);
+      await settle();
+
+      const frames = recordUntilDone(ws);
+      const messageId = crypto.randomUUID();
+      if (transport === "WebSocket") {
+        sendChatRequest(ws, messageId);
+      } else {
+        await expect(agent.testChat("hello")).resolves.toMatchObject({
+          done: false,
+          error: "provider failed"
+        });
+      }
+
+      const recorded = await frames;
+      expectTranscriptBeforeDone(recorded, "Partial answer");
+      expect(recorded.filter((frame) => frame.kind !== "messages")).toEqual([
+        {
+          kind: "done",
+          error: true,
+          frame: expect.objectContaining({
+            body: "provider failed",
+            outcome: "error",
+            ...(transport === "WebSocket" && { messageIds: [messageId] })
+          })
+        }
+      ]);
+      ws.close();
+    }
+  );
 
   it("broadcasts the persisted partial before the error frame when chat() fails mid-stream", async () => {
     const { agent, ws } = await freshAgent();
@@ -193,7 +235,7 @@ describe("Think — terminal frame ordering (#2119)", () => {
 
     const recorded = await frames;
     expectTranscriptBeforeDone(recorded, "");
-    expect(recorded.at(-1)).toEqual({ kind: "done", error: true });
+    expect(recorded.at(-1)).toMatchObject({ kind: "done", error: true });
     ws.close();
   });
 });

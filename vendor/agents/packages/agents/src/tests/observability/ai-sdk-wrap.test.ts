@@ -2009,7 +2009,7 @@ describe("createAISDKWrapper tool approval spans", () => {
     ["approved", "approved", 1],
     ["denied", "denied", 0]
   ] as const)(
-    "records a %s approval as a child of execute_tool",
+    "records a %s approval and only spans tools that execute",
     async (mode, expectedState, expectedExecutions) => {
       const tracing = new RecordingTracer();
       const fixture = approvalAI(mode);
@@ -2030,12 +2030,14 @@ describe("createAISDKWrapper tool approval spans", () => {
         "gen_ai.tool.name": "deploy"
       });
       expect(approval?.ended).toBe(true);
-      expect(approval?.parent?.attributes).toMatchObject({
-        "gen_ai.operation.name": "execute_tool",
-        "gen_ai.tool.call.id": "approval-call-1",
-        "gen_ai.tool.name": "deploy"
-      });
-      expect(approval?.parent?.ended).toBe(true);
+      expect(
+        tracing.spans.filter(
+          (span) => span.attributes["gen_ai.operation.name"] === "execute_tool"
+        )
+      ).toHaveLength(expectedExecutions);
+      expect(approval?.parent?.attributes["gen_ai.operation.name"]).toBe(
+        expectedExecutions === 1 ? "execute_tool" : "invoke_agent"
+      );
     }
   );
 });

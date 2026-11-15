@@ -41,7 +41,7 @@
 
 import { DurableObjectState, DurableObjectStorage } from "../api/actor-state";
 import { DurableObjectId } from "../api/actor";
-import { RpcTarget } from "../api/cloudflare-workers";
+import { RpcTarget, observeWorkerOperation } from "../api/cloudflare-workers";
 import type { FetchPort } from "../api/global-scope";
 import {
   ActorGlobalScope,
@@ -1468,25 +1468,26 @@ class ActorContainerImpl implements ActorContainer {
           // The dispatch is the one moment that knows both the method name and
           // the caller's frames — the provenance `describeLostLock` reports.
           this.#ctx.noteGateUse(`entry ${String(property)}()`, captureGateStack());
-          return this.#ctx
-            .run(
-              () =>
-                this.#withExternalEntry(async () => {
-                  // ← the reply being piped through `waitForOutputLocks()`. This is §1.1's
-                  // whole point: a method that returns without awaiting its own write still
-                  // must not answer before that write is durable. Draining inside `run()`
-                  // keeps the event pending until the reply can leave.
-                  // ← workerd 0b348c30b (`worker-rpc.c++:2268`): a throw, sync or async, waits
-                  // too, and a broken gate's exception replaces the method's.
-                  try {
-                    return (await Reflect.apply(value, subject, args)) as unknown;
-                  } finally {
-                    await this.#ctx.waitForOutputLocks();
-                  }
-                }),
-              { signal },
-            )
-            .catch(this.#throwRpcException);
+          return observeWorkerOperation("do_runtime.actor.rpc", () =>
+            this.#ctx
+              .run(
+                () =>
+                  this.#withExternalEntry(async () => {
+                    // ← the reply being piped through `waitForOutputLocks()`. This is §1.1's
+                    // whole point: a method that returns without awaiting its own write still
+                    // must not answer before that write is durable. Draining inside `run()`
+                    // keeps the event pending until the reply can leave.
+                    // ← workerd 0b348c30b (`worker-rpc.c++:2268`): a throw, sync or async, waits
+                    // too, and a broken gate's exception replaces the method's.
+                    try {
+                      return (await Reflect.apply(value, subject, args)) as unknown;
+                    } finally {
+                      await this.#ctx.waitForOutputLocks();
+                    }
+                  }),
+                { signal },
+              ),
+          ).catch(this.#throwRpcException);
         };
         bound.set(property, gated);
         return gated;
