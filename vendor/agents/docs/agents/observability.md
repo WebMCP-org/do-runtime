@@ -395,29 +395,29 @@ await generateText({
 
 ### Emitted data
 
-| Standard attributes                                                                | Source and scope                                                                             |
-| ---------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
-| `gen_ai.operation.name`                                                            | `invoke_agent`, `chat`, or `execute_tool` on every span                                      |
-| `gen_ai.agent.id`, `gen_ai.agent.name`, `gen_ai.agent.version`                     | Explicit operation identity; Think defaults ID and name, but not version                     |
-| `gen_ai.conversation.id`                                                           | Explicit operation conversation; Think defaults to its opaque Durable Object ID              |
-| `gen_ai.provider.name`                                                             | Normalized provider on operation/model spans when known                                      |
-| `gen_ai.output.type`                                                               | Requested `text` or `json` output on operation/model spans                                   |
-| `gen_ai.request.model`                                                             | Requested model when known                                                                   |
-| `gen_ai.request.frequency_penalty`, `gen_ai.request.presence_penalty`              | Numeric request settings when supplied                                                       |
-| `gen_ai.request.max_tokens`, `gen_ai.request.seed`, `gen_ai.request.top_k`         | Integer request settings when supplied                                                       |
-| `gen_ai.request.stream`                                                            | `true` on streaming operations; omitted otherwise                                            |
-| `gen_ai.request.temperature`, `gen_ai.request.top_p`                               | Numeric request settings when supplied                                                       |
-| `gen_ai.response.id`, `gen_ai.response.model`                                      | Model-call response metadata when actually reported; never inferred from the requested model |
-| `gen_ai.response.time_to_first_chunk`                                              | Model-call streaming latency in seconds                                                      |
-| `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`                          | Aggregate usage on operations and per-call usage on model spans                              |
-| `gen_ai.usage.cache_write.input_tokens`, `gen_ai.usage.cache_read.input_tokens`    | Provider cache usage when reported                                                           |
-| `gen_ai.usage.reasoning.output_tokens`                                             | Reasoning output usage when reported                                                         |
-| `gen_ai.tool.name`, `gen_ai.tool.type`, `gen_ai.tool.call.id`                      | Tool identity; call ID also correlates approval lifecycle segments                           |
-| `cloudflare.agents.tool.approval.state`                                            | Approval lifecycle segment: `requested`, `approved`, or `denied`                             |
-| `gen_ai.input.messages`, `gen_ai.output.messages`                                  | Opt-in OTel-schema model messages on `chat`, including tool parts and output finish reasons  |
-| `gen_ai.tool.call.arguments`, `gen_ai.tool.call.result`                            | Opt-in tool arguments/results on `execute_tool`                                              |
-| `user.id`                                                                          | Explicit v6 metadata key `user.id`                                                           |
-| `error.type`                                                                       | Low-cardinality error class; raw error messages are never recorded                           |
+| Standard attributes                                                             | Source and scope                                                                             |
+| ------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `gen_ai.operation.name`                                                         | `invoke_agent`, `chat`, or `execute_tool` on every span                                      |
+| `gen_ai.agent.id`, `gen_ai.agent.name`, `gen_ai.agent.version`                  | Explicit operation identity; Think defaults ID and name, but not version                     |
+| `gen_ai.conversation.id`                                                        | Explicit operation conversation; Think defaults to its opaque Durable Object ID              |
+| `gen_ai.provider.name`                                                          | Normalized provider on operation/model spans when known                                      |
+| `gen_ai.output.type`                                                            | Requested `text` or `json` output on operation/model spans                                   |
+| `gen_ai.request.model`                                                          | Requested model when known                                                                   |
+| `gen_ai.request.frequency_penalty`, `gen_ai.request.presence_penalty`           | Numeric request settings when supplied                                                       |
+| `gen_ai.request.max_tokens`, `gen_ai.request.seed`, `gen_ai.request.top_k`      | Integer request settings when supplied                                                       |
+| `gen_ai.request.stream`                                                         | `true` on streaming operations; omitted otherwise                                            |
+| `gen_ai.request.temperature`, `gen_ai.request.top_p`                            | Numeric request settings when supplied                                                       |
+| `gen_ai.response.id`, `gen_ai.response.model`                                   | Model-call response metadata when actually reported; never inferred from the requested model |
+| `gen_ai.response.time_to_first_chunk`                                           | Model-call streaming latency in seconds                                                      |
+| `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`                       | Aggregate usage on operations and per-call usage on model spans                              |
+| `gen_ai.usage.cache_write.input_tokens`, `gen_ai.usage.cache_read.input_tokens` | Provider cache usage when reported                                                           |
+| `gen_ai.usage.reasoning.output_tokens`                                          | Reasoning output usage when reported                                                         |
+| `gen_ai.tool.name`, `gen_ai.tool.type`, `gen_ai.tool.call.id`                   | Tool identity; call ID also correlates approval lifecycle segments                           |
+| `cloudflare.agents.tool.approval.state`                                         | Approval lifecycle segment: `requested`, `approved`, or `denied`                             |
+| `gen_ai.input.messages`, `gen_ai.output.messages`                               | Opt-in OTel-schema model messages on `chat`, including tool parts and output finish reasons  |
+| `gen_ai.tool.call.arguments`, `gen_ai.tool.call.result`                         | Opt-in tool arguments/results on `execute_tool`                                              |
+| `user.id`                                                                       | Explicit v6 metadata key `user.id`                                                           |
+| `error.type`                                                                    | Low-cardinality error class; raw error messages are never recorded                           |
 
 The wrapper also emits a small vendor namespace where no standard equivalent
 exists:
