@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.15.0
+
+### Minor Changes
+
+- 7bddf02: Preserve optional W3C trace context on browser MessagePort WebSocket frames and
+  use it when a logical worker reference starts a new placement.
+- 2312744: Add a telemetry entry point for OpenTelemetry worker spans, inference metrics, and bounded OTLP batches. Hosts supply the destination, resource attributes, and export policy.
+  
+  Worker span policies can drop attributes after all values are available. Flush and shutdown drain trace and log batches before collecting the final export health metrics.
+- 9bc45e8: Carry W3C trace context in browser worker bootstrap and record actor RPC and WebSocket timing for configured hosts. Report whether a handoff attached valid context, and keep host recorder failures from changing actor results.
+  Preserve the caller's context when a host cannot record an intermediate span.
+- eaa812e: Preserve active Workers spans across async continuations and support a realm-local span recorder for browser and Node hosts.
+
 ## 0.14.1
 
 ### Patch Changes
