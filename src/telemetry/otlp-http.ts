@@ -1,6 +1,7 @@
 import {
   ROOT_CONTEXT,
   SpanStatusCode,
+  TraceFlags,
   trace,
   type Span,
 } from "@opentelemetry/api";
@@ -11,10 +12,17 @@ import {
   JsonTraceSerializer,
   MetricsExporterMetricsHelper,
 } from "@opentelemetry/otlp-transformer";
-import { resourceFromAttributes } from "@opentelemetry/resources";
+import { defaultResource, resourceFromAttributes } from "@opentelemetry/resources";
 import { LoggerProvider, type ReadableLogRecord } from "@opentelemetry/sdk-logs";
 import { MeterProvider, MetricReader, type ResourceMetrics } from "@opentelemetry/sdk-metrics";
-import { TracerProvider, type ReadableSpan, type SpanProcessor } from "@opentelemetry/sdk-trace";
+import {
+  AlwaysOnSampler,
+  ParentBasedSampler,
+  TracerProvider,
+  createAlwaysRecordSampler,
+  type ReadableSpan,
+  type SpanProcessor,
+} from "@opentelemetry/sdk-trace";
 import { ATTR_ERROR_TYPE, ATTR_SERVICE_INSTANCE_ID } from "@opentelemetry/semantic-conventions";
 import { installWorkerTracing, type WorkerSpanRecorder } from "../api/cloudflare-workers";
 import { platform, platformFetch, platformTimer } from "../api/platform";
@@ -147,8 +155,10 @@ class OtelWorkerSpan implements WorkerSpanRecorder {
     this.span.updateName(this.policy.describe(name).name);
   }
 
-  recordException(): void {
-    this.setAttribute(ATTR_ERROR_TYPE, "error");
+  recordException(exception: unknown): void {
+    // The class name is the semantic-convention value; the host policy decides what to keep.
+    const type = exception instanceof Error && exception.name ? exception.name : "_OTHER";
+    this.setAttribute(ATTR_ERROR_TYPE, type);
     this.setStatus({ code: "error" });
   }
 
@@ -182,7 +192,15 @@ export function configureOtlpTelemetry({
   if ((configuration.metrics || configuration.logs) && !url.pathname.endsWith("/v1/traces")) {
     throw new TypeError("OTLP metrics and logs require a trace endpoint ending in /v1/traces");
   }
-  const resource = resourceFromAttributes(resourceAttributes);
+  // A realm owns its cumulative metric stream, so each recording session is one
+  // service instance with an ephemeral ID that overlapping workers and pages
+  // do not share. The default resource adds the telemetry.sdk.* attributes.
+  const resource = defaultResource().merge(
+    resourceFromAttributes({
+      ...resourceAttributes,
+      [ATTR_SERVICE_INSTANCE_ID]: platform.crypto.randomUUID(),
+    }),
+  );
   const health = { traces: exportHealth(), metrics: exportHealth(), logs: exportHealth() };
 
   // Export outside actor scopes and recheck the host's destination before encoding a batch.
@@ -244,14 +262,7 @@ export function configureOtlpTelemetry({
       })
     : undefined;
   const meter = reader
-    ? new MeterProvider({
-        // A realm owns its cumulative stream. Use an ephemeral exporter ID
-        // so overlapping workers and extension pages are distinct writers.
-        resource: resource.merge(
-          resourceFromAttributes({ [ATTR_SERVICE_INSTANCE_ID]: platform.crypto.randomUUID() }),
-        ),
-        readers: [reader],
-      }).getMeter(scope)
+    ? new MeterProvider({ resource, readers: [reader] }).getMeter(scope)
     : undefined;
   const drops = meter?.createCounter(`${exportMetricPrefix}.dropped`, { unit: "{record}" });
   const failures = meter?.createCounter(`${exportMetricPrefix}.failures`, { unit: "{request}" });
@@ -411,7 +422,9 @@ export function configureOtlpTelemetry({
     },
     onEnd(span) {
       if (stopping) return;
-      traces.add(span);
+      // Unsampled spans still record so metrics and logs do not depend on a
+      // caller's sampling decision; only sampled spans are exported.
+      if (span.spanContext().traceFlags & TraceFlags.SAMPLED) traces.add(span);
       if (!onSpanEnd) return;
       try {
         onSpanEnd(span);
@@ -432,7 +445,11 @@ export function configureOtlpTelemetry({
       ));
     },
   };
-  const tracerProvider = new TracerProvider({ resource, spanProcessors: [spanProcessor] });
+  const tracerProvider = new TracerProvider({
+    resource,
+    sampler: createAlwaysRecordSampler(new ParentBasedSampler({ root: new AlwaysOnSampler() })),
+    spanProcessors: [spanProcessor],
+  });
   function revoke() {
     uninstall?.();
     void tracerProvider.shutdown().catch(globalErrorHandler);

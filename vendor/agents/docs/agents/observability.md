@@ -410,7 +410,7 @@ await generateText({
 | `gen_ai.response.id`, `gen_ai.response.model`                                      | Model-call response metadata when actually reported; never inferred from the requested model |
 | `gen_ai.response.time_to_first_chunk`                                              | Model-call streaming latency in seconds                                                      |
 | `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`                          | Aggregate usage on operations and per-call usage on model spans                              |
-| `gen_ai.usage.cache_creation.input_tokens`, `gen_ai.usage.cache_read.input_tokens` | Provider cache usage when reported                                                           |
+| `gen_ai.usage.cache_write.input_tokens`, `gen_ai.usage.cache_read.input_tokens`    | Provider cache usage when reported                                                           |
 | `gen_ai.usage.reasoning.output_tokens`                                             | Reasoning output usage when reported                                                         |
 | `gen_ai.tool.name`, `gen_ai.tool.type`, `gen_ai.tool.call.id`                      | Tool identity; call ID also correlates approval lifecycle segments                           |
 | `cloudflare.agents.tool.approval.state`                                            | Approval lifecycle segment: `requested`, `approved`, or `denied`                             |

@@ -277,7 +277,7 @@ it("records worker spans under the host policy and rechecks the destination befo
         span.setAttribute("operation.detail", "private in this combination");
         span.setAttribute("operation.count", 1);
         span.setAttribute("private.attribute", "private value");
-        span.recordException(new Error("private exception"));
+        span.recordException(new TypeError("private exception"));
       });
     });
     if (!finalized || !observed) throw new Error("Expected finalized and observed attributes");
@@ -296,7 +296,7 @@ it("records worker spans under the host policy and rechecks the destination befo
             status: { code: 2 },
             attributes: [
               { key: "operation.count", value: { intValue: 1 } },
-              { key: "error.type", value: { stringValue: "error" } },
+              { key: "error.type", value: { stringValue: "TypeError" } },
             ],
           }],
         }],
@@ -450,6 +450,67 @@ it("allows an explicitly configured deadline for a slow collector", async () => 
     tracerProvider.getTracer("test").startSpan("slow receiver").end();
     await tracerProvider.forceFlush();
     expect(notices).toEqual([]);
+  } finally {
+    await tracerProvider.shutdown();
+    await server.close();
+  }
+});
+
+it("records metrics and logs for an unsampled caller and exports only sampled spans", async () => {
+  const received = new Map<string, string[]>();
+  const server = await receiver((path, body) => {
+    received.set(path, [...(received.get(path) ?? []), body]);
+    return {};
+  });
+  const configuration = { endpoint: server.endpoint, metrics: true, logs: true };
+  const { tracerProvider } = await createOtlpTelemetry({
+    configuration,
+    readConfiguration: async () => configuration,
+    resourceAttributes: { "service.name": "test-worker" },
+    scope: "test",
+    workerSpans: { describe: (name) => ({ name, scope: "test" }), attribute: () => undefined },
+    observeSpans: ({ meter, logger }) => {
+      const ended = meter?.createCounter("operation.ended");
+      return (span) => {
+        ended?.add(1, { operation: span.name });
+        logger?.emit({ eventName: span.name });
+      };
+    },
+  });
+  const traceId = "1234567890abcdef1234567890abcdef";
+  try {
+    for (const flags of ["00", "01"]) {
+      withWorkerTraceparent(`00-${traceId}-1234567890abcdef-${flags}`, () => {
+        tracing.enterSpan(`flags-${flags}`, () => undefined);
+      });
+    }
+    await tracerProvider.forceFlush();
+    const traces = (received.get("/v1/traces") ?? []).join("");
+    expect(traces).toContain("flags-01");
+    expect(traces).not.toContain("flags-00");
+    const logs = (received.get("/v1/logs") ?? []).join("");
+    expect(logs).toContain("flags-00");
+    expect(logs).toContain("flags-01");
+    expect(received.get("/v1/metrics")?.join("")).toContain("flags-00");
+
+    // Every signal names the same service instance and the SDK that produced it.
+    type Body = Record<string, [{ resource: { attributes: { key: string; value: { stringValue: string } }[] } }]>;
+    const resources = ["/v1/traces", "/v1/logs", "/v1/metrics"].map((path) => {
+      const [batch] = Object.values(JSON.parse(received.get(path)?.[0] ?? "{}") as Body);
+      return Object.fromEntries(
+        (batch?.[0].resource.attributes ?? []).map(({ key, value }) => [key, value.stringValue]),
+      );
+    });
+    for (const resource of resources) {
+      expect(resource).toMatchObject({
+        "service.name": "test-worker",
+        "telemetry.sdk.language": "nodejs",
+        "telemetry.sdk.name": "opentelemetry",
+        "telemetry.sdk.version": expect.any(String),
+        "service.instance.id": resources[0]?.["service.instance.id"],
+      });
+    }
+    expect(resources[0]?.["service.instance.id"]).toMatch(/^[0-9a-f-]{36}$/u);
   } finally {
     await tracerProvider.shutdown();
     await server.close();

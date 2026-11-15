@@ -550,6 +550,14 @@ uses the corresponding `/v1/metrics` or `/v1/logs` path beside
 spans. Call `scheduleMetrics()` after recording metrics outside that
 callback. The returned tracer provider exposes `forceFlush()`
 and `shutdown()` for the host lifecycle.
+
+A parent whose W3C flags are unsampled still gets recording spans, so
+`observeSpans`, metrics and logs see every operation; only sampled spans are
+exported. Each recording session is one service instance: its ephemeral
+`service.instance.id` and the SDK's `telemetry.sdk.*` attributes are on the
+resource of every signal. A worker span's `recordException` sets `error.type`
+to the exception's class name, or `_OTHER`; the host's attribute policy
+decides which values export.
 [OTLP/HTTP](https://opentelemetry.io/docs/specs/otlp/#otlphttp)
 
 `createGenAiInferenceMetrics(meter)` returns a recorder for provider results.
