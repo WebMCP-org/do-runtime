@@ -27,19 +27,23 @@ async function connectWS(agentClass: string, room: string, pathSuffix = "") {
 
 function waitForDone(
   ws: WebSocket,
-  timeout = 10000
+  requestId?: string
 ): Promise<Array<Record<string, unknown>>> {
   return new Promise((resolve, reject) => {
     const messages: Array<Record<string, unknown>> = [];
     const timer = setTimeout(
       () => reject(new Error("Timeout waiting for done")),
-      timeout
+      10_000
     );
     const handler = (e: MessageEvent) => {
       try {
         const msg = JSON.parse(e.data as string) as Record<string, unknown>;
         messages.push(msg);
-        if (msg.type === MSG_CHAT_RESPONSE && msg.done === true) {
+        if (
+          msg.type === MSG_CHAT_RESPONSE &&
+          msg.done === true &&
+          (requestId === undefined || msg.id === requestId)
+        ) {
           clearTimeout(timer);
           ws.removeEventListener("message", handler);
           resolve(messages);
@@ -67,7 +71,11 @@ function closeWS(ws: WebSocket): Promise<void> {
   });
 }
 
-function sendChatRequest(ws: WebSocket, text: string) {
+function sendChatRequest(
+  ws: WebSocket,
+  text: string,
+  requestId = crypto.randomUUID()
+) {
   const userMessage: UIMessage = {
     id: crypto.randomUUID(),
     role: "user",
@@ -76,7 +84,7 @@ function sendChatRequest(ws: WebSocket, text: string) {
   ws.send(
     JSON.stringify({
       type: MSG_CHAT_REQUEST,
-      id: crypto.randomUUID(),
+      id: requestId,
       init: {
         method: "POST",
         body: JSON.stringify({ messages: [userMessage] })
@@ -271,8 +279,14 @@ describe("Stop before turn admission", () => {
         expect(afterApproval.preparations).toBe(before.preparations + 1);
         expect(afterApproval.actionExecutions).toBe(1);
 
-        const freshDone = waitForDone(ws);
-        sendChatRequest(ws, "fresh request after the cancelled lease settled");
+        // A late resume ACK can replay the previous continuation's terminal.
+        const freshRequestId = crypto.randomUUID();
+        const freshDone = waitForDone(ws, freshRequestId);
+        sendChatRequest(
+          ws,
+          "fresh request after the cancelled lease settled",
+          freshRequestId
+        );
         await freshDone;
         expect(
           (await parent.approvalFacetProbeForTest(childName)).preparations
