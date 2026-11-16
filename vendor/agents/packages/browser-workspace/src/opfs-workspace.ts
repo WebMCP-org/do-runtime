@@ -1,4 +1,5 @@
 import type { FileInfo, Workspace } from "@cloudflare/shell";
+import { createGlobSegmentMatchers } from "./glob";
 import { MAX_SYMLINK_DEPTH, resolveSymlinkTarget } from "./path-utils";
 import type { RangeWorkspaceFsLike } from "./workspace-file-system";
 import {
@@ -65,6 +66,25 @@ type WorkspaceRoots = {
   meta: FileSystemDirectoryHandle;
 };
 
+/** One entry a tree walk lists: a native file or directory, or a symlink. */
+type WalkEntry = {
+  path: string;
+  name: string;
+  /** Levels below the walk's starting directory, whose own entries are 1. */
+  depth: number;
+  native?: NativeEntry;
+  link?: SymlinkEntry;
+};
+
+type TreeWalk = {
+  /** Checked before each directory is listed. */
+  signal?: AbortSignal;
+  /** Runs for every entry while its directory's lock is held. */
+  visit(entry: WalkEntry): Promise<void> | void;
+  /** Whether to list a subdirectory too. */
+  descend(entry: WalkEntry): boolean;
+};
+
 const TEXT_DECODER = new TextDecoder();
 const TEXT_ENCODER = new TextEncoder();
 /** Arbitrary, and only a guard against a pathological path. */
@@ -75,6 +95,10 @@ const MANIFEST_FILE = "entries.json";
 const WORKSPACE_DATA_DIRECTORY = "data";
 /** The symlink manifests, and nothing else. */
 const WORKSPACE_METADATA_DIRECTORY = "meta";
+/** A walk visits a directory's entries this many at a time. A file's size costs
+ * a `File` snapshot, one round trip each: at 10,000 files, batches of 64 took a
+ * third of the time of one at a time, as fast as a whole directory at once. */
+const WALK_BATCH_SIZE = 64;
 
 /** Every key a manifest record may carry, tied to the record it describes so
  * adding a field to SymlinkEntry cannot leave the validator rejecting what
@@ -482,14 +506,37 @@ export class OpfsWorkspace implements RangeWorkspaceFsLike {
       const resolvedPattern = await this.resolveGlobPattern(normalized);
       const matcher = workspaceGlobToRegex(resolvedPattern);
       // Nothing outside the pattern's literal prefix can match the regex, so the
-      // walk is bounded to that subtree — and reading a directory costs a lock, a
-      // manifest and an OPFS enumeration each.
-      const all = await this.collectAllEntriesWithinTree(
-        workspaceGlobPrefix(resolvedPattern)
+      // walk starts there — and reading a directory costs a lock, a manifest and
+      // an OPFS enumeration each. Below the prefix, a pattern without `**` stops
+      // at its last segment and lists only directories whose names match theirs.
+      const prefix = workspaceGlobPrefix(resolvedPattern);
+      const segments = createGlobSegmentMatchers(resolvedPattern)?.slice(
+        pathParts(prefix).length
       );
-      return all
-        .filter((entry) => matcher.test(entry.path))
-        .sort((left, right) => compareBinaryString(left.path, right.path));
+      const matches: FileInfo[] = [];
+      if (matcher.test(prefix)) {
+        const start =
+          prefix === "/"
+            ? nativeDirectoryInfo("/")
+            : await this.lstatWithinTree(prefix);
+        if (start) matches.push(start);
+      }
+      if (segments?.length !== 0) {
+        await this.walkTree(prefix, {
+          descend: ({ name, depth }) =>
+            !segments ||
+            (depth < segments.length && segments[depth - 1]!.test(name)),
+          // Describing a file costs a `File` snapshot, so only matches pay it.
+          visit: async ({ path, link, native }) => {
+            if (!matcher.test(path)) return;
+            const info = await describeEntry(path, link, native);
+            if (info) matches.push(info);
+          }
+        });
+      }
+      return matches.sort((left, right) =>
+        compareBinaryString(left.path, right.path)
+      );
     });
   }
 
@@ -501,24 +548,41 @@ export class OpfsWorkspace implements RangeWorkspaceFsLike {
     return normalizePath(`${resolvedPrefix}${pattern.slice(prefix.length)}`);
   }
 
-  async getWorkspaceInfo(): Promise<{
+  /**
+   * Totals the workspace in one walk that keeps counts, not entries. Symlinks
+   * count as neither files nor directories. The signal stops the walk before
+   * its next directory.
+   */
+  async getWorkspaceInfo(options?: { signal?: AbortSignal }): Promise<{
     fileCount: number;
     directoryCount: number;
     totalBytes: number;
     r2FileCount: number;
   }> {
     return this.withSharedTree(async () => {
-      const entries = await this.collectAllEntriesWithinTree();
-      return {
-        fileCount: entries.filter((entry) => entry.type === "file").length,
-        directoryCount: entries.filter((entry) => entry.type === "directory")
-          .length,
-        totalBytes: entries.reduce(
-          (total, entry) => total + (entry.type === "file" ? entry.size : 0),
-          0
-        ),
+      // The walk visits what is below the root, so the root is counted here.
+      const info = {
+        fileCount: 0,
+        directoryCount: 1,
+        totalBytes: 0,
         r2FileCount: 0
       };
+      await this.walkTree("/", {
+        signal: options?.signal,
+        descend: () => true,
+        visit: async ({ native }) => {
+          if (native?.kind === "directory") {
+            info.directoryCount += 1;
+          } else if (native) {
+            info.fileCount += 1;
+            // OPFS has no cheaper source of a file's size than its snapshot.
+            // Read it before adding: a batch's visits run concurrently.
+            const { size } = await native.getFile();
+            info.totalBytes += size;
+          }
+        }
+      });
+      return info;
     });
   }
 
@@ -1128,25 +1192,65 @@ export class OpfsWorkspace implements RangeWorkspaceFsLike {
     }
   }
 
-  private async collectAllEntriesWithinTree(root = "/"): Promise<FileInfo[]> {
-    const start =
-      root === "/"
-        ? nativeDirectoryInfo("/")
-        : await this.lstatWithinTree(root);
-    if (!start) return [];
-    const output: FileInfo[] = [start];
-    const visit = async (path: string): Promise<void> => {
-      const entries = await this.withDirectoryRead(path, (state) =>
-        this.describeAll(path, state)
-      );
-      entries.sort((left, right) => compareBinaryString(left.path, right.path));
-      for (const entry of entries) {
-        output.push(entry);
-        if (entry.type === "directory") await visit(entry.path);
-      }
+  /**
+   * Walks below the directory at `root`, depth first. Each directory is listed,
+   * and its entries visited, under that directory's shared lock alone, released
+   * before descending: the walk holds one directory lock and one listing at a
+   * time, and keeps per directory on its path only the subdirectories it has
+   * still to visit — nothing per file. The caller's tree lock keeps directories
+   * and symlinks from changing underneath it. A missing root, or a file, is an
+   * empty walk.
+   */
+  private async walkTree(root: string, walk: TreeWalk): Promise<void> {
+    const visitDirectory = async (
+      path: string,
+      depth: number,
+      directory: FileSystemDirectoryHandle,
+      metadata: FileSystemDirectoryHandle | null
+    ): Promise<void> => {
+      walk.signal?.throwIfAborted();
+      const subdirectories: [WalkEntry, FileSystemDirectoryHandle][] = [];
+      await this.withDirectoryLock(path, "shared", async () => {
+        const { manifest } = await this.readManifestIn(metadata, path);
+        const batch: WalkEntry[] = [];
+        const visitBatch = () =>
+          Promise.all(batch.splice(0).map((entry) => walk.visit(entry)));
+        const add = async (entry: WalkEntry) => {
+          batch.push(entry);
+          if (batch.length === WALK_BATCH_SIZE) await visitBatch();
+        };
+        for await (const [name, native] of nativeDirectoryEntries(directory)) {
+          const entry = { path: childPath(path, name), name, depth: depth + 1 };
+          if (manifest.entries[name]) throw symlinkCollision(entry.path);
+          await add({ ...entry, native });
+          if (native.kind === "directory" && walk.descend(entry))
+            subdirectories.push([entry, native]);
+        }
+        for (const [name, link] of Object.entries(manifest.entries))
+          await add({
+            path: childPath(path, name),
+            name,
+            depth: depth + 1,
+            link
+          });
+        await visitBatch();
+      });
+      for (const [entry, handle] of subdirectories)
+        await visitDirectory(
+          entry.path,
+          entry.depth,
+          handle,
+          metadata && (await openDirectoryPath(metadata, [entry.name]))
+        );
     };
-    if (start.type === "directory") await visit(root);
-    return output;
+    const directory = await this.openDataDirectory(root);
+    if (!directory) return;
+    await visitDirectory(
+      root,
+      0,
+      directory,
+      await this.openMetadataDirectory(root)
+    );
   }
 
   /** Opened once per instance. A failure clears the memo rather than poisoning
@@ -1285,12 +1389,7 @@ async function describeEntry(
   native: NativeEntry | undefined
 ): Promise<FileInfo | null> {
   if (link) {
-    if (native) {
-      throw fsError(
-        "EIO",
-        `corrupt manifest: symlink ${path} collides with a native entry`
-      );
-    }
+    if (native) throw symlinkCollision(path);
     return {
       path,
       name: getBasename(path),
@@ -1305,6 +1404,13 @@ async function describeEntry(
   if (!native) return null;
   if (native.kind === "directory") return nativeDirectoryInfo(path);
   return nativeFileInfo(path, await native.getFile());
+}
+
+function symlinkCollision(path: string): Error {
+  return fsError(
+    "EIO",
+    `corrupt manifest: symlink ${path} collides with a native entry`
+  );
 }
 
 /** Where an entry sorts, without describing it: the manifest and the listing

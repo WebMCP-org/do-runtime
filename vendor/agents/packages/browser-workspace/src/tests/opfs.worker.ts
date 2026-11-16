@@ -1,5 +1,6 @@
 import { OpfsWorkspace } from "@mcp-b/browser-workspace";
-import type { WorkspaceFsLike } from "@cloudflare/shell";
+import type { Workspace, WorkspaceFsLike } from "@cloudflare/shell";
+import { seedFiles } from "./native-tree";
 
 async function errorCode(operation: Promise<unknown>): Promise<string> {
   try {
@@ -10,6 +11,64 @@ async function errorCode(operation: Promise<unknown>): Promise<string> {
       ? String(error.code)
       : String(error);
   }
+}
+
+/**
+ * Runs an operation while counting what it asks of OPFS itself: every directory
+ * listing and every file snapshot, as paths below the workspace root
+ * (`data/...` for the files, `meta/...` for symlink manifests).
+ */
+async function observeNativeAccess<T>(
+  root: FileSystemDirectoryHandle,
+  operation: () => Promise<T>,
+  onListing?: (count: number) => void
+): Promise<{ result: T; listed: string[]; read: string[] }> {
+  const listedHandles: FileSystemDirectoryHandle[] = [];
+  const readHandles: FileSystemFileHandle[] = [];
+  const directory = FileSystemDirectoryHandle.prototype;
+  const { entries, keys, values } = directory;
+  const getFile = FileSystemFileHandle.prototype.getFile;
+  const listing = (handle: FileSystemDirectoryHandle) => {
+    listedHandles.push(handle);
+    onListing?.(listedHandles.length);
+  };
+  directory.entries = function () {
+    listing(this);
+    return entries.call(this);
+  };
+  directory.keys = function () {
+    listing(this);
+    return keys.call(this);
+  };
+  directory.values = function () {
+    listing(this);
+    return values.call(this);
+  };
+  FileSystemFileHandle.prototype.getFile = function () {
+    readHandles.push(this);
+    return getFile.call(this);
+  };
+  try {
+    const result = await operation();
+    const paths = (handles: FileSystemHandle[]) =>
+      Promise.all(
+        handles.map(async (handle) =>
+          ((await root.resolve(handle)) ?? ["outside"]).join("/")
+        )
+      );
+    return {
+      result,
+      listed: await paths(listedHandles),
+      read: await paths(readHandles)
+    };
+  } finally {
+    Object.assign(directory, { entries, keys, values });
+    FileSystemFileHandle.prototype.getFile = getFile;
+  }
+}
+
+function errorName(error: unknown): string {
+  return error instanceof Error ? error.name : String(error);
 }
 
 // The basic file contract Shell's in-memory and SQLite workspaces also meet.
@@ -265,6 +324,121 @@ async function run(name: string, operation: string, writer = "") {
         metadataGone,
         kept: await ws.readFile("/files/kept.txt")
       };
+    }
+    case "glob-pruning": {
+      await seedFiles(ws, [
+        ["/projects/a/PROJECT.md", "a"],
+        ["/projects/b/PROJECT.md", "b"],
+        ["/projects/b/notes.md", "notes"],
+        ["/projects/c/readme.md", "c"],
+        ["/projects/PROJECT.md", "too shallow"],
+        ["/other/x/PROJECT.md", "outside the prefix"],
+        ...Array.from({ length: 1000 }, (_, index): [string, string] => [
+          `/projects/a/deep/d${index % 10}/f${index}.md`,
+          "deep"
+        ])
+      ]);
+      await ws.symlink("a", "/projects/link");
+      const { result, listed, read } = await observeNativeAccess(root, () =>
+        ws.glob("/projects/*/PROJECT.md")
+      );
+      return {
+        matches: result.map(({ path }) => path),
+        listed: listed.sort(),
+        read: read.filter((path) => path.startsWith("data/")).sort()
+      };
+    }
+    case "glob-results": {
+      await seedFiles(ws, [
+        ["/g/a.txt", "a"],
+        ["/g/b.md", "b"],
+        ["/g/Ä.txt", "umlaut"],
+        ["/g/😀.txt", "emoji"],
+        ["/g/Z/c.txt", "c"],
+        ["/g/Z/deeper/d.txt", "d"],
+        ["/g/sub/e.txt", "e"],
+        ["/g/sub/f.md", "f"],
+        ["/g/.hidden/h.txt", "h"]
+      ]);
+      await ws.mkdir("/g/empty");
+      await ws.symlink("a.txt", "/g/link.txt");
+      await ws.symlink("sub", "/g/dirlink");
+      await ws.symlink("missing", "/g/dangling");
+      await ws.symlink("/g", "/alias");
+      const patterns = [
+        "/g/*",
+        "/g/*.txt",
+        "/g/*/*.txt",
+        "/g/**/*.txt",
+        "/g/**",
+        "/**/d.txt",
+        "/g/{a,b}.*",
+        "/g/?.md",
+        "/g/[ab].*",
+        "/{g/sub,g/Z}/*.txt",
+        "/alias/*.txt",
+        "/alias/*/*",
+        "/alias",
+        "/g/link.txt",
+        "/g/dangling",
+        "/g/sub",
+        "/",
+        "/g/a.txt/*",
+        "/nope/*"
+      ];
+      const results: Record<string, string[]> = {};
+      for (const pattern of patterns) {
+        results[pattern] = (await ws.glob(pattern)).map(
+          ({ path, type }) => `${type} ${path}`
+        );
+      }
+      return results;
+    }
+    case "workspace-info": {
+      await seedFiles(ws, [
+        ["/notes.md", "hello"],
+        ["/docs/a.txt", "abc"],
+        ["/docs/nested/deep/b.bin", "x".repeat(256)],
+        ["/.Trash/old.txt", "deleted"],
+        ["/.Trash/folder/x.md", "xx"],
+        ["/.config/settings.json", "{}"]
+      ]);
+      await ws.mkdir("/.Trash/folder/empty");
+      await ws.mkdir("/empty");
+      await ws.symlink("notes.md", "/latest");
+      await ws.symlink("nested", "/docs/link-dir");
+      await ws.symlink("gone", "/.Trash/dangling");
+      await ws.symlink("../a.txt", "/docs/nested/up");
+      // The optional signal must leave the method assignable to Shell's own.
+      const getWorkspaceInfo: Workspace["getWorkspaceInfo"] =
+        ws.getWorkspaceInfo.bind(ws);
+      const { result, listed, read } = await observeNativeAccess(
+        root,
+        getWorkspaceInfo
+      );
+      return {
+        info: result,
+        listed: listed.sort(),
+        read: read.filter((path) => path.startsWith("data/")).sort()
+      };
+    }
+    case "workspace-info-abort": {
+      await seedFiles(
+        ws,
+        Array.from({ length: 10 }, (_, index) => [`/d${index}/file.txt`, "x"])
+      );
+      const controller = new AbortController();
+      const { result, listed } = await observeNativeAccess(
+        root,
+        () =>
+          ws
+            .getWorkspaceInfo({ signal: controller.signal })
+            .then(() => "no error", errorName),
+        (count) => {
+          if (count === 3) controller.abort();
+        }
+      );
+      return { error: result, listings: listed.length };
     }
     case "append":
       for (let index = 0; index < 12; index++)
