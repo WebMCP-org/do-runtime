@@ -10,7 +10,12 @@ export default {
     testTimeout: 30_000,
     browser: {
       enabled: true,
-      provider: playwright(),
+      // The OPFS walk test samples reachable heap; it needs gc() and exact sizes.
+      provider: playwright({
+        launchOptions: {
+          args: ["--js-flags=--expose-gc", "--enable-precise-memory-info"]
+        }
+      }),
       headless: true,
       instances: [{ browser: "chromium" }]
     }

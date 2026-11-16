@@ -75,6 +75,22 @@ function braceAlternatives(
   return undefined;
 }
 
+/**
+ * One anchored matcher per `/`-separated segment of a normalized pattern, when
+ * a path matches the whole pattern exactly if it has one name per segment and
+ * each name matches its own: no `**`, no `[...]` class (which can match `/`),
+ * and no brace group spanning a `/`. Otherwise undefined.
+ */
+export function createGlobSegmentMatchers(
+  pattern: string
+): RegExp[] | undefined {
+  if (pattern.includes("**") || pattern.includes("[")) return undefined;
+  const sources = pattern.split("/").filter(Boolean).map(globSource);
+  // A brace group spanning a `/` compiles differently once split.
+  if (`/${sources.join("/")}` !== globSource(pattern)) return undefined;
+  return sources.map((source) => new RegExp(`^${source}$`));
+}
+
 export const GLOB_MAGIC = /[*?[{]/;
 
 export function getGlobPrefix(pattern: string): string {
