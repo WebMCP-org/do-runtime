@@ -343,7 +343,7 @@ export function finishAttributes(input: {
     [TraceAttribute.GenAI.ResponseModel]: input.response?.model,
     [TraceAttribute.GenAI.ResponseTimeToFirstChunk]:
       input.timeToFirstChunkSeconds,
-    [TraceAttribute.GenAI.UsageCacheCreationInputTokens]:
+    [TraceAttribute.GenAI.UsageCacheWriteInputTokens]:
       input.usage?.cacheCreationInputTokens,
     [TraceAttribute.GenAI.UsageCacheReadInputTokens]:
       input.usage?.cacheReadInputTokens,

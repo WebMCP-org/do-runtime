@@ -1351,7 +1351,7 @@ describe("createAISDKWrapper", () => {
       "cloudflare.agents.usage.total_tokens": 16,
       "gen_ai.response.id": "resp-9",
       "gen_ai.response.model": "served-9",
-      "gen_ai.usage.cache_creation.input_tokens": 2,
+      "gen_ai.usage.cache_write.input_tokens": 2,
       "gen_ai.usage.cache_read.input_tokens": 3,
       "gen_ai.usage.input_tokens": 10,
       "gen_ai.usage.output_tokens": 6,

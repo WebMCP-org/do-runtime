@@ -58,7 +58,7 @@ export const TraceAttribute = {
     ToolCallResult: "gen_ai.tool.call.result",
     ToolName: "gen_ai.tool.name",
     ToolType: "gen_ai.tool.type",
-    UsageCacheCreationInputTokens: "gen_ai.usage.cache_creation.input_tokens",
+    UsageCacheWriteInputTokens: "gen_ai.usage.cache_write.input_tokens",
     UsageCacheReadInputTokens: "gen_ai.usage.cache_read.input_tokens",
     UsageInputTokens: "gen_ai.usage.input_tokens",
     UsageOutputTokens: "gen_ai.usage.output_tokens",
