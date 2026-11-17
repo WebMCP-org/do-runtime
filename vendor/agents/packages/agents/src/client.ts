@@ -568,24 +568,28 @@ export class AgentClient<
       resolve: (value: unknown) => void;
       reject: (error: Error) => void;
       stream?: StreamOptions;
+      request: string;
       /**
        * Whether the request was actually transmitted to the server.
-       * Requests issued while disconnected sit in PartySocket's internal
-       * buffer (transmitted: false) and are flushed on the next open —
-       * they survive a transient close instead of being rejected, since
-       * the server never saw them and re-delivery can't double-execute.
+       * Unsent RPCs stay here so a deadline can remove them before reconnect.
        */
       transmitted: boolean;
     }
   >();
   private _readyPromise!: Promise<void>;
   private _resolveReady!: () => void;
+  private _readyPending = false;
   private _previousName: string | null = null;
   private _previousAgent: string | null = null;
 
   private _resetReady() {
+    if (this._readyPending) return;
+    this._readyPending = true;
     this._readyPromise = new Promise((resolve) => {
-      this._resolveReady = resolve;
+      this._resolveReady = () => {
+        this._readyPending = false;
+        resolve();
+      };
     });
   }
 
@@ -781,12 +785,13 @@ export class AgentClient<
       }
     });
 
-    // PartySocket flushes its internal message buffer right before
-    // dispatching "open" — anything queued has now been transmitted.
     this.addEventListener("open", () => {
       this.connectionError = null;
       for (const pending of this._pendingCalls.values()) {
+        if (this.readyState !== this.OPEN) break;
+        if (pending.transmitted) continue;
         pending.transmitted = true;
+        this.send(pending.request);
       }
       const native = this.#capnWeb.current;
       if (native) this.#nativeQueue.flush(native);
@@ -802,8 +807,8 @@ export class AgentClient<
 
       if (this.shouldReconnect && !finalClose) {
         // Transient disconnect: reject calls whose request was already
-        // transmitted — their response can never arrive. Buffered calls
-        // stay pending; PartySocket re-sends them on reconnect.
+        // transmitted — their response can never arrive. Unsent calls stay
+        // pending for the next open, unless their own deadline expires.
         this._rejectPendingCalls("Connection closed", {
           onlyTransmitted: true
         });
@@ -897,8 +902,9 @@ export class AgentClient<
       throw new Error("Connection closed");
     }
 
+    const id = crypto.randomUUID();
+    const request = serializeRpcRequest(id, method, args, options);
     return new Promise((resolve, reject) => {
-      const id = crypto.randomUUID();
       let timeoutId: ReturnType<typeof setTimeout> | undefined;
 
       const { stream: streamOptions, timeout } = splitCallOptions(options);
@@ -933,13 +939,11 @@ export class AgentClient<
           resolve(value);
         },
         stream: streamOptions,
-        // If the socket is open, send() below transmits synchronously;
-        // otherwise the request is buffered until the next open event
-        // (the "open" listener then marks it transmitted).
+        request,
         transmitted: this.readyState === this.OPEN
       });
 
-      this.send(serializeRpcRequest(id, method, args, options));
+      if (this.readyState === this.OPEN) this.send(request);
     });
   }
 }

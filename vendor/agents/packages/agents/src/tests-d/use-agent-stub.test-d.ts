@@ -1,6 +1,7 @@
 import type { env } from "cloudflare:workers";
 import { Agent } from "..";
 import { useAgent } from "../react";
+import { AgentClient } from "../client";
 
 declare class A extends Agent<typeof env, {}> {
   prop: string;
@@ -51,3 +52,24 @@ stub.setState({ prop: "test" });
 stub.nonSerializableParams("test", { c: new Date() });
 // @ts-expect-error Date return not serializable
 stub.nonSerializableReturn("test");
+
+const node = new AgentClient<A>({
+  agent: "test",
+  host: "localhost",
+  startClosed: true
+});
+
+node.stub.f3(1, "test") satisfies Promise<string>;
+node.call("f3", [1, "test"], {
+  traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+}) satisfies Promise<string>;
+// @ts-expect-error the stub infers the required string argument
+node.stub.f3(1);
+// @ts-expect-error the method returns a string
+node.stub.f3(1, "test") satisfies Promise<number>;
+// @ts-expect-error named calls infer the same argument tuple
+node.call("f3", ["test", 1]);
+// @ts-expect-error method names come from the declared Agent
+node.call("notAnAgentMethod");
+// @ts-expect-error RPC arguments exclude functions
+node.stub.f2(() => "test");
