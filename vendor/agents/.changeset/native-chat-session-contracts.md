@@ -11,4 +11,4 @@ Expose `useAgentChatHistory` and `hasReceivedMessages` so applications load and 
 
 Replace Think's deprecated session facade with the native `agents/sessions` handle. Configure blocks through `configureContext`, frozen-prompt storage through `configurePromptStore`, and compaction error handling through `Session.onCompactionError`. Durable storage migrations remain intact. Export the pure schedule grammar at `@cloudflare/think/schedules`.
 
-Export `WorkspaceSource` and branded `SkillSummary` contracts. Require native ranged reads and binary append in browser workspaces, and reject malformed pagination instead of reporting incomplete listings as successful. Client tool wire descriptions are strings and delegated execution preserves the required tool call ID.
+Export `WorkspaceSource` and branded `SkillSummary` contracts and the `isSkillName` decoder for safe names that loaded with authoring warnings. Require native ranged reads and binary append in browser workspaces, and reject malformed pagination instead of reporting incomplete listings as successful. Client tool wire descriptions are strings and delegated execution preserves the required tool call ID.

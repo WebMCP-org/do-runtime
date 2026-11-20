@@ -263,9 +263,13 @@ function specNameProblem(name: string): string | null {
   return null;
 }
 
-/** Whether a name is usable as a directory, enum value, and path segment. */
-function isSafeName(name: string): boolean {
+/**
+ * Whether a loaded name satisfies the native SkillName path-safety contract.
+ * Accepts names that load with format warnings; use parseSkillName for strict authoring.
+ */
+export function isSkillName(name: unknown): name is SkillName {
   return (
+    typeof name === "string" &&
     name.length > 0 &&
     name === name.trim() &&
     name !== "." &&
@@ -294,7 +298,7 @@ function parseName(
   // Padding is a format problem, not something to fix silently: it is
   // trimmed and reported.
   const name = declared.trim().normalize("NFKC");
-  if (!isSafeName(name)) {
+  if (!isSkillName(name)) {
     return {
       fatal: new SkillParseError(
         "invalid-name",
@@ -302,9 +306,9 @@ function parseName(
       )
     };
   }
-  // SAFETY: isSafeName checked the guarantees every SkillName carries. Spec
-  // format problems are reported below, and a strict parse fails on them.
-  const accepted = name as SkillName;
+  // The guard establishes the native name contract. Spec format problems
+  // remain warnings for loaded skills, and strict authoring rejects them.
+  const accepted = name;
 
   const problems: SkillParseError[] = [];
   if (fallback) {
