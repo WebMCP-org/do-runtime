@@ -18,7 +18,7 @@ import type {
   TurnContext
 } from "../../think";
 import { StreamAccumulator, type ClientToolSchema } from "agents/chat";
-import type { Session, SessionMessage } from "../../think";
+import type { Session, SessionMessage } from "agents/sessions";
 
 function createClientToolMockModel(): LanguageModel {
   let callCount = 0;

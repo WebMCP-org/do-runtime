@@ -814,14 +814,14 @@ for providers, tools, and frozen-prompt behavior.
 
 ### Upgrading from 0.17
 
-A subclass written against 0.17 keeps compiling and running. `configureSession(session)` still accepts the `withContext()` / `withCachedPrompt()` chain, and `this.session` still carries the context methods (`addContext`, `getContextBlock`, `replaceContextBlock`, `refreshSystemPrompt`, `freezeSystemPrompt`, `tools()`), which now forward to `this.context`. They are deprecated; move blocks into `configureContext()` and read `this.context` at your own pace. Blocks from both hooks are merged, `configureContext()` first.
+Think uses the native `Session` from `agents/sessions`. Move context declarations to `configureContext()` and context operations to `this.context`; the old `ThinkSession` facade and positional overloads are removed. Use `appendMessage(message, { parentId })` and `getHistory({ leafId })`. Frozen prompts persist automatically; to select an external prompt store, override `configurePromptStore()` and return a `WritableContextProvider` from `agents/context`.
 
-Two things do change on upgrade:
+Durable storage behavior remains:
 
 - **Storage migrates on first wake and cannot be rolled back.** Each Durable Object lifts its `assistant_*` tables into `cf_agents_session_*`, verifies every row, and drops the old tables. An object that has woken on this version has an empty conversation if you roll back; rolling forward again is safe. Canary the deploy if you need a rollback path.
 - **Hydration has no message-count floor.** `hydrationByteBudget` (now 32 MiB) is a hard ceiling that charges each row its stored size plus attachments, so a run of very large messages can hydrate fewer than four. `getHistory()` still reads the full path.
 
-Annotate a `configureSession` override with `Session` imported from `@cloudflare/think`. The `Session` class exported by `agents/sessions` is the raw storage handle and is not assignable to Think's.
+Annotate `configureSession` with `Session` imported from `agents/sessions`. Configure compaction with `onCompaction()`, `onCompactionError()`, and `compactAfter(threshold)`.
 
 `sessionAttachments` is gone (Sessions stores media out of the row on its own), `MediaEvictionConfig.externalizeToWorkspace` is ignored (bytes are always preserved), and `WorkspaceLike.writeFileBytes` is optional (a workspace without it disables media eviction and skills projection with a one-time warning).
 

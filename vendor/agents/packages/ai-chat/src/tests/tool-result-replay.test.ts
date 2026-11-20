@@ -100,7 +100,6 @@ describe("Tool result idempotency (issue #1404)", () => {
     // First apply: legitimate transition input-available → output-available.
     const firstApplied = await agentStub.testApplyToolResult(
       toolCallId,
-      "changeBackgroundColor",
       output
     );
     expect(firstApplied).toBe(true);
@@ -125,7 +124,6 @@ describe("Tool result idempotency (issue #1404)", () => {
     // broadcast a redundant MESSAGE_UPDATED.
     const secondApplied = await agentStub.testApplyToolResult(
       toolCallId,
-      "changeBackgroundColor",
       output
     );
     expect(secondApplied).toBe(true);
@@ -184,7 +182,6 @@ describe("Tool result idempotency (issue #1404)", () => {
     expect(
       await agentStub.testApplyToolResult(
         toolCallId,
-        "changeBackgroundColor",
         undefined,
         "output-error",
         errorText
@@ -196,7 +193,6 @@ describe("Tool result idempotency (issue #1404)", () => {
     expect(
       await agentStub.testApplyToolResult(
         toolCallId,
-        "changeBackgroundColor",
         undefined,
         "output-error",
         errorText
@@ -259,13 +255,9 @@ describe("Tool result idempotency (issue #1404)", () => {
       }
     ]);
 
-    expect(
-      await agentStub.testApplyToolResult(
-        toolCallId,
-        "changeBackgroundColor",
-        realOutput
-      )
-    ).toBe(true);
+    expect(await agentStub.testApplyToolResult(toolCallId, realOutput)).toBe(
+      true
+    );
 
     // The terminal-state duplicate must be preserved (first-write-wins),
     // and the input-available duplicate must transition to output-available.
@@ -321,13 +313,7 @@ describe("Tool result idempotency (issue #1404)", () => {
 
     const broadcasts = collectMessages(ws);
 
-    expect(
-      await agentStub.testApplyToolResult(
-        toolCallId,
-        "changeBackgroundColor",
-        output
-      )
-    ).toBe(true);
+    expect(await agentStub.testApplyToolResult(toolCallId, output)).toBe(true);
 
     const update = (await waitForMessage(
       broadcasts,

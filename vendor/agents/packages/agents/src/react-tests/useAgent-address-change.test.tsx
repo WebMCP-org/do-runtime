@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { render as _render, cleanup } from "vitest-browser-react";
 import { Suspense, useEffect, useRef, useState } from "react";
-import { useAgent } from "../react";
+import { useAgent, type AgentTransport } from "../react";
 import { getTestWorkerHost } from "./test-config";
 
 // Socket traffic legitimately lands outside act() in these tests.
@@ -35,6 +35,7 @@ describe("useAgent when the name changes", () => {
         name: string;
         identified: boolean;
         identityReceived: boolean;
+        connectionKey: string;
       }[] = [];
       const identities: string[] = [];
       const changes: string[][] = [];
@@ -59,6 +60,7 @@ describe("useAgent when the name changes", () => {
         });
         observations.push({
           name,
+          connectionKey: agent.connectionKey,
           identified: agent.identified,
           identityReceived: identifiedSockets.has(agent) && agent.name === name
         });
@@ -91,8 +93,68 @@ describe("useAgent when the name changes", () => {
         )
       ).toEqual([]);
       expect(changes).toEqual([]);
+      const firstKeys = new Set(
+        observations
+          .filter(({ name }) => name === first)
+          .map(({ connectionKey }) => connectionKey)
+      );
+      const otherKeys = new Set(
+        observations
+          .filter(({ name }) => name === other)
+          .map(({ connectionKey }) => connectionKey)
+      );
+      expect(firstKeys.size).toBe(1);
+      expect(otherKeys.size).toBe(1);
+      expect([...firstKeys][0]).not.toBe([...otherKeys][0]);
     }
   );
+
+  it("waits for the replacement transport to identify", async () => {
+    const { host, protocol } = getTestWorkerHost();
+    const identifiedSockets = new WeakSet<object>();
+    const observations: { identified: boolean; received: boolean }[] = [];
+    let changeTransport: ((transport: AgentTransport) => void) | undefined;
+    let current: ReturnType<typeof useAgent<unknown>> | undefined;
+    function Connection() {
+      const [transport, setTransport] =
+        useState<AgentTransport>("cf-websocket");
+      const agent = useAgent({
+        host,
+        protocol,
+        agent: "TestCallableAgent",
+        name: "transport-identity",
+        transport,
+        onIdentity: () => identifiedSockets.add(agent)
+      });
+      current = agent;
+      if (transport === "capnweb")
+        observations.push({
+          identified: agent.identified,
+          received:
+            identifiedSockets.has(agent) &&
+            agent.url.includes("_transport=capnweb")
+        });
+      useEffect(() => {
+        changeTransport = setTransport;
+      }, []);
+      return <div>{agent.identified ? "ready" : "connecting"}</div>;
+    }
+    await render(
+      <Suspense fallback="loading">
+        <Connection />
+      </Suspense>
+    );
+    await vi.waitFor(() => expect(current?.identified).toBe(true));
+    changeTransport?.("capnweb");
+    await vi.waitFor(() =>
+      expect(observations.some(({ received }) => received)).toBe(true)
+    );
+    expect(
+      observations.filter(({ identified, received }) => identified && !received)
+    ).toEqual([]);
+    await expect(current!.ready).resolves.toBeUndefined();
+    expect(current!.name).toBe("transport-identity");
+  });
 
   it("reports server identity changes when credentials refresh at the same address", async () => {
     const { host, protocol } = getTestWorkerHost();
@@ -100,6 +162,7 @@ describe("useAgent when the name changes", () => {
     const other = `identity-user-b-${crypto.randomUUID()}`;
     const identities: string[] = [];
     const changes: string[][] = [];
+    const connectionKeys = new Set<string>();
     let update: ((name: string) => void) | undefined;
 
     function TestComponent() {
@@ -113,6 +176,7 @@ describe("useAgent when the name changes", () => {
         onIdentity: (name) => identities.push(name),
         onIdentityChange: (oldName, newName) => changes.push([oldName, newName])
       });
+      connectionKeys.add(agent.connectionKey);
       useEffect(() => {
         update = setUser;
       }, []);
@@ -135,6 +199,7 @@ describe("useAgent when the name changes", () => {
     await vi.waitFor(() => expect(identities).toEqual([first, other, first]), {
       timeout: 10000
     });
+    expect(connectionKeys.size).toBe(1);
     expect(changes).toEqual([
       [first, other],
       [other, first]

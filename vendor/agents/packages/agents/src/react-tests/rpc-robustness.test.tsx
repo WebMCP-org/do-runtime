@@ -14,7 +14,11 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { render as _render, cleanup } from "vitest-browser-react";
 import { Suspense, useEffect, useRef, useState } from "react";
-import { AgentClient } from "../client";
+import {
+  AgentClient,
+  AgentConnectionClosedError,
+  AgentCallTimeoutError
+} from "../client";
 import { useAgent, type UseAgentOptions } from "../react";
 import { getTestWorkerHost } from "./test-config";
 
@@ -286,7 +290,7 @@ describe("useAgent RPC robustness", () => {
       const slowCall = latestAgent!.call("asyncMethod", [10000]);
       setOptions!({ ...baseOptions, query: { generation: "2" } });
 
-      await expect(slowCall).rejects.toThrow("Connection closed");
+      await expect(slowCall).rejects.toBeInstanceOf(AgentConnectionClosedError);
     });
 
     it("surfaces terminal close as connectionError and stops reconnecting", async () => {
@@ -434,8 +438,8 @@ describe("useAgent RPC robustness", () => {
         expect(latestAgent?.connectionError).toBeNull();
       });
 
-      await expect(latestAgent!.call("add", [1, 2])).rejects.toThrow(
-        /timed out after 200ms/
+      await expect(latestAgent!.call("add", [1, 2])).rejects.toBeInstanceOf(
+        AgentCallTimeoutError
       );
     });
 
@@ -817,7 +821,7 @@ describe("useAgent RPC robustness", () => {
     });
   });
 
-  describe("a transport that closes inside send()", () => {
+  describe("connection lifecycle at the WebSocket boundary", () => {
     /**
      * Replaces only the browser WebSocket. Once its pipe is gone, send()
      * reports the close before returning, as a transport that discovers a
@@ -869,6 +873,150 @@ describe("useAgent RPC robustness", () => {
       }
       return { sockets, DeadPipeSocket };
     }
+
+    it.each(["client", "hook"] as const)(
+      "%s ignores scalar frames and rejects malformed RPC responses",
+      async (kind) => {
+        const { sockets, DeadPipeSocket } = deadPipeSockets();
+        const options = {
+          agent: "TestCallableAgent",
+          host: "localhost",
+          WebSocket: DeadPipeSocket
+        };
+        let client: AgentClient | TestAgent | null = null;
+        if (kind === "client") client = new AgentClient(options);
+        else
+          await render(
+            <ControlledAgentComponent
+              initialOptions={options}
+              onAgent={(agent) => {
+                client = agent;
+              }}
+              exposeSetOptions={() => {}}
+            />
+          );
+        try {
+          await vi.waitFor(() => expect(sockets).toHaveLength(1));
+          sockets[0].open();
+          await vi.waitFor(() =>
+            expect(client?.readyState).toBe(WebSocket.OPEN)
+          );
+          for (const data of [
+            "null",
+            "42",
+            "[]",
+            '{"type":"cf_agent_identity","name":42}'
+          ]) {
+            sockets[0].dispatchEvent(new MessageEvent("message", { data }));
+          }
+          const invalid = client!.call("add", [1, 2]);
+          const { id } = JSON.parse(sockets[0].sent[0]);
+          sockets[0].dispatchEvent(
+            new MessageEvent("message", {
+              data: JSON.stringify({
+                type: "rpc",
+                id,
+                success: "false",
+                result: 3
+              })
+            })
+          );
+          await expect(invalid).rejects.toThrow("Malformed RPC response");
+          const valid = client!.call("add", [3, 4]);
+          sockets[0].respond(sockets[0].sent[1], 7);
+          await expect(valid).resolves.toBe(7);
+        } finally {
+          client?.close();
+        }
+      }
+    );
+
+    it("keeps the same pending AgentClient readiness across an unsuccessful connection", async () => {
+      const { sockets, DeadPipeSocket } = deadPipeSockets();
+      const client = new AgentClient({
+        agent: "TestCallableAgent",
+        host: "localhost",
+        WebSocket: DeadPipeSocket,
+        minReconnectionDelay: 0,
+        maxReconnectionDelay: 0
+      });
+      try {
+        const initialReady = client.ready;
+        await vi.waitFor(() => expect(sockets).toHaveLength(1));
+        sockets[0].close(1006, "handshake failed");
+        await vi.waitFor(() => expect(sockets).toHaveLength(2));
+        sockets[1].open();
+        sockets[1].dispatchEvent(
+          new MessageEvent("message", {
+            data: JSON.stringify({
+              type: "cf_agent_identity",
+              name: "default",
+              agent: "test-callable-agent"
+            })
+          })
+        );
+        expect(client.ready).toBe(initialReady);
+        await initialReady;
+        expect(client.identified).toBe(true);
+      } finally {
+        client.close();
+      }
+    });
+
+    it("discards an AgentClient RPC that expires before the socket opens", async () => {
+      const { sockets, DeadPipeSocket } = deadPipeSockets();
+      const client = new AgentClient({
+        agent: "TestCallableAgent",
+        host: "localhost",
+        WebSocket: DeadPipeSocket
+      });
+      try {
+        await vi.waitFor(() => expect(sockets).toHaveLength(1));
+        await expect(
+          client.call("add", [1, 2], { timeout: 20 })
+        ).rejects.toThrow("timed out after 20ms");
+        sockets[0].open();
+        expect(sockets[0].sent).toEqual([]);
+
+        const next = client.call("add", [3, 4]);
+        expect(sockets[0].sent).toHaveLength(1);
+        sockets[0].respond(sockets[0].sent[0], 7);
+        await expect(next).resolves.toBe(7);
+      } finally {
+        client.close();
+      }
+    });
+
+    it("keeps later AgentClient calls queued when the first flush closes its socket", async () => {
+      const { sockets, DeadPipeSocket } = deadPipeSockets();
+      const client = new AgentClient({
+        agent: "TestCallableAgent",
+        host: "localhost",
+        WebSocket: DeadPipeSocket,
+        minReconnectionDelay: 0,
+        maxReconnectionDelay: 0
+      });
+      try {
+        await vi.waitFor(() => expect(sockets).toHaveLength(1));
+        const first = client.call("add", [1, 2]);
+        const second = client.call("add", [3, 4]);
+        const rejected = expect(first).rejects.toBeInstanceOf(
+          AgentConnectionClosedError
+        );
+        sockets[0].pipeGone = true;
+        sockets[0].open();
+        await rejected;
+        expect(sockets[0].sent).toHaveLength(1);
+
+        await vi.waitFor(() => expect(sockets).toHaveLength(2));
+        sockets[1].open();
+        expect(sockets[1].sent).toHaveLength(1);
+        sockets[1].respond(sockets[1].sent[0], 7);
+        await expect(second).resolves.toBe(7);
+      } finally {
+        client.close();
+      }
+    });
 
     it("rejects a call whose send closed the socket instead of waiting for the timeout", async () => {
       const { host, protocol } = getTestWorkerHost();
@@ -944,7 +1092,7 @@ describe("useAgent RPC robustness", () => {
       sockets[0].pipeGone = true;
       sockets[0].open();
 
-      await expect(first).rejects.toThrow("Connection closed");
+      await expect(first).rejects.toBeInstanceOf(AgentConnectionClosedError);
       expect(sockets[0].sent).toHaveLength(1);
 
       // The second call was never handed to the dead socket, so it moves to

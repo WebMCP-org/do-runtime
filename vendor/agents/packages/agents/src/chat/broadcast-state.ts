@@ -40,8 +40,6 @@ export type BroadcastStreamEvent =
       replay?: boolean;
       replayComplete?: boolean;
       continuation?: boolean;
-      /** @deprecated Continuations now seed from current messages in `messagesUpdate`. */
-      currentMessages?: UIMessage[];
     }
   | {
       type: "resume-fallback";

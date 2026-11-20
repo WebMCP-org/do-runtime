@@ -10,7 +10,8 @@ export {
   getToolInput,
   getToolOutput,
   getToolApproval,
-  getAgentMessages
+  getAgentMessages,
+  useAgentChatHistory
 } from "agents/chat/react";
 
 export type {
@@ -33,15 +34,6 @@ export type UseThinkChatOptions<
   ChatMessage extends UIMessage = UIMessage
 > = ThinkChatOptions<State, ChatMessage>;
 
-const _thinkReactWarnings = new Set<string>();
-
-function isProductionRuntime(): boolean {
-  const maybeGlobal = globalThis as typeof globalThis & {
-    process?: { env?: { NODE_ENV?: string } };
-  };
-  return maybeGlobal.process?.env?.NODE_ENV === "production";
-}
-
 /**
  * Think-facing chat hook.
  *
@@ -53,25 +45,6 @@ export function useAgentChat<
   State = unknown,
   ChatMessage extends UIMessage = UIMessage
 >(options: ThinkChatOptions<State, ChatMessage>) {
-  const maybeSyncMessagesToServer = (
-    options as ThinkChatOptions<State, ChatMessage> & {
-      syncMessagesToServer?: boolean;
-    }
-  ).syncMessagesToServer;
-
-  if (
-    !isProductionRuntime() &&
-    maybeSyncMessagesToServer &&
-    !_thinkReactWarnings.has("syncMessagesToServer")
-  ) {
-    _thinkReactWarnings.add("syncMessagesToServer");
-    console.warn(
-      "[@cloudflare/think] `syncMessagesToServer` has no effect: Think " +
-        "ignores client-pushed transcripts. `setMessages` updates the local " +
-        "view only. Use `clearHistory()` for persisted clears."
-    );
-  }
-
   return useAgentChatCore<State, ChatMessage>({
     ...options,
     syncMessagesToServer: false

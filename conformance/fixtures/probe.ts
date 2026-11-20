@@ -1218,6 +1218,31 @@ export class Probe extends DurableObject<ProbeEnv> {
     };
   }
 
+  /** UTF-8 key order differs from UTF-16 order around astral characters. */
+  async unicodeListOptions(): Promise<Record<string, unknown>> {
+    const storage = this.ctx.storage;
+    const keys = ["\ud7ff", "\ue000", "\ufffd", "\uffff", "\u{10000}", "\u{10000}a", "\u{10ffff}", "\u{10ffff}a"];
+    await storage.put(Object.fromEntries(keys.map((key) => [key, key])));
+    const ranges: DurableObjectListOptions[] = [
+      { start: "\ue000", prefix: "\u{10000}" },
+      { prefix: "\ue000", end: "\u{10000}" },
+      { prefix: "\uffff" },
+      { prefix: "\ud7ff" },
+      { prefix: "\u{10ffff}", reverse: true },
+      { prefix: "\u{10ffff}", end: "\ue000" },
+      { start: "\ue000", end: "\u{10000}" },
+      { prefix: "\ud800" },
+      { start: "\ud800", end: "\ue000" },
+      { end: "\ud800" },
+      { startAfter: "\ud800", end: "\ufffd" },
+    ];
+    return {
+      multiple: [...(await storage.get([...keys].reverse())).keys()],
+      async: await Promise.all(ranges.map(async (options) => [...(await storage.list(options)).keys()])),
+      sync: ranges.map((options) => [...storage.kv.list(options)].map(([key]) => key)),
+    };
+  }
+
   /** `deleteAll()` resets the actor database, including alarm metadata. */
   async deleteAllState(): Promise<Record<string, unknown>> {
     await this.ctx.storage.put("delete-me", "present");

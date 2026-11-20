@@ -1,9 +1,29 @@
 import {
+  ClientReadiness,
+  socketDestinationKey,
+  parseClientFrame
+} from "./client-connection";
+import {
+  JsonRpcClient,
+  NativeCallQueue,
+  nativeCall,
+  DEFAULT_CALL_TIMEOUT_MS,
+  AgentConnectionClosedError,
+  type CallOptions
+} from "./client-rpc";
+export {
+  DEFAULT_CALL_TIMEOUT_MS,
+  AgentConnectionClosedError,
+  AgentCallTimeoutError,
+  type CallOptions,
+  type StreamOptions
+} from "./client-rpc";
+import {
   type PartyFetchOptions,
   PartySocket,
   type PartySocketOptions
 } from "partysocket";
-import type { Agent, RPCRequest, RPCResponse } from "./";
+import type { Agent } from "./";
 import type {
   ClientParameters,
   Method,
@@ -173,216 +193,6 @@ export type AgentClientOptions<State = unknown> = Omit<
   };
 
 /**
- * Default timeout (in milliseconds) applied to non-streaming RPC calls
- * that don't pass an explicit `timeout`. Acts as a backstop so calls
- * whose response is lost (e.g. the connection drops mid-flight) reject
- * instead of hanging forever. Override per client via
- * `defaultCallTimeout`, or per call via `timeout` (0 disables).
- */
-export const DEFAULT_CALL_TIMEOUT_MS = 30_000;
-
-/**
- * Options for streaming RPC calls
- */
-export type StreamOptions = {
-  /** Called when a chunk of data is received */
-  onChunk?: (chunk: unknown) => void;
-  /** Called when the stream ends */
-  onDone?: (finalChunk: unknown) => void;
-  /** Called when an error occurs */
-  onError?: (error: string) => void;
-};
-
-/**
- * Options for RPC calls
- */
-export type CallOptions = {
-  /** Timeout in milliseconds. If the call doesn't complete within this time, it will be rejected. */
-  timeout?: number;
-  /** Streaming options for handling streaming responses */
-  stream?: StreamOptions;
-  /** W3C parent context for a JSON WebSocket call. The host decides whether to use it. */
-  traceparent?: string;
-};
-
-/**
- * Normalize `call()` options. The legacy shape is the stream callbacks
- * themselves (`{ onChunk, onDone, onError }`); the current shape nests
- * them under `stream` beside `timeout`.
- */
-export function splitCallOptions(
-  options: CallOptions | StreamOptions | undefined
-): {
-  stream: StreamOptions | undefined;
-  timeout: number | undefined;
-} {
-  const legacy =
-    options !== undefined &&
-    ("onChunk" in options || "onDone" in options || "onError" in options);
-  return legacy
-    ? { stream: options as StreamOptions, timeout: undefined }
-    : {
-        stream: (options as CallOptions | undefined)?.stream,
-        timeout: (options as CallOptions | undefined)?.timeout
-      };
-}
-
-/** @internal Serialize before either client queues the request for reconnect. */
-export function serializeRpcRequest(
-  id: string,
-  method: string,
-  args: unknown[],
-  options?: CallOptions | StreamOptions
-): string {
-  const traceparent =
-    options && "traceparent" in options ? options.traceparent : undefined;
-  const request: RPCRequest = {
-    args,
-    id,
-    method,
-    type: MessageType.RPC,
-    ...(traceparent ? { traceparent } : {})
-  };
-  return JSON.stringify(request);
-}
-
-/**
- * One native call on the Cap'n Web transport, with the timeout and
- * stream-callback contract `call()` has on the JSON wire. The timeout
- * covers the whole call, draining included: on expiry the stream reader is
- * cancelled and the promise rejects once. A `ReadableStream` result is
- * drained into the stream callbacks when they are given; any other value,
- * live stubs included, passes straight through.
- */
-export async function nativeCall<T>(
-  socket: CapnWebSocket,
-  method: string,
-  args: unknown[],
-  options: CallOptions | StreamOptions | undefined,
-  defaultTimeout: number
-): Promise<T> {
-  const { stream, timeout } = splitCallOptions(options);
-  const effectiveTimeout =
-    timeout !== undefined ? timeout : stream ? undefined : defaultTimeout;
-  let reader: ReadableStreamDefaultReader<unknown> | undefined;
-  let timer: ReturnType<typeof setTimeout> | undefined;
-
-  const work = (async () => {
-    const result = await socket.invoke(method, args);
-    if (stream && result instanceof ReadableStream) {
-      reader = (result as ReadableStream<unknown>).getReader();
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        stream.onChunk?.(value);
-      }
-      stream.onDone?.(undefined);
-      return undefined as T;
-    }
-    return result as T;
-  })();
-
-  const expiry = effectiveTimeout
-    ? new Promise<never>((_, reject) => {
-        timer = setTimeout(() => {
-          void reader?.cancel().catch(() => {});
-          reject(
-            new Error(
-              `RPC call to ${method} timed out after ${effectiveTimeout}ms`
-            )
-          );
-        }, effectiveTimeout);
-      })
-    : undefined;
-
-  try {
-    return await (expiry ? Promise.race([work, expiry]) : work);
-  } catch (error) {
-    // Keep the rejection observed on the losing side of the race.
-    void work.catch(() => {});
-    stream?.onError?.(error instanceof Error ? error.message : String(error));
-    throw error;
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
-}
-
-/**
- * Native calls issued while the Cap'n Web socket is still connecting or
- * between reconnects. They must not fall back to JSON frames — that would
- * change which methods are reachable and lose return-by-reference — so
- * they wait here and run on the next open socket, or reject when the
- * connection ends for good. Their timeout starts when they are issued.
- */
-export class NativeCallQueue {
-  #pending: Array<{
-    run: (socket: CapnWebSocket) => void;
-    reject: (error: Error) => void;
-  }> = [];
-
-  enqueue<T>(
-    method: string,
-    args: unknown[],
-    options: CallOptions | StreamOptions | undefined,
-    defaultTimeout: number
-  ): Promise<T> {
-    return new Promise<T>((resolve, reject) => {
-      const { stream, timeout } = splitCallOptions(options);
-      const effectiveTimeout =
-        timeout !== undefined ? timeout : stream ? undefined : defaultTimeout;
-      const startedAt = Date.now();
-      const entry = {
-        run: (socket: CapnWebSocket) => {
-          // Spend the remaining budget, not a fresh one.
-          const remaining =
-            effectiveTimeout === undefined
-              ? undefined
-              : Math.max(1, effectiveTimeout - (Date.now() - startedAt));
-          const opts =
-            remaining === undefined ? options : { stream, timeout: remaining };
-          nativeCall<T>(socket, method, args, opts, defaultTimeout).then(
-            resolve,
-            reject
-          );
-        },
-        reject: (error: Error) => {
-          stream?.onError?.(error.message);
-          reject(error);
-        }
-      };
-      this.#pending.push(entry);
-      if (effectiveTimeout) {
-        setTimeout(() => {
-          const index = this.#pending.indexOf(entry);
-          if (index === -1) return;
-          this.#pending.splice(index, 1);
-          entry.reject(
-            new Error(
-              `RPC call to ${method} timed out after ${effectiveTimeout}ms`
-            )
-          );
-        }, effectiveTimeout);
-      }
-    });
-  }
-
-  /** Run everything queued on a socket that just opened. */
-  flush(socket: CapnWebSocket): void {
-    const pending = this.#pending;
-    this.#pending = [];
-    for (const entry of pending) entry.run(socket);
-  }
-
-  /** Reject everything queued; the connection will not come back. */
-  rejectAll(reason: string): void {
-    const pending = this.#pending;
-    this.#pending = [];
-    const error = new Error(reason);
-    for (const entry of pending) entry.reject(error);
-  }
-}
-
-/**
  * Options for the agentFetch function
  */
 export type AgentClientFetchOptions = Omit<
@@ -456,7 +266,7 @@ type OptionalArgsAgentClientCall<AgentT> = <
 >(
   method: K,
   args?: ClientParameters<OptionalAgentMethods<AgentT>[K]>,
-  options?: CallOptions | StreamOptions
+  options?: CallOptions
 ) => AgentPromiseReturnType<AgentT, K>;
 
 type RequiredArgsAgentClientCall<AgentT> = <
@@ -464,28 +274,28 @@ type RequiredArgsAgentClientCall<AgentT> = <
 >(
   method: K,
   args: ClientParameters<RequiredAgentMethods<AgentT>[K]>,
-  options?: CallOptions | StreamOptions
+  options?: CallOptions
 ) => AgentPromiseReturnType<AgentT, K>;
 
-type TypedAgentClientCall<AgentT> = OptionalArgsAgentClientCall<AgentT> &
+export type AgentMethodCall<AgentT> = OptionalArgsAgentClientCall<AgentT> &
   RequiredArgsAgentClientCall<AgentT>;
 
 type UntypedAgentClientCall = {
   <T extends SerializableReturnValue>(
     method: string,
     args?: SerializableValue[],
-    options?: CallOptions | StreamOptions
+    options?: CallOptions
   ): Promise<T>;
   <T = unknown>(
     method: string,
     args?: unknown[],
-    options?: CallOptions | StreamOptions
+    options?: CallOptions
   ): Promise<T>;
 };
 
 type AgentClientCall<AgentT> = keyof AgentMethods<AgentT> extends never
   ? UntypedAgentClientCall
-  : TypedAgentClientCall<AgentT>;
+  : AgentMethodCall<AgentT>;
 
 /**
  * Creates a proxy that wraps RPC method calls.
@@ -516,14 +326,6 @@ export class AgentClient<
   AgentT = unknown,
   State = AgentT extends { get state(): infer S } ? S : AgentT
 > extends PartySocket {
-  /**
-   * @deprecated Use agentFetch instead
-   */
-  static fetch(_opts: PartyFetchOptions): Promise<Response> {
-    throw new Error(
-      "AgentClient.fetch is not implemented, use agentFetch instead"
-    );
-  }
   agent: string;
   name: string;
   call: AgentClientCall<AgentT>;
@@ -558,42 +360,22 @@ export class AgentClient<
    * Resets on connection close so it can be awaited again after reconnect.
    */
   get ready(): Promise<void> {
-    return this._readyPromise;
+    return this.#readiness.at(this.connectionKey).promise;
   }
 
   private options: AgentClientOptions<State>;
-  private _pendingCalls = new Map<
-    string,
-    {
-      resolve: (value: unknown) => void;
-      reject: (error: Error) => void;
-      stream?: StreamOptions;
-      /**
-       * Whether the request was actually transmitted to the server.
-       * Requests issued while disconnected sit in PartySocket's internal
-       * buffer (transmitted: false) and are flushed on the next open —
-       * they survive a transient close instead of being rejected, since
-       * the server never saw them and re-delivery can't double-execute.
-       */
-      transmitted: boolean;
-    }
-  >();
-  private _readyPromise!: Promise<void>;
-  private _resolveReady!: () => void;
+  readonly #rpc = new JsonRpcClient();
+  readonly #readiness = new ClientReadiness();
   private _previousName: string | null = null;
   private _previousAgent: string | null = null;
 
-  private _resetReady() {
-    this._readyPromise = new Promise((resolve) => {
-      this._resolveReady = resolve;
-    });
+  /** Canonical destination and transport; refreshed credentials do not change it. */
+  get connectionKey(): string {
+    return JSON.stringify([
+      socketDestinationKey(this.partySocketOptions),
+      this.options.transport ?? "cf-websocket"
+    ]);
   }
-
-  /** Connect-sequence progress for the current socket. */
-  #connect: {
-    stateSeen: boolean;
-    pendingIdentity: { name: string; agent: string } | null;
-  } = { stateSeen: false, pendingIdentity: null };
 
   #applyIdentity(newName: string, newAgent: string): void {
     const oldName = this._previousName;
@@ -601,7 +383,7 @@ export class AgentClient<
 
     // Resolve ready/identified
     this.identified = true;
-    this._resolveReady();
+    this.#readiness.at(this.connectionKey).resolve();
 
     // Detect identity change on reconnect
     if (
@@ -697,31 +479,22 @@ export class AgentClient<
     this.name = options.name || "default";
     this.options = options;
 
-    // Initialize ready promise
-    this._resetReady();
-
     this.addEventListener("message", (event) => {
       if (typeof event.data === "string") {
-        let parsedMessage: Record<string, unknown>;
-        try {
-          parsedMessage = JSON.parse(event.data);
-        } catch (_error) {
-          // silently ignore invalid messages for now
-          // TODO: log errors with log levels
-          return;
-        }
+        const parsedMessage = parseClientFrame(event.data);
+        if (!parsedMessage) return;
         if (parsedMessage.type === MessageType.CF_AGENT_IDENTITY) {
-          const identity = {
-            name: parsedMessage.name as string,
-            agent: parsedMessage.agent as string
-          };
-          // The server flags an identity whose state frame is next, so
-          // `ready` never resolves with the stored state still missing.
-          if (parsedMessage.stateFollows === true && !this.#connect.stateSeen) {
-            this.#connect.pendingIdentity = identity;
+          if (
+            typeof parsedMessage.name !== "string" ||
+            typeof parsedMessage.agent !== "string"
+          )
             return;
-          }
-          this.#applyIdentity(identity.name, identity.agent);
+          this.#readiness.identity(
+            this,
+            { name: parsedMessage.name, agent: parsedMessage.agent },
+            parsedMessage.stateFollows === true,
+            ({ name, agent }) => this.#applyIdentity(name, agent)
+          );
           return;
         }
         if (parsedMessage.type === MessageType.CF_AGENT_STATE) {
@@ -732,12 +505,9 @@ export class AgentClient<
               "server"
             );
           } finally {
-            this.#connect.stateSeen = true;
-            const pending = this.#connect.pendingIdentity;
-            if (pending) {
-              this.#connect.pendingIdentity = null;
-              this.#applyIdentity(pending.name, pending.agent);
-            }
+            this.#readiness.state(this, ({ name, agent }) =>
+              this.#applyIdentity(name, agent)
+            );
           }
           return;
         }
@@ -746,48 +516,14 @@ export class AgentClient<
           return;
         }
         if (parsedMessage.type === MessageType.RPC) {
-          const response = parsedMessage as RPCResponse;
-          const pending = this._pendingCalls.get(response.id);
-          if (!pending) {
-            console.warn(
-              `[AgentClient] Discarded an RPC response with no matching pending call (id "${response.id}"). ` +
-                "The call likely timed out or was rejected when its connection closed before the response arrived."
-            );
-            return;
-          }
-
-          if (!response.success) {
-            pending.reject(new Error(response.error));
-            this._pendingCalls.delete(response.id);
-            pending.stream?.onError?.(response.error);
-            return;
-          }
-
-          // Handle streaming responses
-          if ("done" in response) {
-            if (response.done) {
-              pending.resolve(response.result);
-              this._pendingCalls.delete(response.id);
-              pending.stream?.onDone?.(response.result);
-            } else {
-              pending.stream?.onChunk?.(response.result);
-            }
-          } else {
-            // Non-streaming response
-            pending.resolve(response.result);
-            this._pendingCalls.delete(response.id);
-          }
+          this.#rpc.receive(this, parsedMessage);
         }
       }
     });
 
-    // PartySocket flushes its internal message buffer right before
-    // dispatching "open" — anything queued has now been transmitted.
     this.addEventListener("open", () => {
       this.connectionError = null;
-      for (const pending of this._pendingCalls.values()) {
-        pending.transmitted = true;
-      }
+      this.#rpc.flush(this);
       const native = this.#capnWeb.current;
       if (native) this.#nativeQueue.flush(native);
     });
@@ -797,21 +533,18 @@ export class AgentClient<
       const finalClose = closeClassifier.takeFinalClose();
       // Reset ready state for next connection
       this.identified = false;
-      this._resetReady();
-      this.#connect = { stateSeen: false, pendingIdentity: null };
+      this.#readiness.reset(this.connectionKey, this);
 
       if (this.shouldReconnect && !finalClose) {
         // Transient disconnect: reject calls whose request was already
-        // transmitted — their response can never arrive. Buffered calls
-        // stay pending; PartySocket re-sends them on reconnect.
-        this._rejectPendingCalls("Connection closed", {
-          onlyTransmitted: true
-        });
+        // transmitted — their response can never arrive. Unsent calls stay
+        // pending for the next open, unless their own deadline expires.
+        this.#rpc.close(this);
       } else {
         // Permanent close (close() called or reconnection ended): nothing
         // will ever flush the buffer, so reject everything.
-        this._rejectPendingCalls("Connection closed");
-        this.#nativeQueue.rejectAll("Connection closed");
+        this.#rpc.dispose();
+        this.#nativeQueue.rejectAll(new AgentConnectionClosedError());
         if (finalClose) {
           const error = new AgentConnectionError(event);
           this.connectionError = error;
@@ -824,24 +557,6 @@ export class AgentClient<
     this.stub = createStubProxy((method, args) =>
       this._callImpl(method, args)
     ) as AgentClientStub<AgentT>;
-  }
-
-  /**
-   * Reject pending RPC calls with the given reason.
-   * With `onlyTransmitted`, calls still sitting in the send buffer are
-   * kept pending (they'll be flushed on reconnect).
-   */
-  private _rejectPendingCalls(
-    reason: string,
-    { onlyTransmitted = false }: { onlyTransmitted?: boolean } = {}
-  ) {
-    const error = new Error(reason);
-    for (const [id, pending] of this._pendingCalls) {
-      if (onlyTransmitted && !pending.transmitted) continue;
-      this._pendingCalls.delete(id);
-      pending.reject(error);
-      pending.stream?.onError?.(reason);
-    }
   }
 
   setState(state: State) {
@@ -860,7 +575,8 @@ export class AgentClient<
    */
   close(code?: number, reason?: string) {
     // Immediately reject all pending calls on intentional close
-    this._rejectPendingCalls("Connection closed");
+    this.#rpc.dispose();
+    this.#nativeQueue.rejectAll(new AgentConnectionClosedError());
 
     // Then close the underlying socket
     super.close(code, reason);
@@ -874,7 +590,7 @@ export class AgentClient<
   private async _callImpl(
     method: string,
     args: unknown[] = [],
-    options?: CallOptions | StreamOptions
+    options?: CallOptions
   ): Promise<unknown> {
     // On the Cap'n Web transport, callables are native methods on the
     // session root: invoke them directly so an RpcTarget result arrives as
@@ -887,60 +603,23 @@ export class AgentClient<
         return nativeCall(native, method, args, options, timeout);
       }
       if (this.connectionError && this.readyState === this.CLOSED) {
-        throw new Error("Connection closed");
+        throw new AgentConnectionClosedError();
       }
       // Connecting or between reconnects: hold the call as a native call
       // rather than queueing a JSON frame that would change its meaning.
       return this.#nativeQueue.enqueue(method, args, options, timeout);
     }
     if (this.connectionError && this.readyState === this.CLOSED) {
-      throw new Error("Connection closed");
+      throw new AgentConnectionClosedError();
     }
 
-    return new Promise((resolve, reject) => {
-      const id = crypto.randomUUID();
-      let timeoutId: ReturnType<typeof setTimeout> | undefined;
-
-      const { stream: streamOptions, timeout } = splitCallOptions(options);
-
-      // Apply the default timeout as a backstop for non-streaming calls
-      // so a lost response rejects instead of hanging forever. An
-      // explicit `timeout` (including 0 = disabled) always wins.
-      const effectiveTimeout =
-        timeout !== undefined
-          ? timeout
-          : streamOptions
-            ? undefined
-            : (this.options.defaultCallTimeout ?? DEFAULT_CALL_TIMEOUT_MS);
-
-      if (effectiveTimeout) {
-        timeoutId = setTimeout(() => {
-          const pending = this._pendingCalls.get(id);
-          this._pendingCalls.delete(id);
-          const errorMessage = `RPC call to ${method} timed out after ${effectiveTimeout}ms`;
-          pending?.stream?.onError?.(errorMessage);
-          reject(new Error(errorMessage));
-        }, effectiveTimeout);
-      }
-
-      this._pendingCalls.set(id, {
-        reject: (e: Error) => {
-          if (timeoutId) clearTimeout(timeoutId);
-          reject(e);
-        },
-        resolve: (value: unknown) => {
-          if (timeoutId) clearTimeout(timeoutId);
-          resolve(value);
-        },
-        stream: streamOptions,
-        // If the socket is open, send() below transmits synchronously;
-        // otherwise the request is buffered until the next open event
-        // (the "open" listener then marks it transmitted).
-        transmitted: this.readyState === this.OPEN
-      });
-
-      this.send(serializeRpcRequest(id, method, args, options));
-    });
+    return this.#rpc.call(
+      this,
+      method,
+      args,
+      options,
+      this.options.defaultCallTimeout ?? DEFAULT_CALL_TIMEOUT_MS
+    );
   }
 }
 

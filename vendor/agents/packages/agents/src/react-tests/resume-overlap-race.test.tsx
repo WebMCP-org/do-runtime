@@ -51,6 +51,7 @@ function createFakeAgent({ name, url }: { name: string; url: string }) {
   const target = new EventTarget();
   const sentMessages: string[] = [];
   const agent = {
+    connectionKey: url,
     _pkurl: url,
     _pk: name,
     _url: null as string | null,
@@ -67,7 +68,7 @@ function createFakeAgent({ name, url }: { name: string; url: string }) {
       url.replace("ws://", "http://").replace("wss://", "https://")
   };
   return {
-    agent: agent as unknown as ReturnType<typeof useAgent>,
+    agent: agent as unknown as ReturnType<typeof useAgent<unknown>>,
     target,
     sentMessages
   };
@@ -134,7 +135,7 @@ describe("reconnect-driven stream resume", () => {
     });
     let chat: AgentChatResult | null = null;
     function TestComponent() {
-      chat = useAgentChat({
+      chat = useAgentChat<unknown, UIMessage>({
         agent,
         getInitialMessages: null,
         messages: [
@@ -226,7 +227,11 @@ describe("reconnect-driven stream resume", () => {
         }
       ];
       function Chat({ messages }: { messages: UIMessage[] }) {
-        chat = useAgentChat({ agent, getInitialMessages: null, messages });
+        chat = useAgentChat<unknown, UIMessage>({
+          agent,
+          getInitialMessages: null,
+          messages
+        });
         return (
           <div>
             {chat.messages
@@ -415,7 +420,11 @@ describe("reconnect-driven stream resume", () => {
         }
       ];
       function Chat({ messages }: { messages: UIMessage[] }) {
-        chat = useAgentChat({ agent, getInitialMessages: null, messages });
+        chat = useAgentChat<unknown, UIMessage>({
+          agent,
+          getInitialMessages: null,
+          messages
+        });
         return (
           <div>
             {chat.messages
@@ -565,7 +574,7 @@ describe("reconnect-driven stream resume", () => {
     // Keep PartySocket, useAgent's onMessage, and useAgentChat real. Only the
     // browser WebSocket is replaced; no replay helper participates in this test.
     class TestWebSocket extends EventTarget {
-      readyState = WebSocket.CONNECTING;
+      readyState: number = WebSocket.CONNECTING;
       binaryType: BinaryType = "blob";
       bufferedAmount = 0;
       readonly protocol = "";
@@ -589,8 +598,8 @@ describe("reconnect-driven stream resume", () => {
       }
     }
 
-    function Chat({ agent }: { agent: ReturnType<typeof useAgent> }) {
-      const chat = useAgentChat({
+    function Chat({ agent }: { agent: ReturnType<typeof useAgent<unknown>> }) {
+      const chat = useAgentChat<unknown, UIMessage>({
         agent,
         getInitialMessages: null,
         messages: [],
@@ -703,7 +712,7 @@ describe("reconnect-driven stream resume", () => {
     );
 
     function TestComponent() {
-      const chat = useAgentChat({
+      const chat = useAgentChat<unknown, UIMessage>({
         agent,
         getInitialMessages: null,
         messages: [
@@ -757,7 +766,7 @@ describe("reconnect-driven stream resume", () => {
     );
 
     function Chat() {
-      const chat = useAgentChat({
+      const chat = useAgentChat<unknown, UIMessage>({
         agent,
         getInitialMessages: null,
         messages: [userMessage]
@@ -827,7 +836,7 @@ describe("reconnect-driven stream resume", () => {
         done
       });
       function Chat({ messages }: { messages: UIMessage[] }) {
-        const chat = useAgentChat({
+        const chat = useAgentChat<unknown, UIMessage>({
           agent,
           getInitialMessages: null,
           messages
@@ -950,7 +959,7 @@ describe("reconnect-driven stream resume", () => {
         ]
       };
       function Chat({ messages }: { messages: UIMessage[] }) {
-        const chat = useAgentChat({
+        const chat = useAgentChat<unknown, UIMessage>({
           agent,
           getInitialMessages: null,
           messages
@@ -1028,7 +1037,7 @@ describe("reconnect-driven stream resume", () => {
       });
 
       function TestComponent() {
-        const chat = useAgentChat({
+        const chat = useAgentChat<unknown, UIMessage>({
           agent,
           getInitialMessages: null,
           messages: [] as UIMessage[]
@@ -1083,7 +1092,7 @@ describe("reconnect-driven stream resume", () => {
     });
 
     function TestComponent() {
-      useAgentChat({
+      useAgentChat<unknown, UIMessage>({
         agent,
         getInitialMessages: null,
         messages: [] as UIMessage[]
@@ -1151,7 +1160,7 @@ describe("reconnect-driven stream resume", () => {
     });
 
     function TestComponent() {
-      const chat = useAgentChat({
+      const chat = useAgentChat<unknown, UIMessage>({
         agent,
         getInitialMessages: null,
         messages: [] as UIMessage[],
@@ -1301,7 +1310,7 @@ describe("reconnect-driven stream resume", () => {
     });
 
     function TestComponent() {
-      const chat = useAgentChat({
+      const chat = useAgentChat<unknown, UIMessage>({
         agent,
         getInitialMessages: null,
         messages: [] as UIMessage[]
@@ -1363,7 +1372,7 @@ describe("reconnect-driven stream resume", () => {
     });
 
     function TestComponent() {
-      useAgentChat({
+      useAgentChat<unknown, UIMessage>({
         agent,
         getInitialMessages: null,
         messages: [] as UIMessage[]
@@ -1395,7 +1404,7 @@ describe("reconnect-driven stream resume", () => {
     let chatInstance: ReturnType<typeof useAgentChat> | null = null;
 
     function TestComponent() {
-      const chat = useAgentChat({
+      const chat = useAgentChat<unknown, UIMessage>({
         agent,
         getInitialMessages: null,
         messages: [] as UIMessage[]
@@ -1441,7 +1450,7 @@ describe("reconnect-driven stream resume", () => {
     let chatInstance: ReturnType<typeof useAgentChat> | null = null;
 
     function TestComponent() {
-      const chat = useAgentChat({
+      const chat = useAgentChat<unknown, UIMessage>({
         agent,
         getInitialMessages: null,
         messages: [] as UIMessage[]
@@ -1513,7 +1522,7 @@ describe("reconnect-driven stream resume", () => {
     ];
 
     function TestComponent() {
-      const chat = useAgentChat({
+      const chat = useAgentChat<unknown, UIMessage>({
         agent,
         getInitialMessages: null,
         messages: initialMessages
@@ -1580,7 +1589,7 @@ describe("reconnect-driven stream resume", () => {
     });
 
     function TestComponent() {
-      const chat = useAgentChat({
+      const chat = useAgentChat<unknown, UIMessage>({
         agent,
         getInitialMessages: null,
         messages: [] as UIMessage[],
@@ -1622,8 +1631,12 @@ describe("reconnect-driven stream resume", () => {
       url: "ws://localhost:3000/agents/chat/agent-b?_pk=def"
     });
 
-    function TestComponent({ agent }: { agent: ReturnType<typeof useAgent> }) {
-      useAgentChat({
+    function TestComponent({
+      agent
+    }: {
+      agent: ReturnType<typeof useAgent<unknown>>;
+    }) {
+      useAgentChat<unknown, UIMessage>({
         agent,
         getInitialMessages: null,
         messages: [] as UIMessage[]
@@ -1667,7 +1680,7 @@ describe("reconnect-driven stream resume", () => {
     let chatInstance: ReturnType<typeof useAgentChat> | null = null;
 
     function TestComponent() {
-      const chat = useAgentChat({
+      const chat = useAgentChat<unknown, UIMessage>({
         agent,
         getInitialMessages: null,
         messages: [] as UIMessage[]
@@ -1731,7 +1744,7 @@ describe("reconnect-driven stream resume", () => {
     let chatInstance: ReturnType<typeof useAgentChat> | null = null;
 
     function TestComponent() {
-      const chat = useAgentChat({
+      const chat = useAgentChat<unknown, UIMessage>({
         agent,
         getInitialMessages: null,
         messages: [] as UIMessage[]

@@ -15,11 +15,7 @@ export class AbortRegistry {
    * Get or create an AbortController for the given ID and return its signal.
    * Creates the controller lazily on first access.
    */
-  getSignal(id: string): AbortSignal | undefined {
-    if (typeof id !== "string") {
-      return undefined;
-    }
-
+  getSignal(id: string): AbortSignal {
     if (!this.controllers.has(id)) {
       this.controllers.set(id, new AbortController());
     }

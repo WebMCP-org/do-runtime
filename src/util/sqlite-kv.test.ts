@@ -38,7 +38,7 @@ function listing(kv: SqliteKv) {
     order: "FORWARD" | "REVERSE",
   ): string => {
     const results: string[] = [];
-    const count = kv.list(begin, end, limit, order, (key, value) => {
+    const count = kv.list(begin, end, limit, order).forEach((key, value) => {
       results.push(`${key}=${text(value)}`);
     });
     expect(results.length).toBe(count);
@@ -140,7 +140,7 @@ describe("SQLite-KV", () => {
   test("SQLite-KV multi-put", async () => {
     const kv = new SqliteKv(await openDatabase());
 
-    kv.put(
+    kv.putMultiple(
       [
         { key: "foo", value: bytes("abc") },
         { key: "bar", value: bytes("def") },
@@ -154,7 +154,7 @@ describe("SQLite-KV", () => {
     expect(text(kv.get("baz") as Uint8Array)).toBe("123");
 
     // Test multi-put overwrites existing values.
-    kv.put(
+    kv.putMultiple(
       [
         { key: "foo", value: bytes("xyz") },
         { key: "bar", value: bytes("uvw") },
@@ -168,7 +168,7 @@ describe("SQLite-KV", () => {
     expect(text(kv.get("baz") as Uint8Array)).toBe("123");
 
     // Test empty multi-put (should succeed).
-    kv.put([], { allowUnconfirmed: false });
+    kv.putMultiple([], { allowUnconfirmed: false });
 
     // Verify database unchanged.
     expect(text(kv.get("foo") as Uint8Array)).toBe("xyz");
@@ -182,7 +182,7 @@ describe("SQLite-KV", () => {
     kv.put("existing", bytes("value"));
 
     expect(() =>
-      kv.put(
+      kv.putMultiple(
         [
           { key: "key1", value: bytes("value1") },
           { key: "key2", value: bytes("value2") },
@@ -203,7 +203,7 @@ describe("SQLite-KV", () => {
   test("SQLite-KV multi-put with allowUnconfirmed", async () => {
     const kv = new SqliteKv(await openDatabase());
 
-    kv.put(
+    kv.putMultiple(
       [
         { key: "foo", value: bytes("abc") },
         { key: "bar", value: bytes("def") },

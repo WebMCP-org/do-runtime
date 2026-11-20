@@ -1808,8 +1808,12 @@ export async function createActorContainer(
     if (storedAlarm !== null) await options.ports.alarms.reconcile?.(storedAlarm);
     return new ActorContainerImpl(options, db, tree, tree);
   } catch (error) {
-    facetDb?.close();
-    actorDb.close();
+    using cleanup = new DisposableStack();
+    cleanup.defer(() => actorDb.close());
+    if (facetDb) {
+      const database = facetDb;
+      cleanup.defer(() => database.close());
+    }
     throw error;
   }
 }

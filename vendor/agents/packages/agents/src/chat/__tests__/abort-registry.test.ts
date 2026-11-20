@@ -18,14 +18,6 @@ describe("AbortRegistry", () => {
     expect(s1).toBe(s2);
   });
 
-  it("returns undefined for non-string ids", () => {
-    const registry = new AbortRegistry();
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    expect(registry.getSignal(123 as any)).toBeUndefined();
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    expect(registry.getSignal(null as any)).toBeUndefined();
-  });
-
   it("getExistingSignal returns undefined when no controller exists", () => {
     const registry = new AbortRegistry();
     expect(registry.getExistingSignal("r1")).toBeUndefined();

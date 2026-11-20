@@ -25,6 +25,15 @@ describe("awaitWithDeadline", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
+  it("clears its timer and preserves the source rejection", async () => {
+    vi.useFakeTimers();
+    const error = new Error("source failed");
+    await expect(
+      awaitWithDeadline(Promise.reject(error), Date.now() + 60_000)
+    ).rejects.toBe(error);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it("resolves to TIMED_OUT once the deadline passes", async () => {
     vi.useFakeTimers();
     const pending = new Promise<string>(() => {});

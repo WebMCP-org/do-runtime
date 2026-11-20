@@ -60,20 +60,19 @@ export interface ResumeHandshakeHost {
   persistOrphanedStream(streamId: string): Promise<void>;
   /**
    * Whether the connection that owns the active continuation stream is still
-   * connected. Optional: when omitted the handshake assumes it is (legacy
-   * behavior). Hosts wire their live connection registry so a continuation
+   * connected. Hosts supply their live connection registry so a continuation
    * stream whose owner vanished on an abrupt (1006) reconnect can still be
    * resumed by the replacement connection (#1784).
    */
-  isConnectionPresent?(connectionId: string): boolean;
+  isConnectionPresent(connectionId: string): boolean;
   /**
    * Whether the host still holds the request's terminal frames and will
-   * broadcast them once its message is persisted. Optional: hosts that send
-   * the terminal frame with the stream's end omit it. While true, a resume
+   * broadcast them once its message is persisted. Hosts that send
+   * the terminal frame with the stream's end return false. While true, a resume
    * ACK gets the stored chunks without a terminal, so the connection learns
    * the outcome from the live frame that follows the transcript.
    */
-  holdsTerminalFrames?(requestId: string): boolean;
+  holdsTerminalFrames(requestId: string): boolean;
 }
 
 /**
@@ -209,7 +208,7 @@ export class ResumeHandshake {
       // resume handshake so the terminal error frame can be delivered on the
       // resumed stream (the only path that surfaces as an error on the client)
       // once this connection ACKs — see `_replayTerminalOnAck`.
-    } else if (preStream?.park(connection, probeId)) {
+    } else if (preStream.park(connection, probeId)) {
       // A normal turn is accepted but its resumable stream has not started yet
       // (#1784). `park` enrolled the connection and sent `STREAM_PENDING`; the
       // host flushes it into `STREAM_RESUMING` on stream start, or releases it
@@ -261,9 +260,7 @@ export class ResumeHandshake {
 
   /** Whether the active continuation's owner connection is still present. */
   private _ownerStillPresent(connectionId: string): boolean {
-    return this.host.isConnectionPresent
-      ? this.host.isConnectionPresent(connectionId)
-      : true;
+    return this.host.isConnectionPresent(connectionId);
   }
 
   /** Handle a client `STREAM_RESUME_ACK` for `requestId`. */
@@ -293,7 +290,7 @@ export class ResumeHandshake {
       if (orphanedStreamId) {
         await this.host.persistOrphanedStream(orphanedStreamId);
       }
-    } else if (this.host.holdsTerminalFrames?.(requestId)) {
+    } else if (this.host.holdsTerminalFrames(requestId)) {
       // The stream closed (finished, recovering, or errored) but its message
       // is still being persisted; the held terminal frames are broadcast
       // after the transcript (#2334).

@@ -27,14 +27,16 @@ export async function awaitWithDeadline<T>(
   }
   const remainingMs = Math.max(0, deadline - Date.now());
   let timer: ReturnType<typeof setTimeout>;
-  const result = await Promise.race([
-    promise,
-    new Promise<typeof TIMED_OUT>((resolve) => {
-      timer = setTimeout(() => resolve(TIMED_OUT), remainingMs);
-    })
-  ]);
-  clearTimeout(timer!);
-  return result;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<typeof TIMED_OUT>((resolve) => {
+        timer = setTimeout(() => resolve(TIMED_OUT), remainingMs);
+      })
+    ]);
+  } finally {
+    clearTimeout(timer!);
+  }
 }
 
 /**

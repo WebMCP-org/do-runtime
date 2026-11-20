@@ -71,6 +71,13 @@ export interface SkillCatalogEntry {
   readonly location?: string;
 }
 
+/** Serializable catalog summary for skill selection. Names retain their validated identity. */
+export interface SkillSummary {
+  readonly name: Skill["name"];
+  readonly description: Skill["description"];
+  readonly sourceId: SkillCatalogEntry["sourceId"];
+}
+
 /** A resource read through a {@link SkillCatalog}. */
 export interface SkillCatalogResource {
   /** The skill that owns the resource. */

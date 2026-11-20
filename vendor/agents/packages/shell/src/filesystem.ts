@@ -180,6 +180,11 @@ export type WorkspaceFsLike = Pick<
   | "glob"
 >;
 
+/** Complete browsable workspace capability shared by native stores and remote clients. */
+export type WorkspaceSource = WorkspaceFsLike & {
+  getWorkspaceInfo: Workspace["getWorkspaceInfo"];
+};
+
 // ── Constants ────────────────────────────────────────────────────────
 
 const DEFAULT_INLINE_THRESHOLD = 1_500_000;

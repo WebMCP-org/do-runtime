@@ -9,8 +9,20 @@
 import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, describe, expect, test } from "vitest";
+import { afterAll, afterEach, describe, expect, test, vi } from "vitest";
 import { createNodeSqlProvider } from "./node-sqlite";
+
+import * as filesystem from "node:fs/promises";
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const fs = await importOriginal<typeof import("node:fs/promises")>();
+  return { ...fs, rename: vi.fn(fs.rename), rm: vi.fn(fs.rm), copyFile: vi.fn(fs.copyFile) };
+});
+afterEach(() => {
+  vi.mocked(filesystem.rename).mockReset();
+  vi.mocked(filesystem.rm).mockReset();
+  vi.mocked(filesystem.copyFile).mockReset();
+});
 
 const directories: string[] = [];
 
@@ -213,6 +225,81 @@ describe("node-sqlite backend", () => {
     expect(replicaRoot.exec("SELECT value FROM state", []).rawRows).toEqual([["before"]]);
     expect(replicaFacet.exec("SELECT value FROM state", []).rawRows).toEqual([["child"]]);
     replica.close();
+  });
+
+  test.each(["replacement", "obsolete removal"])(
+    "restores every original database after a failure during %s",
+    async (failurePoint) => {
+      const directory = temporaryDirectory();
+      const provider = createNodeSqlProvider({ directory });
+      for (const name of ["root", "child", "obsolete"]) {
+        const db = await provider.open(name);
+        db.exec("CREATE TABLE state (value TEXT)", []);
+        db.exec("INSERT INTO state VALUES (?)", [`old-${name}`]);
+      }
+      provider.close();
+      const original = await provider.exportSnapshot();
+      const incoming = {
+        ...original,
+        databases: original.databases
+          .filter(({ name }) => name !== "obsolete")
+          .map(({ name, image }) => ({ name: name === "child" ? "new-child" : name, image })),
+      };
+      const failure = new Error(`injected ${failurePoint} failure`);
+      if (failurePoint === "replacement") {
+        const real = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+        vi.mocked(filesystem.rename)
+          .mockImplementationOnce(real.rename)
+          .mockRejectedValueOnce(failure);
+      } else {
+        vi.mocked(filesystem.rm).mockRejectedValueOnce(failure);
+      }
+      await expect(provider.importSnapshot(incoming)).rejects.toBe(failure);
+      expect(await provider.exportSnapshot()).toEqual(original);
+      expect(readdirSync(directory).sort()).toEqual(["child.sqlite", "obsolete.sqlite", "root.sqlite"]);
+    },
+  );
+
+  test("a failed rollback retains original files and reports the recovery directory", async () => {
+    const provider = createNodeSqlProvider({ directory: temporaryDirectory() });
+    const db = await provider.open("root");
+    db.exec("CREATE TABLE state (value TEXT)", []);
+    provider.close();
+    const original = await provider.exportSnapshot();
+    vi.mocked(filesystem.rename).mockRejectedValueOnce(new Error("replacement failed"));
+    const real = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+    vi.mocked(filesystem.copyFile)
+      .mockImplementationOnce(real.copyFile)
+      .mockRejectedValueOnce(new Error("rollback failed"));
+    let failure: unknown;
+    try {
+      await provider.importSnapshot(original);
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBeInstanceOf(AggregateError);
+    if (
+      !(failure instanceof Error) ||
+      !("recoveryDirectory" in failure) ||
+      typeof failure.recoveryDirectory !== "string"
+    ) throw new Error("missing recovery directory");
+    const recovered = await filesystem.readFile(join(failure.recoveryDirectory, "root.sqlite.original"));
+    expect(new Uint8Array(recovered)).toEqual(original.databases[0]!.image);
+  });
+
+  test("provider close attempts every database even when one finalizer throws", async () => {
+    const provider = createNodeSqlProvider();
+    const first = await provider.open("first");
+    const last = await provider.open("last");
+    const closeFirst = vi.spyOn(first, "close");
+    const closeLast = last.close.bind(last);
+    vi.spyOn(last, "close").mockImplementationOnce(() => {
+      closeLast();
+      throw new Error("close failed");
+    });
+    expect(() => provider.close()).toThrow("close failed");
+    expect(closeFirst).toHaveBeenCalledOnce();
+    expect(() => provider.close()).not.toThrow();
   });
 
   test("snapshot import validates every image before replacing storage", async () => {

@@ -811,8 +811,7 @@ describe("useAgent hook", () => {
 
       // Call streaming method
       const result = await capturedAgent!.call("streamNumbers", [5], {
-        onChunk,
-        onDone
+        stream: { onChunk, onDone }
       });
 
       expect(onChunk.mock.calls.length).toBeGreaterThan(0);

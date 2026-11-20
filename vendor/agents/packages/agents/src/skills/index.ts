@@ -10,7 +10,12 @@
 // `./skills/runner` export) reaches them.
 
 export { formatSkill, parseSkill } from "./markdown";
-export { isModelInvocable, parseSkillName, SkillParseError } from "./skill";
+export {
+  isModelInvocable,
+  isSkillName,
+  parseSkillName,
+  SkillParseError
+} from "./skill";
 export type {
   ParseSkillOptions,
   Skill,
@@ -60,3 +65,5 @@ export type {
   SkillDiagnostic,
   SkillResourceError
 } from "./catalog";
+
+export type { SkillSummary } from "./catalog";

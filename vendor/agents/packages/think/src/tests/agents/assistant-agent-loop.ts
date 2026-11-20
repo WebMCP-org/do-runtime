@@ -8,7 +8,7 @@
 import type { LanguageModel, ModelMessage, ToolSet, UIMessage } from "ai";
 import { tool } from "ai";
 import { z } from "zod";
-import type { Session } from "../../think";
+import type { Session } from "agents/sessions";
 import type { ObservabilityEvent } from "agents/observability";
 import type { ChatResponseResult } from "agents/chat";
 import { Think } from "../../think";

@@ -4,6 +4,39 @@ import { createSkillTools } from "../skills/tools/ai-sdk";
 import type { SkillManifest, SkillSource } from "../skills";
 import { MemorySkillWorkspace } from "./memory-skill-workspace";
 
+describe("isSkillName native loaded-name contract", () => {
+  it.each(["UpperCase", "with_underscore", "with spaces", "x".repeat(80)])(
+    "accepts a loaded name with authoring warnings: %s",
+    (name) => {
+      const parsed = skills.parseSkill(
+        skillFile({ name, description: "A loaded skill." })
+      );
+      expect(parsed.ok).toBe(true);
+      if (!parsed.ok) throw parsed.error;
+      expect(parsed.warnings.length).toBeGreaterThan(0);
+      expect(skills.isSkillName(parsed.value.name)).toBe(true);
+      expect(skills.parseSkillName(name).ok).toBe(false);
+    }
+  );
+
+  it.each([
+    undefined,
+    null,
+    42,
+    {},
+    "",
+    ".",
+    "..",
+    "dir/skill",
+    "dir\\skill",
+    "\u0000",
+    "line\nname",
+    " padded "
+  ])("rejects an unsafe loaded name: %j", (name) =>
+    expect(skills.isSkillName(name)).toBe(false)
+  );
+});
+
 type ExecutableTool = {
   execute(input: Record<string, unknown>): Promise<unknown> | unknown;
 };

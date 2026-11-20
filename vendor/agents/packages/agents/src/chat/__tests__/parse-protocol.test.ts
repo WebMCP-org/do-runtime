@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseProtocolMessage } from "../parse-protocol";
+import { parseProtocolMessage, ChatProtocolError } from "../parse-protocol";
 import { CHAT_MESSAGE_TYPES } from "../protocol";
 
 describe("parseProtocolMessage", () => {
@@ -33,17 +33,15 @@ describe("parseProtocolMessage", () => {
     });
   });
 
-  it("parses chat-request with missing init", () => {
-    const msg = {
-      type: CHAT_MESSAGE_TYPES.USE_CHAT_REQUEST,
-      id: "req-1"
-    };
-    const event = parseProtocolMessage(JSON.stringify(msg));
-    expect(event).toEqual({
-      type: "chat-request",
-      id: "req-1",
-      init: {}
-    });
+  it("rejects a recognized request with missing init", () => {
+    expect(() =>
+      parseProtocolMessage(
+        JSON.stringify({
+          type: CHAT_MESSAGE_TYPES.USE_CHAT_REQUEST,
+          id: "req-1"
+        })
+      )
+    ).toThrow(ChatProtocolError);
   });
 
   it("parses clear", () => {
@@ -95,7 +93,7 @@ describe("parseProtocolMessage", () => {
     expect(event!.type).toBe("tool-result");
     if (event?.type === "tool-result") {
       expect(event.toolCallId).toBe("tc1");
-      expect(event.toolName).toBe("");
+      expect(event.toolName).toBeUndefined();
       expect(event.output).toBe("result");
       expect(event.autoContinue).toBeUndefined();
       expect(event.clientTools).toBeUndefined();
@@ -152,11 +150,32 @@ describe("parseProtocolMessage", () => {
     expect(event).toEqual({ type: "messages", messages: msgs });
   });
 
-  it("parses messages with missing messages field", () => {
-    const msg = { type: CHAT_MESSAGE_TYPES.CHAT_MESSAGES };
-    const event = parseProtocolMessage(JSON.stringify(msg));
-    expect(event).toEqual({ type: "messages", messages: [] });
+  it.each([
+    { type: CHAT_MESSAGE_TYPES.CHAT_MESSAGES },
+    { type: CHAT_MESSAGE_TYPES.CHAT_MESSAGES, messages: 42 },
+    {
+      type: CHAT_MESSAGE_TYPES.TOOL_APPROVAL,
+      toolCallId: "tool",
+      approved: "no"
+    },
+    {
+      type: CHAT_MESSAGE_TYPES.TOOL_RESULT,
+      toolCallId: "tool",
+      clientTools: [{ name: 42 }]
+    },
+    { type: CHAT_MESSAGE_TYPES.CHAT_REQUEST_CANCEL, id: null }
+  ])("rejects malformed recognized frames: %j", (frame) => {
+    expect(() => parseProtocolMessage(JSON.stringify(frame))).toThrow(
+      ChatProtocolError
+    );
   });
+
+  it.each(["null", "true", "42", "[]", '"application message"'])(
+    "ignores non-protocol JSON: %s",
+    (raw) => {
+      expect(parseProtocolMessage(raw)).toBeNull();
+    }
+  );
 
   it("does not parse server-to-client types", () => {
     expect(

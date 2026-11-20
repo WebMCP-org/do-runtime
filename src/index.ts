@@ -68,7 +68,6 @@ export {
   STREAMING_TAILS_EXPERIMENTAL_MESSAGE,
   WorkerLoader,
   WorkerStub,
-  jsModuleInPythonWorkerMessage,
   moduleFieldCountMessage,
   moduleNameMessage,
   notSerializableMessage,

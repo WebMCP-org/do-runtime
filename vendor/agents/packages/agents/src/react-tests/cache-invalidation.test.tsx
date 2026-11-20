@@ -21,7 +21,8 @@ const render: typeof _render = async (...args) => {
 };
 
 // Helper to generate cache keys the same way useAgent does internally
-const createCacheKey = _testUtils.createCacheKey;
+const createCacheKey = (agent: string, name: string, deps: unknown[]) =>
+  _testUtils.createCacheKey({ agent, name, ...getTestWorkerHost() }, deps);
 
 // oxlint-disable-next-line @typescript-eslint/no-explicit-any -- tests don't need strict agent typing
 type TestAgent = ReturnType<typeof useAgent<any>>;
@@ -98,43 +99,50 @@ describe("Cache invalidation on disconnect", () => {
     });
   });
 
-  describe("cache key generation", () => {
-    it("should create unique cache keys based on agent namespace and name", () => {
-      // Test the createCacheKey helper via the cache entries
-      const key1 = JSON.stringify(["test-state-agent", "instance-1"]);
-      const key2 = JSON.stringify(["test-state-agent", "instance-2"]);
-      const key3 = JSON.stringify(["other-agent", "instance-1"]);
-
-      const promise = Promise.resolve({ token: "test" });
-
-      _testUtils.setCacheEntry(key1, promise, 60000);
-      _testUtils.setCacheEntry(key2, promise, 60000);
-      _testUtils.setCacheEntry(key3, promise, 60000);
-
-      expect(_testUtils.queryCache.size).toBe(3);
-      expect(_testUtils.getCacheEntry(key1)).toBeDefined();
-      expect(_testUtils.getCacheEntry(key2)).toBeDefined();
-      expect(_testUtils.getCacheEntry(key3)).toBeDefined();
-    });
-
-    it("should include queryDeps in cache key", () => {
-      const keyWithDep1 = JSON.stringify(["test-agent", "default", "user-123"]);
-      const keyWithDep2 = JSON.stringify(["test-agent", "default", "user-456"]);
-
-      const promise1 = Promise.resolve({ token: "token-for-123" });
-      const promise2 = Promise.resolve({ token: "token-for-456" });
-
-      _testUtils.setCacheEntry(keyWithDep1, promise1, 60000);
-      _testUtils.setCacheEntry(keyWithDep2, promise2, 60000);
-
-      expect(_testUtils.queryCache.size).toBe(2);
-
-      // Deleting one key shouldn't affect the other
-      _testUtils.deleteCacheEntry(keyWithDep1);
-      expect(_testUtils.getCacheEntry(keyWithDep1)).toBeUndefined();
-      expect(_testUtils.getCacheEntry(keyWithDep2)?.promise).toBe(promise2);
-    });
-  });
+  it.each(["basePath", "queryDeps"] as const)(
+    "keeps credential queries separate by %s",
+    async (dimension) => {
+      const { host, protocol } = getTestWorkerHost();
+      const first = `cache-a-${crypto.randomUUID()}`;
+      const second = `cache-b-${crypto.randomUUID()}`;
+      const queries = [
+        vi.fn(async () => ({ user: first })),
+        vi.fn(async () => ({ user: second }))
+      ];
+      const identities = new Set<string>();
+      const { container } = await render(
+        <SuspenseWrapper>
+          {[first, second].map((name, index) => (
+            <TestAgentComponent
+              key={name}
+              options={{
+                agent: "TestStateAgent",
+                name: "same-logical-name",
+                host,
+                protocol,
+                basePath:
+                  dimension === "basePath" ? `custom-state/${name}` : "user",
+                queryDeps: dimension === "queryDeps" ? [name] : [],
+                query: queries[index]
+              }}
+              onAgent={(agent) => {
+                if (agent.identified) identities.add(agent.name);
+              }}
+            />
+          ))}
+        </SuspenseWrapper>
+      );
+      await vi.waitFor(
+        () => expect(identities).toEqual(new Set([first, second])),
+        { timeout: 10000 }
+      );
+      expect(
+        container.querySelectorAll('[data-testid="agent-status"]')
+      ).toHaveLength(2);
+      expect(queries[0]).toHaveBeenCalledOnce();
+      expect(queries[1]).toHaveBeenCalledOnce();
+    }
+  );
 
   describe("reconnection with onClose callback", () => {
     it("should call onClose callback when connection closes", async () => {

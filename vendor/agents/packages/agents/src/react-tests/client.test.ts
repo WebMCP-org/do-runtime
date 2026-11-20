@@ -4,7 +4,12 @@
  * against a real miniflare worker.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { AgentClient, agentFetch } from "../client";
+import {
+  AgentClient,
+  AgentConnectionClosedError,
+  AgentCallTimeoutError,
+  agentFetch
+} from "../client";
 import { getTestWorkerHost, getTestWorkerUrl } from "./test-config";
 
 describe("AgentClient", () => {
@@ -467,9 +472,12 @@ describe("AgentClient", () => {
       await client.ready;
 
       // Use asyncMethod with a delay, but with a very short timeout
-      await expect(
-        client.call("asyncMethod", [5000], { timeout: 10 })
-      ).rejects.toThrow(/timed out/);
+      const call = client.call("asyncMethod", [5000], { timeout: 10 });
+      await expect(call).rejects.toBeInstanceOf(AgentCallTimeoutError);
+      await expect(call).rejects.toMatchObject({
+        method: "asyncMethod",
+        timeout: 10
+      });
     });
 
     it("should handle streaming RPC responses", async () => {
@@ -518,7 +526,9 @@ describe("AgentClient", () => {
       client.close();
 
       // The call should be rejected immediately (not waiting for WebSocket close handshake)
-      await expect(callPromise).rejects.toThrow("Connection closed");
+      await expect(callPromise).rejects.toBeInstanceOf(
+        AgentConnectionClosedError
+      );
     });
   });
 
@@ -540,7 +550,7 @@ describe("AgentClient", () => {
       const inFlight = client.call("asyncMethod", [10000]);
       client.reconnect();
 
-      await expect(inFlight).rejects.toThrow("Connection closed");
+      await expect(inFlight).rejects.toBeInstanceOf(AgentConnectionClosedError);
     });
 
     it("stops reconnecting and reports connectionError on terminal close", async () => {

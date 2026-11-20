@@ -395,7 +395,8 @@ export function createSqliteWasmProvider(
       });
     },
     close(): void {
-      for (const database of [...openDatabases]) database.close();
+      using cleanup = new DisposableStack();
+      for (const database of openDatabases) cleanup.defer(() => database.close());
     },
     async exportSnapshot(): Promise<SqlDatabaseSnapshot> {
       requireNoOpenHandles(openDatabases.size);

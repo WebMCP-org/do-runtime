@@ -1,6 +1,8 @@
-import { InMemoryFs, type WorkspaceFsLike } from "@cloudflare/shell";
 import { describe, expect, it } from "vitest";
-import { WorkspaceFileSystem } from "@mcp-b/browser-workspace";
+import {
+  WorkspaceFileSystem,
+  type RangeWorkspaceFsLike
+} from "@mcp-b/browser-workspace";
 import { validateReadRange } from "@mcp-b/browser-workspace/paths";
 
 const unsupported = async (): Promise<never> => {
@@ -8,9 +10,13 @@ const unsupported = async (): Promise<never> => {
 };
 
 // Every member rejects unless a test overrides it.
-function workspaceLike(overrides: Partial<WorkspaceFsLike>): WorkspaceFsLike {
+function workspaceLike(
+  overrides: Partial<RangeWorkspaceFsLike>
+): RangeWorkspaceFsLike {
   return {
     readFile: unsupported,
+    readFileRange: unsupported,
+    appendFileBytes: unsupported,
     readFileBytes: unsupported,
     writeFile: unsupported,
     writeFileBytes: unsupported,
@@ -31,32 +37,24 @@ function workspaceLike(overrides: Partial<WorkspaceFsLike>): WorkspaceFsLike {
 }
 
 describe("WorkspaceFileSystem", () => {
-  it("reads byte ranges through legacy WorkspaceFsLike adapters", async () => {
-    // No readFileRange: the adapter must slice readFileBytes.
-    const memory = new InMemoryFs();
-    const ws = workspaceLike({
-      readFileBytes: (path) => memory.readFileBytes(path).catch(() => null),
-      writeFileBytes: (path, content) =>
-        memory.writeFileBytes(path, new Uint8Array(content)),
-      symlink: (target, linkPath) => memory.symlink(target, linkPath)
-    });
-    const fs = new WorkspaceFileSystem(ws);
-    await ws.writeFileBytes("/ranges", new Uint8Array([0, 128, 255, 4]));
-    await ws.symlink("ranges", "/range-link");
-
-    expect(Array.from(await fs.readFileRange("/range-link", 1, 2))).toEqual([
+  it("delegates bounded reads and binary append to the native owner", async () => {
+    const readRange = async (_path: string, offset: number, length: number) =>
+      new Uint8Array([0, 128, 255, 4]).slice(offset, offset + length);
+    let appended: Uint8Array | ArrayBuffer | undefined;
+    const fs = new WorkspaceFileSystem(
+      workspaceLike({
+        readFileRange: readRange,
+        appendFileBytes: async (_path, bytes) => {
+          appended = bytes;
+        }
+      })
+    );
+    expect(Array.from(await fs.readFileRange("/ranges", 1, 2))).toEqual([
       128, 255
     ]);
-    expect(Array.from(await fs.readFileRange("/ranges", 8, 2))).toEqual([]);
-    expect(Array.from(await fs.readFileRange("/ranges", 0, 0))).toEqual([]);
-    await expect(fs.readFileRange("/missing", 0, 1)).rejects.toMatchObject({
-      code: "ENOENT"
-    });
-    // No appendFileBytes: the adapter must read, join and write.
-    await fs.appendFile("/ranges", new Uint8Array([9]));
-    expect(Array.from(await fs.readFileBytes("/ranges"))).toEqual([
-      0, 128, 255, 4, 9
-    ]);
+    const bytes = new Uint8Array([9]);
+    await fs.appendFile("/ranges", bytes);
+    expect(appended).toBe(bytes);
   });
 
   it("rejects backends that return more bytes than requested", async () => {
@@ -70,7 +68,37 @@ describe("WorkspaceFileSystem", () => {
     });
   });
 
-  it("lists a large directory once from a proxy that ignores readDir paging", async () => {
+  it("reads every page and rejects repeated full pages", async () => {
+    const entries = Array.from({ length: 1001 }, (_, index) => ({
+      path: `/many/${index}`,
+      name: String(index),
+      type: "file" as const,
+      mimeType: "text/plain",
+      size: 0,
+      createdAt: 0,
+      updatedAt: 0
+    }));
+    const fs = new WorkspaceFileSystem(
+      workspaceLike({
+        readDir: async (_path, options) =>
+          entries.slice(
+            options?.offset ?? 0,
+            (options?.offset ?? 0) + (options?.limit ?? entries.length)
+          )
+      })
+    );
+    expect(await fs.readdir("/many")).toEqual(entries.map(({ name }) => name));
+    const repeated = new WorkspaceFileSystem(
+      workspaceLike({
+        readDir: async () => entries.slice(0, 1000)
+      })
+    );
+    await expect(repeated.readdir("/many")).rejects.toMatchObject({
+      code: "EIO"
+    });
+  });
+
+  it("rejects a proxy that ignores readDir paging", async () => {
     const page = Array.from({ length: 1001 }, (_, index) => ({
       path: `/many/${index}`,
       name: String(index),
@@ -84,7 +112,7 @@ describe("WorkspaceFileSystem", () => {
       workspaceLike({ readDir: async () => page })
     );
 
-    await expect(fs.readdir("/many")).resolves.toHaveLength(1001);
+    await expect(fs.readdir("/many")).rejects.toMatchObject({ code: "EIO" });
   });
 });
 

@@ -21,22 +21,20 @@ const READ_DIRECTORY_PAGE_SIZE = 1000;
 const enoent = (path: string) =>
   fileSystemError("ENOENT", `no such file or directory, stat '${path}'`);
 
-/** Shell's `WorkspaceFsLike` plus the optional native range/append members this
- * package's workspaces provide and `WorkspaceFileSystem` prefers when present.
- */
+/** The native operations required by browser workspace adapters. */
 export type RangeWorkspaceFsLike = WorkspaceFsLike & {
-  /** Optional native binary append. Backends providing it serialize the entire
+  /** Native binary append. Backends providing it serialize the entire
    * append, avoiding the adapter's read/concatenate/write fallback. */
-  appendFileBytes?(
+  appendFileBytes(
     path: string,
     content: Uint8Array | ArrayBuffer,
     mimeType?: string
   ): Promise<void>;
-  /** Optional bounded byte read; follows symlinks, returns null for missing files.
+  /** Bounded byte read; follows symlinks, returns null for missing files.
    * Offset and length must be nonnegative safe integers with a safe sum.
    * Reads past EOF return an empty buffer; short reads at EOF are allowed.
    */
-  readFileRange?(
+  readFileRange(
     path: string,
     offset: number,
     length: number
@@ -79,9 +77,7 @@ export class WorkspaceFileSystem implements FileSystem {
     length: number
   ): Promise<Uint8Array> {
     validateReadRange(offset, length);
-    const bytes = this.ws.readFileRange
-      ? await this.ws.readFileRange(path, offset, length)
-      : (await this.ws.readFileBytes(path))?.slice(offset, offset + length);
+    const bytes = await this.ws.readFileRange(path, offset, length);
     if (bytes == null) throw enoent(path);
     if (bytes.byteLength > length)
       throw fileSystemError("EIO", "byte range exceeded requested length");
@@ -102,21 +98,7 @@ export class WorkspaceFileSystem implements FileSystem {
       return;
     }
 
-    if (this.ws.appendFileBytes) {
-      await this.ws.appendFileBytes(path, content);
-      return;
-    }
-
-    const existing = await this.ws.readFileBytes(path);
-    if (existing === null) {
-      await this.ws.writeFileBytes(path, content);
-      return;
-    }
-
-    const combined = new Uint8Array(existing.byteLength + content.byteLength);
-    combined.set(existing);
-    combined.set(content, existing.byteLength);
-    await this.ws.writeFileBytes(path, combined);
+    await this.ws.appendFileBytes(path, content);
   }
 
   async exists(path: string): Promise<boolean> {
@@ -155,19 +137,29 @@ export class WorkspaceFileSystem implements FileSystem {
   }
 
   private async readAllEntries(path: string): Promise<FileInfo[]> {
-    const entries = new Map<string, FileInfo>();
+    const entries: FileInfo[] = [];
+    const names = new Set<string>();
     for (;;) {
       const page = await this.ws.readDir(path, {
         limit: READ_DIRECTORY_PAGE_SIZE,
-        offset: entries.size
+        offset: entries.length
       });
-      const before = entries.size;
-      for (const entry of page) {
-        if (!entries.has(entry.name)) entries.set(entry.name, entry);
+      if (
+        page.length > READ_DIRECTORY_PAGE_SIZE ||
+        page.some((entry) => names.has(entry.name))
+      ) {
+        throw fileSystemError("EIO", `invalid directory page: ${path}`);
       }
-      // A backend that ignores `offset` repeats a page it already returned.
-      if (page.length < READ_DIRECTORY_PAGE_SIZE || entries.size === before)
-        return [...entries.values()];
+      for (const entry of page) {
+        if (names.has(entry.name))
+          throw fileSystemError(
+            "EIO",
+            `duplicate directory entry: ${path}/${entry.name}`
+          );
+        names.add(entry.name);
+        entries.push(entry);
+      }
+      if (page.length < READ_DIRECTORY_PAGE_SIZE) return entries;
     }
   }
 
