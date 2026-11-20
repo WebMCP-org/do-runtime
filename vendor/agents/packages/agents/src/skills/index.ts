@@ -60,3 +60,5 @@ export type {
   SkillDiagnostic,
   SkillResourceError
 } from "./catalog";
+
+export { summarizeSkillCatalog, type SkillSummary } from "./catalog";

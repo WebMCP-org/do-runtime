@@ -28,7 +28,7 @@ import type { WorkflowEvent } from "cloudflare:workers";
 import { tool } from "ai";
 import type { LanguageModel, ToolSet, UIMessage } from "ai";
 import { z } from "zod";
-import type { Session } from "../think";
+import type { Session } from "agents/sessions";
 import type { ObservabilityEvent } from "agents/observability";
 import { Workspace } from "@cloudflare/computer";
 import { action, Think, defaultContextOverflowClassifier } from "../think";

@@ -62,7 +62,7 @@ export {
   ThinkPromptCacheTestAgent,
   ThinkMediaEvictionAutoAgent,
   ThinkPointerHydrationAgent,
-  ThinkLegacySessionApiAgent
+  ThinkNativeSessionApiAgent
 } from "./agents";
 
 import type {
@@ -114,7 +114,7 @@ import type {
   ThinkPromptCacheTestAgent,
   ThinkMediaEvictionAutoAgent,
   ThinkPointerHydrationAgent,
-  ThinkLegacySessionApiAgent
+  ThinkNativeSessionApiAgent
 } from "./agents";
 
 type BrowserRunTestBinding = Fetcher & {
@@ -270,7 +270,7 @@ export type Env = {
   ThinkPromptCacheTestAgent: DurableObjectNamespace<ThinkPromptCacheTestAgent>;
   ThinkMediaEvictionAutoAgent: DurableObjectNamespace<ThinkMediaEvictionAutoAgent>;
   ThinkPointerHydrationAgent: DurableObjectNamespace<ThinkPointerHydrationAgent>;
-  ThinkLegacySessionApiAgent: DurableObjectNamespace<ThinkLegacySessionApiAgent>;
+  ThinkNativeSessionApiAgent: DurableObjectNamespace<ThinkNativeSessionApiAgent>;
   BrowserToolsHost: DurableObjectNamespace<BrowserToolsHost>;
   LOADER: WorkerLoader;
 };

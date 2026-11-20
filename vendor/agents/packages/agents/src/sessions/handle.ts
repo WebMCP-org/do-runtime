@@ -38,6 +38,9 @@ export class Session {
 
   #compactionFn: CompactionFunction | null = null;
   #tokenThreshold: number | undefined;
+  #compactionErrorHandler:
+    | ((error: unknown) => void | Promise<void>)
+    | undefined;
 
   /** @internal Constructed by the Sessions capability only. */
   constructor(
@@ -55,6 +58,12 @@ export class Session {
   /** Register the function `compact()` calls to summarize a branch. */
   onCompaction(fn: CompactionFunction): this {
     this.#compactionFn = fn;
+    return this;
+  }
+
+  /** Observe a failed compaction without discarding the stored conversation. */
+  onCompactionError(handler: (error: unknown) => void | Promise<void>): this {
+    this.#compactionErrorHandler = handler;
     return this;
   }
 
@@ -448,9 +457,18 @@ export class Session {
     try {
       result = await fn(history);
     } catch (error) {
+      let failure = error;
+      if (this.#compactionErrorHandler) {
+        try {
+          await this.#compactionErrorHandler(error);
+          return null;
+        } catch (handlerError) {
+          failure = handlerError;
+        }
+      }
       this.#core.io.emit("session:error", {
         sessionId: this.sessionId,
-        error: error instanceof Error ? error.message : String(error)
+        error: failure instanceof Error ? failure.message : String(failure)
       });
       return null;
     }

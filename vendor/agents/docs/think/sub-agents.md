@@ -58,7 +58,8 @@ Tools belong to the child agent. Define durable capabilities with the child's `g
 ### Example: Parent agent calling a child
 
 ```typescript
-import { Think, Session } from "@cloudflare/think";
+import { Think } from "@cloudflare/think";
+import type { Session } from "agents/sessions";
 import type { StreamCallback } from "@cloudflare/think";
 
 export class ParentAgent extends Think<Env> {

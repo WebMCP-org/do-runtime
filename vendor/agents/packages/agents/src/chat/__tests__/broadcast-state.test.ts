@@ -245,15 +245,13 @@ describe("broadcast stream state machine", () => {
 
   it("seeds a continuation from the current messages update", () => {
     const currentMessages = makeMessages("hi", "current response");
-    const staleRenderedMessages = makeMessages("hi", "stale response");
 
     const result = transition(idle, {
       type: "response",
       streamId: "s1",
       messageId: "fallback-id",
       chunkData: { type: "text-delta", delta: " continued" },
-      continuation: true,
-      currentMessages: staleRenderedMessages
+      continuation: true
     });
 
     expect(result.state.status).toBe("observing");
@@ -616,8 +614,7 @@ describe("broadcast stream state machine", () => {
         messageId: "tmp",
         chunkData,
         replay: true,
-        continuation: true,
-        currentMessages: current
+        continuation: true
       }).state;
     }
     const firstReplay = transition(state, {
@@ -626,8 +623,7 @@ describe("broadcast stream state machine", () => {
       messageId: "tmp",
       replay: true,
       replayComplete: true,
-      continuation: true,
-      currentMessages: current
+      continuation: true
     });
     current = firstReplay.messagesUpdate!(current);
     state = firstReplay.state;
@@ -639,8 +635,7 @@ describe("broadcast stream state machine", () => {
         messageId: "tmp",
         chunkData,
         replay: true,
-        continuation: true,
-        currentMessages: current
+        continuation: true
       }).state;
     }
     const done = transition(state, {
@@ -648,8 +643,7 @@ describe("broadcast stream state machine", () => {
       streamId: "req-c",
       messageId: "tmp",
       done: true,
-      continuation: true,
-      currentMessages: current
+      continuation: true
     });
     const messages = done.messagesUpdate!(current);
     const assistant = messages.at(-1);

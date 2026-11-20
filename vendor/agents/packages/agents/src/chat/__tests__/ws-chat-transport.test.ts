@@ -90,8 +90,7 @@ describe("WebSocketChatTransport unacknowledged request replay", () => {
         }
         send(frame);
       });
-      const activeRequestIds = new Set<string>();
-      const transport = new WebSocketChatTransport({ agent, activeRequestIds });
+      const transport = new WebSocketChatTransport({ agent });
       if (mode === "tool continuation") transport.expectToolContinuation();
       const resumed = transport.reconnectToStream({ chatId: mode });
       if (mode === "tool continuation") {
@@ -108,7 +107,7 @@ describe("WebSocketChatTransport unacknowledged request replay", () => {
         value: { type: "error", errorText: "WebSocket closed mid-stream" }
       });
       await expect(reader.read()).resolves.toMatchObject({ done: true });
-      expect(activeRequestIds.size).toBe(0);
+      expect(transport.ownsRequest("replay")).toBe(false);
       expect(transport.retryPendingResume()).toBe(false);
       expect(transport.abortActiveToolContinuation()).toBe(false);
     }

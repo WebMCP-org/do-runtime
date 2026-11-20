@@ -1,13 +1,7 @@
 import type { LanguageModel, ToolSet, UIMessage } from "ai";
 import { hasToolCall, Output, tool } from "ai";
 import { MockLanguageModelV3 } from "ai/test";
-import {
-  action,
-  skills,
-  Think,
-  type ThinkSession,
-  UnfinishedToolInputError
-} from "../../think";
+import { action, skills, Think, UnfinishedToolInputError } from "../../think";
 import { Agent } from "agents";
 import type {
   AgentPathStep,
@@ -75,7 +69,7 @@ import type {
   TurnQueue
 } from "agents/chat";
 import type { Schedule } from "agents";
-import type { Session } from "../../think";
+import type { Session } from "agents/sessions";
 import type { ContextConfig } from "agents/context";
 import { z } from "zod";
 import { WorkspaceFiles } from "../../workspace-files";
@@ -13804,26 +13798,41 @@ export class ThinkPointerHydrationAgent extends Think {
   }
 }
 
-/**
- * A subclass written against the pre-Sessions Think API: context declared
- * through `configureSession(session).withContext(...)`, the context
- * accessors read off `this.session`, and the positional `appendMessage` /
- * `getHistory` forms. Every call here must keep compiling and behaving.
- */
-export class ThinkLegacySessionApiAgent extends Think {
-  private _response = "Hello from legacy session agent!";
+/** Exercises native Sessions and context configuration through Think. */
+export class ThinkNativeSessionApiAgent extends Think {
+  private _response = "Hello from native session agent!";
   private _compactionErrors: string[] = [];
 
-  override configureSession(session: ThinkSession): ThinkSession {
-    return session
-      .withContext("soul", {
-        provider: { get: async () => "You are a legacy-configured agent." }
-      })
-      .withContext("memory", {
+  protected override configurePromptStore() {
+    return {
+      get: async () =>
+        (await this.ctx.storage.get<string>("custom-frozen-prompt")) ?? null,
+      set: async (content: string) => {
+        await this.ctx.storage.put("custom-frozen-prompt", content);
+      }
+    };
+  }
+
+  async customFrozenPrompt(): Promise<string | undefined> {
+    return this.ctx.storage.get<string>("custom-frozen-prompt");
+  }
+
+  override configureContext(): ContextConfig[] {
+    return [
+      {
+        label: "soul",
+        provider: { get: async () => "You are a configured agent." }
+      },
+      {
+        label: "memory",
         description: "Important facts learned during conversation.",
         maxTokens: 2000
-      })
-      .withCachedPrompt()
+      }
+    ];
+  }
+
+  override configureSession(session: Session): Session {
+    return session
       .onCompaction(async () => {
         throw new Error("summarizer down");
       })
@@ -13849,34 +13858,34 @@ export class ThinkLegacySessionApiAgent extends Think {
     };
   }
 
-  async legacyBlockLabels(): Promise<string[]> {
-    return this.session.getContextBlocks().map((block) => block.label);
+  async contextBlockLabels(): Promise<string[]> {
+    return this.context.getBlocks().map((block) => block.label);
   }
 
-  async legacyBlockContent(label: string): Promise<string | null> {
-    return this.session.getContextBlock(label)?.content ?? null;
+  async contextBlockContent(label: string): Promise<string | null> {
+    return this.context.getBlock(label)?.content ?? null;
   }
 
-  async legacyReplaceBlock(label: string, content: string): Promise<void> {
-    await this.session.replaceContextBlock(label, content);
+  async replaceContextBlock(label: string, content: string): Promise<void> {
+    await this.context.setBlock(label, content);
   }
 
-  async legacyFreezeSystemPrompt(): Promise<string> {
-    return this.session.freezeSystemPrompt();
+  async freezeContextPrompt(): Promise<string> {
+    return this.context.freezeSystemPrompt();
   }
 
-  async legacyAddAndRemoveContext(label: string): Promise<boolean> {
-    await this.session.addContext(label, { description: "Dynamic block" });
-    await this.session.refreshSystemPrompt();
-    return this.session.removeContext(label);
+  async addAndRemoveContext(label: string): Promise<boolean> {
+    await this.context.addBlock({ label, description: "Dynamic block" });
+    await this.context.refreshSystemPrompt();
+    return this.context.removeBlock(label);
   }
 
-  async legacyToolNames(): Promise<string[]> {
-    return Object.keys(await this.session.tools());
+  async contextToolNames(): Promise<string[]> {
+    return Object.keys(await this.context.tools());
   }
 
-  /** Positional `appendMessage(message, parentId)` and `getHistory(leafId)`. */
-  async legacyPositionalWrites(): Promise<{
+  /** Branch writes and reads use the native session options. */
+  async writeSessionBranches(): Promise<{
     rootLength: number;
     branchLength: number;
   }> {
@@ -13885,21 +13894,27 @@ export class ThinkLegacySessionApiAgent extends Think {
       role: "user",
       parts: [{ type: "text", text: content }]
     });
-    await this.session.appendMessage(text("legacy-root", "root"), null);
-    await this.session.appendMessage(text("legacy-a", "a"), "legacy-root");
-    await this.session.appendMessage(text("legacy-b", "b"), "legacy-root");
-    const branch = await this.session.getHistory("legacy-a");
-    const root = await this.session.getHistory(null);
+    await this.session.appendMessage(text("legacy-root", "root"), {
+      parentId: null
+    });
+    await this.session.appendMessage(text("legacy-a", "a"), {
+      parentId: "legacy-root"
+    });
+    await this.session.appendMessage(text("legacy-b", "b"), {
+      parentId: "legacy-root"
+    });
+    const branch = await this.session.getHistory({ leafId: "legacy-a" });
+    const root = await this.session.getHistory({ leafId: null });
     return { rootLength: root.length, branchLength: branch.length };
   }
 
   /** `getRecentHistory(budget, minRecentMessages)` still accepts two args. */
-  async legacyRecentHistoryLength(): Promise<number> {
-    const recent = await this.session.getRecentHistory(1024 * 1024, 4);
+  async recentHistoryLength(): Promise<number> {
+    const recent = await this.session.getRecentHistory(1024 * 1024);
     return recent.messages.length;
   }
 
-  async legacyCompact(): Promise<{
+  async compactSession(): Promise<{
     result: unknown;
     errors: string[];
   }> {

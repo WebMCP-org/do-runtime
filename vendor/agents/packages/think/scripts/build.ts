@@ -9,6 +9,7 @@ async function main() {
     target: "es2021",
     entry: [
       "src/think.ts",
+      "src/schedules.ts",
       "src/workflows.ts",
       "src/extensions/index.ts",
       "src/react.tsx",

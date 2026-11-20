@@ -71,6 +71,22 @@ export interface SkillCatalogEntry {
   readonly location?: string;
 }
 
+/** Serializable catalog summary for skill selection. Names retain their validated identity. */
+export interface SkillSummary {
+  readonly name: Skill["name"];
+  readonly description: Skill["description"];
+  readonly sourceId: SkillCatalogEntry["sourceId"];
+}
+
+/** Project a loaded catalog for clients that select skills without loading their contents. */
+export function summarizeSkillCatalog(catalog: SkillCatalog): SkillSummary[] {
+  return catalog.skills.map(({ skill, sourceId }) => ({
+    name: skill.name,
+    description: skill.description,
+    sourceId
+  }));
+}
+
 /** A resource read through a {@link SkillCatalog}. */
 export interface SkillCatalogResource {
   /** The skill that owns the resource. */

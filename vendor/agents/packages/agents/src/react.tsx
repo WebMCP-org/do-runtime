@@ -1,27 +1,27 @@
+import {
+  ClientReadiness,
+  socketDestinationKey,
+  parseClientFrame
+} from "./client-connection";
+import { JsonRpcClient, nativeCall, NativeCallQueue } from "./client-rpc";
 import type { PartySocket } from "partysocket";
 import { usePartySocket } from "partysocket/react";
 import { useCallback, useRef, use, useMemo, useState, useEffect } from "react";
-import type { MCPServersState, RPCResponse } from "./";
+import type { MCPServersState } from "./";
 import type {
   AgentConnectionError,
-  AgentPromiseReturnType,
+  AgentMethodCall,
   AgentStub,
   CallOptions,
-  OptionalAgentMethods,
-  RequiredAgentMethods,
-  StreamOptions,
   UntypedAgentStub
 } from "./client";
-import type { ClientParameters } from "./serializable";
+import type { Method } from "./serializable";
 import {
+  AgentConnectionClosedError,
   createStubProxy,
   DEFAULT_CALL_TIMEOUT_MS,
   AgentConnectionError as AgentConnectionErrorCtor,
-  createCloseClassifier,
-  nativeCall,
-  NativeCallQueue,
-  serializeRpcRequest,
-  splitCallOptions
+  createCloseClassifier
 } from "./client";
 import {
   boundCapnWebSocket,
@@ -78,51 +78,6 @@ interface CacheEntry {
 
 const queryCache = new Map<string, CacheEntry>();
 
-type SocketDestination = {
-  host?: string;
-  basePath?: string;
-  party?: string;
-  prefix?: string;
-  room?: string;
-  path?: string;
-  protocol?: string;
-  protocols?: unknown;
-};
-
-function socketDestinationKey(options: SocketDestination): string {
-  return JSON.stringify([
-    options.host ?? null,
-    options.basePath ?? null,
-    options.party ?? null,
-    options.prefix ?? null,
-    options.room ?? null,
-    options.path ?? null,
-    options.protocol ?? null,
-    options.protocols ?? null
-  ]);
-}
-
-type ReadyEntry = {
-  promise: Promise<void>;
-  resolve: () => void;
-  resolved: boolean;
-};
-
-function createReadyEntry(): ReadyEntry {
-  let resolvePromise!: () => void;
-  const entry: ReadyEntry = {
-    promise: new Promise<void>((r) => {
-      resolvePromise = r;
-    }),
-    resolved: false,
-    resolve: () => {
-      entry.resolved = true;
-      resolvePromise();
-    }
-  };
-  return entry;
-}
-
 /** The host `usePartySocket` connects to when none is given. */
 function defaultSocketHost(): string {
   return typeof window !== "undefined"
@@ -130,41 +85,11 @@ function defaultSocketHost(): string {
     : "dummy-domain.com";
 }
 
-function createCacheKey(
-  agentNamespace: string,
-  name: string | undefined,
-  subChainOrDeps: ReadonlyArray<{ agent: string; name: string }> | unknown[],
-  deps?: unknown[]
+function createCacheKey<State>(
+  options: UseAgentOptions<State>,
+  deps: unknown[]
 ): string {
-  // Backwards-compatible overload: if called with 3 args, the third
-  // argument is `deps` and `subChain` defaults to empty. With 4 args,
-  // the third is the sub-chain. This keeps existing callers (and
-  // the `_testUtils` surface) working while letting new callers
-  // include the nested chain in the cache key.
-  //
-  // Empty sub-chain must produce the same key as the old 3-arg
-  // form, so nested-addressing code can opt-in without invalidating
-  // existing caches.
-  if (deps === undefined) {
-    return JSON.stringify([
-      agentNamespace,
-      name || "default",
-      ...(subChainOrDeps as unknown[])
-    ]);
-  }
-  const subChain = subChainOrDeps as ReadonlyArray<{
-    agent: string;
-    name: string;
-  }>;
-  if (subChain.length === 0) {
-    return JSON.stringify([agentNamespace, name || "default", ...deps]);
-  }
-  return JSON.stringify([
-    agentNamespace,
-    name || "default",
-    subChain.map((s) => [s.agent, s.name]),
-    ...deps
-  ]);
+  return JSON.stringify([getAgentConnectionKey(options), deps]);
 }
 
 /** Build a URL path tail `/sub/{agent-kebab}/{name}/...` from a sub chain. */
@@ -340,29 +265,35 @@ export type UseAgentOptions<State = unknown> = Omit<
     onConnectionError?: (error: AgentConnectionError) => void;
   };
 
-type OptionalArgsAgentMethodCall<AgentT> = <
-  K extends keyof OptionalAgentMethods<AgentT>
->(
-  method: K,
-  args?: ClientParameters<OptionalAgentMethods<AgentT>[K]>,
-  options?: CallOptions | StreamOptions
-) => AgentPromiseReturnType<AgentT, K>;
-
-type RequiredArgsAgentMethodCall<AgentT> = <
-  K extends keyof RequiredAgentMethods<AgentT>
->(
-  method: K,
-  args: ClientParameters<RequiredAgentMethods<AgentT>[K]>,
-  options?: CallOptions | StreamOptions
-) => AgentPromiseReturnType<AgentT, K>;
-
-type AgentMethodCall<AgentT> = OptionalArgsAgentMethodCall<AgentT> &
-  RequiredArgsAgentMethodCall<AgentT>;
+/** Canonical hook destination, independent of refreshed credentials and callbacks. */
+export function getAgentConnectionKey<State>(
+  options: UseAgentOptions<State>
+): string {
+  const path = buildSubPath(options.sub ?? [], options.path);
+  const socketOptions = options.basePath
+    ? {
+        ...options,
+        host: options.host || defaultSocketHost(),
+        path: path || undefined
+      }
+    : {
+        ...options,
+        host: options.host || defaultSocketHost(),
+        party: camelCaseToKebabCase(options.agent),
+        prefix: options.prefix ?? "agents",
+        room: options.name || "default",
+        path: path || undefined
+      };
+  return JSON.stringify([
+    socketDestinationKey(socketOptions),
+    options.transport ?? "cf-websocket"
+  ]);
+}
 
 type UntypedAgentMethodCall = <T = unknown>(
   method: string,
   args?: unknown[],
-  options?: CallOptions | StreamOptions
+  options?: CallOptions
 ) => Promise<T>;
 
 /**
@@ -377,6 +308,7 @@ export function useAgent<State = unknown>(
   path: ReadonlyArray<{ agent: string; name: string }>;
   identified: boolean;
   ready: Promise<void>;
+  connectionKey: string;
   state: State | undefined;
   connectionError: AgentConnectionError | null;
   setState: (state: State) => void;
@@ -385,9 +317,11 @@ export function useAgent<State = unknown>(
   getHttpUrl: () => string;
 };
 export function useAgent<
-  AgentT extends {
-    get state(): State;
-  },
+  AgentT extends
+    | {
+        get state(): State;
+      }
+    | Record<string, Method>,
   State
 >(
   options: UseAgentOptions<State>
@@ -397,6 +331,7 @@ export function useAgent<
   path: ReadonlyArray<{ agent: string; name: string }>;
   identified: boolean;
   ready: Promise<void>;
+  connectionKey: string;
   state: State | undefined;
   connectionError: AgentConnectionError | null;
   setState: (state: State) => void;
@@ -413,6 +348,7 @@ export function useAgent<State>(options: UseAgentOptions<unknown>): Omit<
   path: ReadonlyArray<{ agent: string; name: string }>;
   identified: boolean;
   ready: Promise<void>;
+  connectionKey: string;
   state: State | undefined;
   connectionError: AgentConnectionError | null;
   setState: (state: State) => void;
@@ -488,37 +424,7 @@ export function useAgent<State>(options: UseAgentOptions<unknown>): Omit<
     [options.agent, options.name, subChain]
   );
 
-  // Keep track of pending RPC calls.
-  //
-  // Each entry is tagged with the socket the request was transmitted on
-  // (`sentOn`). Requests are only handed to a socket once it's OPEN —
-  // until then they stay queued here (`sentOn: null`). This matters
-  // because `usePartySocket` *replaces* the socket object whenever
-  // connection options change (async query refresh, path change, etc.):
-  // anything buffered inside a replaced socket is lost forever, and a
-  // call transmitted on a replaced socket can never receive its
-  // response. Tagging lets us:
-  // - flush still-queued requests on whichever socket connects next
-  //   (safe: they were never transmitted, so no double-execution risk)
-  // - reject calls transmitted on a socket that closed or was replaced
-  //   (their response can never arrive)
-  // - avoid rejecting calls in flight on the *new* socket when a stale
-  //   close event from an old socket trickles in
-  const pendingCallsRef = useRef(
-    new Map<
-      string,
-      {
-        resolve: (value: unknown) => void;
-        reject: (error: Error) => void;
-        stream?: StreamOptions;
-        timeoutId?: ReturnType<typeof setTimeout>;
-        /** Serialized RPC request, kept so it can be (re)transmitted */
-        request: string;
-        /** Socket the request was transmitted on; null while queued */
-        sentOn: PartySocket | null;
-      }
-    >()
-  );
+  const [rpc] = useState(() => new JsonRpcClient());
 
   // Always points at the socket from the latest render. `call`,
   // `setState`, and the queue-flushing logic go through this ref so
@@ -531,55 +437,21 @@ export function useAgent<State>(options: UseAgentOptions<unknown>): Omit<
   );
   defaultCallTimeoutRef.current = defaultCallTimeout ?? DEFAULT_CALL_TIMEOUT_MS;
 
-  /** Reject (and remove) every pending call transmitted on `socket`. */
-  const rejectCallsSentOn = (socket: PartySocket, reason: string) => {
-    const error = new Error(reason);
-    for (const [id, pending] of pendingCallsRef.current) {
-      if (pending.sentOn === socket) {
-        if (pending.timeoutId) clearTimeout(pending.timeoutId);
-        pendingCallsRef.current.delete(id);
-        pending.reject(error);
-        pending.stream?.onError?.(reason);
-      }
-    }
-  };
-
-  /** Transmit queued (never-sent) calls if the live socket is open. */
   const flushQueuedCalls = () => {
     const socket = socketRef.current;
     if (!socket || socket.readyState !== socket.OPEN) return;
-    for (const pending of pendingCallsRef.current.values()) {
-      // A send that closed the socket leaves the rest queued for the next one.
-      if (socket.readyState !== socket.OPEN) break;
-      if (pending.sentOn === null) {
-        pending.sentOn = socket;
-        socket.send(pending.request);
-      }
-    }
+    rpc.flush(socket);
     const native =
       transportRef.current === "capnweb" ? capnWebRef.current : null;
     if (native) nativeQueueRef.current.flush(native);
   };
 
-  /** Reject (and remove) every still-queued (never transmitted) call. */
-  const rejectQueuedCalls = (reason: string) => {
-    nativeQueueRef.current.rejectAll(reason);
-    const error = new Error(reason);
-    for (const [id, pending] of pendingCallsRef.current) {
-      if (pending.sentOn === null) {
-        if (pending.timeoutId) clearTimeout(pending.timeoutId);
-        pendingCallsRef.current.delete(id);
-        pending.reject(error);
-        pending.stream?.onError?.(reason);
-      }
-    }
+  const rejectQueuedCalls = (error: Error) => {
+    nativeQueueRef.current.rejectAll(error);
+    rpc.discardQueued(error);
   };
 
-  const cacheKey = useMemo(
-    () =>
-      createCacheKey(agentNamespace, options.name, subChain, queryDeps || []),
-    [agentNamespace, options.name, subChain, queryDeps]
-  );
+  const cacheKey = createCacheKey(options, queryDeps ?? []);
 
   // Track current cache key in a ref for use in onClose handler.
   // This ensures we invalidate the correct cache entry when the connection closes,
@@ -741,22 +613,10 @@ export function useAgent<State>(options: UseAgentOptions<unknown>): Omit<
   // Ready promise - resolves when identity is received, resets on close
   // One entry per socket destination, so `ready` for a newly requested
   // agent is not the previous agent's resolved promise.
-  const readyRef = useRef(new Map<string, ReadyEntry>());
-  const readyFor = (destination: string): ReadyEntry => {
-    let entry = readyRef.current.get(destination);
-    if (!entry) {
-      entry = createReadyEntry();
-      readyRef.current.set(destination, entry);
-    }
-    return entry;
-  };
-  // A still-pending promise is kept, so a caller already awaiting it is
-  // resolved by the next identity rather than left on a replaced promise.
-  const resetReady = (destination: string) => {
-    if (readyRef.current.get(destination)?.resolved !== false) {
-      readyRef.current.set(destination, createReadyEntry());
-    }
-  };
+  const [readiness] = useState(() => new ClientReadiness());
+  const [socketTransports] = useState(
+    () => new WeakMap<PartySocket, AgentTransport>()
+  );
 
   const mutableAgentRef = useRef<{
     agent: string;
@@ -833,10 +693,11 @@ export function useAgent<State>(options: UseAgentOptions<unknown>): Omit<
     agentChatReplayRef.current.frames.length = 0;
     agentChatReplayRef.current.overflowed = false;
   }
-  const destination = socketDestinationKey({
+  const socketDestination = socketDestinationKey({
     ...socketOptions,
     host: socketOptions.host || defaultSocketHost()
   });
+  const destination = JSON.stringify([socketDestination, transport]);
   // The seeded identity (before any identity message) belongs to the
   // destination of the first render.
   const seedDestinationRef = useRef(destination);
@@ -845,24 +706,6 @@ export function useAgent<State>(options: UseAgentOptions<unknown>): Omit<
       ? connectionError
       : null;
   connectionErrorRef.current = visibleConnectionError;
-
-  // Connect-sequence progress per socket: whether the state frame has
-  // landed, and an identity held back until it does.
-  const connectProgressRef = useRef(
-    new WeakMap<
-      PartySocket,
-      { stateSeen: boolean; pendingIdentity: [string, string] | null }
-    >()
-  );
-  const connectProgress = (socket: PartySocket | null) => {
-    if (!socket) return { stateSeen: false, pendingIdentity: null };
-    let progress = connectProgressRef.current.get(socket);
-    if (!progress) {
-      progress = { stateSeen: false, pendingIdentity: null };
-      connectProgressRef.current.set(socket, progress);
-    }
-    return progress;
-  };
 
   const applyIdentity = (
     newName: string,
@@ -874,7 +717,9 @@ export function useAgent<State>(options: UseAgentOptions<unknown>): Omit<
     if (
       !identifiedSocket ||
       identifiedSocket !== socketRef.current ||
-      socketDestinationKey(identifiedSocket.partySocketOptions) !== destination
+      socketDestinationKey(identifiedSocket.partySocketOptions) !==
+        socketDestination ||
+      socketTransports.get(identifiedSocket) !== transport
     ) {
       return;
     }
@@ -897,7 +742,7 @@ export function useAgent<State>(options: UseAgentOptions<unknown>): Omit<
     });
 
     // Resolve ready promise
-    readyFor(destination).resolve();
+    readiness.at(destination).resolve();
 
     // Detect identity change on reconnect
     if (
@@ -950,14 +795,8 @@ export function useAgent<State>(options: UseAgentOptions<unknown>): Omit<
     },
     onMessage: (message) => {
       if (typeof message.data === "string") {
-        let parsedMessage: Record<string, unknown>;
-        try {
-          parsedMessage = JSON.parse(message.data);
-        } catch (_error) {
-          // silently ignore invalid messages for now
-          // TODO: log errors with log levels
-          return options.onMessage?.(message);
-        }
+        const parsedMessage = parseClientFrame(message.data);
+        if (!parsedMessage) return options.onMessage?.(message);
         if (parsedMessage.type === "agent-tool-event") {
           // Stash for a subscriber that hasn't attached yet; the frame
           // still falls through to socket listeners and options.onMessage.
@@ -976,16 +815,18 @@ export function useAgent<State>(options: UseAgentOptions<unknown>): Omit<
         if (parsedMessage.type === MessageType.CF_AGENT_IDENTITY) {
           const identifiedSocket =
             (message.target as PartySocket | null) ?? socketRef.current;
-          const newName = parsedMessage.name as string;
-          const newAgent = parsedMessage.agent as string;
-          const progress = connectProgress(identifiedSocket);
-          // The server flags an identity whose state frame is next, so
-          // `ready` never resolves with the stored state still missing.
-          if (parsedMessage.stateFollows === true && !progress.stateSeen) {
-            progress.pendingIdentity = [newName, newAgent];
+          if (
+            !identifiedSocket ||
+            typeof parsedMessage.name !== "string" ||
+            typeof parsedMessage.agent !== "string"
+          )
             return;
-          }
-          applyIdentity(newName, newAgent, identifiedSocket);
+          readiness.identity(
+            identifiedSocket,
+            { name: parsedMessage.name, agent: parsedMessage.agent },
+            parsedMessage.stateFollows === true,
+            ({ name, agent }) => applyIdentity(name, agent, identifiedSocket)
+          );
           return;
         }
         if (parsedMessage.type === MessageType.CF_AGENT_STATE) {
@@ -1000,13 +841,10 @@ export function useAgent<State>(options: UseAgentOptions<unknown>): Omit<
           try {
             options.onStateUpdate?.(parsedMessage.state as State, "server");
           } finally {
-            const progress = connectProgress(stateSocket);
-            progress.stateSeen = true;
-            const pending = progress.pendingIdentity;
-            if (pending) {
-              progress.pendingIdentity = null;
-              applyIdentity(pending[0], pending[1], stateSocket);
-            }
+            if (stateSocket)
+              readiness.state(stateSocket, ({ name, agent }) =>
+                applyIdentity(name, agent, stateSocket)
+              );
           }
           return;
         }
@@ -1019,40 +857,10 @@ export function useAgent<State>(options: UseAgentOptions<unknown>): Omit<
           return;
         }
         if (parsedMessage.type === MessageType.RPC) {
-          const response = parsedMessage as RPCResponse;
-          const pending = pendingCallsRef.current.get(response.id);
-          if (!pending) {
-            console.warn(
-              `[useAgent] Discarded an RPC response with no matching pending call (id "${response.id}"). ` +
-                "The call likely timed out or was rejected when its connection closed before the response arrived."
-            );
-            return;
-          }
-
-          if (!response.success) {
-            if (pending.timeoutId) clearTimeout(pending.timeoutId);
-            pending.reject(new Error(response.error));
-            pendingCallsRef.current.delete(response.id);
-            pending.stream?.onError?.(response.error);
-            return;
-          }
-
-          // Handle streaming responses
-          if ("done" in response) {
-            if (response.done) {
-              if (pending.timeoutId) clearTimeout(pending.timeoutId);
-              pending.resolve(response.result);
-              pendingCallsRef.current.delete(response.id);
-              pending.stream?.onDone?.(response.result);
-            } else {
-              pending.stream?.onChunk?.(response.result);
-            }
-          } else {
-            // Non-streaming response
-            if (pending.timeoutId) clearTimeout(pending.timeoutId);
-            pending.resolve(response.result);
-            pendingCallsRef.current.delete(response.id);
-          }
+          rpc.receive(
+            (message.target as PartySocket | null) ?? socketRef.current,
+            parsedMessage
+          );
           return;
         }
       }
@@ -1069,7 +877,6 @@ export function useAgent<State>(options: UseAgentOptions<unknown>): Omit<
         (event.target as PartySocket | null) ?? socketRef.current;
       const isCurrentSocket = closedSocket === socketRef.current;
       const finalClose = closeClassifier.takeFinalClose();
-      if (closedSocket) connectProgressRef.current.delete(closedSocket);
       const reconnecting = !!closedSocket?.shouldReconnect && !finalClose;
 
       // Calls transmitted on the closed socket can never receive their
@@ -1077,16 +884,19 @@ export function useAgent<State>(options: UseAgentOptions<unknown>): Omit<
       // stay pending and are flushed when a socket next opens; calls
       // in flight on a *different* (newer) socket are untouched.
       if (closedSocket) {
-        rejectCallsSentOn(closedSocket, "Connection closed");
+        rpc.close(closedSocket);
         if (isCurrentSocket && !reconnecting) {
-          rejectQueuedCalls("Connection closed");
+          rejectQueuedCalls(new AgentConnectionClosedError());
         }
       }
 
       if (isCurrentSocket) {
         // Reset ready state for next connection
         if (closedSocket) {
-          resetReady(socketDestinationKey(closedSocket.partySocketOptions));
+          readiness.reset(
+            socketDestinationKey(closedSocket.partySocketOptions),
+            closedSocket
+          );
         }
         if (mutableAgentRef.current) {
           mutableAgentRef.current.identified = false;
@@ -1120,6 +930,7 @@ export function useAgent<State>(options: UseAgentOptions<unknown>): Omit<
     name: string;
     identified: boolean;
     ready: Promise<void>;
+    connectionKey: string;
     state: State | undefined;
     connectionError: AgentConnectionError | null;
     setState: (state: State) => void;
@@ -1135,8 +946,10 @@ export function useAgent<State>(options: UseAgentOptions<unknown>): Omit<
   // the socket is disabled) `agent` still points at the previous one. Query
   // params are not part of the destination: a token refresh reaches the
   // same agent.
+  if (!socketTransports.has(agent)) socketTransports.set(agent, transport);
   const socketAddressPending =
-    socketDestinationKey(agent.partySocketOptions) !== destination;
+    socketDestinationKey(agent.partySocketOptions) !== socketDestination ||
+    socketTransports.get(agent) !== transport;
 
   // When `usePartySocket` replaces the socket object (connection options
   // changed — async query refresh, path change, enabled toggle, ...) the
@@ -1175,18 +988,18 @@ export function useAgent<State>(options: UseAgentOptions<unknown>): Omit<
       connectionErrorAddressKeyRef.current = null;
       setConnectionError(null);
       rejectQueuedCalls(
-        "Call discarded: the agent address changed before the request could be sent"
+        new Error(
+          "Call discarded: the agent address changed before the request could be sent"
+        )
       );
     }
 
     // Pending entries stay: a caller may still await one, and returning to
     // that destination must resolve the promise it already holds.
-    for (const [key, entry] of readyRef.current) {
-      if (key !== destination && entry.resolved) readyRef.current.delete(key);
-    }
+    readiness.retainPending(destination);
 
     if (prev && prev !== agent) {
-      rejectCallsSentOn(prev, "Connection closed");
+      rpc.close(prev);
     }
     // The helpers only touch refs; re-running on socket/address change is all we need.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1199,7 +1012,7 @@ export function useAgent<State>(options: UseAgentOptions<unknown>): Omit<
     <T = unknown,>(
       method: string,
       args: unknown[] = [],
-      options?: CallOptions | StreamOptions
+      options?: CallOptions
     ): Promise<T> => {
       // On the Cap'n Web transport, callables are native methods on the
       // session root: invoke them directly so an RpcTarget result arrives
@@ -1222,7 +1035,7 @@ export function useAgent<State>(options: UseAgentOptions<unknown>): Omit<
           connectionErrorRef.current &&
           socket.readyState === socket.CLOSED
         ) {
-          return Promise.reject(new Error("Connection closed"));
+          return Promise.reject(new AgentConnectionClosedError());
         }
         // Connecting or between reconnects: hold the call as a native call
         // rather than queueing a JSON frame that would change its meaning.
@@ -1233,65 +1046,21 @@ export function useAgent<State>(options: UseAgentOptions<unknown>): Omit<
           defaultCallTimeoutRef.current
         );
       }
-      return new Promise((resolve, reject) => {
-        const socket = socketRef.current;
-        if (
-          socket &&
-          connectionErrorRef.current &&
-          socket.readyState === socket.CLOSED
-        ) {
-          reject(new Error("Connection closed"));
-          return;
-        }
-
-        const id = crypto.randomUUID();
-        let timeoutId: ReturnType<typeof setTimeout> | undefined;
-
-        const { stream: streamOptions, timeout } = splitCallOptions(options);
-
-        // Apply the default timeout as a backstop for non-streaming
-        // calls so a lost response rejects instead of hanging forever.
-        // An explicit `timeout` (including 0 = disabled) always wins.
-        const effectiveTimeout =
-          timeout !== undefined
-            ? timeout
-            : streamOptions
-              ? undefined
-              : defaultCallTimeoutRef.current;
-
-        if (effectiveTimeout) {
-          timeoutId = setTimeout(() => {
-            const pending = pendingCallsRef.current.get(id);
-            pendingCallsRef.current.delete(id);
-            const errorMessage = `RPC call to ${method} timed out after ${effectiveTimeout}ms`;
-            pending?.stream?.onError?.(errorMessage);
-            reject(new Error(errorMessage));
-          }, effectiveTimeout);
-        }
-
-        const request = serializeRpcRequest(id, method, args, options);
-
-        pendingCallsRef.current.set(id, {
-          reject,
-          resolve: resolve as (value: unknown) => void,
-          stream: streamOptions,
-          timeoutId,
-          request,
-          sentOn: null
-        });
-
-        // Transmit immediately if the live socket is open; otherwise the
-        // request stays queued and is flushed on the next open event.
-        // We never hand requests to a non-open socket: its internal
-        // buffer is lost forever if the socket gets replaced.
-        // Tag before sending: a transport may report its close from inside
-        // send(), and that close must reject this call.
-        if (socket && socket.readyState === socket.OPEN) {
-          const pending = pendingCallsRef.current.get(id);
-          if (pending) pending.sentOn = socket;
-          socket.send(request);
-        }
-      });
+      const socket = socketRef.current;
+      if (
+        socket &&
+        connectionErrorRef.current &&
+        socket.readyState === socket.CLOSED
+      ) {
+        return Promise.reject(new AgentConnectionClosedError());
+      }
+      return rpc.call<T>(
+        socket,
+        method,
+        args,
+        options,
+        defaultCallTimeoutRef.current
+      );
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
     []
@@ -1334,8 +1103,9 @@ export function useAgent<State>(options: UseAgentOptions<unknown>): Omit<
   // A replaced socket's close may never reach onClose. Reset here, not in an
   // effect, so the replacement's first render already hands out a pending
   // promise; later renders keep that entry.
-  if (!agent.identified) resetReady(destination);
-  agent.ready = readyFor(destination).promise;
+  if (!agent.identified) readiness.reset(destination);
+  agent.ready = readiness.at(destination).promise;
+  agent.connectionKey = getAgentConnectionKey(options);
   agent.state = agentState;
   agent.connectionError = visibleConnectionError;
   mutableAgentRef.current = agent;

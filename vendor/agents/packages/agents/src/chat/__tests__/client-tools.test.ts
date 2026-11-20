@@ -51,17 +51,4 @@ describe("createToolsFromClientSchemas", () => {
       { toolName: "get_time", input: { tz: "UTC" }, toolCallId: "tc-1" }
     ]);
   });
-
-  it("falls back to an empty toolCallId when execute options are absent", async () => {
-    let seen: string | undefined;
-    const tools = createToolsFromClientSchemas([{ name: "ping" }], {
-      execute: (call) => {
-        seen = call.toolCallId;
-        return "pong";
-      }
-    });
-    const output = await tools.ping.execute!({}, undefined as never);
-    expect(output).toBe("pong");
-    expect(seen).toBe("");
-  });
 });

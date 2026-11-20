@@ -3,7 +3,6 @@ import { getToolName, isToolUIPart } from "ai";
 import type {
   ChatInit,
   JSONSchema7,
-  Tool,
   UIMessage as Message,
   UIMessage
 } from "ai";
@@ -14,16 +13,12 @@ import { chatThrottleOptions } from "./chat-throttle";
 import type { ChatTurnOutcome, OutgoingMessage } from "./wire-types";
 import { STREAM_RESUME_NONE_REASONS } from "./protocol";
 import { MessageType } from "./wire-types";
-import {
-  observedDivergesFrom,
-  transition as broadcastTransition,
-  type BroadcastStreamState
-} from "./broadcast-state";
+import { observedDivergesFrom } from "./broadcast-state";
 import {
   WebSocketChatTransport,
   type AgentConnection
 } from "./ws-chat-transport";
-import { _drainAgentChatReplayFrames } from "../react";
+import { _drainAgentChatReplayFrames, type useAgent } from "../react";
 import { restoreContinuationMessage } from "./message-builder";
 
 export { WebSocketChatTransport } from "./ws-chat-transport";
@@ -78,7 +73,7 @@ export type JSONSchemaType = JSONSchema7;
  */
 export type AITool<Input = unknown, Output = unknown> = {
   /** Human-readable description of what the tool does */
-  description?: Tool["description"];
+  description?: string;
   /** JSON Schema defining the tool's input parameters */
   parameters?: JSONSchema7;
   /**
@@ -272,27 +267,86 @@ export async function getAgentMessages<M extends UIMessage = UIMessage>(
     messagesUrl = `${base}/agents/${agentSlug}/${options.name}/get-messages`;
   }
 
-  try {
-    const response = await fetch(messagesUrl, {
-      credentials: options.credentials,
-      headers: options.headers
-    });
-
-    if (!response.ok) {
-      console.warn(
-        `[getAgentMessages] Failed to fetch: ${response.status} ${response.statusText}`
-      );
-      return [];
-    }
-
-    const text = await response.text();
-    if (!text.trim()) return [];
-
-    return JSON.parse(text) as M[];
-  } catch (error) {
-    console.warn("[getAgentMessages] Fetch error:", error);
-    return [];
+  const response = await fetch(messagesUrl, {
+    credentials: options.credentials,
+    headers: options.headers
+  });
+  if (!response.ok) {
+    throw new Error(
+      `Failed to fetch messages: ${response.status} ${response.statusText}`
+    );
   }
+  const text = await response.text();
+  if (!text.trim()) return [];
+  const messages: unknown = JSON.parse(text);
+  if (!Array.isArray(messages))
+    throw new Error("Message history must be an array");
+  return messages as M[];
+}
+
+/**
+ * Load one transcript per mounted native destination before creating a chat.
+ * Credential refresh and reconnect retain history; a new connectionKey retires
+ * the old request. Rejections remain observable to the caller's error boundary.
+ */
+export function useAgentChatHistory<
+  AgentT extends { state: State },
+  State,
+  MessageT extends UIMessage = UIMessage
+>(
+  agent: ReturnType<typeof useAgent<AgentT, State>>,
+  loader?: (
+    agent: ReturnType<typeof useAgent<AgentT, State>>
+  ) => Promise<MessageT[]>
+): MessageT[] | undefined {
+  const key = agent.connectionKey;
+  const selectedDestination = useRef({ key });
+  if (selectedDestination.current.key !== key)
+    selectedDestination.current = { key };
+  const destination = selectedDestination.current;
+  const [result, setResult] = useState<{
+    destination: { key: string };
+    messages?: MessageT[];
+    error?: unknown;
+  }>();
+  const request = useRef<{
+    destination: { key: string };
+    promise: Promise<MessageT[]>;
+  } | null>(null);
+  const current = useRef({ agent, loader });
+  current.current = { agent, loader };
+  useEffect(() => {
+    if (!agent.identified) return;
+    let retired = false;
+    const selected = current.current;
+    const load = async () => {
+      if (selected.loader) return selected.loader(selected.agent);
+      const url = new URL(selected.agent.getHttpUrl());
+      url.pathname += "/get-messages";
+      return getAgentMessages<MessageT>({ url: url.toString() });
+    };
+    if (request.current?.destination !== destination)
+      request.current = { destination, promise: load() };
+    const pending = request.current;
+    void pending.promise.then(
+      (messages) => {
+        if (!retired) setResult({ destination, messages });
+      },
+      (error: unknown) => {
+        if (request.current === pending) request.current = null;
+        if (!retired && current.current.agent.identified)
+          setResult({ destination, error });
+      }
+    );
+    return () => {
+      retired = true;
+    };
+  }, [destination, agent.identified]);
+  const active = result?.destination === destination ? result : undefined;
+  if (active?.messages !== undefined) return active.messages;
+  if (agent.identified && active && "error" in active) throw active.error;
+  if (agent.connectionError) throw agent.connectionError;
+  return undefined;
 }
 
 // ── END Standalone fetch ───────────────────────────────────────────
@@ -426,6 +480,7 @@ export type UseAgentChatOptions<
   agent: AgentConnection & {
     agent: string;
     name: string;
+    connectionKey: string;
     path?: ReadonlyArray<{ agent: string; name: string }>;
     connectionError?: AgentConnectionErrorLike | null;
     getHttpUrl: () => string;
@@ -711,6 +766,8 @@ export function useAgentChat<
   options: UseAgentChatOptions<State, ChatMessage>
 ): Omit<ReturnType<typeof useChat<ChatMessage>>, "addToolOutput"> & {
   clearHistory: () => void;
+  /** A native server transcript or message update has been applied for this destination. */
+  hasReceivedMessages: boolean;
   /**
    * Provide output for a tool call. Use this for tools that require user interaction
    * or client-side execution.
@@ -853,122 +910,27 @@ export function useAgentChat<
     const rawHttpUrl = agent.getHttpUrl();
     const url = rawHttpUrl ? new URL(rawHttpUrl) : null;
     url?.searchParams.delete("_pk");
-    // The socket's route (host, base path, extra path) is part of the address:
-    // the same agent name on another host or route has its own history. The
-    // socket options are set from the first render, and exclude the query.
-    const route = (
-      agent as {
-        partySocketOptions?: {
-          host?: string;
-          basePath?: string;
-          prefix?: string;
-          party?: string;
-          path?: string;
-        };
-      }
-    ).partySocketOptions;
     address = {
       urlString: url?.toString() ?? null,
-      addressKey: JSON.stringify([
-        Array.isArray(agent.path)
-          ? agent.path.map((step) => [step.agent, step.name])
-          : [[agent.agent ?? "", agent.name ?? ""]],
-        route
-          ? [
-              route.host ?? null,
-              route.basePath ?? null,
-              route.prefix ?? null,
-              route.party ?? null,
-              route.path ?? null
-            ]
-          : null
-      ]),
+      addressKey: agent.connectionKey,
       agent: agent.agent,
       name: agent.name
     };
     if (!socketAddressPending) committedAddressRef.current = address;
   }
-  const agentUrl = address.urlString ? new URL(address.urlString) : null;
   const agentUrlString = address.urlString;
   const agentAddressKey = address.addressKey;
 
-  // Cache key for the request-dedup `requestCache` and the late-seed
-  // effect. It uses the full root-first agent address when `useAgent`
-  // provides one, so sub-agents with the same leaf class/name under
-  // different parents do not share hydrated messages.
-  //
-  //   - Query params like auth tokens change across page loads and
-  //     must not bust the cache, or Suspense re-triggers and breaks
-  //     stream resume (see issue #1223).
-  //   - The origin+pathname portion of the socket URL can legitimately
-  //     transition from empty → resolved on the second render when
-  //     `useAgent()` finishes its handshake. Including it here would
-  //     cause `doGetInitialMessages` to miss the cache after the URL
-  //     arrives, re-invoke the loader, and re-trigger Suspense — the
-  //     exact regression #1356 reports when a custom `getInitialMessages`
-  //     is provided.
-  //
-  // `resolvedInitialMessagesCacheKey` is still computed because the
-  // `stableChatIdRef` logic below uses it to detect the URL-arrival
-  // transition separately from identity changes.
-  const resolvedInitialMessagesCacheKey = agentUrl
-    ? `${agentUrl.origin}${agentUrl.pathname}|${agentAddressKey}`
-    : null;
   const initialMessagesCacheKey = agentAddressKey;
-
-  // Stable chat ID for `useChat({ id })`.
-  //
-  // The AI SDK recreates the underlying Chat instance whenever its `id`
-  // changes, which aborts any in-flight `transport.reconnectToStream()`
-  // (the resume path) and leaves the recreated Chat without any resume
-  // having been fired on it — the AI SDK's `useEffect(() => {
-  // if (resume) chatRef.current.resumeStream() }, [resume, chatRef])`
-  // deps are object-stable, so the effect does not re-fire on recreation.
-  // See issue #1356.
-  //
-  // Two things can move across renders and must NOT cause an id flip:
-  //
-  //   1. The origin+pathname of the socket URL can transition from
-  //      `null` → resolved on the second render when `useAgent()`
-  //      finishes its handshake. The Chat id must stay on its
-  //      first-render fallback through that transition; upgrading to
-  //      the URL-resolved key would recreate Chat and drop optimistic
-  //      messages sent immediately after mount.
-  //
-  //   2. `agent.name` can transition from the client-side fallback
-  //      ("default") to a server-assigned value when
-  //      `static options = { sendIdentityOnConnect: true }` is set and
-  //      the consumer uses the `basePath` pattern (the server owns the
-  //      DO instance name, not the browser). `useAgent` mutates the
-  //      same agent object's `.name` in place here.
-  //
-  // What IS a genuine chat switch: the consumer passes a different
-  // `agent` object to `useAgentChat`. That's a new `useAgent({...})`
-  // return value, typically from swapping or remounting a parent. We
-  // detect this by reference equality — `useAgent`'s return is stable
-  // across renders for a given mount, so a reference change is the
-  // unambiguous "chat switch" signal.
-  const stableChatIdRef = useRef<string | null>(null);
-  const previousAgentRef = useRef<typeof agent | null>(null);
-  const previousAgentAddressKeyRef = useRef<string | null>(null);
-  const fallbackChatId = agentAddressKey;
-  const agentPathChanged =
-    Array.isArray(agent.path) &&
-    previousAgentAddressKeyRef.current !== null &&
-    previousAgentAddressKeyRef.current !== agentAddressKey;
-
-  if (stableChatIdRef.current === null) {
-    // First render: initialize.
-    stableChatIdRef.current = resolvedInitialMessagesCacheKey ?? fallbackChatId;
-  } else if (previousAgentRef.current !== agent || agentPathChanged) {
-    // Consumer swapped in a different agent object, or the full
-    // sub-agent address changed on a `useAgent` object — genuine chat switch.
-    // Recompute from current values.
-    stableChatIdRef.current = resolvedInitialMessagesCacheKey ?? fallbackChatId;
-  }
-
-  previousAgentRef.current = agent;
-  previousAgentAddressKeyRef.current = agentAddressKey;
+  const stableChatIdRef = useRef(agentAddressKey);
+  stableChatIdRef.current = agentAddressKey;
+  const chatDestination = useRef({ key: agentAddressKey });
+  if (chatDestination.current.key !== agentAddressKey)
+    chatDestination.current = { key: agentAddressKey };
+  const destination = chatDestination.current;
+  const [receivedMessagesDestination, setReceivedMessagesDestination] =
+    useState<typeof destination | null>(null);
+  const hasReceivedMessages = receivedMessagesDestination === destination;
 
   // Keep a ref to always point to the latest agent instance.
   // Updated synchronously during render (not in useEffect) so the
@@ -987,29 +949,11 @@ export function useAgentChat<
     }
     const getMessagesUrl = new URL(url);
     getMessagesUrl.pathname += "/get-messages";
-    const response = await fetch(getMessagesUrl.toString(), {
+    return getAgentMessages<ChatMessage>({
+      url: getMessagesUrl.toString(),
       credentials: options.credentials,
       headers: options.headers
     });
-
-    if (!response.ok) {
-      console.warn(
-        `Failed to fetch initial messages: ${response.status} ${response.statusText}`
-      );
-      return [];
-    }
-
-    const text = await response.text();
-    if (!text.trim()) {
-      return [];
-    }
-
-    try {
-      return JSON.parse(text) as ChatMessage[];
-    } catch (error) {
-      console.warn("Failed to parse initial messages JSON:", error);
-      return [];
-    }
   }
 
   const getInitialMessagesFetch =
@@ -1082,29 +1026,12 @@ export function useAgentChat<
   const bodyOptionRef = useRef(bodyOption);
   bodyOptionRef.current = bodyOption;
 
-  /**
-   * Tracks request IDs initiated by this tab via the transport.
-   * Used by onAgentMessage to skip messages already handled by the transport.
-   */
-  const localRequestIdsRef = useRef<Set<string>>(new Set());
   // Ids of sends the transport buffered (socket not OPEN when `send()` ran, so
   // the server hasn't seen them). Consumed by the next transcript snapshot to
   // rescue the optimistic messages from the reconnect replay.
   const pendingBufferedSendIdsRef = useRef<Set<string>>(new Set());
   const pendingReplayResumeRequestIdsRef = useRef<Set<string>>(new Set());
   const replayHydratedAssistantMessageIdsRef = useRef<Set<string>>(new Set());
-  /**
-   * Request ids this socket already ACKed via the fallback resume path.
-   * The server sends CF_AGENT_STREAM_RESUMING for the same request from
-   * both onConnect and its CF_AGENT_STREAM_RESUME_REQUEST handler (#1733).
-   * The transport-handled path dedupes the second notify via
-   * localRequestIdsRef, but the fallback path used to ACK both — triggering
-   * a second full-buffer replay that duplicated streamed parts. Entries are
-   * dropped when the turn completes; the whole set resets when the socket
-   * closes, since a new connection legitimately needs a fresh ACK+replay.
-   */
-  const fallbackAckedResumeRequestIdsRef = useRef<Set<string>>(new Set());
-
   // WebSocket-based transport that speaks the CF_AGENT protocol natively.
   // Replaces the old aiFetch + DefaultChatTransport indirection.
   //
@@ -1121,7 +1048,6 @@ export function useAgentChat<
   if (customTransportRef.current === null) {
     customTransportRef.current = new WebSocketChatTransport<ChatMessage>({
       agent: agentRef.current,
-      activeRequestIds: localRequestIdsRef.current,
       cancelOnClientAbort,
       onRequestBuffered: (messageId) => {
         if (messageId) {
@@ -1682,7 +1608,7 @@ export function useAgentChat<
     processedToolCalls.current.clear();
     localResponseMessageIdsRef.current.clear();
     pendingReplayResumeRequestIdsRef.current.clear();
-    fallbackAckedResumeRequestIdsRef.current.clear();
+    customTransport.resetObserverResumes();
     replayHydratedAssistantMessageIdsRef.current.clear();
     protectedStreamingAssistantRef.current = null;
     pendingBufferedSendIdsRef.current.clear();
@@ -2083,8 +2009,6 @@ export function useAgentChat<
     finishOnToolCall
   ]);
 
-  const streamStateRef = useRef<BroadcastStreamState>({ status: "idle" });
-
   // #1620: a durable chat turn is being recovered (interrupted by a
   // deploy/eviction or a stream-stall watchdog abort and now resuming). Driven
   // by the server's `CF_AGENT_CHAT_RECOVERING` frames; surfaced as a "working,
@@ -2146,7 +2070,7 @@ export function useAgentChat<
       // This listener runs before the transport's, so the Chat is still
       // streaming the request: a send from the callback now would overlap it.
       if (
-        localRequestIdsRef.current.has(frame.id) &&
+        customTransport.ownsRequest(frame.id) &&
         (statusRef.current === "submitted" || statusRef.current === "streaming")
       ) {
         pendingTurnEndsRef.current.push(event);
@@ -2172,9 +2096,9 @@ export function useAgentChat<
       switch (data.type) {
         case MessageType.CF_AGENT_CHAT_CLEAR:
           // Broadcast-specific resets (cross-tab stream tracking).
-          streamStateRef.current = broadcastTransition(streamStateRef.current, {
+          customTransport.transitionObserved({
             type: "clear"
-          }).state;
+          });
           setIsServerStreaming(false);
           setUnresolvedObservedRequestId(null);
           setRecoveringRequestId(null);
@@ -2194,6 +2118,7 @@ export function useAgentChat<
           break;
 
         case MessageType.CF_AGENT_CHAT_MESSAGES: {
+          setReceivedMessagesDestination(destination);
           // One-shot, consumed outside the updater so a re-invoked updater
           // sees the same ids. Only a connect transcript predates the buffered
           // sends; any other snapshot (e.g. a `drop` rollback after a
@@ -2216,7 +2141,7 @@ export function useAgentChat<
             // start-chunk re-arm above). Re-apply the accumulator — it adopted
             // the server id from the `start` chunk, so `mergeInto` replaces the
             // snapshot's copy in place (or appends a not-yet-persisted turn).
-            const observed = streamStateRef.current;
+            const observed = customTransport.observedStream;
             if (
               observed.status === "observing" &&
               observed.accumulator.parts.length > 0
@@ -2255,6 +2180,7 @@ export function useAgentChat<
         }
 
         case MessageType.CF_AGENT_MESSAGE_UPDATED:
+          setReceivedMessagesDestination(destination);
           // Server updated a message (e.g., applied tool result)
           // Update the specific message in local state
           setMessages((prevMessages: ChatMessage[]) => {
@@ -2325,10 +2251,9 @@ export function useAgentChat<
             data.reason === STREAM_RESUME_NONE_REASONS.IDLE &&
             typeof data.probeId === "string"
           ) {
-            const result = broadcastTransition(streamStateRef.current, {
+            const result = customTransport.transitionObserved({
               type: "clear"
             });
-            streamStateRef.current = result.state;
             setIsServerStreaming(result.isStreaming);
             setUnresolvedObservedRequestId(null);
             if (!serverReportsRecovery) setRecoveringRequestId(null);
@@ -2393,7 +2318,7 @@ export function useAgentChat<
           // the fallback-ACK dedupe below so a fallback-observed stream can
           // still become transport-owned via a later resumeStream() — the
           // transport's replay is isolated from the broadcast accumulator
-          // by localRequestIdsRef, so it cannot duplicate parts.
+          // by transport request ownership, so it cannot duplicate parts.
           if (customTransport.handleStreamResuming(data)) {
             return;
           }
@@ -2401,13 +2326,13 @@ export function useAgentChat<
           // (server sends STREAM_RESUMING from both onConnect and the
           // RESUME_REQUEST handler — the second one must not trigger
           // a duplicate ACK / replay).
-          if (localRequestIdsRef.current.has(data.id)) return;
+          if (customTransport.ownsRequest(data.id)) return;
           // Duplicate offer for a stream this socket already ACKed via the
           // fallback path (#1733): the server notifies from both onConnect
           // and the RESUME_REQUEST handler. With nobody waiting on the
           // handshake, re-ACKing would only trigger a second full-buffer
           // replay into the same accumulator; drop it.
-          if (fallbackAckedResumeRequestIdsRef.current.has(data.id)) return;
+          if (customTransport.hasAcknowledgedObserverResume(data.id)) return;
           if (isEarlyToolContinuation) {
             pendingToolContinuationRef.current = false;
             observedToolContinuationRequestIdRef.current = data.id;
@@ -2418,11 +2343,11 @@ export function useAgentChat<
           }
           // Fallback for cross-tab broadcasts or cases where the
           // transport isn't expecting a resume.
-          streamStateRef.current = broadcastTransition(streamStateRef.current, {
+          customTransport.transitionObserved({
             type: "resume-fallback",
             streamId: data.id,
             messageId: nanoid()
-          }).state;
+          });
           customTransport.observeServerTurn(data.id);
           setIsServerStreaming(true);
           if (
@@ -2436,13 +2361,7 @@ export function useAgentChat<
           setIsRecovering(false);
           // Remember the ACK so a duplicate STREAM_RESUMING for the same
           // request on this socket doesn't trigger a second replay (#1733).
-          fallbackAckedResumeRequestIdsRef.current.add(data.id);
-          agentRef.current.send(
-            JSON.stringify({
-              type: MessageType.CF_AGENT_STREAM_RESUME_ACK,
-              id: data.id
-            })
-          );
+          customTransport.acknowledgeObserverResume(data.id);
           break;
         }
 
@@ -2467,7 +2386,7 @@ export function useAgentChat<
             setRecoveringRequestId(null);
           }
           reportTurnEnd(data);
-          if (localRequestIdsRef.current.has(data.id)) {
+          if (customTransport.ownsRequest(data.id)) {
             if (data.body?.trim()) {
               try {
                 const chunkData = JSON.parse(data.body) as {
@@ -2557,17 +2476,17 @@ export function useAgentChat<
             }
             if (data.done || data.error) {
               if (
-                streamStateRef.current.status === "observing" &&
-                streamStateRef.current.streamId === data.id
+                customTransport.observedStream.status === "observing" &&
+                customTransport.observedStream.streamId === data.id
               ) {
-                streamStateRef.current = { status: "idle" };
+                customTransport.transitionObserved({ type: "clear" });
                 setIsServerStreaming(false);
               }
               customTransport.handleServerTurnCompleted(data.id, data);
               restoreProtectedStreamingAssistant(localResponseIds.get(data.id));
               localResponseIds.delete(data.id);
-              localRequestIdsRef.current.delete(data.id);
-              fallbackAckedResumeRequestIdsRef.current.delete(data.id);
+              customTransport.releaseRequest(data.id);
+              customTransport.releaseRequest(data.id);
               if (observedToolContinuationRequestIdRef.current === data.id) {
                 resetToolContinuation();
               }
@@ -2578,8 +2497,8 @@ export function useAgentChat<
           let chunkData: unknown;
           if (
             data.replay &&
-            (streamStateRef.current.status !== "observing" ||
-              streamStateRef.current.streamId !== data.id) &&
+            (customTransport.observedStream.status !== "observing" ||
+              customTransport.observedStream.streamId !== data.id) &&
             !pendingReplayResumeRequestIdsRef.current.has(data.id)
           ) {
             return;
@@ -2590,32 +2509,31 @@ export function useAgentChat<
             data.done &&
             !data.error &&
             !(
-              streamStateRef.current.status === "observing" &&
-              streamStateRef.current.streamId === data.id
+              customTransport.observedStream.status === "observing" &&
+              customTransport.observedStream.streamId === data.id
             ) &&
             !pendingReplayResumeRequestIdsRef.current.has(data.id) &&
             observedToolContinuationRequestIdRef.current !== data.id
           ) {
             customTransport.appliedChunks.forget(data.id);
             customTransport.handleServerTurnCompleted(data.id, data);
-            fallbackAckedResumeRequestIdsRef.current.delete(data.id);
+            customTransport.releaseRequest(data.id);
             break;
           }
           if (data.error) {
             pendingReplayResumeRequestIdsRef.current.delete(data.id);
             customTransport.appliedChunks.forget(data.id);
             customTransport.handleServerTurnCompleted(data.id, data);
-            fallbackAckedResumeRequestIdsRef.current.delete(data.id);
+            customTransport.releaseRequest(data.id);
             setIsRecovering(false);
 
             if (
-              streamStateRef.current.status === "idle" ||
-              streamStateRef.current.streamId === data.id
+              customTransport.observedStream.status === "idle" ||
+              customTransport.observedStream.streamId === data.id
             ) {
-              const result = broadcastTransition(streamStateRef.current, {
+              const result = customTransport.transitionObserved({
                 type: "clear"
               });
-              streamStateRef.current = result.state;
               setIsServerStreaming(result.isStreaming);
             }
             if (observedToolContinuationRequestIdRef.current === data.id) {
@@ -2684,7 +2602,7 @@ export function useAgentChat<
           }
           if (data.done) {
             customTransport.handleServerTurnCompleted(data.id, data);
-            fallbackAckedResumeRequestIdsRef.current.delete(data.id);
+            customTransport.releaseRequest(data.id);
             // A terminal turn outcome resolves any in-progress recovery (#1620).
             if (data.outcome !== "recovering") setIsRecovering(false);
           }
@@ -2701,7 +2619,7 @@ export function useAgentChat<
             customTransport.appliedChunks.record(data.id, data.seq);
           }
 
-          const result = broadcastTransition(streamStateRef.current, {
+          const result = customTransport.transitionObserved({
             type: "response",
             streamId: data.id,
             messageId: nanoid(),
@@ -2713,7 +2631,6 @@ export function useAgentChat<
             continuation: data.continuation
           });
 
-          streamStateRef.current = result.state;
           if (result.messagesUpdate) {
             setMessages(
               result.messagesUpdate as unknown as (
@@ -2739,21 +2656,17 @@ export function useAgentChat<
       }
     }
 
-    const fallbackAckedResumeRequestIds =
-      fallbackAckedResumeRequestIdsRef.current;
-
     let socketIsOpen = false;
     let sawClose = false;
     let disposed = false;
 
     const clearFallbackObserver = () => {
-      if (streamStateRef.current.status === "observing") {
-        setUnresolvedObservedRequestId(streamStateRef.current.streamId);
+      if (customTransport.observedStream.status === "observing") {
+        setUnresolvedObservedRequestId(customTransport.observedStream.streamId);
       }
-      const result = broadcastTransition(streamStateRef.current, {
+      const result = customTransport.transitionObserved({
         type: "clear"
       });
-      streamStateRef.current = result.state;
       setIsServerStreaming(result.isStreaming);
       if (observedToolContinuationRequestIdRef.current !== null) {
         resetToolContinuation();
@@ -2810,7 +2723,7 @@ export function useAgentChat<
       socketIsOpen = false;
       sawClose = true;
       serverReportsRecovery = false;
-      fallbackAckedResumeRequestIds.clear();
+      customTransport.resetObserverResumes();
       // Streaming protection keeps a live local assistant ahead of behind
       // snapshots until its done/error frame. The transport ends every local
       // stream on close, and that frame never arrives here, so the cut-off
@@ -2830,7 +2743,7 @@ export function useAgentChat<
       if (!resume) {
         idleProbeNeeded ||=
           unfinishedTurnId !== null ||
-          streamStateRef.current.status === "observing" ||
+          customTransport.observedStream.status === "observing" ||
           unresolvedObservedRequestIdRef.current !== null ||
           recoveringRequestIdRef.current !== null;
         clearFallbackObserver();
@@ -2844,7 +2757,7 @@ export function useAgentChat<
       // The replacement socket can refresh the canonical transcript before
       // offering its current stream. A prior stream's accumulator/protection
       // must not overwrite content that arrived while we were disconnected.
-      streamStateRef.current = { status: "idle" };
+      customTransport.transitionObserved({ type: "clear" });
       protectedStreamingAssistantRef.current = null;
       reconnectProbePendingRef.current = true;
       tryPendingReconnectProbe();
@@ -2870,8 +2783,8 @@ export function useAgentChat<
       agent.removeEventListener("close", onAgentClose);
       agent.removeEventListener("open", onAgentOpen);
       releaseAgentChatReplaySubscription();
-      fallbackAckedResumeRequestIds.clear();
-      streamStateRef.current = { status: "idle" };
+      customTransport.resetObserverResumes();
+      customTransport.transitionObserved({ type: "clear" });
       setIsServerStreaming(false);
       setUnresolvedObservedRequestId(null);
       setIsRecovering(false);
@@ -2895,7 +2808,8 @@ export function useAgentChat<
     restoreProtectedStreamingAssistant,
     resetLocalChatState,
     invalidateResumeGeneration,
-    setRecoveringRequestId
+    setRecoveringRequestId,
+    destination
   ]);
 
   // Own mount/chat-generation resumption so StrictMode, reconnects, tool
@@ -3150,6 +3064,8 @@ export function useAgentChat<
     ...useChatHelpers,
     resumeStream,
     messages: messagesWithToolResults,
+    /** True once a server transcript or message update has been applied for this destination. */
+    hasReceivedMessages,
     isServerStreaming: effectiveIsServerStreaming,
     isStreaming,
     /**

@@ -13,7 +13,7 @@
  * Used by both @cloudflare/ai-chat and @cloudflare/think.
  */
 
-import type { JSONSchema7, Tool, ToolSet } from "ai";
+import type { JSONSchema7, ToolSet } from "ai";
 import { tool, jsonSchema } from "ai";
 
 /**
@@ -25,7 +25,7 @@ export type ClientToolSchema = {
   /** Unique name for the tool */
   name: string;
   /** Human-readable description of what the tool does */
-  description?: Tool["description"];
+  description?: string;
   /** JSON Schema defining the tool's input parameters */
   parameters?: JSONSchema7;
 };
@@ -80,40 +80,24 @@ export function createToolsFromClientSchemas(
   }
 
   const execute = options?.execute;
-  // The AI SDK's `tool()` overloads infer the input type as `never` when an
-  // `execute` is combined with a runtime `jsonSchema(...)`. Cast to a
-  // permissive signature (same approach as `agentTool()`), since the wire
-  // schema is untyped JSON.
-  const createTool = tool as unknown as (config: {
-    description: string | ((options: unknown) => string);
-    inputSchema: ReturnType<typeof jsonSchema>;
-    execute?: (
-      input: unknown,
-      executeOptions?: { toolCallId?: string }
-    ) => unknown | Promise<unknown>;
-  }) => Tool;
-
   return Object.fromEntries(
-    clientTools.map((t) => [
-      t.name,
-      createTool({
-        description:
-          typeof t.description === "function" ? "" : (t.description ?? ""),
-        inputSchema: jsonSchema(t.parameters ?? { type: "object" }),
-        ...(execute
-          ? {
-              execute: (
-                input: unknown,
-                executeOptions?: { toolCallId?: string }
-              ) =>
-                execute({
-                  toolName: t.name,
-                  input,
-                  toolCallId: executeOptions?.toolCallId ?? ""
-                })
-            }
-          : {})
-      })
-    ])
+    clientTools.map((definition) => {
+      const config = {
+        description: definition.description,
+        inputSchema: jsonSchema<unknown>(
+          definition.parameters ?? { type: "object" }
+        )
+      };
+      return [
+        definition.name,
+        execute
+          ? tool({
+              ...config,
+              execute: (input, { toolCallId }) =>
+                execute({ toolName: definition.name, input, toolCallId })
+            })
+          : tool(config)
+      ];
+    })
   );
 }

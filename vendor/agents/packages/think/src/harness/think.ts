@@ -34,7 +34,6 @@ import {
 import { createWorkersAI } from "workers-ai-provider";
 import { anthropic } from "workers-ai-provider/anthropic";
 import { openai } from "workers-ai-provider/openai";
-import { ThinkSession } from "../session";
 import { Think as LegacyThink } from "../think";
 import type { Session, SessionMessage } from "agents/sessions";
 import type {
@@ -135,7 +134,7 @@ export class Think<
   readonly #handlers: WebSocketHandlers[] = [];
 
   /** The conversation, configured by {@link configureSession}. */
-  session!: ThinkSession;
+  session!: Session;
 
   #messages: UIMessage[] = [];
   #handle: Session | undefined;
@@ -216,13 +215,7 @@ export class Think<
 
     const onStart = this.onStart.bind(this);
     this.onStart = async (props?: Props) => {
-      this.session = await this.configureSession(
-        new ThinkSession(await this.#rootHandle(), () => {
-          throw new Error(
-            "Context blocks are not supported by the harness-backed Think yet"
-          );
-        })
-      );
+      this.session = await this.configureSession(await this.#rootHandle());
       this.harness.observe((session, event) => {
         if (session !== this.harness.session().id) return;
         if (event.type === "reset") this.#messages = [];
@@ -291,9 +284,7 @@ export class Think<
     return {};
   }
 
-  configureSession(
-    session: ThinkSession
-  ): ThinkSession | Promise<ThinkSession> {
+  configureSession(session: Session): Session | Promise<Session> {
     return session;
   }
 

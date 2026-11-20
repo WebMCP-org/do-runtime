@@ -1,3 +1,8 @@
+import {
+  transition as transitionBroadcast,
+  type BroadcastStreamState,
+  type BroadcastStreamEvent
+} from "./broadcast-state";
 /**
  * Framework-neutral WebSocket transport for AI SDK chat clients.
  *
@@ -181,12 +186,6 @@ export type WebSocketChatTransportOptions<
     messageId?: string;
   }) => Promise<Record<string, unknown>> | Record<string, unknown>;
   /**
-   * Optional set to track active request IDs.
-   * IDs are added when a request starts and removed when it completes.
-   * Used by the onAgentMessage handler to skip messages already handled by the transport.
-   */
-  activeRequestIds?: Set<string>;
-  /**
    * Whether generic client-side abort/cancel lifecycle should cancel the
    * server turn. Explicit cancellation via cancelActiveServerTurn() always
    * sends CF_AGENT_CHAT_REQUEST_CANCEL.
@@ -218,7 +217,9 @@ export class WebSocketChatTransport<
 > implements ChatTransport<ChatMessage> {
   agent: AgentConnection;
   private prepareBody?: WebSocketChatTransportOptions<ChatMessage>["prepareBody"];
-  private activeRequestIds?: Set<string>;
+  private readonly activeRequestIds = new Set<string>();
+  private readonly observerResumeAcks = new Set<string>();
+  private broadcastState: BroadcastStreamState = { status: "idle" };
   private cancelOnClientAbort: boolean;
   private onRequestBuffered?: WebSocketChatTransportOptions<ChatMessage>["onRequestBuffered"];
   private onRequestAcknowledged?: WebSocketChatTransportOptions<ChatMessage>["onRequestAcknowledged"];
@@ -245,7 +246,6 @@ export class WebSocketChatTransport<
   constructor(options: WebSocketChatTransportOptions<ChatMessage>) {
     this.agent = options.agent;
     this.prepareBody = options.prepareBody;
-    this.activeRequestIds = options.activeRequestIds;
     this.cancelOnClientAbort = options.cancelOnClientAbort ?? false;
     this.onRequestBuffered = options.onRequestBuffered;
     this.onRequestAcknowledged = options.onRequestAcknowledged;
@@ -260,6 +260,50 @@ export class WebSocketChatTransport<
     if (this.agent === agent) return;
     this.resetResumeState();
     this.agent = agent;
+  }
+
+  /** Native observed stream state, shared by resume and cross-tab paths. */
+  get observedStream(): BroadcastStreamState {
+    return this.broadcastState;
+  }
+
+  transitionObserved(event: BroadcastStreamEvent) {
+    const result = transitionBroadcast(this.broadcastState, event);
+    this.broadcastState = result.state;
+    return result;
+  }
+
+  /** Whether a response belongs to the AI SDK stream reader rather than the observer. */
+  ownsRequest(requestId: string): boolean {
+    return this.activeRequestIds.has(requestId);
+  }
+
+  /** Release terminal ownership after a cancelled reader has drained its final frame. */
+  releaseRequest(requestId: string): void {
+    this.activeRequestIds.delete(requestId);
+    this.observerResumeAcks.delete(requestId);
+  }
+
+  /** An observer may acknowledge an offer once per physical socket. */
+  hasAcknowledgedObserverResume(requestId: string): boolean {
+    return this.observerResumeAcks.has(requestId);
+  }
+
+  acknowledgeObserverResume(requestId: string): void {
+    if (this.ownsRequest(requestId) || this.observerResumeAcks.has(requestId))
+      return;
+    this.observerResumeAcks.add(requestId);
+    this.agent.send(
+      JSON.stringify({
+        type: MessageType.CF_AGENT_STREAM_RESUME_ACK,
+        id: requestId
+      })
+    );
+  }
+
+  /** A replacement socket needs a new ACK and full replay, even for the same turn. */
+  resetObserverResumes(): void {
+    this.observerResumeAcks.clear();
   }
 
   setCancelOnClientAbort(cancelOnClientAbort: boolean) {
@@ -378,6 +422,8 @@ export class WebSocketChatTransport<
     this._expectToolContinuation = false;
     this.cancelPendingResume();
     this._detachResumeStream?.();
+    this.resetObserverResumes();
+    this.transitionObserved({ type: "clear" });
   }
 
   /**
@@ -496,7 +542,7 @@ export class WebSocketChatTransport<
     });
 
     // Track this request so the onAgentMessage handler skips it
-    this.activeRequestIds?.add(requestId);
+    this.activeRequestIds.add(requestId);
 
     // Create a ReadableStream<UIMessageChunk> that emits parsed chunks
     // as they arrive over the WebSocket
@@ -524,7 +570,7 @@ export class WebSocketChatTransport<
         // Stream may already be closed
       }
       if (!keepId) {
-        activeIds?.delete(requestId);
+        activeIds.delete(requestId);
       }
       abortController.abort();
     };
@@ -783,7 +829,7 @@ export class WebSocketChatTransport<
       if (attachment) {
         if (!toolContinuation && !keepServerTurn)
           this.clearActiveServerTurn(attachment.requestId);
-        if (!keepRequestId) this.activeRequestIds?.delete(attachment.requestId);
+        if (!keepRequestId) this.activeRequestIds.delete(attachment.requestId);
       }
       listenerAbort.abort();
       resolveResume(attachment ? stream : null);
@@ -887,7 +933,7 @@ export class WebSocketChatTransport<
         ),
         ackSent: false
       };
-      this.activeRequestIds?.add(requestId);
+      this.activeRequestIds.add(requestId);
       this._detachResumeStream = detach;
       if (!toolContinuation) {
         this.setActiveServerTurn(requestId, cancelAttached);

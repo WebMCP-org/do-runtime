@@ -135,9 +135,8 @@ function makeHost(opts: {
   heldTerminalRequestIds?: Set<string>;
 }): ResumeHandshakeHost {
   return {
-    ...(opts.heldTerminalRequestIds && {
-      holdsTerminalFrames: (id: string) => opts.heldTerminalRequestIds!.has(id)
-    }),
+    holdsTerminalFrames: (id: string) =>
+      opts.heldTerminalRequestIds?.has(id) ?? false,
     responseMessageType: RESPONSE_TYPE,
     resumableStream: opts.resumableStream,
     continuation: opts.continuation ?? new ContinuationState<Connection>(),
@@ -150,9 +149,8 @@ function makeHost(opts: {
     persistOrphanedStream: async (id: string) => {
       opts.persistCalls?.push(id);
     },
-    isConnectionPresent: opts.presentConnectionIds
-      ? (id: string) => opts.presentConnectionIds!.has(id)
-      : undefined
+    isConnectionPresent: (id: string) =>
+      opts.presentConnectionIds?.has(id) ?? true
   };
 }
 

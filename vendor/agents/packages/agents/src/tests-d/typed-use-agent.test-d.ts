@@ -2,6 +2,23 @@ import type { env } from "cloudflare:workers";
 import { Agent } from "..";
 import { useAgent } from "../react";
 import type { StreamingResponse } from "../index";
+import type { AgentClient } from "../client";
+
+// A callable contract need not mirror the server's state or extend Agent.
+// Node and React clients expose the same call signature for that contract.
+type Directory = { startThread(id: string): Promise<void> };
+const directory = useAgent<Directory, { count: number }>({
+  agent: "directory"
+});
+directory.state satisfies { count: number } | undefined;
+declare const shared:
+  | AgentClient<Directory, { count: number }>
+  | typeof directory;
+shared.call("startThread", ["thread"]) satisfies Promise<void>;
+// @ts-expect-error wrong argument type remains rejected through either client
+shared.call("startThread", [1]);
+// @ts-expect-error callable contracts do not permit arbitrary methods
+shared.call("missing");
 
 declare class A extends Agent<typeof env, {}> {
   prop: string;

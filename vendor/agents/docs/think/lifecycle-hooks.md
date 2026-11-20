@@ -62,7 +62,8 @@ configureSession(session: Session): Session | Promise<Session>
 ```
 
 ```typescript
-import { Think, Session } from "@cloudflare/think";
+import { Think } from "@cloudflare/think";
+import type { Session } from "agents/sessions";
 import { createCompactFunction } from "agents/sessions";
 import { generateText } from "ai";
 
@@ -87,7 +88,7 @@ export class MyAgent extends Think<Env> {
 }
 ```
 
-The handle also accepts the 0.17 `withContext()` / `withCachedPrompt()` chain and the positional `appendMessage(message, parentId)` form, so an existing override keeps working; see [Upgrading from 0.17](./index.md#upgrading-from-017).
+The handle is the native `Session` from `agents/sessions`. Use `configureContext()` for prompt blocks and `configurePromptStore()` for an external frozen-prompt provider. See [Upgrading from 0.17](./index.md#upgrading-from-017).
 
 `createCompactFunction` takes exactly two options: `summarize`, which calls the model with a prompt and returns its text, and `keepRecentTokens`, the token budget for the recent tail kept verbatim (default `20_000`). `compactAfter(threshold)` gates on the O(1) token estimate Sessions stamps on each row. See the [Sessions documentation](https://github.com/cloudflare/agents/blob/main/docs/agents/sessions.md) for the full API.
 

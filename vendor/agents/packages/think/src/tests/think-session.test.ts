@@ -23,7 +23,7 @@ import type {
   ThinkAsyncHookTestAgent,
   ThinkRecoveryTestAgent,
   ThinkNonRecoveryTestAgent,
-  ThinkLegacySessionApiAgent,
+  ThinkNativeSessionApiAgent,
   TestChatResult
 } from "./agents/think-session";
 import type {
@@ -1647,54 +1647,55 @@ describe("Think — Session integration", () => {
   });
 });
 
-// ── Pre-Sessions Think API ───────────────────────────────────────
+// ── Native Sessions and context API ───────────────────────────────────────
 
-async function freshLegacyAgent(name: string) {
+async function freshNativeAgent(name: string) {
   return getAgentByName(
-    env.ThinkLegacySessionApiAgent as unknown as DurableObjectNamespace<ThinkLegacySessionApiAgent>,
+    env.ThinkNativeSessionApiAgent as unknown as DurableObjectNamespace<ThinkNativeSessionApiAgent>,
     name
   );
 }
 
-describe("Think — pre-Sessions session API keeps working", () => {
-  it("folds withContext() blocks into the prompt and serves the context forwards", async () => {
-    const agent = await freshLegacyAgent("legacy-context");
+describe("Think — native session and context APIs", () => {
+  it("loads configured blocks and exposes context operations", async () => {
+    const agent = await freshNativeAgent("native-context");
 
-    expect(await agent.legacyBlockLabels()).toEqual(["soul", "memory"]);
-    await agent.legacyReplaceBlock("memory", "User prefers TypeScript.");
-    expect(await agent.legacyBlockContent("memory")).toBe(
+    expect(await agent.contextBlockLabels()).toEqual(["soul", "memory"]);
+    await agent.replaceContextBlock("memory", "User prefers TypeScript.");
+    expect(await agent.contextBlockContent("memory")).toBe(
       "User prefers TypeScript."
     );
 
-    const prompt = await agent.legacyFreezeSystemPrompt();
-    expect(prompt).toContain("You are a legacy-configured agent.");
+    const prompt = await agent.freezeContextPrompt();
+    expect(prompt).toContain("You are a configured agent.");
     expect(prompt).toContain("User prefers TypeScript.");
+    expect(await agent.customFrozenPrompt()).toBe(prompt);
 
-    expect(await agent.legacyToolNames()).toContain("set_context");
-    expect(await agent.legacyAddAndRemoveContext("scratch")).toBe(true);
-    expect(await agent.legacyBlockLabels()).toEqual(["soul", "memory"]);
+    expect(await agent.contextToolNames()).toContain("set_context");
+    expect(await agent.addAndRemoveContext("scratch")).toBe(true);
+    expect(await agent.contextBlockLabels()).toEqual(["soul", "memory"]);
 
     await agent.testChat("Hello!");
-    expect(await agent.legacyBlockContent("memory")).toBe(
+    expect(await agent.contextBlockContent("memory")).toBe(
       "User prefers TypeScript."
     );
   });
 
-  it("accepts the positional appendMessage / getHistory / getRecentHistory forms", async () => {
-    const agent = await freshLegacyAgent("legacy-positional");
+  it("reads branches through canonical session options", async () => {
+    const agent = await freshNativeAgent("native-options");
 
-    expect(await agent.legacyPositionalWrites()).toEqual({
+    expect(await agent.writeSessionBranches()).toEqual({
       rootLength: 2,
       branchLength: 2
     });
-    expect(await agent.legacyRecentHistoryLength()).toBe(2);
+    expect(await agent.recentHistoryLength()).toBe(2);
   });
 
   it("routes a failing compaction function through onCompactionError()", async () => {
-    const agent = await freshLegacyAgent("legacy-compaction-error");
-    await agent.legacyPositionalWrites();
+    const agent = await freshNativeAgent("native-compaction-error");
+    await agent.writeSessionBranches();
 
-    expect(await agent.legacyCompact()).toEqual({
+    expect(await agent.compactSession()).toEqual({
       result: null,
       errors: ["summarizer down"]
     });

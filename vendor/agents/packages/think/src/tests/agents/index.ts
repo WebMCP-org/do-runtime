@@ -39,7 +39,7 @@ export {
   ThinkMediaEvictionAgent,
   ThinkMediaEvictionAutoAgent,
   ThinkPointerHydrationAgent,
-  ThinkLegacySessionApiAgent
+  ThinkNativeSessionApiAgent
 } from "./think-session";
 export { ThinkFetchToolsTestAgent } from "./fetch-tools";
 export { ThinkExecuteToolAgent } from "./execute-tool";

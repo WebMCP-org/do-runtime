@@ -1,139 +1,118 @@
-/**
- * Protocol Message Parser — typed parsing of cf_agent_chat_* WebSocket messages.
- *
- * Parses raw WebSocket messages into a discriminated union of protocol events.
- * Both AIChatAgent and Think can use this instead of manual JSON.parse + type checking.
- */
-
+/** Decode untrusted chat frames once, before either chat host uses their fields. */
+import { z } from "zod";
 import { CHAT_MESSAGE_TYPES } from "./protocol";
 
-/**
- * Discriminated union of all incoming chat protocol events.
- *
- * Each agent handles the events it cares about and ignores the rest.
- * Returns `null` for non-JSON messages or unrecognized types.
- */
-export type ChatProtocolEvent =
-  | {
-      type: "chat-request";
-      id: string;
-      init: { method?: string; body?: string; [key: string]: unknown };
+const requestId = z.string().min(1);
+const clientTool = z.object({
+  name: z.string().min(1),
+  description: z.string().optional(),
+  parameters: z.record(z.string(), z.unknown()).optional()
+});
+const incomingFrame = z
+  .discriminatedUnion("type", [
+    z.object({
+      type: z.literal(CHAT_MESSAGE_TYPES.USE_CHAT_REQUEST),
+      id: requestId,
+      init: z
+        .object({ method: z.string().optional(), body: z.string().optional() })
+        .catchall(z.unknown())
+    }),
+    z.object({ type: z.literal(CHAT_MESSAGE_TYPES.CHAT_CLEAR) }),
+    z.object({
+      type: z.literal(CHAT_MESSAGE_TYPES.CHAT_REQUEST_CANCEL),
+      id: requestId
+    }),
+    z.object({
+      type: z.literal(CHAT_MESSAGE_TYPES.TOOL_RESULT),
+      toolCallId: requestId,
+      toolName: z.string().optional(),
+      output: z.unknown().optional(),
+      state: z.enum(["output-available", "output-error"]).optional(),
+      errorText: z.string().optional(),
+      autoContinue: z.boolean().optional(),
+      clientTools: z.array(clientTool).optional()
+    }),
+    z.object({
+      type: z.literal(CHAT_MESSAGE_TYPES.TOOL_APPROVAL),
+      toolCallId: requestId,
+      approved: z.boolean(),
+      autoContinue: z.boolean().optional()
+    }),
+    z.object({
+      type: z.literal(CHAT_MESSAGE_TYPES.STREAM_RESUME_REQUEST),
+      probeId: requestId.optional()
+    }),
+    z.object({
+      type: z.literal(CHAT_MESSAGE_TYPES.STREAM_RESUME_ACK),
+      id: requestId
+    }),
+    z.object({
+      type: z.literal(CHAT_MESSAGE_TYPES.CHAT_MESSAGES),
+      messages: z.array(z.unknown())
+    })
+  ])
+  .transform((frame) => {
+    switch (frame.type) {
+      case CHAT_MESSAGE_TYPES.USE_CHAT_REQUEST:
+        return { ...frame, type: "chat-request" as const };
+      case CHAT_MESSAGE_TYPES.CHAT_CLEAR:
+        return { type: "clear" as const };
+      case CHAT_MESSAGE_TYPES.CHAT_REQUEST_CANCEL:
+        return { ...frame, type: "cancel" as const };
+      case CHAT_MESSAGE_TYPES.TOOL_RESULT:
+        return { ...frame, type: "tool-result" as const };
+      case CHAT_MESSAGE_TYPES.TOOL_APPROVAL:
+        return { ...frame, type: "tool-approval" as const };
+      case CHAT_MESSAGE_TYPES.STREAM_RESUME_REQUEST:
+        return { ...frame, type: "stream-resume-request" as const };
+      case CHAT_MESSAGE_TYPES.STREAM_RESUME_ACK:
+        return { ...frame, type: "stream-resume-ack" as const };
+      case CHAT_MESSAGE_TYPES.CHAT_MESSAGES:
+        return { ...frame, type: "messages" as const };
     }
-  | { type: "clear" }
-  | { type: "cancel"; id: string }
-  | {
-      type: "tool-result";
-      toolCallId: string;
-      toolName: string;
-      output: unknown;
-      state?: string;
-      errorText?: string;
-      autoContinue?: boolean;
-      clientTools?: Array<{
-        name: string;
-        description?: string;
-        parameters?: unknown;
-      }>;
-    }
-  | {
-      type: "tool-approval";
-      toolCallId: string;
-      approved: boolean;
-      autoContinue?: boolean;
-    }
-  | { type: "stream-resume-request"; probeId?: string }
-  | { type: "stream-resume-ack"; id: string }
-  | { type: "messages"; messages: unknown[] };
+  });
 
-/**
- * Parse a raw WebSocket message string into a typed protocol event.
- *
- * Returns `null` if the message is not valid JSON or not a recognized
- * protocol message type. Callers should fall through to the user's
- * `onMessage` handler when `null` is returned.
- *
- * @example
- * ```typescript
- * const event = parseProtocolMessage(rawMessage);
- * if (!event) return userOnMessage(connection, rawMessage);
- *
- * switch (event.type) {
- *   case "chat-request": { ... }
- *   case "clear": { ... }
- *   case "tool-result": { ... }
- * }
- * ```
- */
+export type ChatProtocolEvent = z.output<typeof incomingFrame>;
+
+/** A recognized protocol frame failed validation; never dispatch it as an application message. */
+export class ChatProtocolError extends Error {
+  constructor(
+    readonly frameType: string,
+    cause: z.ZodError
+  ) {
+    super(`Invalid chat protocol frame: ${frameType}`, { cause });
+    this.name = "ChatProtocolError";
+  }
+}
+
+const recognizedTypes = new Set<string>([
+  CHAT_MESSAGE_TYPES.USE_CHAT_REQUEST,
+  CHAT_MESSAGE_TYPES.CHAT_CLEAR,
+  CHAT_MESSAGE_TYPES.CHAT_REQUEST_CANCEL,
+  CHAT_MESSAGE_TYPES.TOOL_RESULT,
+  CHAT_MESSAGE_TYPES.TOOL_APPROVAL,
+  CHAT_MESSAGE_TYPES.STREAM_RESUME_REQUEST,
+  CHAT_MESSAGE_TYPES.STREAM_RESUME_ACK,
+  CHAT_MESSAGE_TYPES.CHAT_MESSAGES
+]);
+
+/** Unknown application messages return null; malformed recognized chat frames throw. */
 export function parseProtocolMessage(raw: string): ChatProtocolEvent | null {
-  let data: Record<string, unknown>;
+  let data: unknown;
   try {
-    data = JSON.parse(raw) as Record<string, unknown>;
+    data = JSON.parse(raw);
   } catch {
     return null;
   }
-
-  const wireType = data.type as string | undefined;
-  if (!wireType) return null;
-
-  switch (wireType) {
-    case CHAT_MESSAGE_TYPES.USE_CHAT_REQUEST:
-      return {
-        type: "chat-request",
-        id: data.id as string,
-        init: (data.init as { method?: string; body?: string }) ?? {}
-      };
-
-    case CHAT_MESSAGE_TYPES.CHAT_CLEAR:
-      return { type: "clear" };
-
-    case CHAT_MESSAGE_TYPES.CHAT_REQUEST_CANCEL:
-      return { type: "cancel", id: data.id as string };
-
-    case CHAT_MESSAGE_TYPES.TOOL_RESULT:
-      return {
-        type: "tool-result",
-        toolCallId: data.toolCallId as string,
-        toolName: (data.toolName as string) ?? "",
-        output: data.output,
-        state: data.state as string | undefined,
-        errorText: data.errorText as string | undefined,
-        autoContinue: data.autoContinue as boolean | undefined,
-        clientTools: data.clientTools as
-          | Array<{
-              name: string;
-              description?: string;
-              parameters?: unknown;
-            }>
-          | undefined
-      };
-
-    case CHAT_MESSAGE_TYPES.TOOL_APPROVAL:
-      return {
-        type: "tool-approval",
-        toolCallId: data.toolCallId as string,
-        approved: data.approved as boolean,
-        autoContinue: data.autoContinue as boolean | undefined
-      };
-
-    case CHAT_MESSAGE_TYPES.STREAM_RESUME_REQUEST:
-      return {
-        type: "stream-resume-request",
-        ...(typeof data.probeId === "string" ? { probeId: data.probeId } : {})
-      };
-
-    case CHAT_MESSAGE_TYPES.STREAM_RESUME_ACK:
-      return {
-        type: "stream-resume-ack",
-        id: data.id as string
-      };
-
-    case CHAT_MESSAGE_TYPES.CHAT_MESSAGES:
-      return {
-        type: "messages",
-        messages: (data.messages as unknown[]) ?? []
-      };
-
-    default:
-      return null;
-  }
+  if (
+    data === null ||
+    typeof data !== "object" ||
+    !("type" in data) ||
+    typeof data.type !== "string" ||
+    !recognizedTypes.has(data.type)
+  )
+    return null;
+  const result = incomingFrame.safeParse(data);
+  if (!result.success) throw new ChatProtocolError(data.type, result.error);
+  return result.data;
 }

@@ -16,10 +16,10 @@ const a1 = useAgent<{}>({
 // state should be typed as State | undefined
 a1.state satisfies {} | undefined;
 
-// ensure retro-compatibility with useAgent<State> API
+// The state-only overload still allows untyped RPC calls.
 a1.call("fn");
 a1.call("fn", [1]);
-a1.call("fn", [1], { onDone: () => {} });
+a1.call("fn", [1], { stream: { onDone: () => {} } });
 a1.call("nonSerializableParams", [
   "test",
   { c: new Date(), unexistent: "property" }

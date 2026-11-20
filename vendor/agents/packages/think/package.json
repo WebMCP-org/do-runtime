@@ -147,6 +147,10 @@
     "./messengers/browser/discord-js": {
       "types": "./dist/messengers/browser/discord-js.d.ts",
       "import": "./dist/messengers/browser/discord-js.js"
+    },
+    "./schedules": {
+      "types": "./dist/schedules.d.ts",
+      "import": "./dist/schedules.js"
     }
   },
   "files": [

@@ -10,6 +10,7 @@ export {
   type FileStat,
   type WorkspaceChangeEvent,
   type WorkspaceChangeType,
+  type WorkspaceSource,
   type WorkspaceFsLike
 } from "./filesystem";
 
