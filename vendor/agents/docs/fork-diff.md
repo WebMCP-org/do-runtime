@@ -147,7 +147,7 @@ the elapsed queue wait and the status of the durable submission.
 
 ## Native chat and session contracts
 
-- `chat/protocol.ts` validates each native frame before React or transport consumes it;
+- `chat/parse-protocol.ts` validates each native frame before React or transport consumes it;
   malformed stream, state and resume frames are covered by protocol tests. Async
   iterator deadlines release timers in `finally`. These boundaries cannot be
   repaired by a host after private stream state has changed; retire when upstream
@@ -171,7 +171,8 @@ the elapsed queue wait and the status of the durable submission.
   or comparing message-array references. Browser history/adoption regressions
   cover rapid A→B→A selection, disconnect, retry and server receipt. Retire when
   upstream exposes equivalent lifecycle and adoption contracts.
-- `agents/skills` exports the whole `SkillSummary` domain type for DS consumers;
+- `agents/skills` exports the whole `SkillSummary` domain type for DS consumers
+  and `isSkillName` validates loaded names without imposing strict authoring rules;
   SDK client-tool wire descriptions are strings and execution IDs retain their
   native type. These replace downstream mirrors and coercions; typechecks and
   protocol tests guard the boundaries.

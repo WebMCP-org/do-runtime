@@ -1693,7 +1693,7 @@ export class AIChatAgent<
 
           // Update cached client tools so subsequent continuations use the latest schemas
           if (clientTools?.length) {
-            this._lastClientTools = clientTools as ClientToolSchema[];
+            this._lastClientTools = clientTools;
             this._persistRequestContext();
           }
 
@@ -1703,20 +1703,13 @@ export class AIChatAgent<
           this._emit("tool:result", { toolCallId, toolName });
 
           this._enqueueInteractionApply(() =>
-            this._applyToolResult(
-              toolCallId,
-              toolName,
-              output,
-              overrideState,
-              errorText
-            )
+            this._applyToolResult(toolCallId, output, overrideState, errorText)
           );
 
           if (autoContinue) {
             this._scheduleAutoContinuation(
               connection,
-              (clientTools as ClientToolSchema[] | undefined) ??
-                this._lastClientTools,
+              clientTools ?? this._lastClientTools,
               this._lastBody,
               "[AIChatAgent] Tool continuation failed:"
             );
@@ -6853,7 +6846,6 @@ export class AIChatAgent<
    * #1404.
    *
    * @param toolCallId - The tool call ID this result is for
-   * @param _toolName - The name of the tool (unused, kept for API compat)
    * @param output - The output from the tool execution
    * @param overrideState - Optional state override ("output-error" to signal denial/failure)
    * @param errorText - Error message when overrideState is "output-error"
@@ -6861,7 +6853,6 @@ export class AIChatAgent<
    */
   private async _applyToolResult(
     toolCallId: string,
-    _toolName: string,
     output: unknown,
     overrideState?: "output-error",
     errorText?: string

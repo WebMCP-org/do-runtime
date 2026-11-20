@@ -576,7 +576,6 @@ export class TestChatAgent extends AIChatAgent<Env> {
   // auto-continuation (issue #1404).
   async testApplyToolResult(
     toolCallId: string,
-    toolName: string,
     output: unknown,
     overrideState?: "output-error",
     errorText?: string
@@ -585,13 +584,12 @@ export class TestChatAgent extends AIChatAgent<Env> {
       this as unknown as {
         _applyToolResult(
           toolCallId: string,
-          toolName: string,
           output: unknown,
           overrideState?: "output-error",
           errorText?: string
         ): Promise<boolean>;
       }
-    )._applyToolResult(toolCallId, toolName, output, overrideState, errorText);
+    )._applyToolResult(toolCallId, output, overrideState, errorText);
   }
 
   private _getChainedContinuationRegressionResponse(): Response | undefined {

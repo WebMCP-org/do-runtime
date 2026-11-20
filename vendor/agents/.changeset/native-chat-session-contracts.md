@@ -1,5 +1,6 @@
 ---
 "agents": minor
+"@cloudflare/ai-chat": patch
 "@cloudflare/think": minor
 "@cloudflare/shell": minor
 "@mcp-b/browser-workspace": minor

@@ -9,7 +9,7 @@ import {
   type AITool,
   type ChatTurnEndEvent
 } from "../react";
-import type { useAgent } from "agents/react";
+import { getAgentConnectionKey, type useAgent } from "agents/react";
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -38,7 +38,15 @@ function createAgent({
   send?: (data: string) => void;
 }) {
   const target = new EventTarget();
+  const address = new URL(url || "ws://localhost:3000");
+  const root = path?.[0] ?? { agent: "Chat", name };
   const baseAgent = {
+    connectionKey: getAgentConnectionKey({
+      ...root,
+      host: address.host,
+      protocol: address.protocol === "wss:" ? "wss" : "ws",
+      sub: path?.slice(1)
+    }),
     _pkurl: url,
     _pk: name,
     _url: null as string | null,
@@ -1076,7 +1084,7 @@ describe("useAgentChat Chat instance stability", () => {
       .toHaveTextContent("real-user");
   });
 
-  it("should treat a different agent object reference as a chat switch and recreate the Chat", async () => {
+  it("should recreate the Chat when the native connection destination changes", async () => {
     const agentA = createAgent({
       name: "thread-a",
       url: "ws://localhost:3000/agents/chat/thread-a?_pk=abc"
