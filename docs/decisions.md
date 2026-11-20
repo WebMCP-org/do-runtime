@@ -229,7 +229,9 @@ consumer peer dependencies retain one identity.
 
 1. Hold the input gate for the synchronous slice and its microtask checkpoint.
 2. Retain it across storage backpressure only; `allowConcurrency` selects the
-   released form.
+   released form. SQLite cache operations are immediate and produce no
+   backpressure, including `deleteAll`; the public option is accepted without
+   adding a hypothetical asynchronous cache branch.
 3. Use workerd-shaped `CriticalSection` semantics rather than a mutex or
    queue.
 4. Implement `blockConcurrencyWhile()` with that critical section and its

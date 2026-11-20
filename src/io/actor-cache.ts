@@ -55,10 +55,8 @@ export type GetResultList = readonly KeyValuePair[];
  * opt-out: it selects `awaitIo` over `awaitIoWithInputLock`, which per §1.7.1
  * also ends the implicit transaction.
  *
- * Nothing passes any of these today — not upstream, not this repo, not the
- * vendored tests. They are built anyway; building half of the
- * `awaitIoWithInputLock` branch is the feature-subset failure the porting
- * philosophy rejects. The conformance suite exercises them deliberately.
+ * SQLite operations are immediate, so allowConcurrency and noCache do not
+ * alter this backend's behavior. They remain accepted public Workers options.
  *
  * Placement note: upstream's `ActorCacheReadOptions` holds only `noCache`, and
  * `allowConcurrency` is read one layer up, in `DurableObjectStorageOperations`
@@ -94,11 +92,10 @@ export type DeleteAllOptions = {
  * ← `ActorCacheInterface::DeleteAllResults`.
  *
  * Upstream splits these "so client code that doesn't need the count doesn't have
- * to wait for it just to account for backpressure". Both arms are immediate for
- * SQLite: `backpressure` is always `kj::none` and `count` is a ready promise.
+ * to wait for it just to account for backpressure". SQLite has no backpressure;
+ * only the immediate deleted-key count remains.
  */
 export type DeleteAllResults = {
-  readonly backpressure: Promise<void> | undefined;
   readonly count: number;
 };
 
@@ -210,11 +207,6 @@ export interface ActorCacheTransaction extends ActorCacheOps {
 export interface ActorCacheInterface extends ActorCacheOps {
   startTransaction(): ActorCacheTransaction;
   deleteAll(options: WriteOptions, deleteAllOptions?: DeleteAllOptions): DeleteAllResults;
-  /**
-   * "Call each time the isolate lock is taken to evict stale entries." There is
-   * no cache to evict from and never any backpressure to apply.
-   */
-  evictStale(now: number): undefined;
   shutdown(exception?: unknown): void;
 
   armAlarmHandler(scheduledTime: number, currentTime: number): ArmAlarmResult;

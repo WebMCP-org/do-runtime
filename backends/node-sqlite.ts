@@ -13,9 +13,8 @@
  * conformance lane.
  */
 
-import { randomUUID } from "node:crypto";
 import { rmSync } from "node:fs";
-import { readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { copyFile, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { SQLInputValue, StatementSync } from "node:sqlite";
@@ -64,7 +63,8 @@ export function createNodeSqlProvider(
       return database;
     },
     close(): void {
-      for (const database of [...openDatabases]) database.close();
+      using cleanup = new DisposableStack();
+      for (const database of openDatabases) cleanup.defer(() => database.close());
     },
     async exportSnapshot(): Promise<SqlDatabaseSnapshot> {
       const path = requireSnapshotDirectory(directory);
@@ -98,32 +98,66 @@ export function createNodeSqlProvider(
         name,
         image: new Uint8Array(image),
       }));
-      const temporary: { name: string; file: string }[] = [];
+      const staging = await mkdtemp(join(path, ".restore-"));
+      const originals = new Set<string>();
+      const touched = new Set<string>();
+      let retainRecovery = false;
       try {
+        const existing = (await readdir(path)).filter((file) =>
+          /\.sqlite(?:-(?:journal|wal|shm))?$/.test(file),
+        );
+        for (const file of existing) {
+          requireSafeDatabaseName(file.replace(/\.sqlite(?:-(?:journal|wal|shm))?$/, ""));
+          await copyFile(join(path, file), join(staging, `${file}.original`));
+          originals.add(file);
+        }
         for (const { name, image } of databases) {
-          const file = join(path, `.${name}.${randomUUID()}.restore`);
-          await writeFile(file, image);
-          temporary.push({ name, file });
+          await writeFile(join(staging, `${name}.incoming`), image);
         }
-        const existing = await readdir(path);
-        existing
-          .filter((file) => file.endsWith(".sqlite"))
-          .map((file) => file.slice(0, -".sqlite".length))
-          .forEach(requireSafeDatabaseName);
-        for (const file of existing) {
-          if (/\.sqlite-(?:journal|wal|shm)$/.test(file)) await rm(join(path, file), { force: true });
-        }
-        for (const { name, file } of temporary) {
-          await rename(file, join(path, `${name}.sqlite`));
-        }
-        const restored = new Set(databases.map(({ name }) => `${name}.sqlite`));
-        for (const file of existing) {
-          if (file.endsWith(".sqlite") && !restored.has(file)) {
-            await rm(join(path, file), { force: true });
+        // All input and recovery files exist before any live file changes.
+        try {
+          for (const file of existing) {
+            if (!file.endsWith(".sqlite")) {
+              touched.add(file);
+              await rm(join(path, file), { force: true });
+            }
           }
+          for (const { name } of databases) {
+            const file = `${name}.sqlite`;
+            touched.add(file);
+            await rename(join(staging, `${name}.incoming`), join(path, file));
+          }
+          const restored = new Set(databases.map(({ name }) => `${name}.sqlite`));
+          for (const file of existing) {
+            if (file.endsWith(".sqlite") && !restored.has(file)) {
+              touched.add(file);
+              await rm(join(path, file), { force: true });
+            }
+          }
+        } catch (cause) {
+          const recovery = await Promise.allSettled(
+            [...touched].map((file) =>
+              originals.has(file)
+                ? copyFile(join(staging, `${file}.original`), join(path, file))
+                : rm(join(path, file), { force: true }),
+            ),
+          );
+          const failures = recovery.filter((result) => result.status === "rejected");
+          if (failures.length) {
+            retainRecovery = true;
+            throw Object.assign(
+              new AggregateError(
+                [cause, ...failures.map((failure) => failure.reason)],
+                `Snapshot replacement and rollback failed; original files remain in ${staging}`,
+                { cause },
+              ),
+              { recoveryDirectory: staging },
+            );
+          }
+          throw cause;
         }
       } finally {
-        await Promise.all(temporary.map(({ file }) => rm(file, { force: true })));
+        if (!retainRecovery) await rm(staging, { recursive: true, force: true });
       }
     },
   };

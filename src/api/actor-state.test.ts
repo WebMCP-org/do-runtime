@@ -18,27 +18,15 @@
  *
  * The remaining groups have no upstream test at all and are the claims this
  * section owes: the facet limits and `clone()`, the substrate-boundary
- * messages, the `allowConcurrency` branch, and §1.7.1 seen from the JS surface
+ * messages, and §1.7.1 seen from the JS surface
  * rather than from `ActorSqlite`.
  */
 
 import { expect, test } from "vitest";
 import { createNodeSqlProvider } from "../../backends/node-sqlite";
 import { SqliteDatabase } from "../util/sqlite";
-import type { SqliteKv } from "../util/sqlite-kv";
 import { InputGate, OutputGate } from "../io/io-gate";
 import { type Actor, IoContext, type Timer } from "../io/io-context";
-import type {
-  ActorCacheTransaction,
-  DeleteAllOptions,
-  DeleteAllResults,
-  GetResultList,
-  Key,
-  KeyValuePair,
-  ReadOptions,
-  Value,
-  WriteOptions,
-} from "../io/actor-cache";
 import { PITR_UNIMPLEMENTED_MESSAGE, REPLICATION_UNIMPLEMENTED_MESSAGE } from "../io/actor-cache";
 import { ActorSqlite } from "../io/actor-sqlite";
 import { asFacetStub, type FacetManager, type FacetStartInfo } from "../io/worker";
@@ -60,7 +48,6 @@ import {
   FACET_CLASS_UNSUPPORTED_MESSAGE,
   FACET_NAME_MAX_LENGTH,
   FACET_TREE_MAX_DEPTH,
-  type StorageCache,
 } from "./actor-state";
 import { HibernatableWebSocketRegistry } from "./web-socket";
 
@@ -188,7 +175,7 @@ class Harness {
   readonly scheduled: Array<number | null> = [];
   commits = 0;
 
-  constructor(db: SqliteDatabase, wrapCache?: (cache: ActorSqlite) => StorageCache) {
+  constructor(db: SqliteDatabase) {
     this.db = db;
     this.cache = new ActorSqlite(
       db,
@@ -207,7 +194,7 @@ class Harness {
     this.ctx = new IoContext(this.actor, this.timer);
     this.storage = new DurableObjectStorage(
       this.ctx,
-      wrapCache === undefined ? this.cache : wrapCache(this.cache),
+      this.cache,
     );
     this.webSockets = new HibernatableWebSocketRegistry(this.ctx, {
       message(): void {},
@@ -244,9 +231,9 @@ async function quiesce(turns = 8): Promise<void> {
   }
 }
 
-async function newHarness(wrapCache?: (cache: ActorSqlite) => StorageCache): Promise<Harness> {
+async function newHarness(): Promise<Harness> {
   const db = new SqliteDatabase(await createNodeSqlProvider().open("actor-state-test"));
-  return new Harness(db, wrapCache);
+  return new Harness(db);
 }
 
 /** Most cases are one gated invocation over a fresh actor. */
@@ -1052,158 +1039,6 @@ test("abort carries the caller's reason", async () => {
   await expect(h.ctx.onAbort()).rejects.toThrow(
     "broken.outputGateBroken; jsg.Error: because I said so",
   );
-});
-
-// =======================================================================================
-// Decision 2 — the allowConcurrency branch
-//
-// Its one reachable site: `deleteAll`'s backpressure promise. Every other `OneOf<T, Promise<T>>`
-// upstream branches on collapsed to `T` in Section 4, because §1.4 measures that a SQLite-backed
-// actor never takes the promise arm. Nothing in the system passes the flag, which is why it is
-// exercised here deliberately rather than incidentally.
-
-class BackpressureCache implements StorageCache {
-  released = false;
-  readonly #inner: ActorSqlite;
-  readonly #backpressure: Promise<void>;
-
-  constructor(inner: ActorSqlite, backpressure: Promise<void>) {
-    this.#inner = inner;
-    this.#backpressure = backpressure;
-  }
-
-  deleteAll(options: WriteOptions, deleteAllOptions?: DeleteAllOptions): DeleteAllResults {
-    const result = this.#inner.deleteAll(options, deleteAllOptions);
-    return { backpressure: this.#backpressure, count: result.count };
-  }
-
-  // Everything else is the real engine.
-  get(key: Key, options: ReadOptions): Value | undefined {
-    return this.#inner.get(key, options);
-  }
-  getMultiple(keys: readonly Key[], options: ReadOptions): GetResultList {
-    return this.#inner.getMultiple(keys, options);
-  }
-  getAlarm(options: ReadOptions): number | null {
-    return this.#inner.getAlarm(options);
-  }
-  list(begin: Key, end: Key | undefined, limit: number | undefined, o: ReadOptions): GetResultList {
-    return this.#inner.list(begin, end, limit, o);
-  }
-  listReverse(
-    begin: Key,
-    end: Key | undefined,
-    limit: number | undefined,
-    o: ReadOptions,
-  ): GetResultList {
-    return this.#inner.listReverse(begin, end, limit, o);
-  }
-  put(key: Key, value: Value, options: WriteOptions): void {
-    this.#inner.put(key, value, options);
-  }
-  putMultiple(pairs: readonly KeyValuePair[], options: WriteOptions): void {
-    this.#inner.putMultiple(pairs, options);
-  }
-  delete(key: Key, options: WriteOptions): boolean {
-    return this.#inner.delete(key, options);
-  }
-  deleteMultiple(keys: readonly Key[], options: WriteOptions): number {
-    return this.#inner.deleteMultiple(keys, options);
-  }
-  setAlarm(newAlarmTime: number | null, options: WriteOptions): void {
-    this.#inner.setAlarm(newAlarmTime, options);
-  }
-  startTransaction(): ActorCacheTransaction {
-    return this.#inner.startTransaction();
-  }
-  evictStale(now: number): undefined {
-    return this.#inner.evictStale(now);
-  }
-  shutdown(exception?: unknown): void {
-    this.#inner.shutdown(exception);
-  }
-  armAlarmHandler(scheduledTime: number, currentTime: number): ReturnType<ActorSqlite["armAlarmHandler"]> {
-    return this.#inner.armAlarmHandler(scheduledTime, currentTime);
-  }
-  cancelDeferredAlarmDeletion(): void {
-    this.#inner.cancelDeferredAlarmDeletion();
-  }
-  abandonAlarm(scheduledTime: number): Promise<number | null> {
-    return this.#inner.abandonAlarm(scheduledTime);
-  }
-  onNoPendingFlush(): Promise<void> {
-    return this.#inner.onNoPendingFlush();
-  }
-  getCurrentBookmark(): Promise<string> {
-    return this.#inner.getCurrentBookmark();
-  }
-  getBookmarkForTime(timestamp: number): Promise<string> {
-    return this.#inner.getBookmarkForTime(timestamp);
-  }
-  onNextSessionRestoreBookmark(bookmark: string): Promise<string> {
-    return this.#inner.onNextSessionRestoreBookmark(bookmark);
-  }
-  waitForBookmark(bookmark: string): Promise<void> {
-    return this.#inner.waitForBookmark(bookmark);
-  }
-  ensureReplicas(): void {
-    this.#inner.ensureReplicas();
-  }
-  disableReplicas(): void {
-    this.#inner.disableReplicas();
-  }
-  configureReadReplication(enabled: boolean): Promise<void> {
-    return this.#inner.configureReadReplication(enabled);
-  }
-  getSqliteDatabase(): SqliteDatabase {
-    return this.#inner.getSqliteDatabase();
-  }
-  getSqliteKv(): SqliteKv {
-    return this.#inner.getSqliteKv();
-  }
-  transactionSync<T>(callback: () => T): T {
-    return this.#inner.transactionSync(callback);
-  }
-}
-
-/**
- * Runs `deleteAll` with a backpressure promise nobody has resolved yet and reports whether a
- * concurrent event got in while it was outstanding. Holding the gate is the default; releasing it
- * is what `allowConcurrency` buys.
- */
-async function backpressureAdmitsConcurrentEvent(allowConcurrency: boolean): Promise<boolean> {
-  const backpressure = Promise.withResolvers<void>();
-  let cache: BackpressureCache | undefined;
-  const h = await newHarness((inner) => {
-    cache = new BackpressureCache(inner, backpressure.promise);
-    return cache;
-  });
-
-  let admitted = false;
-  let pending: Promise<void> | undefined;
-  let outsider: Promise<void> | undefined;
-
-  await h.ctx.run(() => {
-    pending = h.storage.deleteAll({ allowConcurrency });
-    outsider = h.ctx.run(() => {
-      admitted = true;
-    });
-  });
-  await quiesce();
-
-  const observed = admitted;
-  backpressure.resolve();
-  await pending;
-  await outsider;
-  return observed;
-}
-
-test("decision 2 the default holds the input gate across storage backpressure", async () => {
-  expect(await backpressureAdmitsConcurrentEvent(false)).toBe(false);
-});
-
-test("decision 2 allowConcurrency releases the input gate across storage backpressure", async () => {
-  expect(await backpressureAdmitsConcurrentEvent(true)).toBe(true);
 });
 
 // =======================================================================================

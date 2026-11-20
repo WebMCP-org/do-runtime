@@ -19,11 +19,10 @@
  *  - `delete_` is spelled `delete` — the C++ name carries a trailing underscore
  *    only because `delete` is a keyword there.
  *  - Upstream's `Uninitialized` / `Initialized` pair exists solely to hold
- *    thirteen `SqliteDatabase::Statement`s. Prepared statements are not part of
+ *    prepared `SqliteDatabase::Statement`s. Prepared statements are not part of
  *    our backend seam (each `exec` prepares), so the pair collapses into the
  *    `tableCreated` flag it already sits beside. The statements survive as
- *    `STMT` below: same names, same order, SQL copied verbatim, so the
- *    correspondence a reader needs is intact.
+ *    `STMT` below; list queries combine fixed range, direction and limit clauses.
  *
  * Not ported: `SqliteKvRegulator`. Its remaining job is `shouldAddQueryStats`,
  * which is row-count billing; neither backend exposes those counters.
@@ -40,6 +39,19 @@ import {
   type SqliteDatabase,
 } from "./sqlite";
 
+const textEncoder = new TextEncoder();
+
+/** SQLite BINARY ordering compares UTF-8 bytes, including embedded nulls. */
+export function compareStorageKeys(left: string, right: string): number {
+  const a = textEncoder.encode(left);
+  const b = textEncoder.encode(right);
+  for (let i = 0; i < Math.min(a.length, b.length); i++) {
+    const difference = a[i]! - b[i]!;
+    if (difference !== 0) return difference;
+  }
+  return a.length - b.length;
+}
+
 export type KeyPtr = string;
 export type ValuePtr = Uint8Array;
 
@@ -51,7 +63,7 @@ export type WriteOptions = {
   allowUnconfirmed?: boolean;
 };
 
-/** ← `SqliteKv::ListCursor::KeyValuePair`, and the shape `put(pairs)` iterates. */
+/** ← `SqliteKv::ListCursor::KeyValuePair`, and the shape `putMultiple(pairs)` iterates. */
 export type KeyValuePair = {
   key: KeyPtr;
   value: ValuePtr;
@@ -68,50 +80,6 @@ const STMT = {
     `,
   delete: `
       DELETE FROM _cf_KV WHERE key = ?
-    `,
-  list: `
-      SELECT * FROM _cf_KV
-      WHERE key >= ?
-      ORDER BY key
-    `,
-  listEnd: `
-      SELECT * FROM _cf_KV
-      WHERE key >= ? AND key < ?
-      ORDER BY key
-    `,
-  listLimit: `
-      SELECT * FROM _cf_KV
-      WHERE key >= ?
-      ORDER BY key
-      LIMIT ?
-    `,
-  listEndLimit: `
-      SELECT * FROM _cf_KV
-      WHERE key >= ? AND key < ?
-      ORDER BY key
-      LIMIT ?
-    `,
-  listReverse: `
-      SELECT * FROM _cf_KV
-      WHERE key >= ?
-      ORDER BY key DESC
-    `,
-  listEndReverse: `
-      SELECT * FROM _cf_KV
-      WHERE key >= ? AND key < ?
-      ORDER BY key DESC
-    `,
-  listLimitReverse: `
-      SELECT * FROM _cf_KV
-      WHERE key >= ?
-      ORDER BY key DESC
-      LIMIT ?
-    `,
-  listEndLimitReverse: `
-      SELECT * FROM _cf_KV
-      WHERE key >= ? AND key < ?
-      ORDER BY key DESC
-      LIMIT ?
     `,
   countKeys: `
       SELECT count(*) FROM _cf_KV
@@ -168,57 +136,22 @@ export class SqliteKv implements ResetListener {
    * Search for all known keys and values in a range. `end` and `limit` can be
    * undefined to request no constraint be enforced.
    *
-   * With a callback, calls it for each row seen and returns the count. Without
-   * one, returns a cursor which can be iterated one at a time.
+   * Returns the cursor; callers choose how to consume it.
    */
   list(
     begin: KeyPtr,
     end: KeyPtr | undefined,
     limit: number | undefined,
     order: Order,
-  ): SqliteKvListCursor;
-  list(
-    begin: KeyPtr,
-    end: KeyPtr | undefined,
-    limit: number | undefined,
-    order: Order,
-    callback: (key: KeyPtr, value: ValuePtr) => void,
-  ): number;
-  list(
-    begin: KeyPtr,
-    end: KeyPtr | undefined,
-    limit: number | undefined,
-    order: Order,
-    callback?: (key: KeyPtr, value: ValuePtr) => void,
-  ): SqliteKvListCursor | number {
-    const cursor = this.#openCursor(begin, end, limit, order);
-    return callback === undefined ? cursor : cursor.forEach(callback);
+  ): SqliteKvListCursor {
+    return this.#openCursor(begin, end, limit, order);
   }
 
-  /** Store a value into the table, or atomically store multiple values. */
-  put(key: KeyPtr, value: ValuePtr, options?: WriteOptions): void;
-  put(pairs: Iterable<KeyValuePair>, options: WriteOptions): void;
-  put(
-    keyOrPairs: KeyPtr | Iterable<KeyValuePair>,
-    valueOrOptions?: ValuePtr | WriteOptions,
-    maybeOptions?: WriteOptions,
-  ): void {
-    // The two overloads share a parameter position, and narrowing it by test
-    // rather than by cast is what keeps a caller who mixes them up from writing
-    // an options object into the table as a value.
-    if (typeof keyOrPairs === "string") {
-      if (!(valueOrOptions instanceof Uint8Array)) {
-        throw new Error("put(key, value) takes a Uint8Array value.");
-      }
-      const allowUnconfirmed = maybeOptions?.allowUnconfirmed ?? false;
-      this.#ensureInitialized(allowUnconfirmed);
-      this.#db.run({ allowUnconfirmed }, STMT.put, keyOrPairs, valueOrOptions);
-      return;
-    }
-    if (valueOrOptions instanceof Uint8Array) {
-      throw new Error("put(pairs, options) takes an options object.");
-    }
-    this.#putMultiple(keyOrPairs, valueOrOptions ?? {});
+  /** Store one value. Batch writes use putMultiple's savepoint. */
+  put(key: KeyPtr, value: ValuePtr, options: WriteOptions = {}): void {
+    const allowUnconfirmed = options.allowUnconfirmed ?? false;
+    this.#ensureInitialized(allowUnconfirmed);
+    this.#db.run({ allowUnconfirmed }, STMT.put, key, value);
   }
 
   /** Delete the key and return whether it was matched. */
@@ -282,7 +215,7 @@ export class SqliteKv implements ResetListener {
     }
   }
 
-  #putMultiple(pairs: Iterable<KeyValuePair>, options: WriteOptions): void {
+  putMultiple(pairs: Iterable<KeyValuePair>, options: WriteOptions = {}): void {
     const allowUnconfirmed = options.allowUnconfirmed ?? false;
     this.#ensureInitialized(allowUnconfirmed);
     this.#db.run({ allowUnconfirmed }, STMT.multiPutSavepoint);
@@ -401,25 +334,23 @@ export class SqliteKvListCursor {
   }
 }
 
-/** ← the eight-way branch in `SqliteKv::list`, in the same order. */
+/** Assemble only fixed SQL fragments; all key and limit values stay bound. */
 function selectListStatement(
   begin: KeyPtr,
   end: KeyPtr | undefined,
   limit: number | undefined,
   order: Order,
 ): [sql: string, params: (string | number)[]] {
-  if (order === "FORWARD") {
-    if (end !== undefined) {
-      if (limit !== undefined) return [STMT.listEndLimit, [begin, end, limit]];
-      return [STMT.listEnd, [begin, end]];
-    }
-    if (limit !== undefined) return [STMT.listLimit, [begin, limit]];
-    return [STMT.list, [begin]];
-  }
+  let sql = "SELECT * FROM _cf_KV WHERE key >= ?";
+  const params: (string | number)[] = [begin];
   if (end !== undefined) {
-    if (limit !== undefined) return [STMT.listEndLimitReverse, [begin, end, limit]];
-    return [STMT.listEndReverse, [begin, end]];
+    sql += " AND key < ?";
+    params.push(end);
   }
-  if (limit !== undefined) return [STMT.listLimitReverse, [begin, limit]];
-  return [STMT.listReverse, [begin]];
+  sql += order === "FORWARD" ? " ORDER BY key" : " ORDER BY key DESC";
+  if (limit !== undefined) {
+    sql += " LIMIT ?";
+    params.push(limit);
+  }
+  return [sql, params];
 }

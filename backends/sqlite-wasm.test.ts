@@ -706,3 +706,19 @@ function memoryHost(files: Map<string, Uint8Array>): SqliteWasmHost {
     },
   };
 }
+
+test("provider close releases siblings after a database finalizer throws", async () => {
+  const pool = { ...memoryHost(new Map()).pool, OpfsSAHPoolDb: sqlite3.oo1.DB };
+  const provider = createSqliteWasmProvider({ pool, capi: sqlite3.capi }, { prefix: "/close-all" });
+  const first = await provider.open("first");
+  const last = await provider.open("last");
+  const closeFirst = vi.spyOn(first, "close");
+  const closeLast = last.close.bind(last);
+  vi.spyOn(last, "close").mockImplementationOnce(() => {
+    closeLast();
+    throw new Error("close failed");
+  });
+  expect(() => provider.close()).toThrow("close failed");
+  expect(closeFirst).toHaveBeenCalledOnce();
+  expect(() => provider.close()).not.toThrow();
+});

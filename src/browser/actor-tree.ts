@@ -273,7 +273,10 @@ export class BrowserActorTree<
   }
 
   closeAll(): void {
-    for (const id of new Set([...this.#live.keys(), ...this.#starting.keys()])) this.abort(id);
+    using cleanup = new DisposableStack();
+    for (const id of new Set([...this.#live.keys(), ...this.#starting.keys()])) {
+      cleanup.defer(() => this.abort(id));
+    }
   }
 
   drainWaitUntil(): Promise<void[]> {

@@ -133,11 +133,6 @@ export function moduleFieldCountMessage(name: string, fieldCount: number): strin
   );
 }
 
-/** Historical diagnostic, kept for consumers; Python workers now accept JS modules. */
-export function jsModuleInPythonWorkerMessage(name: string): string {
-  return `Module "${name}" is a JS module, but the main module is a Python module.`;
-}
-
 /** ← `JSG_FAIL_REQUIRE` at `worker-loader.c++:266-267`. */
 export function pythonModuleInJsWorkerMessage(name: string): string {
   return `Module "${name}" is a Python module, but the main module isn't a Python module.`;

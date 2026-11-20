@@ -74,7 +74,7 @@ import {
 } from "./actor-cache";
 import { TaskSet, atCheckpointEnd } from "./io-context";
 import type { OutputGate } from "./io-gate";
-import { SqliteKv } from "../util/sqlite-kv";
+import { compareStorageKeys, SqliteKv } from "../util/sqlite-kv";
 import { SqliteMetadata } from "../util/sqlite-metadata";
 import { type SqliteCriticalError, SqliteDatabase } from "../util/sqlite";
 
@@ -139,16 +139,6 @@ export const DEFAULT_ALARM_OUTLET: AlarmOutlet = {
 function willFireEarlier(alarm1: number | null, alarm2: number | null): boolean {
   // Intuitively, an unset alarm is effectively indistinguishable from an alarm set at infinity.
   return (alarm1 ?? Infinity) < (alarm2 ?? Infinity);
-}
-
-/**
- * Set options.allowUnconfirmed to false and log a reason why.
- *
- * Upstream mutates the caller's bag and logs; there is no logger here and the
- * bag belongs to the caller, so the disabled copy is returned instead.
- */
-function disableAllowUnconfirmed(options: WriteOptions, _reason: string): WriteOptions {
-  return { ...options, allowUnconfirmed: false };
 }
 
 /**
@@ -690,7 +680,7 @@ export class ActorSqlite implements ActorCacheInterface {
       const value = this.#kv.get(key);
       if (value !== undefined) results.push({ key, value });
     }
-    results.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+    results.sort((a, b) => compareStorageKeys(a.key, b.key));
     return results;
   }
 
@@ -719,7 +709,7 @@ export class ActorSqlite implements ActorCacheInterface {
     this.requireNotBroken();
 
     const results: KeyValuePair[] = [];
-    this.#kv.list(begin, end, limit, "FORWARD", (key, value) => {
+    this.#kv.list(begin, end, limit, "FORWARD").forEach((key, value) => {
       results.push({ key, value });
     });
 
@@ -736,7 +726,7 @@ export class ActorSqlite implements ActorCacheInterface {
     this.requireNotBroken();
 
     const results: KeyValuePair[] = [];
-    this.#kv.list(begin, end, limit, "REVERSE", (key, value) => {
+    this.#kv.list(begin, end, limit, "REVERSE").forEach((key, value) => {
       results.push({ key, value });
     });
 
@@ -761,7 +751,7 @@ export class ActorSqlite implements ActorCacheInterface {
       throw new Error("we must have a transaction at this point");
     }
 
-    this.#kv.put(pairs, { allowUnconfirmed: options.allowUnconfirmed ?? false });
+    this.#kv.putMultiple(pairs, { allowUnconfirmed: options.allowUnconfirmed ?? false });
   }
 
   delete(key: Key, options: WriteOptions = {}): boolean {
@@ -801,9 +791,8 @@ export class ActorSqlite implements ActorCacheInterface {
     return new ExplicitTxn(this);
   }
 
-  deleteAll(options: WriteOptions = {}, deleteAllOptions: DeleteAllOptions = {}): DeleteAllResults {
+  deleteAll(_options: WriteOptions = {}, deleteAllOptions: DeleteAllOptions = {}): DeleteAllResults {
     this.requireNotBroken();
-    const effectiveOptions = disableAllowUnconfirmed(options, "deleteAll is not supported");
 
     // kv.deleteAll() clears the database, so save and possibly restore the alarm state.
     const localAlarmState = this.#metadata.getAlarm();
@@ -873,18 +862,13 @@ export class ActorSqlite implements ActorCacheInterface {
         this.#alarmVersion += 1;
         this.haveDeferredDelete = false;
       } else if (
-        this.#metadata.setAlarm(localAlarmState, effectiveOptions.allowUnconfirmed ?? false)
+        this.#metadata.setAlarm(localAlarmState, false)
       ) {
         this.#alarmVersion += 1;
       }
     }
 
-    return { backpressure: undefined, count };
-  }
-
-  evictStale(_now: number): undefined {
-    // This implementation never needs to apply backpressure.
-    return undefined;
+    return { count };
   }
 
   shutdown(exception?: unknown): void {
@@ -899,9 +883,6 @@ export class ActorSqlite implements ActorCacheInterface {
       // request is ongoing after the actor cache is shutting down, the output gate is only broken
       // if they had to send a flush after shutdown, either from a scheduled flush or a retry after
       // failure.
-    } else {
-      // We've already experienced a terminal exception either from shutdown or OOM, there should
-      // already be a flush scheduled that will break the output gate.
     }
   }
 

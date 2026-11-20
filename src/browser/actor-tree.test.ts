@@ -371,3 +371,24 @@ test("a placed facet whose container breaks reports its request and reason to th
   expect(broken[0]![0]).toEqual(request);
   expect(String(broken[0]![1])).toContain("child crashed");
 });
+
+test("closeAll releases sibling facets after one scope finalizer throws", async () => {
+  const released: number[] = [];
+  using placed = await createTree("close-siblings", {
+    async load(facet, scope) {
+      scope.use({
+        [Symbol.dispose]() {
+          released.push(facet.id);
+          if (facet.id === 2) throw new Error("scope cleanup failed");
+        },
+      });
+      return { env: {}, exports: {}, construct: () => ({}) };
+    },
+  });
+  await placed.tree.start(request).stub;
+  await placed.tree.start({ ...request, id: 2, name: "Child\0two" }).stub;
+  expect(() => placed.tree.closeAll()).toThrow("scope cleanup failed");
+  expect(released.sort()).toEqual([1, 2]);
+  expect(placed.tree.placements()).toHaveLength(0);
+  expect(() => placed.tree.closeAll()).not.toThrow();
+});

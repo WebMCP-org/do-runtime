@@ -30,11 +30,8 @@
  * pair release the gate via `awaitIo`, and `transaction()` takes a critical
  * section.
  *
- * **Decision 2's branch has one reachable site**, and it is not where upstream's
- * is. §1.4 measures that SQLite cache operations are immediate, so their
- * `kj::OneOf<T, kj::Promise<T>>` branch has nothing to select between.
- * `transformMaybeBackpressure` keeps the branch because
- * `DeleteAllResults.backpressure` is still a promise in `io/actor-cache.ts`.
+ * SQLite cache operations are immediate, including deleteAll. Public concurrency
+ * options are accepted, but there is no remote-cache backpressure to await.
  *
  * Not ported, because the substrate has no equivalent: V8's private wire bytes,
  * replaced by a browser-safe structured-clone encoding with the same public
@@ -68,7 +65,7 @@ import {
   setUserErrorDetail,
 } from "../io/io-context";
 import type { FacetManager, FacetStartInfo } from "../io/worker";
-import type { SqliteKv, SqliteKvListCursor } from "../util/sqlite-kv";
+import { compareStorageKeys, type SqliteKv, type SqliteKvListCursor } from "../util/sqlite-kv";
 import type { SqliteDatabase } from "../util/sqlite";
 import { DurableObjectClass } from "./actor";
 import { LoopbackColoLocalActorNamespace, LoopbackDurableObjectNamespace } from "./export-loopback";
@@ -150,8 +147,6 @@ function isPutOptions(value: unknown): boolean {
 
 /** The key immediately after `k` in byte order is `k` plus this. */
 const NULL_CHARACTER = "\u0000";
-/** ← the `0xff` upstream strips from the tail of a prefix, in UTF-16 code units. */
-const MAX_CODE_UNIT = 0xffff;
 
 // =======================================================================================
 // The value codec
@@ -206,29 +201,6 @@ export function deserializeValue<T = unknown>(key: string, buffer: Uint8Array): 
 }
 
 // =======================================================================================
-// The option transforms
-
-/**
- * ← `transformMaybeBackpressure` (`actor-state.c++:103-119`). THIS is decision
- * 2's live site: `DeleteAllResults.backpressure` is still `Promise<void> |
- * undefined`, so the branch has something to select between.
- *
- * Upstream's own note, kept because it is the reason the flag is threaded here
- * at all: "In practice `allowConcurrency` will have no effect on a backpressure
- * promise since backpressure blocks everything anyway, but we pass the option
- * through for consistency in case of future changes."
- */
-function transformMaybeBackpressure(
-  ctx: IoContext,
-  options: { readonly allowConcurrency?: boolean },
-  maybeBackpressure: Promise<void> | undefined,
-): Promise<void> {
-  if (maybeBackpressure === undefined) return Promise.resolve();
-  if (options.allowConcurrency === true) return ctx.awaitIo(maybeBackpressure);
-  return ctx.awaitIoWithInputLock(maybeBackpressure, () => {});
-}
-
-// =======================================================================================
 // compileListOptions
 
 /** ← `DurableObjectStorageOperations::CompiledListOptions`. */
@@ -245,13 +217,9 @@ type CompiledListOptions = {
  * provably return no results. `SyncKvStorage` reuses it, exactly as upstream's
  * comment says it must.
  *
- * Two translations. `startAfter` gains ONE null character where upstream's
- * `kj::String` gains two, because the second of upstream's is the terminator and
- * a JS string has none. And every comparison here is on UTF-16 code units where
- * upstream's is on UTF-8 bytes, while the range the database actually applies is
- * SQLite's `BINARY` collation over UTF-8 — the two orders agree for every key
- * outside the astral planes, and a key that mixes astral characters with a
- * prefix can land on the wrong side of a clamp this function computes.
+ * startAfter gains one null character: upstream's second byte is its string
+ * terminator. Options are normalized as UTF-8 storage keys, and range clamps
+ * compare their bytes rather than JavaScript's UTF-16 code units.
  */
 function compileListOptions(
   options: DurableObjectListOptions | undefined,
@@ -266,15 +234,15 @@ function compileListOptions(
       if (options.startAfter !== undefined) {
         throw new TypeError("list() cannot be called with both start and startAfter values.");
       }
-      start = options.start;
+      start = storageRangeBoundary(options.start);
     }
     if (options.startAfter !== undefined) {
       // Convert an exclusive startAfter into an inclusive start key, so the implementation below
       // does not have to handle both. ONE null character, not upstream's two: the second of
       // upstream's is `kj::String`'s terminator, and a JS string has none.
-      start = options.startAfter + NULL_CHARACTER;
+      start = storageRangeBoundary(options.startAfter + NULL_CHARACTER);
     }
-    if (options.end !== undefined) end = options.end;
+    if (options.end !== undefined) end = storageRangeBoundary(options.end);
     if (options.reverse !== undefined) reverse = options.reverse;
     if (options.limit !== undefined) {
       if (!(options.limit > 0)) throw new TypeError("List limit must be positive.");
@@ -282,38 +250,19 @@ function compileListOptions(
     }
 
     const prefix = options.prefix;
+    // workerd preserves lone-surrogate UTF-8 bytes; no well-formed SQLite key has that prefix.
+    if (prefix !== undefined && !prefix.isWellFormed()) return undefined;
     if (prefix !== undefined && prefix.length > 0) {
-      // Let's clamp `start` and `end` to include only keys with the given prefix.
-      if (start < prefix) {
-        // `start` is before `prefix`, so listing should actually start at `prefix`.
-        start = prefix;
-      } else if (start.startsWith(prefix)) {
-        // `start` is within the prefix, so need not be modified.
-      } else {
-        // `start` comes after the last value with the prefix, so there's no overlap.
-        return undefined;
-      }
-
-      const keyAfterPrefix = firstKeyAfterPrefix(prefix);
-      if (keyAfterPrefix === undefined) {
-        // The prefix is a run of maximal code units, so it includes the entire key space through
-        // the last possible key. Hence there is no end — but an end specified earlier still holds.
-      } else if (end === undefined) {
-        // We didn't have any end set, so use the end of the prefix range.
-        end = keyAfterPrefix;
-      } else if (end <= prefix) {
-        // No keys could possibly match both the end and the prefix.
-        return undefined;
-      } else if (end.startsWith(prefix)) {
-        // `end` is within the prefix, so need not be modified.
-      } else {
-        // `end` comes after all keys with the prefix, so stop at the end of the prefix.
-        end = keyAfterPrefix;
+      // Intersect the requested interval with the prefix interval.
+      if (compareStorageKeys(start, prefix) < 0) start = prefix;
+      const prefixEnd = firstKeyAfterPrefix(prefix);
+      if (prefixEnd !== undefined && (end === undefined || compareStorageKeys(prefixEnd, end) < 0)) {
+        end = prefixEnd;
       }
     }
   }
 
-  if (end !== undefined && end <= start) {
+  if (end !== undefined && compareStorageKeys(end, start) <= 0) {
     // Key range is empty.
     return undefined;
   }
@@ -322,19 +271,33 @@ function compileListOptions(
 }
 
 /**
- * ← the `keyAfterPrefix` vector: strip maximal trailing units, then increment.
- *
- * Returns undefined when the prefix is nothing but maximal units, which is
- * upstream's "the prefix is a string of some number of 0xff bytes, so includes
- * the entire key space up through the last possible key".
+ * workerd's string boundary retains lone-surrogate bytes (WTF-8). Native host
+ * bindings store well-formed UTF-8. The first valid key after any surrogate
+ * byte sequence starts with U+E000; suffixes after that sequence cannot affect
+ * the bound. This also avoids turning a malformed bound into U+FFFD.
  */
-function firstKeyAfterPrefix(prefix: string): string | undefined {
-  let head = prefix;
-  while (head.length > 0 && head.charCodeAt(head.length - 1) === MAX_CODE_UNIT) {
-    head = head.slice(0, -1);
+function storageRangeBoundary(key: string): string {
+  if (key.isWellFormed()) return key;
+  let prefix = "";
+  for (const scalar of key) {
+    const code = scalar.codePointAt(0)!;
+    if (code >= 0xd800 && code <= 0xdfff) return prefix + "\ue000";
+    prefix += scalar;
   }
-  if (head.length === 0) return undefined;
-  return head.slice(0, -1) + String.fromCharCode(head.charCodeAt(head.length - 1) + 1);
+  return key;
+}
+
+/** The first valid UTF-8 key after every key starting with this prefix. */
+function firstKeyAfterPrefix(prefix: string): string | undefined {
+  const scalars = [...prefix];
+  while (scalars.length) {
+    const last = scalars.pop()!.codePointAt(0)!;
+    if (last === 0x10ffff) continue;
+    // Surrogates are not Unicode scalars and cannot occur in a UTF-8 key.
+    const next = last === 0xd7ff ? 0xe000 : last + 1;
+    return scalars.join("") + String.fromCodePoint(next);
+  }
+  return undefined;
 }
 
 // =======================================================================================
@@ -656,8 +619,8 @@ export class DurableObjectStorage
   deleteAll(maybeOptions?: DurableObjectPutOptions): Promise<void> {
     requireInputLock(this.ctx, "deleteAll()");
     const options = { ...maybeOptions };
-    const result = this.#cache.deleteAll(options, { deleteAlarm: true });
-    return transformMaybeBackpressure(this.ctx, options, result.backpressure);
+    this.#cache.deleteAll(options, { deleteAlarm: true });
+    return Promise.resolve();
   }
 
   /**

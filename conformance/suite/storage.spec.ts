@@ -66,3 +66,25 @@ it("§2.4 put() reads what jsg::Dict refuses as a coerced key, not as empty entr
       "put(entries, options)",
   });
 });
+
+it("§2.4 list ranges follow UTF-8 ordering across BMP, astral and maximal prefixes", async () => {
+  const probe = await host.spawn("unicode-list-options");
+  const expected = [
+    ["\u{10000}", "\u{10000}a"],
+    ["\ue000"],
+    ["\uffff"],
+    ["\ud7ff"],
+    ["\u{10ffff}a", "\u{10ffff}"],
+    [],
+    ["\ue000", "\ufffd", "\uffff"],
+    [],
+    [],
+    ["\ud7ff"],
+    ["\ue000"],
+  ];
+  expect(await probe.call("unicodeListOptions")).toEqual({
+    multiple: ["\ud7ff", "\ue000", "\ufffd", "\uffff", "\u{10000}", "\u{10000}a", "\u{10ffff}", "\u{10ffff}a"],
+    async: expected,
+    sync: expected,
+  });
+});

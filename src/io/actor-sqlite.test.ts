@@ -1389,7 +1389,6 @@ actorTest("calling deleteAll() preserves alarm state if alarm is set", async (te
     expect(test.actor.isCommitScheduled()).toBe(false);
     const results = test.actor.deleteAll({});
     expect(test.actor.isCommitScheduled()).toBe(true);
-    expect(results.backpressure).toBeUndefined();
     expect(results.count).toBe(0);
     expect(test.getAlarm()).toBe(oneMs);
 
@@ -1409,8 +1408,6 @@ actorTest("calling deleteAll() preserves alarm state if alarm is set", async (te
     const results1 = test.actor.deleteAll({});
     const results2 = test.actor.deleteAll({});
     expect(test.actor.isCommitScheduled()).toBe(true);
-    expect(results1.backpressure).toBeUndefined();
-    expect(results2.backpressure).toBeUndefined();
     expect(results1.count).toBe(0);
     expect(results2.count).toBe(0);
     expect(test.getAlarm()).toBe(oneMs);
@@ -1446,7 +1443,6 @@ actorTest("calling deleteAll() preserves alarm state if alarm is not set", async
     expect(test.actor.isCommitScheduled()).toBe(false);
     const results = test.actor.deleteAll({});
     expect(test.actor.isCommitScheduled()).toBe(true);
-    expect(results.backpressure).toBeUndefined();
     expect(test.getAlarm()).toBe(null);
 
     const commit = (await test.pollAndExpectCalls(["commit"]))[0];
@@ -1467,8 +1463,6 @@ actorTest("calling deleteAll() preserves alarm state if alarm is not set", async
     const results1 = test.actor.deleteAll({});
     const results2 = test.actor.deleteAll({});
     expect(test.actor.isCommitScheduled()).toBe(true);
-    expect(results1.backpressure).toBeUndefined();
-    expect(results2.backpressure).toBeUndefined();
     expect(test.getAlarm()).toBe(null);
 
     // With no alarm to restore, successive deletion commits coalesce.
@@ -1494,7 +1488,6 @@ actorTest("calling deleteAll() during an implicit transaction preserves alarm st
 
   const results = test.actor.deleteAll({});
   expect(test.actor.isCommitScheduled()).toBe(true);
-  expect(results.backpressure).toBeUndefined();
   expect(test.getAlarm()).toBe(oneMs);
 
   (await test.pollAndExpectCalls(["scheduleRun(1ms)"]))[0]?.fulfill();
@@ -3076,9 +3069,7 @@ actorTest("the local-development bookmark increments and sorts", async (test) =>
   (await test.pollAndExpectCalls(["commit"]))[0]?.fulfill();
 });
 
-actorTest("evictStale never applies backpressure", async (test) => {
-  expect(test.actor.evictStale(0)).toBeUndefined();
-});
+
 
 actorTest("list and listReverse read a range", async (test) => {
   test.putMultiple([

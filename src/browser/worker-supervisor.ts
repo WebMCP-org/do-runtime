@@ -340,12 +340,16 @@ export type BrowserWorkerSupervisorOptions<Configuration> = {
   readonly idleGraceMs: number;
 };
 
+type PlacementPhase =
+  | { readonly kind: "starting" }
+  | { readonly kind: "ready" }
+  | { readonly kind: "hibernating"; ready: boolean; canceled: boolean };
+
 type Placement<Configuration, Service> = SupervisedWorker<Configuration, Service> & {
-  readyNow: boolean;
+  phase: PlacementPhase;
   readonly readiness: PromiseWithResolvers<void>;
   readonly worker: Worker;
   readonly hostSession: ReturnType<typeof newRpcSession>;
-  hibernation?: { canceled: boolean };
   /** The worker's last lifecycle report was idle. */
   idle: boolean;
   idleTimer?: ReturnType<typeof setTimeout>;
@@ -365,7 +369,11 @@ type Socket<Configuration> = {
   port?: MessagePort;
 };
 
-type Identity<Configuration> = { readonly configuration: Configuration; epoch: number };
+type Identity<Configuration> = {
+  readonly configuration: Configuration;
+  readonly sockets: Map<string, Socket<Configuration>>;
+  epoch: number;
+};
 
 type Deletion<Configuration> = {
   includes(configuration: Configuration): boolean;
@@ -400,7 +408,6 @@ export class BrowserWorkerSupervisor<
   readonly #options: BrowserWorkerSupervisorOptions<Configuration>;
   readonly #workers = new Map<string, Placement<Configuration, Service>>();
   readonly #hibernated = new Map<string, WorkerHibernationSnapshot>();
-  readonly #sockets = new Set<Socket<Configuration>>();
   /** Every configuration seen, so deletion can reach storage whose worker is not running. */
   readonly #identities = new Map<string, Identity<Configuration>>();
   readonly #deletions = new Set<Deletion<Configuration>>();
@@ -461,7 +468,8 @@ export class BrowserWorkerSupervisor<
       receive: (message) => this.#receive(socket, message),
       close: (code = 1000, reason = "") => this.#close(socket, code, reason, false),
     };
-    const previous = this.#socketsFor(key).find((candidate) => candidate.id === socket.id);
+    const identity = this.#identity(configuration);
+    const previous = identity.sockets.get(socket.id);
     if (previous) {
       this.#close(previous, 1008, "Connection superseded", true);
       socket.peer.send({ type: "close", code: 1012, reason: "Previous connection is closing" });
@@ -471,7 +479,7 @@ export class BrowserWorkerSupervisor<
     try {
       // Wake before registering: a hibernation snapshot describes only the existing transports.
       const placement = this.#ensure(configuration);
-      this.#sockets.add(socket);
+      identity.sockets.set(socket.id, socket);
       this.#connect(socket, placement);
     } catch (error) {
       this.#finish(socket);
@@ -607,7 +615,7 @@ export class BrowserWorkerSupervisor<
     const existing = this.#workers.get(key);
     if (!existing) return this.#spawn(configuration, key);
     // New work cancels a hibernation probe and restarts a pending idle grace.
-    if (existing.hibernation) existing.hibernation.canceled = true;
+    if (existing.phase.kind === "hibernating") existing.phase.canceled = true;
     if (existing.idleTimer !== undefined) this.#scheduleIdle(existing);
     return existing;
   }
@@ -630,7 +638,13 @@ export class BrowserWorkerSupervisor<
             worker,
             readiness,
             ready: readiness.promise,
-            readyNow: false,
+            phase: { kind: "starting" },
+            get readyNow() {
+              return (
+                placement.phase.kind === "ready" ||
+                (placement.phase.kind === "hibernating" && placement.phase.ready)
+              );
+            },
             idle: false,
             hostSession: newRpcSession(
               host.port1,
@@ -660,7 +674,8 @@ export class BrowserWorkerSupervisor<
           }
           if (message.type === "failed") this.#discard(placement, message.message, false);
           else {
-            placement.readyNow = true;
+            if (placement.phase.kind === "hibernating") placement.phase.ready = true;
+            else placement.phase = { kind: "ready" };
             readiness.resolve();
             this.#flush(placement);
           }
@@ -728,7 +743,7 @@ export class BrowserWorkerSupervisor<
     const key = this.#options.key(configuration);
     let identity = this.#identities.get(key);
     if (!identity) {
-      identity = { configuration, epoch: 0 };
+      identity = { configuration, epoch: 0, sockets: new Map() };
       this.#identities.set(key, identity);
     }
     return identity;
@@ -741,13 +756,13 @@ export class BrowserWorkerSupervisor<
     if (!this.#isCurrent(placement)) return;
     placement.idle = state === "idle";
     if (state === "active") {
-      if (placement.hibernation) placement.hibernation.canceled = true;
+      if (placement.phase.kind === "hibernating") placement.phase.canceled = true;
       this.#clearIdle(placement);
     } else this.#scheduleIdle(placement);
   }
 
   #socketsFor(key: string): Socket<Configuration>[] {
-    return [...this.#sockets].filter((socket) => socket.key === key);
+    return [...(this.#identities.get(key)?.sockets.values() ?? [])];
   }
 
   #connect(socket: Socket<Configuration>, placement: Placement<Configuration, Service>): void {
@@ -781,7 +796,7 @@ export class BrowserWorkerSupervisor<
     // Waking a worker whose snapshot no longer matches its transports ends this socket.
     if (socket.closed) return;
     if (!socket.port) this.#connect(socket, placement);
-    if (!placement.readyNow || placement.hibernation) socket.pending.push(message);
+    if (placement.phase.kind !== "ready") socket.pending.push(message);
     else this.#post(socket, message);
   }
 
@@ -804,7 +819,7 @@ export class BrowserWorkerSupervisor<
   }
 
   #flush(placement: Placement<Configuration, Service>): void {
-    if (!placement.readyNow || placement.hibernation) return;
+    if (placement.phase.kind !== "ready") return;
     for (const socket of this.#socketsFor(placement.key)) {
       if (!socket.port) continue;
       for (const message of socket.pending.splice(0)) {
@@ -817,7 +832,8 @@ export class BrowserWorkerSupervisor<
   #finish(socket: Socket<Configuration>): void {
     if (socket.closed) return;
     socket.closed = true;
-    this.#sockets.delete(socket);
+    const sockets = this.#identities.get(socket.key)?.sockets;
+    if (sockets?.get(socket.id) === socket) sockets.delete(socket.id);
     socket.port?.close();
     delete socket.port;
     socket.peer.close();
@@ -839,12 +855,12 @@ export class BrowserWorkerSupervisor<
     key: string,
     snapshot: WorkerHibernationSnapshot,
   ): { ports: MessagePort[]; snapshot: WorkerRehydrationSnapshot } {
-    const sockets = new Map(this.#socketsFor(key).map((socket) => [socket.id, socket]));
+    const sockets = this.#identities.get(key)?.sockets;
     const ports: MessagePort[] = [];
     const restore = (part: WorkerHibernationPlacement): WorkerRehydrationPlacement => ({
       autoResponse: part.autoResponse,
       sockets: part.sockets.map((state) => {
-        const socket = sockets.get(state.id);
+        const socket = sockets?.get(state.id);
         if (!socket) throw new Error(`Missing host transport ${state.id}`);
         const channel = new MessageChannel();
         this.#attach(socket, channel.port1);
@@ -863,14 +879,14 @@ export class BrowserWorkerSupervisor<
 
   /** The snapshot names exactly the key's live transport IDs, each once. */
   #describesLiveSockets(key: string, snapshot: WorkerHibernationSnapshot): boolean {
-    const live = new Set(this.#socketsFor(key).map((socket) => socket.id));
+    const live = this.#identities.get(key)?.sockets;
     const ids = [snapshot.root, ...snapshot.facets].flatMap((part) =>
       part.sockets.map((socket) => socket.id),
     );
     return (
       ids.length === new Set(ids).size &&
-      ids.length === live.size &&
-      ids.every((id) => live.has(id))
+      ids.length === (live?.size ?? 0) &&
+      ids.every((id) => live?.has(id))
     );
   }
 
@@ -891,9 +907,13 @@ export class BrowserWorkerSupervisor<
   }
 
   async #hibernate(placement: Placement<Configuration, Service>): Promise<boolean> {
-    if (!this.#isCurrent(placement) || placement.hibernation) return false;
-    const attempt = { canceled: false };
-    placement.hibernation = attempt;
+    if (!this.#isCurrent(placement) || placement.phase.kind === "hibernating") return false;
+    const attempt: Extract<PlacementPhase, { kind: "hibernating" }> = {
+      kind: "hibernating",
+      ready: placement.phase.kind === "ready",
+      canceled: false,
+    };
+    placement.phase = attempt;
     // The snapshot crosses RPC from the worker it describes, so check it here, once.
     let snapshot: unknown;
     try {
@@ -919,7 +939,8 @@ export class BrowserWorkerSupervisor<
 
   /** End a hibernation attempt and deliver the frames it held. */
   #resume(placement: Placement<Configuration, Service>): void {
-    delete placement.hibernation;
+    if (placement.phase.kind !== "hibernating") return;
+    placement.phase = { kind: placement.phase.ready ? "ready" : "starting" };
     this.#flush(placement);
   }
 
@@ -930,7 +951,6 @@ export class BrowserWorkerSupervisor<
   ): void {
     if (!this.#isCurrent(placement)) return;
     this.#clearIdle(placement);
-    delete placement.hibernation;
     this.#workers.delete(placement.key);
     if (!keepSockets) this.#hibernated.delete(placement.key);
     placement.readiness.reject(new Error(reason));

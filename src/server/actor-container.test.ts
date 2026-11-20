@@ -449,6 +449,36 @@ describe("createActorContainer", () => {
     },
   );
 
+  test("construction failure closes both databases and preserves the original error when cleanup throws", async () => {
+    const provider = createNodeSqlProvider();
+    const closed: string[] = [];
+    const cleanupFailure = new Error("facet close failed");
+    const sql: SqlDatabaseProvider = {
+      async open(name) {
+        const database = await provider.open(name);
+        if (name === "facets") database.exec(`PRAGMA user_version = ${RUNTIME_STORAGE_VERSION + 1}`, []);
+        const close = database.close.bind(database);
+        vi.spyOn(database, "close").mockImplementation(() => {
+          close();
+          closed.push(name);
+          if (name === "facets") throw cleanupFailure;
+        });
+        return database;
+      },
+    };
+    let failure: unknown;
+    try {
+      await createActorContainer(options({ ports: { ...options().ports, sql } }));
+    } catch (error) {
+      failure = error;
+    }
+    expect(closed).toEqual(["facets", "root"]);
+    expect(failure).toBeInstanceOf(SuppressedError);
+    if (!(failure instanceof SuppressedError)) throw new Error("missing construction failure");
+    expect(failure.error).toBe(cleanupFailure);
+    expect(failure.suppressed.message).toContain("written by a newer @mcp-b/do-runtime");
+  });
+
   test("hands a persisted alarm to AlarmOutlet.reconcile once, before the actor starts", async () => {
     const { provider } = sharedProvider();
     const reconcile = vi.fn();

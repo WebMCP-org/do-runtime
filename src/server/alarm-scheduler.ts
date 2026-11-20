@@ -326,6 +326,11 @@ type ScheduledAlarm = {
   countedRetry: number;
 };
 
+/** A retry of persistence must never repeat an already-completed user delivery. */
+type AlarmTaskPhase =
+  | { readonly kind: "deliver"; readonly backoff: number }
+  | { readonly kind: "bookkeeping"; readonly result: AlarmResult; readonly backoff: number };
+
 /**
  * The half of a `ScheduledAlarm` that outlives the process holding it: one row
  * of `_cf_ALARM` past `scheduled_time`, validated.
@@ -553,8 +558,7 @@ export class AlarmScheduler {
     persisted: PersistedAlarm,
   ): PersistedAlarm {
     const backoff = Math.min(RETRY_BACKOFF_MAX, persisted.backoff);
-    let delay = alarmRetryDelayMs(backoff);
-    delay += this.#jitterMsForDelay(delay);
+    const delay = this.#retryDelay(backoff);
 
     const resumed: PersistedAlarm = {
       retryTime: now + delay,
@@ -664,8 +668,7 @@ export class AlarmScheduler {
     delay: number,
     entry: ScheduledAlarm,
     scheduledTime: number,
-    completed?: AlarmResult,
-    bookkeepingBackoff = 0,
+    phase: AlarmTaskPhase = { kind: "deliver", backoff: 0 },
   ): Promise<void> {
     const actorId = entry.actorId;
     await this.#checkTimestamp(delay, scheduledTime, entry.cancel.signal);
@@ -674,9 +677,9 @@ export class AlarmScheduler {
     // dropping the entry destroyed this task before it could resume; this is that cancellation.
     if (this.#alarms.get(actorId) !== entry) return;
 
-    let retryInfo = completed;
+    let current = phase;
     try {
-      if (retryInfo === undefined) {
+      if (current.kind === "deliver") {
         // Refuse delivery until its running mark is durable. A transient write
         // failure retries this start, not an unrecorded handler invocation.
         this.#db.run(STMT.markRunning, actorId);
@@ -684,11 +687,17 @@ export class AlarmScheduler {
         entry.wakeTime = null;
         this.#activeDeliveries.add(entry);
         this.#projectNextWake();
-        retryInfo = await this.#runAlarmGuarded(actorId, scheduledTime, entry.countedRetry);
+        current = {
+          kind: "bookkeeping",
+          result: await this.#runAlarmGuarded(actorId, scheduledTime, entry.countedRetry),
+          backoff: current.backoff,
+        };
       } else {
         this.#activeDeliveries.add(entry);
         this.#projectNextWake();
       }
+
+      const retryInfo = current.result;
 
       // ← `:214`'s second `KJ_ASSERT_NONNULL`, which upstream reaches by way of its outer catch when
       // `deleteAll()` cleared the map during the run.
@@ -739,9 +748,7 @@ export class AlarmScheduler {
           backoff = 0;
         }
         backoff = Math.min(RETRY_BACKOFF_MAX, backoff);
-        let retryDelay = alarmRetryDelayMs(backoff);
-
-        retryDelay += this.#jitterMsForDelay(retryDelay);
+        const retryDelay = this.#retryDelay(backoff);
 
         backoff += 1;
         // Persisted before the task is armed, and it also clears `running`, so the two facts a
@@ -776,11 +783,12 @@ export class AlarmScheduler {
         // needs this owner to make progress while it remains alive. Reuse the
         // timer with bounded backoff; keep the due projection until cleanup
         // is durable, and carry the result so the handler is not redelivered.
-        entry.status = retryInfo === undefined ? "WAITING" : "FINISHED";
-        const backoff = Math.min(RETRY_BACKOFF_MAX, bookkeepingBackoff);
-        let retryDelay = alarmRetryDelayMs(backoff);
-        retryDelay += this.#jitterMsForDelay(retryDelay);
-        entry.task = this.#makeAlarmTask(retryDelay, entry, scheduledTime, retryInfo, backoff + 1);
+        entry.status = current.kind === "deliver" ? "WAITING" : "FINISHED";
+        const backoff = Math.min(RETRY_BACKOFF_MAX, current.backoff);
+        entry.task = this.#makeAlarmTask(this.#retryDelay(backoff), entry, scheduledTime, {
+          ...current,
+          backoff: backoff + 1,
+        });
       }
     } finally {
       this.#activeDeliveries.delete(entry);
@@ -790,6 +798,11 @@ export class AlarmScheduler {
         this.#taskFailed(exception);
       }
     }
+  }
+
+  #retryDelay(backoff: number): number {
+    const delay = alarmRetryDelayMs(backoff);
+    return delay + this.#jitterMsForDelay(delay);
   }
 
   /**

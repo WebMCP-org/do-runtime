@@ -64,7 +64,6 @@ import {
   STREAMING_TAILS_EXPERIMENTAL_MESSAGE,
   WorkerLoader,
   WorkerStub,
-  jsModuleInPythonWorkerMessage,
   moduleFieldCountMessage,
   moduleNameMessage,
   notSerializableMessage,
@@ -285,10 +284,6 @@ test("every ported message is upstream's, character for character", () => {
   expect(moduleFieldCountMessage("a.js", 2)).toBe(
     "Each module must contain exactly one of 'js', 'cjs', 'text', 'data', 'json', 'py', or " +
       "'wasm'. Module 'a.js' contained 2 properties.",
-  );
-
-  expect(jsModuleInPythonWorkerMessage("foo.js")).toBe(
-    'Module "foo.js" is a JS module, but the main module is a Python module.',
   );
 
   expect(pythonModuleInJsWorkerMessage("foo.py")).toBe(
